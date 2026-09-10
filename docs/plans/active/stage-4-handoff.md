@@ -2,11 +2,12 @@
 
 Date: 2026-09-10
 
-This handoff covers two rounds: the initial Stage 4 implementation, and a
-follow-up round resolving four bounded findings from independent review of
-that candidate. Both rounds are on `feature/sparring-v2`; see "Review round
-2" below for the second round's own branch/candidate state, provider
-findings, and live smoke test.
+This handoff covers three rounds, all on `feature/sparring-v2`: the initial
+Stage 4 implementation, a follow-up round resolving four bounded findings
+(including a live-smoke-test-caught bug), and a third round resolving two
+further read-only-integrity findings. See "Review round 2" and "Review
+round 3" below for each follow-up round's own branch/candidate state and
+findings.
 
 ## Branch state (round 1, initial implementation)
 
@@ -339,19 +340,132 @@ for f in test_*.py; do python3 "$f"; done
 All 15 test modules pass (`OK`), plus the live smoke test above.
 `git diff --check`: clean.
 
-### Known limitations / unresolved questions (round 2)
+### Known limitations / unresolved questions (round 2, superseded/updated by round 3 below)
 
-- The live smoke test above is exactly the kind of check that caught a
-  real bug the unit tests missed (a fake `runner` cannot detect that a CLI
-  subcommand rejects a flag, or that an unrelated default changed). It was
-  run manually in this session, not wired into CI; a future Codex CLI
+- ~~a real escape hatch remained: `CodexCliAdapter.sandbox` was still a
+  mutable field after construction, and `extra_args` could inject an
+  arbitrary config override~~ -- fixed by round 3's fix 1.
+- ~~the repo-integrity check was skipped when the provider itself
+  raised/mismatched/returned an unparseable verdict~~ -- fixed by round
+  3's fix 2.
+- The live smoke test in round 2 is exactly the kind of check that caught
+  a real bug the unit tests missed (a fake `runner` cannot detect that a
+  CLI subcommand rejects a flag, or that an unrelated default changed). It
+  was run manually in that session, not wired into CI; a future Codex CLI
   release changing this contract again would again only be caught by
   another manual live probe.
-- The `(branch, HEAD, dirty paths)` fingerprint still cannot detect a
-  provider that edits-then-restores a file byte-for-byte while also
-  checking back out to the original branch -- documented, not solved, as
-  in round 1.
+- Still true after round 3: the `(branch, HEAD, dirty paths)` fingerprint
+  still cannot detect a provider that edits-then-restores a file
+  byte-for-byte while also checking back out to the original branch --
+  documented, not solved.
 - No `.sparring/project.toml`/`PROJECT.md` exists yet for this repo itself
   (Stage 7 in the plan is the Sporely pilot).
 - Stage 5 (the unattended stage<->sparring loop) and Stage 6 (acceptance)
-  remain explicitly out of scope and were not started in this round either.
+  remain explicitly out of scope and were not started in any round.
+
+## Review round 3: remaining read-only-integrity findings
+
+- Base for this round: `f84e8d3c36adea0868eb257129c5197e0213bf8e`
+  (round 2's fix candidate)
+- Round-3 candidate SHA: `ab031666e0a823e45469b495e6a0054e5cf4b182`
+- Branch: `feature/sparring-v2`, pushed to `origin`
+  (`c95fad8..ab03166`)
+
+Two further bounded findings from independent review, both resolved:
+
+### Fix 1 -- remove the remaining programmatic write-permission escape hatch
+
+Round 2 made `CodexCliAdapter.__post_init__` reject `sandbox != "read-only"`
+at construction, but `sandbox` remained a normal mutable dataclass field
+afterward (`adapter.sandbox = "workspace-write"` would silently change what
+`_build_args()` used), and `extra_args` was appended after the fixed
+sandbox config, so a caller could inject an arbitrary Codex/config flag --
+including a conflicting sandbox override -- through it.
+
+`CodexCliAdapter` no longer has a `sandbox` field or an `extra_args`
+field at all. The verified read-only config pair is now a module-level
+constant, `_SANDBOX_CONFIG_ARG = ("-c", 'sandbox_mode="read-only"')`, that
+`_build_args()` always includes; there is no field, parameter, or
+attribute anywhere on the class that changes it. Setting an unrelated
+same-named attribute on an instance after construction (`adapter.sandbox =
+...`) is still possible in plain Python, but has no effect, since
+`_build_args()` never reads any such attribute. `model`/`executable`/
+`timeout_seconds`/`runner` remain configurable, unchanged. No
+flag-sanitization machinery and no contributor-sparrer mode were built.
+Module/class docstrings were also corrected: they no longer describe
+`--sandbox read-only` as this adapter's current invocation (that flag is
+what the very first exploratory probe used on a fresh `codex exec` call,
+before round 2 discovered `codex exec resume` rejects it outright); the
+verified, always-used mechanism is `-c sandbox_mode="read-only"` for both
+start and resume.
+
+Regressions in `tests/test_providers_codex_cli.py`:
+`test_sandbox_is_not_a_supported_constructor_parameter` and
+`test_extra_args_is_not_a_supported_constructor_parameter` (both assert
+`TypeError` -- an unknown constructor keyword, not a validated-and-rejected
+one), and `test_mutating_sandbox_attribute_after_construction_has_no_effect`
+(sets `adapter.sandbox = "workspace-write"` after construction, then
+asserts the built argv still carries the fixed read-only config and never
+`--sandbox`). The existing `test_default_sandbox_is_read_only` (fresh) and
+`test_resume_args_include_resume_subcommand_and_session_id` (resume) were
+kept as the "both fresh/resume argv contain the fixed verified read-only
+config" coverage the finding asked for.
+
+### Fix 2 -- run the repo-integrity check even when the provider fails
+
+Round 2's `run_sparring_agent` only computed the after-turn fingerprint
+inside the success path: a `ProviderError` from `adapter.start()`/
+`resume()`, a resume session-id mismatch, or an unparseable verdict all
+raised *before* the repository was ever re-fingerprinted, so the
+independent read-only backstop covered only a successful-looking turn --
+exactly the case it matters least for.
+
+`run_sparring_agent` now captures the provider call's outcome without
+immediately raising (`result: SparringAgentResult | None`,
+`provider_error: ProviderError | None`), always recomputes the
+`(branch, HEAD, dirty_paths)` fingerprint next regardless of which
+happened, and only then decides what to raise: an integrity violation is
+raised first (folding in a note that the provider also failed, if it
+did), then a bare provider failure, then a resume session-id mismatch,
+then a verdict-parse failure -- in that order, all strictly after the
+unconditional integrity check. Nothing is rolled back or reset in any
+case; the fingerprint itself is unchanged (still the same deliberately
+cheap `(branch, HEAD, dirty_paths)` snapshot, not a forensic audit).
+
+Regression: `test_integrity_check_still_catches_a_write_when_provider_also_fails`
+in `tests/test_sparring_agent.py` uses a new `_WritingThenFailingAdapter`
+fake that writes and commits a file and then raises `ProviderError`.
+Asserts: the raised `SparringAgentRunError` message contains "read-only
+contract violated" (the integrity violation, not just a provider-crashed
+message) and "provider also failed"; `sparring_session_id` stays `None`;
+and `sparring.md` is byte-for-byte unchanged from before the call.
+
+### Verification (round 3)
+
+```
+cd /Users/sigmundas/Documents/Code/agent-sparring/tests
+for f in test_*.py; do python3 "$f"; done
+```
+
+All 15 test modules pass (`OK`). `git diff --check`: clean.
+
+No live Codex smoke test was run in this round: per the review's own
+guidance, neither fix altered the actual Codex invocation shape beyond
+hard-coding the config arg pair round 2 had already verified live
+(`-c sandbox_mode="read-only"`); fix 2 is pure orchestration-layer control
+flow with no provider-facing change at all.
+
+### Known limitations / unresolved questions (round 3)
+
+- The `(branch, HEAD, dirty paths)` fingerprint still cannot detect a
+  provider that edits-then-restores a file byte-for-byte while also
+  checking back out to the original branch. Unchanged from round 1/2;
+  still documented, not solved, in `sparring_agent.py`'s module docstring.
+- `CodexCliAdapter`'s own unit tests still use an injectable fake `runner`
+  rather than the real CLI in CI, per rounds 1-2's note; round 2's live
+  smoke test is the concrete precedent for how contract drift here would
+  actually be caught.
+- No `.sparring/project.toml`/`PROJECT.md` exists yet for this repo itself
+  (Stage 7 in the plan is the Sporely pilot).
+- Stage 5 (the unattended stage<->sparring loop) and Stage 6 (acceptance)
+  remain explicitly out of scope and were not started in this round.
