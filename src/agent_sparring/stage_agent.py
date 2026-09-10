@@ -16,7 +16,7 @@ from pathlib import Path
 
 from agent_sparring.branch_guard import BranchGuardError, ensure_branch_for_unattended_run
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
-from agent_sparring.git_context import GitContextError
+from agent_sparring.git_context import GitContextError, resolve_commit
 from agent_sparring.handoff import generate_handoff
 from agent_sparring.providers import ProviderError, StageAgentAdapter, StageAgentResult
 from agent_sparring.stage import Stage
@@ -54,12 +54,22 @@ def run_stage_agent(
 
     Records the provider's own returned session id in state.json and
     regenerates handoff.md from the provider's result and actual git
-    context (never invented test evidence). Raises
-    :class:`StageAgentRunError` if: the branch guard refuses the run; the
-    worktree is already locked by another live process; the provider
-    itself fails; or, on resume, the provider returns a different session
-    id than the one it was asked to resume (the recorded implementation
-    session identity is never silently replaced).
+    context (never invented test evidence). On the stage's first run, the
+    pre-turn HEAD is recorded as the stage's ``base_sha`` so the handoff can
+    show the stage's accumulated changes; that base is preserved across
+    later SEND_BACK/resume turns, never re-resolved.
+
+    Immediately after the provider returns, the branch is re-checked: a
+    provider can run arbitrary git commands, so a successful-looking turn
+    that actually left the worktree off ``expected_branch`` (e.g. on
+    main/master) is treated as a failure, not silently accepted.
+
+    Raises :class:`StageAgentRunError` if: the branch guard refuses the run
+    (before or after the provider turn); the worktree is already locked by
+    another live process; the provider itself fails; or, on resume, the
+    provider returns a different session id than the one it was asked to
+    resume (the recorded implementation session identity is never silently
+    replaced).
     """
 
     if not expected_branch or not expected_branch.strip():
@@ -77,6 +87,15 @@ def run_stage_agent(
         with worktree_lock(repo_root):
             state = stage.read_state()
             resume_id = state.implementation_session_id
+
+            if state.base_sha is not None:
+                base_sha = state.base_sha
+            else:
+                try:
+                    base_sha = resolve_commit(repo_root, "HEAD", label="stage base")
+                except GitContextError as exc:
+                    raise StageAgentRunError(str(exc)) from exc
+
             prompt = build_stage_prompt(
                 stage,
                 sparring_dir,
@@ -98,7 +117,16 @@ def run_stage_agent(
                     "silently replace the recorded implementation session identity"
                 )
 
+            try:
+                ensure_branch_for_unattended_run(repo_root, expected_branch=expected_branch)
+            except BranchGuardError as exc:
+                raise StageAgentRunError(
+                    f"provider turn left the worktree off the expected branch: {exc}"
+                ) from exc
+
             state.implementation_session_id = result.session_id
+            if state.base_sha is None:
+                state.base_sha = base_sha
             stage.write_state(state)
 
             try:
@@ -108,6 +136,7 @@ def run_stage_agent(
                     stage_goal=stage.read_brief(),
                     claims=result.text,
                     check_pushed=False,
+                    base_sha=base_sha,
                 )
             except GitContextError as exc:
                 raise StageAgentRunError(str(exc)) from exc

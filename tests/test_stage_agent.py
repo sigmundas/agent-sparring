@@ -34,6 +34,60 @@ class _FakeAdapter:
         return self._resume_result
 
 
+class _CommittingAdapter:
+    """A fake provider that makes a real commit during its turn."""
+
+    def __init__(self, repo: Path, *, filename: str, session_id: str = "sess-1"):
+        self.repo = repo
+        self.filename = filename
+        self.session_id = session_id
+        self.start_calls = []
+        self.resume_calls = []
+
+    def _commit(self) -> None:
+        (self.repo / self.filename).write_text("added by stage agent\n", encoding="utf-8")
+        _run_git(self.repo, "add", self.filename)
+        _run_git(self.repo, "commit", "-q", "-m", f"stage agent: add {self.filename}")
+
+    def start(self, prompt: str) -> StageAgentResult:
+        self.start_calls.append(prompt)
+        self._commit()
+        return StageAgentResult(session_id=self.session_id, text="did it", is_error=False)
+
+    def resume(self, session_id: str, prompt: str) -> StageAgentResult:
+        self.resume_calls.append((session_id, prompt))
+        self._commit()
+        return StageAgentResult(session_id=self.session_id, text="did more", is_error=False)
+
+
+class _BranchSwitchingAdapter:
+    """A fake provider that checks out a different branch during its turn."""
+
+    def __init__(self, repo: Path, target_branch: str, *, session_id: str = "sess-1"):
+        self.repo = repo
+        self.target_branch = target_branch
+        self.session_id = session_id
+        self.start_calls = []
+        self.resume_calls = []
+
+    def start(self, prompt: str) -> StageAgentResult:
+        self.start_calls.append(prompt)
+        _run_git(self.repo, "checkout", "-q", self.target_branch)
+        return StageAgentResult(session_id=self.session_id, text="switched", is_error=False)
+
+    def resume(self, session_id: str, prompt: str) -> StageAgentResult:
+        self.resume_calls.append((session_id, prompt))
+        _run_git(self.repo, "checkout", "-q", self.target_branch)
+        return StageAgentResult(session_id=self.session_id, text="switched", is_error=False)
+
+
+def _head_sha(repo: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
 class StageAgentRunTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -187,6 +241,65 @@ class StageAgentRunTests(unittest.TestCase):
                     expected_branch="feature/x",
                 )
         self.assertEqual(adapter.start_calls, [])
+
+    def test_first_run_captures_base_sha_and_handoff_shows_accumulated_changes(self):
+        pre_run_sha = _head_sha(self.repo)
+        adapter = _CommittingAdapter(self.repo, filename="widget.txt")
+
+        run_result = run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
+
+        self.assertEqual(self.stage.read_state().base_sha, pre_run_sha)
+        post_run_sha = _head_sha(self.repo)
+        self.assertNotEqual(pre_run_sha, post_run_sha)
+
+        handoff = run_result.handoff
+        self.assertIn(pre_run_sha, handoff)
+        self.assertIn(post_run_sha, handoff)
+        self.assertIn("widget.txt", handoff)
+
+    def test_resumed_run_does_not_move_base_sha_forward(self):
+        adapter = _CommittingAdapter(self.repo, filename="widget.txt", session_id="sess-1")
+        run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
+        first_base = self.stage.read_state().base_sha
+        self.assertIsNotNone(first_base)
+
+        resume_adapter = _CommittingAdapter(self.repo, filename="widget2.txt", session_id="sess-1")
+        run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, resume_adapter, expected_branch="feature/x"
+        )
+
+        self.assertEqual(self.stage.read_state().base_sha, first_base)
+
+    def test_provider_switching_branches_during_start_is_refused(self):
+        adapter = _BranchSwitchingAdapter(self.repo, "main")
+        with self.assertRaises(StageAgentRunError):
+            run_stage_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
+        # Refused before being treated as a success: no session id recorded.
+        self.assertIsNone(self.stage.read_state().implementation_session_id)
+
+    def test_provider_switching_branches_during_resume_is_refused(self):
+        good_adapter = _CommittingAdapter(self.repo, filename="ok.txt", session_id="sess-1")
+        run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, good_adapter, expected_branch="feature/x"
+        )
+
+        switching_adapter = _BranchSwitchingAdapter(self.repo, "main", session_id="sess-1")
+        with self.assertRaises(StageAgentRunError):
+            run_stage_agent(
+                self.stage,
+                self.sparring_dir,
+                self.repo,
+                switching_adapter,
+                expected_branch="feature/x",
+            )
+        # The identity recorded by the prior successful run must be untouched.
+        self.assertEqual(self.stage.read_state().implementation_session_id, "sess-1")
 
 
 if __name__ == "__main__":
