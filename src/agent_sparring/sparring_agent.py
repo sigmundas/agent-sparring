@@ -21,6 +21,17 @@ provider that ignores its own read-only flag) cannot silently become a
 contributor to the candidate, and cannot silently review a different branch
 than the one the caller was told to expect.
 
+This read-only integrity check runs after *every attempted* provider turn,
+not only a successful one: a provider that raises (a
+:class:`~agent_sparring.providers.ProviderError`), returns a mismatched
+resume session id, or returns an unparseable verdict may still have
+written to the repository first. The check is evaluated before any of
+those failure modes is raised, and a repository-integrity violation is
+reported ahead of (and never masked by) a plain provider failure, since a
+provider that both failed *and* wrote to the repository is the more
+important condition to surface. Nothing is ever rolled back or reset here
+-- only reported.
+
 The provider's final structured message is expected to carry both the tiny
 routing verdict (``action``/``summary``/``needs_you_reason``) and separate
 human-readable ``findings``/``deferred`` prose (see
@@ -166,12 +177,19 @@ def run_sparring_agent(
 
     Raises :class:`SparringAgentRunError` if: ``expected_branch`` is
     missing/blank; the worktree is not on ``expected_branch`` before the
-    turn (provider is never invoked in this case); the provider itself
-    fails; the provider turn left the repository modified or switched
-    branches (read-only contract violated -- the sparring result is not
-    recorded in this case); the provider's final message is not a usable
-    routing verdict; or, on resume, the provider returns a different
-    session id than the one it was asked to resume.
+    turn (provider is never invoked in this case); the provider turn left
+    the repository modified or switched branches (read-only contract
+    violated -- checked after *every* attempted turn, including one where
+    the provider itself raised, returned a mismatched resume session id, or
+    returned an unparseable verdict; a repository-integrity violation is
+    reported ahead of any of those, since a provider that both failed and
+    wrote to the repository is the more important condition to surface);
+    the provider itself fails (and the repository was not touched); the
+    provider's final message is not a usable routing verdict; or, on
+    resume, the provider returns a different session id than the one it
+    was asked to resume. In every raised case, the sparring result is not
+    recorded: neither ``sparring_session_id`` nor ``sparring.md`` is
+    updated.
     """
 
     if not expected_branch or not expected_branch.strip():
@@ -198,13 +216,39 @@ def run_sparring_agent(
             f"{before_branch!r}; refusing to spar against the wrong branch"
         )
 
+    result: SparringAgentResult | None = None
+    provider_error: ProviderError | None = None
     try:
         if resume_id:
             result = adapter.resume(resume_id, prompt)
         else:
             result = adapter.start(prompt)
     except ProviderError as exc:
+        provider_error = exc
+
+    # The integrity check runs after every attempted turn, whether the
+    # provider raised or not: a provider that fails may still have written
+    # to the repository first (see module docstring).
+    try:
+        after_branch, after_head, after_dirty = _repo_fingerprint(repo_root)
+    except GitContextError as exc:
         raise SparringAgentRunError(str(exc)) from exc
+
+    if (after_branch, after_head, after_dirty) != (before_branch, before_head, before_dirty):
+        detail = (
+            "sparring turn modified the repository or switched branches "
+            f"(read-only contract violated): branch {before_branch!r} -> "
+            f"{after_branch!r}, HEAD {before_head} -> {after_head}, dirty "
+            f"paths {before_dirty!r} -> {after_dirty!r}"
+        )
+        if provider_error is not None:
+            detail += f"; the provider also failed: {provider_error}"
+        raise SparringAgentRunError(detail)
+
+    if provider_error is not None:
+        raise SparringAgentRunError(str(provider_error))
+
+    assert result is not None  # provider_error is None, so the call above succeeded
 
     if resume_id and result.session_id != resume_id:
         raise SparringAgentRunError(
@@ -214,29 +258,16 @@ def run_sparring_agent(
         )
 
     try:
-        after_branch, after_head, after_dirty = _repo_fingerprint(repo_root)
-    except GitContextError as exc:
-        raise SparringAgentRunError(str(exc)) from exc
-
-    if (after_branch, after_head, after_dirty) != (before_branch, before_head, before_dirty):
-        raise SparringAgentRunError(
-            "sparring turn modified the repository or switched branches "
-            f"(read-only contract violated): branch {before_branch!r} -> "
-            f"{after_branch!r}, HEAD {before_head} -> {after_head}, dirty "
-            f"paths {before_dirty!r} -> {after_dirty!r}"
-        )
-
-    try:
         routing, findings_text = _parse_verdict(result.text)
     except RoutingResultError as exc:
         raise SparringAgentRunError(
             f"provider's final message was not a usable routing verdict: {exc}"
         ) from exc
 
-    # Both the integrity check above and the session-id record below only
-    # happen once the turn is confirmed read-only/on-branch and the verdict
-    # parses; a failed/refused turn must not record a session id or
-    # overwrite sparring.md.
+    # The integrity check above, the provider-error/session-mismatch checks,
+    # and the verdict parse above all happen before this point; a
+    # failed/refused turn must not record a session id or overwrite
+    # sparring.md.
     state.sparring_session_id = result.session_id
     stage.write_state(state)
 

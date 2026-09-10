@@ -236,10 +236,10 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
                 f"unsupported sparring agent provider {provider!r}; only 'codex-cli' is "
                 "implemented so far"
             )
-        # No --sandbox override is exposed here: CodexCliAdapter always
-        # runs read-only (see providers/codex_cli.py) and refuses
-        # construction with anything else, so there is no writable-sandbox
-        # escape hatch for this adapter.
+        # No --sandbox override is exposed here: CodexCliAdapter has no
+        # sandbox field or extra_args passthrough at all -- read-only is
+        # hard-coded (see providers/codex_cli.py), so there is no
+        # writable-sandbox escape hatch for this adapter.
         adapter = CodexCliAdapter(
             repo_root=repo_root,
             executable=args.codex_executable,
@@ -429,8 +429,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="codex CLI executable to invoke (default: codex)",
     )
     run_sparring.add_argument("--model", default=None, help="model override for the provider")
-    # No --sandbox flag: CodexCliAdapter always runs read-only and refuses
-    # any other sandbox at construction time (see providers/codex_cli.py).
+    # No --sandbox flag: CodexCliAdapter has no sandbox field at all --
+    # read-only is hard-coded (see providers/codex_cli.py).
     run_sparring.add_argument(
         "--dry-run",
         action="store_true",

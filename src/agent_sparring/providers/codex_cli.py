@@ -4,22 +4,26 @@ Behavior asserted here was verified against a real local ``codex`` install
 (version 0.153.4), not assumed -- see the Stage 4 handoff for the full
 capability probe. Summary of what was actually confirmed on this machine:
 
-- ``codex exec --sandbox read-only --json --output-schema <file>
-  -o <file> <prompt>`` prints one JSON object per line (JSONL) on stdout: a
-  ``thread.started`` event carrying the provider-issued ``thread_id`` (used
-  as this adapter's session id), zero or more ``item.started``/
-  ``item.completed`` events, and a final ``turn.completed`` (or
-  ``turn.failed`` on error) event. The model's final message -- validated
-  against ``--output-schema`` -- is also written verbatim to the
-  ``-o``/``--output-last-message`` file; that file, not re-parsed JSONL item
-  text, is treated as authoritative here.
-- ``--sandbox read-only`` is enforced by the OS, not merely a prompt
+- ``codex exec ... --json --output-schema <file> -o <file> <prompt>``
+  prints one JSON object per line (JSONL) on stdout: a ``thread.started``
+  event carrying the provider-issued ``thread_id`` (used as this adapter's
+  session id), zero or more ``item.started``/``item.completed`` events,
+  and a final ``turn.completed`` (or ``turn.failed`` on error) event. The
+  model's final message -- validated against ``--output-schema`` -- is
+  also written verbatim to the ``-o``/``--output-last-message`` file; that
+  file, not re-parsed JSONL item text, is treated as authoritative here.
+- A read-only sandbox is enforced by the OS, not merely a prompt
   instruction: a write attempt by the model's own shell tool fails with
   "operation not permitted" and no file is created, while read-only
   repository inspection (``git log``, ``git status``, ``git diff``) still
-  works. This is the concrete evidence for choosing Codex CLI as the first
-  local sparring provider over Claude Code CLI's ``--permission-mode``
-  (a tool-gating setting inside the CLI, not an OS-enforced sandbox).
+  works. This was first confirmed with the top-level ``--sandbox
+  read-only`` flag on a fresh ``codex exec`` run; the third bullet below
+  explains why this adapter actually uses a different mechanism
+  (``-c sandbox_mode=...``) so the same guarantee also holds on resume.
+  This OS-level enforcement is the concrete evidence for choosing Codex
+  CLI as the first local sparring provider over Claude Code CLI's
+  ``--permission-mode`` (a tool-gating setting inside the CLI, not an
+  OS-enforced sandbox).
 - ``codex exec resume <thread_id> ...`` continues that same session and
   reports the same ``thread_id`` back. Resuming an unknown/invalid thread id
   fails non-zero with a plain-text error on stderr (not JSON) and prints no
@@ -45,15 +49,22 @@ capability probe. Summary of what was actually confirmed on this machine:
   controllable and was not used or probed further once this CLI's headless
   ``exec``/``exec resume`` surface was confirmed sufficient.
 
-This adapter always runs with ``--sandbox read-only``: that is what makes
-it a genuinely read-only sparrer rather than a prompt-only promise (see
-above -- a write attempt actually fails at the OS level). A writable
+This adapter always runs with ``-c sandbox_mode="read-only"``: that is what
+makes it a genuinely read-only sparrer rather than a prompt-only promise
+(see above -- a write attempt actually fails at the OS level). A writable
 sandbox would turn the sparrer into a contributor to the candidate, which
 per the project plan's independence principle forfeits that sparrer's
 authority to give independent acceptance -- a distinct, not-yet-built mode.
-There is deliberately no supported way to opt into a writable sandbox here;
-:meth:`CodexCliAdapter.__post_init__` refuses construction outright if
-``sandbox`` is anything other than ``"read-only"``.
+
+For this adapter, read-only is an invariant, not a configuration option:
+there is no ``sandbox`` constructor field, no runtime-mutable attribute,
+and no ``extra_args`` passthrough that could inject a different sandbox or
+config override. The verified read-only setting is hard-coded directly
+into argument-building (see ``_SANDBOX_CONFIG_ARG`` below) with no
+supported path -- constructor, attribute mutation after construction, or
+otherwise -- to select anything else. A future contributor-sparrer mode
+(one that legitimately edits and forfeits independent acceptance
+authority) would be a distinct adapter/mode, not a flag on this one.
 
 This module is the only place that knows any of the above. Generic
 orchestration code talks to the :class:`~agent_sparring.providers.
@@ -73,6 +84,15 @@ from agent_sparring.providers import ProviderError, SparringAgentResult
 
 DEFAULT_EXECUTABLE = "codex"
 DEFAULT_SANDBOX = "read-only"
+
+# Verified live (see module docstring): "codex exec resume" rejects the
+# top-level --sandbox flag outright, and without any override does not
+# inherit the original session's read-only sandbox either -- a real write
+# succeeded. "-c sandbox_mode=..." is accepted by, and verified to enforce
+# read-only on, both "codex exec" and "codex exec resume". This is the
+# fixed, hard-coded config arg pair this adapter always passes; there is
+# no field or parameter anywhere in this class that can change it.
+_SANDBOX_CONFIG_ARG: tuple[str, str] = ("-c", f'sandbox_mode="{DEFAULT_SANDBOX}"')
 
 # Every property must be listed in "required" (Codex's strict-schema
 # requirement, verified above); an optional field is expressed as a
@@ -120,19 +140,22 @@ def _default_runner(
 class CodexCliAdapter:
     """Sparring adapter backed by the ``codex`` CLI's ``exec`` mode.
 
-    Always invokes ``codex exec`` with ``--sandbox read-only`` (OS-enforced,
-    see module docstring) and ``--output-schema``/``-o`` so the final
-    message is a schema-validated JSON routing verdict written to a file
-    this adapter controls. ``runner`` is injectable so tests can exercise
+    Always invokes ``codex exec`` with the fixed, hard-coded
+    ``-c sandbox_mode="read-only"`` config override (OS-enforced, see
+    module docstring) and ``--output-schema``/``-o`` so the final message
+    is a schema-validated JSON routing verdict written to a file this
+    adapter controls. There is deliberately no ``sandbox`` field and no
+    ``extra_args`` passthrough on this class: for this sparring adapter,
+    read-only is an invariant, not something a caller can configure,
+    mutate after construction, or bypass by injecting arbitrary
+    Codex/config flags. ``runner`` is injectable so tests can exercise
     argument-building and output-parsing without launching a real CLI
     process or model.
     """
 
     repo_root: Path
     executable: str = DEFAULT_EXECUTABLE
-    sandbox: str = DEFAULT_SANDBOX
     model: str | None = None
-    extra_args: tuple[str, ...] = ()
     timeout_seconds: float | None = None
     runner: Runner = field(default=_default_runner)
 
@@ -141,21 +164,6 @@ class CodexCliAdapter:
     # say so via this flag rather than the caller discovering it by a failed
     # call.
     supports_resume: bool = True
-
-    def __post_init__(self) -> None:
-        # Read-only is not a passthrough knob (see module docstring): a
-        # writable sandbox would silently turn this into a contributor
-        # sparrer, which is out of scope for Stage 4. Refuse at
-        # construction time rather than letting a caller quietly configure
-        # it away.
-        if self.sandbox != DEFAULT_SANDBOX:
-            raise ProviderError(
-                f"CodexCliAdapter only supports sandbox={DEFAULT_SANDBOX!r} "
-                f"(got {self.sandbox!r}); a writable sandbox would make the "
-                "sparrer a contributor to the candidate, forfeiting its "
-                "independent acceptance authority -- that is a distinct, "
-                "not-yet-built mode, not a configuration option here"
-            )
 
     def start(self, prompt: str) -> SparringAgentResult:
         return self._invoke(prompt, resume_session_id=None)
@@ -180,16 +188,13 @@ class CodexCliAdapter:
         args = [self.executable, "exec"]
         if resume_session_id:
             args += ["resume", resume_session_id]
-        # Verified live (see module docstring): "codex exec resume" rejects
-        # the top-level --sandbox flag outright, and -- without any
-        # override -- does not inherit the original session's read-only
-        # sandbox either. "-c sandbox_mode=..." is accepted by, and
-        # verified to enforce read-only on, both "codex exec" and
-        # "codex exec resume", so it is used uniformly for both instead of
-        # --sandbox.
+        # _SANDBOX_CONFIG_ARG is the fixed, hard-coded read-only config
+        # override (see module docstring for why it is "-c sandbox_mode=..."
+        # and not --sandbox). There is no field on this class that can
+        # change it, and no extra_args passthrough that could append a
+        # conflicting override after it.
+        args += list(_SANDBOX_CONFIG_ARG)
         args += [
-            "-c",
-            f'sandbox_mode="{self.sandbox}"',
             "--json",
             "--output-schema",
             str(schema_path),
@@ -198,7 +203,6 @@ class CodexCliAdapter:
         ]
         if self.model:
             args += ["--model", self.model]
-        args += list(self.extra_args)
         args.append(prompt)
         return args
 

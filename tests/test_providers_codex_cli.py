@@ -137,22 +137,43 @@ class CodexCliAdapterStartTests(unittest.TestCase):
         self.assertNotIn("--sandbox", args)
         self.assertEqual(_sandbox_config_value(args), "read-only")
 
-    def test_workspace_write_sandbox_is_refused_at_construction(self):
-        # Stage 4 finding: there must be no escape hatch to a writable
-        # sandbox for the normal read-only sparring adapter. This must be
-        # refused outright, not silently exercised as supported behavior.
-        with self.assertRaises(ProviderError):
+    def test_sandbox_is_not_a_supported_constructor_parameter(self):
+        # Stage 4 finding: read-only must be an invariant, not a
+        # configuration option -- there must be no "sandbox" constructor
+        # field to override at all (not even one that validates and
+        # rejects unsafe values). Passing it must fail as an unknown
+        # keyword argument, exactly like any other nonexistent parameter.
+        with self.assertRaises(TypeError):
             CodexCliAdapter(
                 repo_root=self.repo_root, runner=lambda *a, **k: None, sandbox="workspace-write"
             )
 
-    def test_danger_full_access_sandbox_is_refused_at_construction(self):
-        with self.assertRaises(ProviderError):
+    def test_extra_args_is_not_a_supported_constructor_parameter(self):
+        # Stage 4 finding: extra_args could inject an arbitrary Codex/config
+        # flag (including a conflicting sandbox override) after the fixed
+        # read-only config arg, so this adapter exposes no such passthrough.
+        with self.assertRaises(TypeError):
             CodexCliAdapter(
                 repo_root=self.repo_root,
                 runner=lambda *a, **k: None,
-                sandbox="danger-full-access",
+                extra_args=("-c", 'sandbox_mode="workspace-write"'),
             )
+
+    def test_mutating_sandbox_attribute_after_construction_has_no_effect(self):
+        # Even if a caller sets an attribute of this name directly on the
+        # instance (Python does not prevent arbitrary attribute
+        # assignment), there is no runtime path by which it changes what
+        # is actually invoked: _build_args never reads it.
+        stdout = _jsonl({"type": "thread.started", "thread_id": "t1"}, {"type": "turn.completed"})
+        runner, captured = self._make_runner(stdout, write_output="{}")
+
+        adapter = CodexCliAdapter(repo_root=self.repo_root, runner=runner)
+        adapter.sandbox = "workspace-write"  # not a real field; has no effect
+        adapter.start("hello")
+
+        args = captured["args"]
+        self.assertNotIn("--sandbox", args)
+        self.assertEqual(_sandbox_config_value(args), "read-only")
 
 
 class CodexCliAdapterResumeTests(unittest.TestCase):

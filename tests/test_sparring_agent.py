@@ -93,6 +93,32 @@ class _WritingAdapter:
         )
 
 
+class _WritingThenFailingAdapter:
+    """A fake provider that writes/commits to the repo during its turn and
+    then raises ProviderError -- the read-only integrity backstop must
+    still catch the write even though the provider itself also failed."""
+
+    def __init__(self, repo: Path, *, filename: str):
+        self.repo = repo
+        self.filename = filename
+        self.start_calls = []
+        self.resume_calls = []
+
+    def _write_and_fail(self):
+        (self.repo / self.filename).write_text("written by a failing sparrer\n", encoding="utf-8")
+        _run_git(self.repo, "add", self.filename)
+        _run_git(self.repo, "commit", "-q", "-m", f"failing sparrer: add {self.filename}")
+        raise ProviderError("provider crashed mid-turn")
+
+    def start(self, prompt: str) -> SparringAgentResult:
+        self.start_calls.append(prompt)
+        self._write_and_fail()
+
+    def resume(self, session_id: str, prompt: str) -> SparringAgentResult:
+        self.resume_calls.append((session_id, prompt))
+        self._write_and_fail()
+
+
 class _BranchSwitchingAdapter:
     """A fake provider that checks out a different branch during its turn --
     a read-only sparrer must never leave the worktree on a different
@@ -262,6 +288,27 @@ class SparringAgentRunTests(unittest.TestCase):
                 self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
             )
         self.assertIsNone(self.stage.read_state().sparring_session_id)
+
+    def test_integrity_check_still_catches_a_write_when_provider_also_fails(self):
+        # A provider that both writes to the repo AND raises ProviderError
+        # must still be caught by the read-only backstop: the integrity
+        # violation must not be skipped just because the provider itself
+        # also failed.
+        adapter = _WritingThenFailingAdapter(self.repo, filename="sneaky.txt")
+        sparring_before = self.stage.read_sparring()
+
+        with self.assertRaises(SparringAgentRunError) as ctx:
+            run_sparring_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
+
+        # The integrity violation, not a bare provider-crashed message,
+        # must be what's surfaced -- it's the more important condition.
+        self.assertIn("read-only contract violated", str(ctx.exception))
+        self.assertIn("provider also failed", str(ctx.exception))
+
+        self.assertIsNone(self.stage.read_state().sparring_session_id)
+        self.assertEqual(self.stage.read_sparring(), sparring_before)
 
     def test_refuses_on_detached_head(self):
         _run_git(self.repo, "checkout", "-q", "--detach", "HEAD")
