@@ -123,6 +123,100 @@ class CliHandoffAndSparringTests(unittest.TestCase):
         )
         self.assertEqual(exit_code, 0)
 
+    def test_handoff_missing_project_toml_uses_default_repo_root(self):
+        # No project.toml at all: the default repo root (parent of
+        # .sparring) must be used, and must not require --repo-root.
+        main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(self.sparring_dir),
+                "handoff",
+                "stage-1",
+                "--claims",
+                "did the thing",
+                "--no-check-pushed",
+            ]
+        )
+        self.assertEqual(exit_code, 0)
+        handoff_path = self.sparring_dir / "stages" / "stage-1" / "handoff.md"
+        self.assertIn("`main`", handoff_path.read_text(encoding="utf-8"))
+
+    def test_handoff_malformed_toml_fails_cleanly(self):
+        # project.toml exists but is not valid TOML: must fail cleanly
+        # (no traceback), and must NOT silently fall back to the default
+        # repo root as if project.toml were absent.
+        project_dir = Path(self._tmp.name) / "project3"
+        project_dir.mkdir()
+        sparring_dir = project_dir / ".sparring"
+        sparring_dir.mkdir()
+        (sparring_dir / "project.toml").write_text("this is [ not valid toml", encoding="utf-8")
+        main(["--sparring-dir", str(sparring_dir), "new-stage", "stage-1"])
+
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(sparring_dir),
+                "handoff",
+                "stage-1",
+                "--claims",
+                "did the thing",
+                "--no-check-pushed",
+            ]
+        )
+        self.assertEqual(exit_code, 1)
+
+    def test_handoff_invalid_repo_root_type_fails_cleanly(self):
+        # [repo].root has an invalid type: must fail cleanly, not silently
+        # pick the default repo root nor raise an unhandled traceback.
+        project_dir = Path(self._tmp.name) / "project4"
+        project_dir.mkdir()
+        sparring_dir = project_dir / ".sparring"
+        sparring_dir.mkdir()
+        (sparring_dir / "project.toml").write_text(
+            'project = "x"\n\n[repo]\nroot = 123\n', encoding="utf-8"
+        )
+        main(["--sparring-dir", str(sparring_dir), "new-stage", "stage-1"])
+
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(sparring_dir),
+                "handoff",
+                "stage-1",
+                "--claims",
+                "did the thing",
+                "--no-check-pushed",
+            ]
+        )
+        self.assertEqual(exit_code, 1)
+
+    def test_handoff_explicit_repo_root_overrides_malformed_toml(self):
+        # --repo-root must short-circuit before project.toml is even read,
+        # so it works even when project.toml cannot be parsed at all.
+        project_dir = Path(self._tmp.name) / "project5"
+        project_dir.mkdir()
+        sparring_dir = project_dir / ".sparring"
+        sparring_dir.mkdir()
+        (sparring_dir / "project.toml").write_text("this is [ not valid toml", encoding="utf-8")
+        main(["--sparring-dir", str(sparring_dir), "new-stage", "stage-1"])
+
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(sparring_dir),
+                "handoff",
+                "stage-1",
+                "--claims",
+                "did the thing",
+                "--repo-root",
+                str(self.repo),
+                "--no-check-pushed",
+            ]
+        )
+        self.assertEqual(exit_code, 0)
+
     def test_handoff_missing_stage_fails(self):
         exit_code = main(
             [

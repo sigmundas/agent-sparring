@@ -12,7 +12,12 @@ import argparse
 import sys
 from pathlib import Path
 
-from agent_sparring.config import ProjectConfigError, load_project_config, load_project_markdown
+from agent_sparring.config import (
+    CONFIG_FILENAME,
+    ProjectConfigError,
+    load_project_config,
+    load_project_markdown,
+)
 from agent_sparring.git_context import GitContextError
 from agent_sparring.handoff import generate_handoff
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
@@ -53,25 +58,33 @@ def _cmd_new_stage(args: argparse.Namespace) -> int:
 def _resolve_repo_root(args: argparse.Namespace, sparring_dir: Path) -> Path:
     """Precedence: explicit --repo-root > configured [repo].root > the
     parent of --sparring-dir. A relative configured root is resolved
-    against the project root (the parent of --sparring-dir), never CWD."""
+    against the project root (the parent of --sparring-dir), never CWD.
+
+    An explicit --repo-root short-circuits before project.toml is even
+    looked at, so it works even when project.toml is missing or malformed.
+    A missing project.toml is a legitimate "use the default" case; a
+    project.toml that exists but fails to parse is not — that is let
+    through as :class:`ProjectConfigError` rather than silently falling
+    back, since silently picking a different repo root would be worse than
+    failing loudly.
+    """
 
     if args.repo_root:
         return Path(args.repo_root)
 
     project_root = sparring_dir.resolve().parent
-    try:
-        config = load_project_config(sparring_dir)
-    except ProjectConfigError:
+    if not (sparring_dir / CONFIG_FILENAME).is_file():
         return project_root
 
+    config = load_project_config(sparring_dir)
     configured = Path(config.repo_root)
     return configured if configured.is_absolute() else (project_root / configured).resolve()
 
 
 def _cmd_handoff(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
-    repo_root = _resolve_repo_root(args, sparring_dir)
     try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
         stage = Stage.resolve(sparring_dir, args.stage_id)
         if not stage.exists():
             raise StageError(f"stage {args.stage_id!r} does not exist at {stage.directory}")
@@ -86,7 +99,7 @@ def _cmd_handoff(args: argparse.Namespace) -> int:
             base_sha=args.base_sha,
             candidate_sha=args.candidate_sha,
         )
-    except (StageError, GitContextError) as exc:
+    except (StageError, GitContextError, ProjectConfigError) as exc:
         print(f"could not generate handoff: {exc}", file=sys.stderr)
         return 1
     print(content)
