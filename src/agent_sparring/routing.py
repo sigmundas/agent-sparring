@@ -73,6 +73,8 @@ class RoutingResult:
             raise RoutingResultError("summary must be a non-empty string")
         if self.needs_you_reason is not None and not isinstance(self.needs_you_reason, str):
             raise RoutingResultError("needs_you_reason must be a string if present")
+        if not isinstance(self.details, Mapping):
+            raise RoutingResultError(f"details must be a mapping, got {self.details!r}")
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -97,9 +99,13 @@ class RoutingResult:
 
         reason = payload.get("needs_you_reason")
 
-        details = payload.get("details") or {}
-        if not isinstance(details, Mapping):
-            raise RoutingResultError("routing result 'details' must be an object")
+        details = payload.get("details")
+        if details is None:
+            details = {}
+        elif not isinstance(details, Mapping):
+            raise RoutingResultError(
+                f"routing result 'details' must be an object, got {details!r}"
+            )
 
         return cls(
             action=action,

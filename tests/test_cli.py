@@ -64,6 +64,65 @@ class CliHandoffAndSparringTests(unittest.TestCase):
         sparring_path = self.sparring_dir / "stages" / "stage-1" / "sparring.md"
         self.assertIn("fix the widget", sparring_path.read_text(encoding="utf-8"))
 
+    def test_handoff_honors_configured_repo_root_relative_to_project(self):
+        # .sparring lives in a plain project directory; the actual git repo
+        # is a sibling directory, reachable only through [repo].root in
+        # project.toml. Without --repo-root, the CLI must resolve that
+        # configured root relative to the project root (parent of
+        # .sparring), not the process CWD.
+        project_dir = Path(self._tmp.name) / "project"
+        project_dir.mkdir()
+        sparring_dir = project_dir / ".sparring"
+        sparring_dir.mkdir()
+        (sparring_dir / "project.toml").write_text(
+            'project = "x"\n\n[repo]\nroot = "../repo"\n', encoding="utf-8"
+        )
+
+        exit_code = main(["--sparring-dir", str(sparring_dir), "new-stage", "stage-1"])
+        self.assertEqual(exit_code, 0)
+
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(sparring_dir),
+                "handoff",
+                "stage-1",
+                "--claims",
+                "did the thing",
+                "--no-check-pushed",
+            ]
+        )
+        self.assertEqual(exit_code, 0)
+        handoff_path = sparring_dir / "stages" / "stage-1" / "handoff.md"
+        content = handoff_path.read_text(encoding="utf-8")
+        self.assertIn("`main`", content)
+        self.assertIn("did the thing", content)
+
+    def test_handoff_explicit_repo_root_overrides_configured_root(self):
+        project_dir = Path(self._tmp.name) / "project2"
+        project_dir.mkdir()
+        sparring_dir = project_dir / ".sparring"
+        sparring_dir.mkdir()
+        (sparring_dir / "project.toml").write_text(
+            'project = "x"\n\n[repo]\nroot = "../nonexistent"\n', encoding="utf-8"
+        )
+        main(["--sparring-dir", str(sparring_dir), "new-stage", "stage-1"])
+
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(sparring_dir),
+                "handoff",
+                "stage-1",
+                "--claims",
+                "did the thing",
+                "--repo-root",
+                str(self.repo),
+                "--no-check-pushed",
+            ]
+        )
+        self.assertEqual(exit_code, 0)
+
     def test_handoff_missing_stage_fails(self):
         exit_code = main(
             [

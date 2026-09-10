@@ -23,8 +23,12 @@ class GitContextError(RuntimeError):
 
 @dataclass(frozen=True)
 class ChangedFile:
+    """One changed path. ``old_path`` is the rename/copy source (``status``
+    starting with ``R``/``C``); ``None`` for every other status."""
+
     status: str
     path: str
+    old_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,40 +90,80 @@ def resolve_commit(repo_root: Path, rev: str, *, label: str = "revision") -> str
     return sha
 
 
-def changed_files(repo_root: Path, base_sha: str, candidate_sha: str) -> tuple[ChangedFile, ...]:
-    """Files changed between ``base_sha`` and ``candidate_sha`` (name-status)."""
+def _split_nul(raw: str) -> list[str]:
+    tokens = raw.split("\0")
+    if tokens and tokens[-1] == "":
+        tokens.pop()
+    return tokens
 
-    output = _git(repo_root, "diff", "--name-status", f"{base_sha}..{candidate_sha}")
+
+def changed_files(repo_root: Path, base_sha: str, candidate_sha: str) -> tuple[ChangedFile, ...]:
+    """Files changed between ``base_sha`` and ``candidate_sha`` (name-status).
+
+    Uses NUL-delimited output (``-z``) so filenames containing spaces, tabs,
+    or newlines survive intact, and passes ``-M`` so a rename reports both
+    its source and destination path rather than collapsing to a plain
+    delete+add pair.
+    """
+
+    result = _run(repo_root, "diff", "--name-status", "-M", "-z", f"{base_sha}..{candidate_sha}")
+    if result.returncode != 0:
+        raise GitContextError(result.stderr.strip() or "git diff --name-status failed")
+    tokens = _split_nul(result.stdout)
+
     files: list[ChangedFile] = []
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        status, path = parts[0], parts[-1]
-        files.append(ChangedFile(status=status, path=path))
+    i = 0
+    while i < len(tokens):
+        status = tokens[i]
+        i += 1
+        if i >= len(tokens):
+            break
+        if status[:1] in ("R", "C"):
+            old_path = tokens[i]
+            i += 1
+            if i >= len(tokens):
+                break
+            new_path = tokens[i]
+            i += 1
+            files.append(ChangedFile(status=status, path=new_path, old_path=old_path))
+        else:
+            path = tokens[i]
+            i += 1
+            files.append(ChangedFile(status=status, path=path))
     return tuple(files)
 
 
 def dirty_paths(repo_root: Path) -> tuple[str, ...]:
-    """Working-tree paths reported by ``git status --porcelain``.
+    """Working-tree paths reported by ``git status --porcelain=v1 -z``.
 
-    Uses the raw (un-stripped) command output: porcelain's first status
-    column can be a leading space, and stripping the whole output before
-    slicing would eat that column on the first line.
+    NUL-delimited output preserves filenames containing spaces, tabs, or
+    newlines. A rename/copy entry is followed by its own source-path token
+    (no ``XY`` prefix); that token is consumed here so it is not
+    misinterpreted as an unrelated entry, and folded into one descriptive
+    path so the caller still sees both sides of the rename.
     """
 
-    result = _run(repo_root, "status", "--porcelain")
+    result = _run(repo_root, "status", "--porcelain=v1", "-z")
     if result.returncode != 0:
         raise GitContextError(result.stderr.strip() or "git status --porcelain failed")
+    tokens = _split_nul(result.stdout)
+
     paths: list[str] = []
-    for line in result.stdout.splitlines():
-        if not line.strip():
+    i = 0
+    while i < len(tokens):
+        entry = tokens[i]
+        i += 1
+        if len(entry) < 3:
+            if entry:
+                paths.append(entry)
             continue
-        # Porcelain lines are "XY <path>" (or "XY <old> -> <new>" for renames);
-        # the status codes occupy the first two columns.
-        paths.append(line[3:] if len(line) > 3 else line.strip())
+        status, path = entry[:2], entry[3:]
+        if status[0] in ("R", "C") and i < len(tokens):
+            old_path = tokens[i]
+            i += 1
+            paths.append(f"{path} (renamed from {old_path})")
+        else:
+            paths.append(path)
     return tuple(paths)
 
 
@@ -171,9 +215,17 @@ def verify_pushed(repo_root: Path, candidate_sha: str, branch: str) -> tuple[boo
 
 
 def diff_patch(repo_root: Path, base_sha: str, candidate_sha: str) -> str:
-    """Raw unified diff text between ``base_sha`` and ``candidate_sha``."""
+    """Raw unified diff text between ``base_sha`` and ``candidate_sha``.
 
-    return _git(repo_root, "diff", f"{base_sha}..{candidate_sha}")
+    Returned byte-for-byte from git's stdout (only ``check=False`` is used,
+    never ``.strip()``): a real patch's meaningful trailing whitespace on a
+    changed line must survive for ``git apply``/``patch`` to work from it.
+    """
+
+    result = _run(repo_root, "diff", f"{base_sha}..{candidate_sha}")
+    if result.returncode != 0:
+        raise GitContextError(result.stderr.strip() or "git diff failed")
+    return result.stdout
 
 
 def gather_git_context(

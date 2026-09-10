@@ -94,6 +94,15 @@ class RoutingResultConstructionTests(unittest.TestCase):
         with self.assertRaises(RoutingResultError):
             RoutingResult(action=RoutingAction.READY, summary=123)
 
+    def test_direct_construction_non_mapping_details_refused_cleanly(self):
+        # Regression: a malformed details value passed directly (not via
+        # from_dict) must raise RoutingResultError here, not surface later
+        # as a confusing AttributeError from render_sparring treating it
+        # as a mapping.
+        for bad_details in ([], "", 0):
+            with self.assertRaises(RoutingResultError):
+                RoutingResult(action=RoutingAction.READY, summary="x", details=bad_details)
+
 
 class RoutingResultSerializationTests(unittest.TestCase):
     def test_round_trip_without_reason(self):
@@ -127,6 +136,23 @@ class RoutingResultSerializationTests(unittest.TestCase):
     def test_from_dict_non_string_summary_refused_cleanly(self):
         with self.assertRaises(RoutingResultError):
             RoutingResult.from_dict({"action": "READY", "summary": 123})
+
+    def test_from_dict_missing_details_defaults_to_empty(self):
+        result = RoutingResult.from_dict({"action": "READY", "summary": "x"})
+        self.assertEqual(result.details, {})
+
+    def test_from_dict_none_details_defaults_to_empty(self):
+        result = RoutingResult.from_dict({"action": "READY", "summary": "x", "details": None})
+        self.assertEqual(result.details, {})
+
+    def test_from_dict_falsey_non_mapping_details_refused(self):
+        # Regression: a present-but-falsey non-mapping ([], "", 0) must be
+        # rejected, not silently treated as {} by `payload.get(...) or {}`.
+        for bad_details in ([], "", 0):
+            with self.assertRaises(RoutingResultError):
+                RoutingResult.from_dict(
+                    {"action": "READY", "summary": "x", "details": bad_details}
+                )
 
     def test_schema_stays_tiny_no_finding_list_required(self):
         # Detailed findings belong in sparring.md, not this schema; the

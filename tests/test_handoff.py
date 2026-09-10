@@ -112,6 +112,29 @@ class HandoffTests(unittest.TestCase):
         content = render_thin_handoff(self.stage, handoff_input)
         self.assertIn("Fix the off-by-one bug.", content)
 
+    def test_previous_sparring_findings_include_detailed_discussion_and_summary(self):
+        # Regression: a SEND_BACK's detailed explanation (## Finding /
+        # discussion) must survive into the next handoff, not just the
+        # short routing summary line.
+        from agent_sparring.routing import RoutingAction, RoutingResult
+        from agent_sparring.sparring_exchange import record_sparring
+
+        detailed = (
+            "The off-by-one in paginate() double-counts the last row when "
+            "page_size divides total_count evenly; reproduced with 20/20."
+        )
+        short_summary = "Fix the pagination off-by-one bug"
+        record_sparring(
+            self.stage,
+            RoutingResult(action=RoutingAction.SEND_BACK, summary=short_summary),
+            findings=detailed,
+        )
+
+        handoff_input = HandoffInput(stage_goal="g", claims="c", git=self._git_context())
+        content = render_thin_handoff(self.stage, handoff_input)
+        self.assertIn(detailed, content)
+        self.assertIn(short_summary, content)
+
     def test_generate_handoff_writes_file_and_uses_stage_state(self):
         self.stage.write_state(
             StageState(base_sha=self.base_sha, candidate_sha=self.candidate_sha)

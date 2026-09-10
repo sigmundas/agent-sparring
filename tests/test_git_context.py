@@ -9,6 +9,7 @@ from agent_sparring.git_context import (
     GitContextError,
     changed_files,
     current_branch,
+    diff_patch,
     dirty_paths,
     gather_git_context,
     resolve_commit,
@@ -110,6 +111,71 @@ class GitContextTests(unittest.TestCase):
         self.assertIsNone(ctx.base_sha)
         self.assertEqual(ctx.changed_files, tuple())
         self.assertIsNone(ctx.pushed)
+
+    def test_changed_files_preserves_spaces_and_tabs_in_filenames(self):
+        weird_name = "a file\twith tab.txt"
+        (self.repo / weird_name).write_text("content\n", encoding="utf-8")
+        _run(self.repo, "add", weird_name)
+        _run(self.repo, "commit", "-q", "-m", "weird filename")
+        new_sha = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        files = changed_files(self.repo, self.candidate_sha, new_sha)
+        paths = {f.path for f in files}
+        self.assertIn(weird_name, paths)
+
+    def test_dirty_paths_preserves_spaces_and_tabs_in_filenames(self):
+        weird_name = "untracked file\twith tab.txt"
+        (self.repo / weird_name).write_text("content\n", encoding="utf-8")
+        self.assertIn(weird_name, dirty_paths(self.repo))
+
+    def test_changed_files_rename_retains_both_paths(self):
+        # Needs enough shared content for git's similarity heuristic to
+        # detect a rename rather than reporting a delete+add pair.
+        (self.repo / "a.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+        _run(self.repo, "add", "a.txt")
+        _run(self.repo, "commit", "-q", "-m", "grow a.txt")
+        grown_sha = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        _run(self.repo, "mv", "a.txt", "renamed.txt")
+        (self.repo / "renamed.txt").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+        _run(self.repo, "add", "-A")
+        _run(self.repo, "commit", "-q", "-m", "rename a.txt")
+        renamed_sha = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        files = changed_files(self.repo, grown_sha, renamed_sha)
+        renames = [f for f in files if f.status.startswith("R")]
+        self.assertEqual(len(renames), 1)
+        self.assertEqual(renames[0].old_path, "a.txt")
+        self.assertEqual(renames[0].path, "renamed.txt")
+
+    def test_diff_patch_preserves_trailing_whitespace_on_changed_line(self):
+        (self.repo / "trailing.txt").write_text("line one\nline two \n", encoding="utf-8")
+        _run(self.repo, "add", "trailing.txt")
+        _run(self.repo, "commit", "-q", "-m", "trailing whitespace")
+        new_sha = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        patch = diff_patch(self.repo, self.candidate_sha, new_sha)
+        self.assertIn("+line two \n", patch)
 
     def test_gather_git_context_with_base_and_dirty(self):
         (self.repo / "c.txt").write_text("dirty\n", encoding="utf-8")

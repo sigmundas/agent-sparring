@@ -50,9 +50,27 @@ def _cmd_new_stage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_repo_root(args: argparse.Namespace, sparring_dir: Path) -> Path:
+    """Precedence: explicit --repo-root > configured [repo].root > the
+    parent of --sparring-dir. A relative configured root is resolved
+    against the project root (the parent of --sparring-dir), never CWD."""
+
+    if args.repo_root:
+        return Path(args.repo_root)
+
+    project_root = sparring_dir.resolve().parent
+    try:
+        config = load_project_config(sparring_dir)
+    except ProjectConfigError:
+        return project_root
+
+    configured = Path(config.repo_root)
+    return configured if configured.is_absolute() else (project_root / configured).resolve()
+
+
 def _cmd_handoff(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
-    repo_root = Path(args.repo_root) if args.repo_root else sparring_dir.resolve().parent
+    repo_root = _resolve_repo_root(args, sparring_dir)
     try:
         stage = Stage.resolve(sparring_dir, args.stage_id)
         if not stage.exists():
@@ -142,7 +160,11 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument(
         "--repo-root",
         default=None,
-        help="repository root (default: the parent of --sparring-dir)",
+        help=(
+            "repository root; overrides project.toml's [repo].root if set "
+            "(default: [repo].root from project.toml, resolved against the "
+            "project root, else the parent of --sparring-dir)"
+        ),
     )
     handoff.add_argument(
         "--self-contained",

@@ -70,7 +70,14 @@ def _previous_sparring_section(stage: Stage) -> str:
     except Exception:
         return "(no sparring.md available)"
     parts = []
-    for heading in ("## SEND BACK TO STAGE", "## NEEDS YOU", "## ESCALATE", "## Deferred"):
+    for heading in (
+        "## Finding / discussion",
+        "## Routing outcome",
+        "## SEND BACK TO STAGE",
+        "## NEEDS YOU",
+        "## ESCALATE",
+        "## Deferred",
+    ):
         body = _extract_section(sparring, heading)
         if body:
             parts.append(f"{heading}\n\n{body}")
@@ -88,7 +95,13 @@ def _pushed_line(git: GitContext) -> str:
 def _changed_files_block(files: tuple[ChangedFile, ...]) -> str:
     if not files:
         return "(no base commit recorded, or no changes between base and candidate)"
-    return "\n".join(f"- {f.status}\t{f.path}" for f in files)
+    lines = []
+    for f in files:
+        if f.old_path is not None:
+            lines.append(f"- {f.status}\t{f.old_path} -> {f.path}")
+        else:
+            lines.append(f"- {f.status}\t{f.path}")
+    return "\n".join(lines)
 
 
 def _dirty_paths_block(paths: tuple[str, ...]) -> str:
