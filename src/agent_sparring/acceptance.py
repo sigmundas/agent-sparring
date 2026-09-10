@@ -51,6 +51,16 @@ the sparrer becomes a contributor. No contributor ledger, signature, or
 reviewer identity is therefore recorded here: the rule stands as a
 documented convention until a writable sparrer mode actually exists to
 need metadata for it.
+
+Both operations run inside :func:`agent_sparring.concurrency.worktree_lock`
+-- the same one-writer-per-worktree lock :func:`agent_sparring.stage_agent.
+run_stage_agent` already holds for an implementation turn. This is not a
+second lock system: it is the existing lock, reused, so a FROZEN stage's
+correction turn and a concurrent freeze/accept on the same worktree cannot
+interleave (one checks HEAD and changes lifecycle state while the other is
+mid-commit). A contended lock is wrapped as :class:`AcceptanceError` rather
+than left as a raw :class:`~agent_sparring.concurrency.WorktreeLockError`,
+and, like every other refusal here, leaves ``state.json`` untouched.
 """
 
 from __future__ import annotations
@@ -58,15 +68,45 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import (
+    DirtyEntry,
     GitContextError,
     current_branch,
-    dirty_paths,
+    dirty_entries,
     is_full_sha,
     resolve_commit,
     verify_pushed,
 )
-from agent_sparring.stage import Stage, StageError, StageState, StageStatus
+from agent_sparring.stage import (
+    BRIEF_FILENAME,
+    HANDOFF_FILENAME,
+    NOTES_FILENAME,
+    SPARRING_FILENAME,
+    STATE_FILENAME,
+    Stage,
+    StageError,
+    StageState,
+    StageStatus,
+)
+
+# The only paths ever exempted from the "no unrepresented dirty changes"
+# checks below: this stage's own artifact files, which agent_sparring
+# itself rewrites on every stage/sparring turn (see stage.py's Stage.create/
+# write_state/write_handoff/write_sparring/write_notes). These are workflow
+# bookkeeping and evidence, deliberately outside candidate identity -- never
+# application/test/config code. The exemption is an explicit allowlist of
+# exact filenames, not a subtree/prefix rule: naming a directory
+# "sparring_dir" must never make an arbitrary tree (up to and including the
+# whole repository, if a caller passed sparring_dir == repo_root) invisible
+# to this check.
+_STAGE_ARTIFACT_FILENAMES = (
+    STATE_FILENAME,
+    BRIEF_FILENAME,
+    NOTES_FILENAME,
+    HANDOFF_FILENAME,
+    SPARRING_FILENAME,
+)
 
 
 class AcceptanceError(RuntimeError):
@@ -131,47 +171,82 @@ def _require_branch(repo_root: Path, expected_branch: str, *, operation: str) ->
     return branch
 
 
-def _sparring_dir_prefix(repo_root: Path, sparring_dir: Path) -> str | None:
-    """The repo-relative path prefix of ``sparring_dir``, or ``None`` if it
-    lives outside the repository."""
+def _stage_artifact_allowlist(repo_root: Path, stage: Stage) -> frozenset[str]:
+    """This stage's own artifact files, as exact repo-relative posix paths.
 
-    try:
-        relative = sparring_dir.resolve().relative_to(repo_root.resolve())
-    except ValueError:
-        return None
-    text = relative.as_posix()
-    return "" if text in ("", ".") else f"{text}/"
-
-
-def _partition_dirty(
-    repo_root: Path, sparring_dir: Path
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Split the working tree's dirty paths into (blocking, ignored).
-
-    Workflow artifacts inside the stage's own ``.sparring`` directory are
-    ignored: this tool rewrites ``state.json``/``handoff.md``/``sparring.md``
-    on every stage and sparring turn, so a project that neither commits nor
-    ignores that directory would otherwise be unable to freeze anything at
-    all. Everything else — any unrepresented source, test, or config change
-    that the candidate commit does not contain — blocks the freeze.
+    Computed from ``stage.directory`` itself (``<sparring_dir>/stages/
+    <stage_id>/``), never from ``sparring_dir`` by prefix -- so the
+    allowlist is always exactly these five filenames for this one stage,
+    regardless of where ``sparring_dir`` happens to live (including the
+    degenerate case of ``sparring_dir == repo_root``, which must not turn
+    into "everything is exempt").
     """
 
     try:
-        paths = dirty_paths(repo_root)
+        rel_dir = stage.directory.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        # The stage directory is outside the repository entirely -- nothing
+        # can match it, so the allowlist is correctly empty rather than an
+        # error here (the dirty check below will simply block on anything).
+        return frozenset()
+    return frozenset((rel_dir / name).as_posix() for name in _STAGE_ARTIFACT_FILENAMES)
+
+
+def _entry_is_exempt(entry: DirtyEntry, allowed: frozenset[str]) -> bool:
+    """Is this one status entry entirely accounted for by the allowlist?
+
+    A plain add/modify/delete is exempt only if its path is allowed. A
+    rename/copy is exempt only if *both* the destination and the source are
+    allowed -- exempting only the destination would let a rename from a
+    real, non-workflow file (an unrepresented deletion elsewhere) hide
+    behind a workflow-artifact-looking destination name.
+    """
+
+    if entry.path not in allowed:
+        return False
+    if entry.old_path is not None and entry.old_path not in allowed:
+        return False
+    return True
+
+
+def _partition_dirty(
+    repo_root: Path, stage: Stage
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split the working tree's status entries into (blocking, ignored).
+
+    Only this stage's own artifact files (see ``_STAGE_ARTIFACT_FILENAMES``)
+    are ignored: agent_sparring itself rewrites those on every stage/
+    sparring turn, so a project that neither commits nor gitignores them
+    would otherwise be unable to freeze anything at all. Everything else —
+    any unrepresented source, test, config, or *other* file under
+    ``sparring_dir`` (another stage's artifacts, ``project.toml``,
+    ``PROJECT.md``, or anything else a caller happened to name
+    ``sparring_dir``) — blocks the freeze.
+
+    Uses ``--untracked-files=all`` (via
+    :func:`~agent_sparring.git_context.dirty_entries`) rather than git's
+    default collapsed directory reporting: a brand-new, wholly-untracked
+    stage directory must be checked file-by-file so a non-workflow file
+    dropped alongside the real artifacts is still caught, instead of
+    disappearing inside one collapsed ``?? .sparring/`` entry.
+    """
+
+    try:
+        entries = dirty_entries(repo_root, all_untracked=True)
     except GitContextError as exc:
         raise AcceptanceError(str(exc)) from exc
 
-    prefix = _sparring_dir_prefix(repo_root, sparring_dir)
-    if prefix is None:
-        return paths, tuple()
+    allowed = _stage_artifact_allowlist(repo_root, stage)
 
     blocking: list[str] = []
     ignored: list[str] = []
-    for path in paths:
-        # dirty_paths folds a rename into "<new> (renamed from <old>)"; the
-        # destination path is what matters for this classification.
-        head = path.split(" (renamed from ", 1)[0]
-        (ignored if head.startswith(prefix) else blocking).append(path)
+    for entry in entries:
+        description = (
+            f"{entry.path} (renamed from {entry.old_path})"
+            if entry.old_path is not None
+            else entry.path
+        )
+        (ignored if _entry_is_exempt(entry, allowed) else blocking).append(description)
     return tuple(blocking), tuple(ignored)
 
 
@@ -188,13 +263,20 @@ def freeze_candidate(
     parameter, because "the candidate" means the state that actually exists
     right now and has actually been pushed, not a revision someone typed.
 
+    Runs inside :func:`~agent_sparring.concurrency.worktree_lock` -- the
+    same lock :func:`~agent_sparring.stage_agent.run_stage_agent` holds for
+    an implementation turn -- so a freeze cannot interleave with a
+    concurrent stage-agent turn on the same worktree. A contended lock
+    raises :class:`AcceptanceError` without touching ``state.json``.
+
     Checks, in order, all before anything is written:
 
     1. the stage's state is readable and is not already ACCEPTED;
     2. the worktree is on ``expected_branch``;
     3. ``HEAD`` resolves to a full 40-hex commit;
-    4. the worktree holds no unrepresented dirty changes outside
-       ``sparring_dir`` (see :func:`_partition_dirty`);
+    4. the worktree holds no unrepresented dirty changes outside this
+       stage's own artifact files (see :func:`_partition_dirty`) --
+       ``sparring_dir`` itself is not treated as a blanket-exempt subtree;
     5. that commit is reachable from ``expected_branch``'s configured
        remote ref, proven locally by
        :func:`~agent_sparring.git_context.verify_pushed` rather than trusted
@@ -210,6 +292,29 @@ def freeze_candidate(
     Raises :class:`AcceptanceError` if any check above fails.
     """
 
+    # sparring_dir is accepted for call-signature/API stability (and because
+    # it is what a caller naturally has on hand) but is not used to compute
+    # the workflow-artifact exemption below -- see _stage_artifact_allowlist,
+    # which is derived from stage.directory only, precisely so that naming
+    # some other tree "sparring_dir" (up to and including sparring_dir ==
+    # repo_root) can never widen what is exempt from the dirty-tree check.
+    del sparring_dir
+
+    try:
+        with worktree_lock(repo_root):
+            return _freeze_candidate_locked(stage, repo_root, expected_branch=expected_branch)
+    except WorktreeLockError as exc:
+        raise AcceptanceError(
+            f"cannot freeze a candidate for stage {stage.stage_id!r}: {exc}"
+        ) from exc
+
+
+def _freeze_candidate_locked(
+    stage: Stage,
+    repo_root: Path,
+    *,
+    expected_branch: str,
+) -> FreezeResult:
     state = _read_state(stage)
 
     if state.status is StageStatus.ACCEPTED:
@@ -227,7 +332,7 @@ def freeze_candidate(
     except GitContextError as exc:
         raise AcceptanceError(str(exc)) from exc
 
-    blocking, ignored = _partition_dirty(repo_root, sparring_dir)
+    blocking, ignored = _partition_dirty(repo_root, stage)
     if blocking:
         listed = ", ".join(blocking)
         raise AcceptanceError(
@@ -264,28 +369,63 @@ def accept_candidate(
 ) -> AcceptanceResult:
     """Accept exactly the frozen candidate, or refuse.
 
+    Runs inside :func:`~agent_sparring.concurrency.worktree_lock`, the same
+    lock a stage-agent turn holds, so acceptance cannot interleave with a
+    concurrent correction turn on the same worktree. A contended lock
+    raises :class:`AcceptanceError` without touching ``state.json``.
+
     The frozen ``candidate_sha`` is not trusted as a description of the
-    repository: the current ``HEAD`` is resolved independently here and the
-    two must be identical. If they are not, the candidate has moved on and
-    :class:`StaleCandidateError` is raised — the new HEAD is never accepted
-    in its place, no commit is created, and ``candidate_sha`` keeps its
-    frozen value so the refusal is repeatable and inspectable. Presenting
-    the changed code means freezing it again and sparring it again first.
+    repository. Two things are independently re-checked here, not merely
+    read back from ``state.json``:
+
+    - the current ``HEAD`` must be identical to the frozen ``candidate_sha``.
+      If not, the candidate has moved on and :class:`StaleCandidateError` is
+      raised — the new HEAD is never accepted in its place, no commit is
+      created, and ``candidate_sha`` keeps its frozen value so the refusal
+      is repeatable and inspectable. Presenting the changed code means
+      freezing it again and sparring it again first.
+    - the worktree must hold no unrepresented dirty changes outside this
+      stage's own artifact files (the same check and the same allowlist
+      :func:`freeze_candidate` uses -- see :func:`_partition_dirty`). A
+      clean freeze of commit A followed by an uncommitted edit to a real
+      file leaves ``HEAD`` at A but the worktree no longer *is* A; that must
+      refuse acceptance too, not just a moved ``HEAD``.
 
     Nothing about the candidate's sparring *history* is consulted: a SHA
     that previously drew SEND_BACK/NEEDS_YOU/ESCALATE is perfectly
     acceptable now if it is still the frozen candidate, which is what makes
     same-SHA reconsideration after new evidence work without a dummy commit.
+    Updating only this stage's own artifact files (recording evidence in
+    ``notes.md``, a fresh ``sparring.md`` exchange) never blocks that
+    reconsideration, by the same allowlist.
 
     On success, ``status`` becomes ACCEPTED and ``candidate_sha`` remains
     the exact accepted SHA.
 
     Raises :class:`AcceptanceError` if the stage's state is unreadable, no
     candidate has been frozen (status WORKING), the recorded candidate is
-    missing or malformed, the stage is already ACCEPTED, or the worktree is
-    not on ``expected_branch``.
+    missing or malformed, the stage is already ACCEPTED, the worktree is not
+    on ``expected_branch``, or the worktree holds unrepresented dirty
+    changes. Raises :class:`StaleCandidateError` (a subclass of
+    :class:`AcceptanceError`) specifically when ``HEAD`` no longer matches
+    the frozen candidate.
     """
 
+    try:
+        with worktree_lock(repo_root):
+            return _accept_candidate_locked(stage, repo_root, expected_branch=expected_branch)
+    except WorktreeLockError as exc:
+        raise AcceptanceError(
+            f"cannot accept the candidate for stage {stage.stage_id!r}: {exc}"
+        ) from exc
+
+
+def _accept_candidate_locked(
+    stage: Stage,
+    repo_root: Path,
+    *,
+    expected_branch: str,
+) -> AcceptanceResult:
     state = _read_state(stage)
 
     if state.status is StageStatus.ACCEPTED:
@@ -322,6 +462,20 @@ def accept_candidate(
             "frozen again and go through sparring again before it can be "
             "accepted; no commit was created and the frozen candidate was "
             "left unchanged."
+        )
+
+    # HEAD matches, but HEAD alone does not prove the worktree still *is*
+    # the frozen candidate: an uncommitted edit to a real file leaves HEAD
+    # untouched. The same allowlist freeze uses applies here, so recording
+    # evidence in this stage's own artifact files never blocks acceptance.
+    blocking, _ignored = _partition_dirty(repo_root, stage)
+    if blocking:
+        listed = ", ".join(blocking)
+        raise AcceptanceError(
+            f"refusing to accept {frozen_sha} for stage {stage.stage_id!r}: "
+            f"the working tree holds changes that commit does not represent "
+            f"({listed}), even though HEAD still matches the frozen "
+            "candidate. Commit or discard them first."
         )
 
     state.status = StageStatus.ACCEPTED

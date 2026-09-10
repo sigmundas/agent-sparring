@@ -147,37 +147,87 @@ def changed_files(repo_root: Path, base_sha: str, candidate_sha: str) -> tuple[C
     return tuple(files)
 
 
-def dirty_paths(repo_root: Path) -> tuple[str, ...]:
-    """Working-tree paths reported by ``git status --porcelain=v1 -z``.
+@dataclass(frozen=True)
+class DirtyEntry:
+    """One working-tree status entry, with both sides of a rename kept
+    separate rather than folded into one descriptive string. ``old_path`` is
+    the rename/copy source (``status`` starting with ``R``/``C``); ``None``
+    for every other status."""
+
+    status: str
+    path: str
+    old_path: str | None = None
+
+
+def _status_entries(repo_root: Path, *, all_untracked: bool = False) -> tuple[DirtyEntry, ...]:
+    """Parse ``git status --porcelain=v1 -z`` into structured entries.
+
+    ``all_untracked``, when true, adds ``--untracked-files=all`` so an
+    untracked directory is reported file-by-file instead of collapsed into
+    one ``?? dir/`` entry -- needed by any caller that must classify
+    individual untracked files (e.g. the acceptance gate's workflow-artifact
+    exemption) rather than merely list that something changed under a
+    directory.
 
     NUL-delimited output preserves filenames containing spaces, tabs, or
     newlines. A rename/copy entry is followed by its own source-path token
     (no ``XY`` prefix); that token is consumed here so it is not
-    misinterpreted as an unrelated entry, and folded into one descriptive
-    path so the caller still sees both sides of the rename.
+    misinterpreted as an unrelated entry.
     """
 
-    result = _run(repo_root, "status", "--porcelain=v1", "-z")
+    args = ["status", "--porcelain=v1", "-z"]
+    if all_untracked:
+        args.append("--untracked-files=all")
+    result = _run(repo_root, *args)
     if result.returncode != 0:
         raise GitContextError(result.stderr.strip() or "git status --porcelain failed")
     tokens = _split_nul(result.stdout)
 
-    paths: list[str] = []
+    entries: list[DirtyEntry] = []
     i = 0
     while i < len(tokens):
         entry = tokens[i]
         i += 1
         if len(entry) < 3:
             if entry:
-                paths.append(entry)
+                entries.append(DirtyEntry(status=entry, path=entry))
             continue
         status, path = entry[:2], entry[3:]
         if status[0] in ("R", "C") and i < len(tokens):
             old_path = tokens[i]
             i += 1
-            paths.append(f"{path} (renamed from {old_path})")
+            entries.append(DirtyEntry(status=status, path=path, old_path=old_path))
         else:
-            paths.append(path)
+            entries.append(DirtyEntry(status=status, path=path))
+    return tuple(entries)
+
+
+def dirty_entries(repo_root: Path, *, all_untracked: bool = False) -> tuple[DirtyEntry, ...]:
+    """Working-tree status entries, each side of a rename kept separate.
+
+    See :func:`dirty_paths` for the folded-string form used by handoff
+    rendering; this structured form is for callers (the acceptance gate)
+    that must classify the source and destination of a rename independently
+    rather than treat the folded description as one opaque path.
+    """
+
+    return _status_entries(repo_root, all_untracked=all_untracked)
+
+
+def dirty_paths(repo_root: Path) -> tuple[str, ...]:
+    """Working-tree paths reported by ``git status --porcelain=v1 -z``.
+
+    NUL-delimited output preserves filenames containing spaces, tabs, or
+    newlines. A rename/copy entry is folded into one descriptive path so the
+    caller still sees both sides of the rename.
+    """
+
+    paths: list[str] = []
+    for entry in _status_entries(repo_root):
+        if entry.old_path is not None:
+            paths.append(f"{entry.path} (renamed from {entry.old_path})")
+        else:
+            paths.append(entry.path)
     return tuple(paths)
 
 

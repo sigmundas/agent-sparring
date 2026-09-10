@@ -12,6 +12,7 @@ from agent_sparring.acceptance import (
     accept_candidate,
     freeze_candidate,
 )
+from agent_sparring.concurrency import worktree_lock
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.stage import Stage, StageStatus
@@ -377,6 +378,256 @@ class AcceptanceTests(unittest.TestCase):
         self._accept()
         self.assertEqual(_commit_count(self.repo), before_count)
         self.assertEqual(self.stage.read_state().candidate_sha, self.candidate_sha)
+
+
+class NarrowedDirtyExemptionTests(unittest.TestCase):
+    """Finding 1: the workflow-artifact exemption is an exact allowlist of
+    this stage's own artifact files, never a subtree/prefix rule keyed off
+    wherever the caller happened to put ``sparring_dir``."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+
+        self.remote = root / "remote.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(self.remote)], check=True, capture_output=True
+        )
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        _run_git(self.repo, "init", "-q", "-b", "main")
+        _run_git(self.repo, "config", "user.email", "test@example.com")
+        _run_git(self.repo, "config", "user.name", "Test")
+        _run_git(self.repo, "remote", "add", "origin", str(self.remote))
+        (self.repo / "f.txt").write_text("hi\n", encoding="utf-8")
+        _run_git(self.repo, "add", "f.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "base")
+        _run_git(self.repo, "push", "-q", "-u", "origin", "main")
+        _run_git(self.repo, "checkout", "-q", "-b", "feature/x")
+        (self.repo / "impl.txt").write_text("implementation\n", encoding="utf-8")
+        _run_git(self.repo, "add", "impl.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "candidate")
+        _run_git(self.repo, "push", "-q", "-u", "origin", "feature/x")
+        self.candidate_sha = _head_sha(self.repo)
+
+    def test_sparring_dir_equal_to_repo_root_cannot_hide_a_dirty_source_file(self):
+        # sparring_dir == repo_root would make the old prefix-based
+        # exemption compute an empty prefix, matching every path. The new
+        # allowlist is derived from the stage's own directory instead, so
+        # this must still block.
+        stage = Stage.resolve(self.repo, "stage-1").create()
+        (self.repo / "stray_source.py").write_text("x = 1\n", encoding="utf-8")
+
+        with self.assertRaises(AcceptanceError) as ctx:
+            freeze_candidate(stage, self.repo, self.repo, expected_branch="feature/x")
+        self.assertIn("stray_source.py", str(ctx.exception))
+        self.assertEqual(stage.read_state().status, StageStatus.WORKING)
+
+    def test_non_workflow_file_underneath_sparring_dir_blocks_freeze(self):
+        sparring_dir = self.repo / ".sparring"
+        stage = Stage.resolve(sparring_dir, "stage-1").create()
+        # A file dropped alongside the real artifacts, in the very same
+        # stage directory, that is not one of the known artifact filenames.
+        (stage.directory / "extra-not-a-workflow-file.txt").write_text(
+            "not a recognized artifact\n", encoding="utf-8"
+        )
+
+        with self.assertRaises(AcceptanceError) as ctx:
+            freeze_candidate(stage, sparring_dir, self.repo, expected_branch="feature/x")
+        self.assertIn("extra-not-a-workflow-file.txt", str(ctx.exception))
+        self.assertEqual(stage.read_state().status, StageStatus.WORKING)
+
+    def test_rename_from_outside_sparring_dir_into_it_blocks_freeze(self):
+        sparring_dir = self.repo / ".sparring"
+        stage = Stage.resolve(sparring_dir, "stage-1").create()
+        _run_git(self.repo, "add", ".sparring")
+        _run_git(self.repo, "commit", "-q", "-m", "commit workflow artifacts")
+        # Remove the template notes.md first so the destination path is free
+        # for `git mv` (which refuses to overwrite an existing path); the
+        # point under test is the rename itself, not this fixture detail.
+        _run_git(self.repo, "rm", "-q", str(stage.directory / "notes.md"))
+        _run_git(self.repo, "commit", "-q", "-m", "clear notes.md for the rename")
+
+        # Rename a real, tracked source file into the stage's own directory
+        # under a name that collides with a real artifact filename. The
+        # destination alone looks like an exempt workflow file; the source
+        # is a real, unrepresented change elsewhere that must still block.
+        _run_git(self.repo, "mv", "impl.txt", str(stage.directory / "notes.md"))
+
+        with self.assertRaises(AcceptanceError) as ctx:
+            freeze_candidate(stage, sparring_dir, self.repo, expected_branch="feature/x")
+        message = str(ctx.exception)
+        self.assertIn("impl.txt", message)
+        self.assertEqual(stage.read_state().status, StageStatus.WORKING)
+
+    def test_project_toml_and_other_stage_dirs_are_not_exempt(self):
+        sparring_dir = self.repo / ".sparring"
+        stage = Stage.resolve(sparring_dir, "stage-1").create()
+        (sparring_dir / "project.toml").write_text("project = \"x\"\n", encoding="utf-8")
+        other_stage = Stage.resolve(sparring_dir, "stage-2").create()
+
+        with self.assertRaises(AcceptanceError) as ctx:
+            freeze_candidate(stage, sparring_dir, self.repo, expected_branch="feature/x")
+        message = str(ctx.exception)
+        self.assertIn("project.toml", message)
+        # Another stage's own artifacts are not this stage's allowlist.
+        self.assertIn(f"stages/{other_stage.stage_id}", message)
+        self.assertEqual(stage.read_state().status, StageStatus.WORKING)
+
+    def test_intended_stage_artifacts_still_do_not_block_freeze_or_same_sha_reconsideration(self):
+        sparring_dir = self.repo / ".sparring"
+        stage = Stage.resolve(sparring_dir, "stage-1").create()
+
+        first = freeze_candidate(stage, sparring_dir, self.repo, expected_branch="feature/x")
+        self.assertEqual(first.candidate_sha, self.candidate_sha)
+        accept_candidate(stage, self.repo, expected_branch="feature/x")
+        self.assertEqual(stage.read_state().status, StageStatus.ACCEPTED)
+
+
+class AcceptanceDirtyRecheckTests(unittest.TestCase):
+    """Finding 2: acceptance must not rely on HEAD alone -- a real,
+    unrepresented worktree change made after a clean freeze must refuse
+    acceptance even though HEAD has not moved."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+
+        self.remote = root / "remote.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(self.remote)], check=True, capture_output=True
+        )
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        _run_git(self.repo, "init", "-q", "-b", "main")
+        _run_git(self.repo, "config", "user.email", "test@example.com")
+        _run_git(self.repo, "config", "user.name", "Test")
+        _run_git(self.repo, "remote", "add", "origin", str(self.remote))
+        (self.repo / "f.txt").write_text("hi\n", encoding="utf-8")
+        _run_git(self.repo, "add", "f.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "base")
+        _run_git(self.repo, "push", "-q", "-u", "origin", "main")
+        _run_git(self.repo, "checkout", "-q", "-b", "feature/x")
+        (self.repo / "impl.txt").write_text("implementation\n", encoding="utf-8")
+        _run_git(self.repo, "add", "impl.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "candidate")
+        _run_git(self.repo, "push", "-q", "-u", "origin", "feature/x")
+        self.candidate_sha = _head_sha(self.repo)
+
+        self.sparring_dir = self.repo / ".sparring"
+        self.stage = Stage.resolve(self.sparring_dir, "stage-1").create()
+
+    def test_uncommitted_edit_to_a_real_file_after_clean_freeze_refuses_acceptance(self):
+        freeze_candidate(
+            self.stage, self.sparring_dir, self.repo, expected_branch="feature/x"
+        )
+        self.assertEqual(_head_sha(self.repo), self.candidate_sha)
+
+        (self.repo / "impl.txt").write_text("uncommitted edit\n", encoding="utf-8")
+
+        with self.assertRaises(AcceptanceError) as ctx:
+            accept_candidate(self.stage, self.repo, expected_branch="feature/x")
+        self.assertIn("impl.txt", str(ctx.exception))
+
+        state = self.stage.read_state()
+        self.assertEqual(state.status, StageStatus.FROZEN)
+        self.assertEqual(state.candidate_sha, self.candidate_sha)
+        # HEAD is unchanged -- this is not the stale-candidate path.
+        self.assertEqual(_head_sha(self.repo), self.candidate_sha)
+
+    def test_new_untracked_source_file_after_clean_freeze_refuses_acceptance(self):
+        freeze_candidate(
+            self.stage, self.sparring_dir, self.repo, expected_branch="feature/x"
+        )
+        (self.repo / "sneaky.py").write_text("y = 2\n", encoding="utf-8")
+
+        with self.assertRaises(AcceptanceError) as ctx:
+            accept_candidate(self.stage, self.repo, expected_branch="feature/x")
+        self.assertIn("sneaky.py", str(ctx.exception))
+        self.assertEqual(self.stage.read_state().status, StageStatus.FROZEN)
+
+    def test_evidence_only_update_still_permits_acceptance(self):
+        # The permitted case from the same-SHA reconsideration workflow:
+        # only this stage's own notes.md/sparring.md change.
+        freeze_candidate(
+            self.stage, self.sparring_dir, self.repo, expected_branch="feature/x"
+        )
+        self.stage.write_notes("# Notes: stage-1\n\nDevice check performed, passed.\n")
+        record_sparring(
+            self.stage,
+            RoutingResult(action=RoutingAction.READY, summary="evidence satisfied"),
+            findings="same commit, manual check now satisfied",
+        )
+
+        result = accept_candidate(self.stage, self.repo, expected_branch="feature/x")
+        self.assertEqual(result.candidate_sha, self.candidate_sha)
+        self.assertEqual(self.stage.read_state().status, StageStatus.ACCEPTED)
+
+
+class AcceptanceWorktreeLockTests(unittest.TestCase):
+    """Finding 3: freeze/accept serialize with the existing implementation
+    worktree lock rather than running concurrently with a stage-agent turn
+    on the same worktree."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+
+        self.remote = root / "remote.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(self.remote)], check=True, capture_output=True
+        )
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        _run_git(self.repo, "init", "-q", "-b", "main")
+        _run_git(self.repo, "config", "user.email", "test@example.com")
+        _run_git(self.repo, "config", "user.name", "Test")
+        _run_git(self.repo, "remote", "add", "origin", str(self.remote))
+        (self.repo / "f.txt").write_text("hi\n", encoding="utf-8")
+        _run_git(self.repo, "add", "f.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "base")
+        _run_git(self.repo, "push", "-q", "-u", "origin", "main")
+        _run_git(self.repo, "checkout", "-q", "-b", "feature/x")
+        (self.repo / "impl.txt").write_text("implementation\n", encoding="utf-8")
+        _run_git(self.repo, "add", "impl.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "candidate")
+        _run_git(self.repo, "push", "-q", "-u", "origin", "feature/x")
+        self.candidate_sha = _head_sha(self.repo)
+
+        self.sparring_dir = self.repo / ".sparring"
+        self.stage = Stage.resolve(self.sparring_dir, "stage-1").create()
+
+    def test_freeze_refuses_while_worktree_lock_is_held_elsewhere(self):
+        with worktree_lock(self.repo):
+            with self.assertRaises(AcceptanceError):
+                freeze_candidate(
+                    self.stage, self.sparring_dir, self.repo, expected_branch="feature/x"
+                )
+        self.assertEqual(self.stage.read_state().status, StageStatus.WORKING)
+        self.assertIsNone(self.stage.read_state().candidate_sha)
+
+        # Once the lock is released, freezing proceeds normally -- this was
+        # a contention refusal, not a permanent one.
+        result = freeze_candidate(
+            self.stage, self.sparring_dir, self.repo, expected_branch="feature/x"
+        )
+        self.assertEqual(result.candidate_sha, self.candidate_sha)
+
+    def test_accept_refuses_while_worktree_lock_is_held_elsewhere(self):
+        freeze_candidate(self.stage, self.sparring_dir, self.repo, expected_branch="feature/x")
+
+        with worktree_lock(self.repo):
+            with self.assertRaises(AcceptanceError):
+                accept_candidate(self.stage, self.repo, expected_branch="feature/x")
+        state = self.stage.read_state()
+        self.assertEqual(state.status, StageStatus.FROZEN)
+        self.assertEqual(state.candidate_sha, self.candidate_sha)
+
+        result = accept_candidate(self.stage, self.repo, expected_branch="feature/x")
+        self.assertEqual(result.candidate_sha, self.candidate_sha)
 
 
 if __name__ == "__main__":

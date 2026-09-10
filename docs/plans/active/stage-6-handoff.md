@@ -261,19 +261,251 @@ Exercised through the real CLI (`freeze-candidate`/`accept-candidate`):
   stage; further work belongs to a new stage) — a small hard-gate choice not
   literally spelled out in the task.
 
-## Known limitations / unresolved questions
+## Known limitations / unresolved questions (round 1, superseded/updated by round 2 below)
 
+- ~~Dirty paths inside the stage's own `sparring_dir` do not block a freeze;
+  everything else does~~ — narrowed by round 2's fix 1: only this stage's
+  own five artifact filenames are exempt now, not an entire subtree.
+- ~~A change to a *tracked* file inside `.sparring/` (e.g. an edited
+  `project.toml`) does not block a freeze~~ — no longer true after fix 1:
+  `project.toml`/`PROJECT.md`/another stage's artifacts were never on the
+  allowlist and are exercised by a regression now.
+- ~~Acceptance trusts a matching `HEAD` alone~~ — fixed by round 2's fix 2:
+  the worktree is independently re-checked for unrepresented dirty changes
+  at acceptance time too, not only at freeze time.
+- ~~`freeze_candidate`/`accept_candidate` run outside the implementation
+  worktree lock~~ — fixed by round 2's fix 3.
 - Acceptance verifies candidate *identity*, not that any particular sparring
   exchange happened. "The changed candidate must go through sparring again"
   is a convention plus the normal `run-loop` route, not a mechanical
   precondition — by design, per the task's prohibition on review-attempt
-  identity.
+  identity. Unchanged by round 2.
 - `verify_pushed` proves reachability from the branch's configured remote
   ref; if the remote is unreachable at freeze time the freeze is refused
   (fails closed), which is intended but does mean freezing needs network
-  access to a real remote.
-- The `.sparring` carve-out means a change to a *tracked* file inside
-  `.sparring/` (e.g. an edited `project.toml`) does not block a freeze. This
-  is the intended trade-off but is worth a sparrer's opinion.
+  access to a real remote. Unchanged by round 2.
 - Stage 7 (the Sporely pilot) was not started; no `.sparring/project.toml`
-  or `PROJECT.md` exists for this repo itself yet.
+  or `PROJECT.md` exists for this repo itself yet. Unchanged by round 2.
+
+## Round 2: narrow the dirty exemption, re-check at acceptance, serialize with the worktree lock
+
+- Base for this round: `2d5b967eaad017ed5e27e26d6ae505d54a742650` (round 1's
+  implementation candidate; `bee52b1` on top of it was documentation-only)
+- Round-2 candidate SHA: recorded below after the push
+- Branch: `feature/sparring-v2`, pushed to `origin`
+
+Three findings, all resolved. All original Stage 6 semantics are preserved:
+exact full candidate SHA, freeze proves pushed/reachable, stale HEAD is
+refused, same-SHA reconsideration, no dummy commits, no READY-history state,
+explicit acceptance, the ACCEPTED implementation guard, and the
+contributor-sparrer convention-only stance.
+
+### Fix 1 — narrow the `.sparring` dirty-path exemption to an exact per-stage artifact allowlist
+
+The round-1 exemption matched any dirty path whose *destination* started
+with the repo-relative prefix of `sparring_dir`. Three concrete problems:
+
+- `sparring_dir == repo_root` computed an empty prefix, so `str.startswith("")`
+  is true for every path — every dirty file in the repository was silently
+  exempt.
+- Any file dropped anywhere under `sparring_dir` was exempt merely by
+  location, not because it was actually a workflow artifact — including
+  `project.toml`, `PROJECT.md`, another stage's own directory, or a stray
+  file.
+- A rename was classified only by its destination path, so renaming a real,
+  tracked source file *into* `sparring_dir` under a name that happened to
+  collide with a real artifact filename hid an unrepresented deletion
+  elsewhere.
+
+Fixed by replacing the prefix rule with `_stage_artifact_allowlist()`: an
+exact set of five repo-relative paths, computed from `stage.directory`
+itself (`<sparring_dir>/stages/<stage_id>/{state.json,brief.md,notes.md,
+handoff.md,sparring.md}` — the exact filenames `stage.py` defines and
+`Stage.create`/`write_state`/`write_handoff`/`write_sparring`/`write_notes`
+actually rewrite), never from `sparring_dir` by prefix. A dirty entry is
+exempt only if its path is in that set; a rename is exempt only if *both*
+its destination and its source are in that set (`_entry_is_exempt`) — so a
+rename from a real file outside the allowlist blocks, regardless of its
+destination name.
+
+This also required more precise status data than `git status`'s default
+reporting gives: an entirely untracked stage directory collapses to one
+`?? .sparring/...` entry by default, which is too coarse to tell "the five
+real artifacts" apart from "the five real artifacts plus one stray file" in
+the same untracked directory. `git_context.py` gained `DirtyEntry` (status
+plus separate `path`/`old_path`, not folded into one string) and
+`dirty_entries(repo_root, *, all_untracked=False)`, which passes
+`--untracked-files=all` when requested so every file is reported
+individually; `dirty_paths()` (used by handoff rendering, unchanged
+contract) is now a thin fold on top of the same parser. Acceptance always
+calls `dirty_entries(..., all_untracked=True)`.
+
+Regressions (`tests/test_acceptance.py::NarrowedDirtyExemptionTests`, 5
+new): `sparring_dir == repo_root` still blocks a dirty source file
+(`test_sparring_dir_equal_to_repo_root_cannot_hide_a_dirty_source_file`); a
+non-artifact file dropped in the stage's own directory blocks
+(`test_non_workflow_file_underneath_sparring_dir_blocks_freeze`); a rename
+from a real tracked file into a colliding artifact-looking destination name
+blocks (`test_rename_from_outside_sparring_dir_into_it_blocks_freeze`);
+`project.toml` and another stage's own artifacts are not exempt
+(`test_project_toml_and_other_stage_dirs_are_not_exempt`); the five real
+artifacts for *this* stage still do not block freeze or same-SHA
+reconsideration
+(`test_intended_stage_artifacts_still_do_not_block_freeze_or_same_sha_reconsideration`).
+Live-verified too (see below): a dirty `stray.py` at `sparring_dir ==
+repo_root` blocked; a stray file inside the stage directory blocked; a
+`project.toml` at the `.sparring` root blocked; the five real artifacts
+alone still froze cleanly.
+
+### Fix 2 — independently re-check the worktree for unrepresented dirty changes at acceptance time
+
+Previously `accept_candidate` trusted `HEAD == frozen_sha` as proof the
+worktree still *is* the frozen candidate. It is not: a source/test/config
+file can be edited without committing, leaving `HEAD` untouched while the
+worktree no longer represents that commit.
+
+`_accept_candidate_locked` now calls the same `_partition_dirty(repo_root,
+stage)` freeze uses (same allowlist from fix 1) immediately after
+confirming `HEAD == frozen_sha`, and raises a plain `AcceptanceError`
+(*not* `StaleCandidateError` — `HEAD` has not moved, so this is a distinct
+failure mode) if anything blocks. Recording evidence in this stage's own
+`notes.md`/`sparring.md` still never blocks, by the same allowlist, so the
+same-SHA reconsideration workflow is unaffected.
+
+Regressions (`tests/test_acceptance.py::AcceptanceDirtyRecheckTests`, 3
+new): an uncommitted edit to a real tracked file after a clean freeze
+refuses acceptance, with `HEAD` still equal to the frozen SHA (proving this
+is not the stale-candidate path) and status remaining `FROZEN`
+(`test_uncommitted_edit_to_a_real_file_after_clean_freeze_refuses_acceptance`);
+a new untracked source file after a clean freeze refuses acceptance
+(`test_new_untracked_source_file_after_clean_freeze_refuses_acceptance`); an
+evidence-only update (`notes.md` plus a fresh `sparring.md` exchange) still
+permits acceptance
+(`test_evidence_only_update_still_permits_acceptance`). Live-verified: an
+uncommitted edit to `impl.txt` after a clean freeze refused acceptance with
+status remaining `frozen`; reverting the edit let the same `accept-candidate`
+invocation succeed.
+
+### Fix 3 — serialize freeze/accept with the existing implementation worktree lock
+
+`freeze_candidate`/`accept_candidate` previously ran with no lock at all,
+while `run_stage_agent` already acquires
+`agent_sparring.concurrency.worktree_lock` for an implementation turn. That
+left a window where a FROZEN stage's correction turn could be mutating the
+worktree while acceptance was independently reading `HEAD`/dirty state and
+about to flip lifecycle status.
+
+Both functions are now thin wrappers: `freeze_candidate`/`accept_candidate`
+open `with worktree_lock(repo_root):` around the entire check-and-write body
+(delegated to new `_freeze_candidate_locked`/`_accept_candidate_locked`
+functions) and catch `WorktreeLockError`, re-raising it as `AcceptanceError`
+without touching `state.json` — no second lock system, the same one
+`run_stage_agent` already uses, keyed the same way (by `repo_root`'s
+resolved identity), so a stage-agent turn and an acceptance operation on the
+same worktree now genuinely contend on one lock.
+
+Regressions (`tests/test_acceptance.py::AcceptanceWorktreeLockTests`, 2
+new): holding `worktree_lock(repo)` in the test itself makes a concurrent
+`freeze_candidate` raise `AcceptanceError` leaving status `WORKING` and
+`candidate_sha` `None`, and releasing the lock lets an identical call
+succeed immediately after
+(`test_freeze_refuses_while_worktree_lock_is_held_elsewhere`); the same
+pattern for `accept_candidate` against an already-frozen stage, leaving
+status `FROZEN` with the frozen SHA intact, then succeeding once the lock is
+released
+(`test_accept_refuses_while_worktree_lock_is_held_elsewhere`). These
+directly verify serialization with agent-sparring's own implementation
+writer, per the task's scope — no claim is made about, or attempt made at,
+blocking arbitrary external Git processes. Live-verified: holding the lock
+via `worktree_lock(repo)` from a separate Python process in the same shell
+session made both `freeze_candidate` and `accept_candidate` raise
+`AcceptanceError` mentioning "already locked by another live implementation
+process", with lifecycle state unchanged in both cases; both succeeded
+immediately once the lock was released.
+
+### Files changed (round 2)
+
+Production code (modified):
+- `src/agent_sparring/git_context.py` — `DirtyEntry`, `dirty_entries()`;
+  `dirty_paths()` refactored to use the same parser, contract unchanged
+- `src/agent_sparring/acceptance.py` — `_stage_artifact_allowlist`,
+  `_entry_is_exempt`, rewritten `_partition_dirty`; `freeze_candidate`/
+  `accept_candidate` split into lock-acquiring wrappers plus
+  `_freeze_candidate_locked`/`_accept_candidate_locked`; the new dirty
+  re-check in `_accept_candidate_locked`
+
+Tests (modified):
+- `tests/test_acceptance.py` — three new test classes:
+  `NarrowedDirtyExemptionTests` (+5), `AcceptanceDirtyRecheckTests` (+3),
+  `AcceptanceWorktreeLockTests` (+2); all 27 round-1 tests unchanged and
+  still passing against the new implementation
+
+Production code changed: **yes**. Tests changed: **yes**.
+
+### Verification (round 2)
+
+```
+cd /Users/sigmundas/Documents/Code/agent-sparring/tests
+for f in test_*.py; do python3 "$f"; done
+```
+
+All 17 test modules pass (`OK`) — 242 tests total (round 1's 232 plus 10 new
+in `test_acceptance.py`, now 37 tests in that module). `git diff --check`
+(staged): clean.
+
+### Live disposable-repo check (round 2, performed)
+
+Run against a second throwaway repo with a real bare local remote, created
+under the session scratchpad and deleted afterwards; `git status --short`
+on this candidate repo immediately after cleanup showed only the intended
+round-2 file changes, nothing leaked in.
+
+Exercised through the real CLI plus a couple of direct Python calls (for the
+lock-contention check, which needs to hold the lock from the same process
+while calling in):
+
+1. `sparring_dir == repo_root`: a dirty `stray.py` at repo root blocked
+   freeze with "the working tree holds changes that commit does not
+   represent (stray.py)".
+2. A stray `random.txt` dropped inside the stage's own
+   `.sparring/stages/stage1/` blocked freeze, naming that exact path.
+3. A `project.toml` written directly under `.sparring/` blocked freeze,
+   naming that exact path.
+4. Control: with only the five real artifacts present, freeze succeeded
+   normally, reporting all five as `ignored_dirty_paths`.
+5. An uncommitted edit to `impl.txt` after that clean freeze made
+   `accept-candidate` refuse, naming `impl.txt`, with `state.json` still
+   `frozen` at the original SHA; reverting the edit let the same
+   `accept-candidate` invocation succeed and record `accepted`.
+6. On a second stage: holding `worktree_lock(repo)` from a Python
+   `with`-block made a concurrent `freeze_candidate()` call raise
+   `AcceptanceError` naming "already locked by another live implementation
+   process", leaving status `working`/`candidate_sha=None`; releasing the
+   lock let an identical call freeze normally. The same pattern for
+   `accept_candidate()` against that now-frozen stage: refused while locked
+   (status stayed `frozen`, SHA unchanged), succeeded once released.
+
+### Deliberate deviations (round 2)
+
+- The accept-time dirty-change refusal raises plain `AcceptanceError`, not
+  `StaleCandidateError` — `HEAD` has not moved in that scenario, so labeling
+  it "stale" would misdescribe the failure. `StaleCandidateError` remains
+  reserved for an actual `HEAD` mismatch.
+- The per-stage artifact allowlist exempts exactly
+  `{state.json, brief.md, notes.md, handoff.md, sparring.md}` for the
+  *current* stage only — including `brief.md`, since a freshly created stage
+  (`Stage.create()`) writes all five as untracked files immediately, and
+  round 1's own tests already relied on none of the five blocking a freeze.
+  Narrowing the exemption below all five would have broken ordinary,
+  already-tested usage rather than closing a real gap.
+- `freeze_candidate`'s `sparring_dir` parameter is now unused by the
+  exemption logic (which is derived from `stage.directory`) but is kept for
+  call-signature/API stability; this is called out explicitly in the
+  function body rather than left implicit.
+- The worktree lock wraps the *entire* check-and-write body of both
+  functions (state read through the final `write_state`), not just the
+  final write — so lock contention is reported as early as possible and no
+  partial check work happens under a lock that might be released and
+  re-acquired mid-function.
+
+Do not begin Stage 7 / the Sporely pilot.
