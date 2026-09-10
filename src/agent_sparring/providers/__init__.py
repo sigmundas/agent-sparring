@@ -50,8 +50,51 @@ class StageAgentAdapter(Protocol):
         """Resume an existing session by its provider-issued id."""
 
 
+@dataclass(frozen=True)
+class SparringAgentResult:
+    """One sparring-provider turn's outcome.
+
+    Shape mirrors :class:`StageAgentResult` deliberately: ``session_id`` is
+    the provider's own identifier for this sparring conversation, read from
+    its machine-readable output, never invented or taken from agent-authored
+    text. ``text`` is the provider's final message, expected (by prompt
+    contract, not enforced here) to be a JSON routing verdict that the
+    caller parses into a :class:`~agent_sparring.routing.RoutingResult`.
+    Kept as a distinct type from ``StageAgentResult`` rather than reused,
+    since a given provider may support one role and not the other (see the
+    project plan's provider-adapters section: not every provider must
+    initially support every operation).
+    """
+
+    session_id: str
+    text: str
+    is_error: bool
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class SparringAgentAdapter(Protocol):
+    """What the orchestrator needs from any sparring-agent provider.
+
+    A sparring adapter must be read-only by contract (per the project plan:
+    "Sparring is read-only by default"): implementations should invoke their
+    underlying provider in a read-only mode where the provider supports one,
+    and callers additionally verify the repository was not modified (see
+    :mod:`agent_sparring.sparring_agent`) rather than trusting the provider
+    alone.
+    """
+
+    def start(self, prompt: str) -> SparringAgentResult:
+        """Start a fresh sparring session and return its result."""
+
+    def resume(self, session_id: str, prompt: str) -> SparringAgentResult:
+        """Resume an existing sparring session by its provider-issued id."""
+
+
 __all__ = [
     "ProviderError",
     "StageAgentResult",
     "StageAgentAdapter",
+    "SparringAgentResult",
+    "SparringAgentAdapter",
 ]

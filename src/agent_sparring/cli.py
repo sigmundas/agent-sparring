@@ -24,8 +24,11 @@ from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
     ClaudeCliAdapter,
 )
+from agent_sparring.providers.codex_cli import DEFAULT_SANDBOX, CodexCliAdapter
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
+from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.sparring_exchange import record_sparring
+from agent_sparring.sparring_prompt import build_sparring_prompt
 from agent_sparring.stage import Stage, StageError
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 from agent_sparring.stage_prompt import build_stage_prompt
@@ -194,6 +197,66 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
     return 1 if run_result.result.is_error else 0
 
 
+def _resolve_sparring_provider(args: argparse.Namespace, sparring_dir: Path) -> str:
+    """Precedence: explicit --provider > configured [agents.sparring].provider
+    > ``codex-cli`` (the initial default, per the Stage 4 capability probe)."""
+
+    if args.provider:
+        return args.provider
+    if (sparring_dir / CONFIG_FILENAME).is_file():
+        config = load_project_config(sparring_dir)
+        if config.sparring_agent_provider:
+            return config.sparring_agent_provider
+    return "codex-cli"
+
+
+def _cmd_run_sparring(args: argparse.Namespace) -> int:
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        stage = Stage.resolve(sparring_dir, args.stage_id)
+        if not stage.exists():
+            raise StageError(f"stage {args.stage_id!r} does not exist at {stage.directory}")
+
+        if args.dry_run:
+            state = stage.read_state()
+            prompt = build_sparring_prompt(
+                stage,
+                sparring_dir,
+                resume=state.sparring_session_id is not None,
+                expected_branch=args.expected_branch,
+            )
+            print(prompt)
+            return 0
+
+        provider = _resolve_sparring_provider(args, sparring_dir)
+        if provider != "codex-cli":
+            raise StageError(
+                f"unsupported sparring agent provider {provider!r}; only 'codex-cli' is "
+                "implemented so far"
+            )
+        adapter = CodexCliAdapter(
+            repo_root=repo_root,
+            executable=args.codex_executable,
+            sandbox=args.sandbox,
+            model=args.model,
+        )
+        run_result = run_sparring_agent(
+            stage, sparring_dir, repo_root, adapter, expected_branch=args.expected_branch
+        )
+    except (StageError, SparringAgentRunError, ProjectConfigError, GitContextError) as exc:
+        print(f"could not run sparring agent: {exc}", file=sys.stderr)
+        return 1
+
+    print(run_result.sparring)
+    print(
+        f"session_id={run_result.result.session_id} resumed={run_result.resumed} "
+        f"action={run_result.routing.action.value}",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sparring")
     parser.add_argument(
@@ -319,6 +382,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the bounded stage prompt without invoking any provider",
     )
     run_stage.set_defaults(func=_cmd_run_stage)
+
+    run_sparring = subparsers.add_parser(
+        "run-sparring", help="start or resume the sparring-agent adapter for a stage"
+    )
+    run_sparring.add_argument("stage_id")
+    run_sparring.add_argument(
+        "--repo-root",
+        default=None,
+        help=(
+            "repository root; overrides project.toml's [repo].root if set "
+            "(default: [repo].root from project.toml, resolved against the "
+            "project root, else the parent of --sparring-dir)"
+        ),
+    )
+    run_sparring.add_argument(
+        "--expected-branch",
+        default=None,
+        help="the branch the candidate lives on; included in the prompt if given",
+    )
+    run_sparring.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "sparring agent provider (default: project.toml's "
+            "[agents.sparring].provider, else codex-cli)"
+        ),
+    )
+    run_sparring.add_argument(
+        "--codex-executable",
+        default="codex",
+        help="codex CLI executable to invoke (default: codex)",
+    )
+    run_sparring.add_argument("--model", default=None, help="model override for the provider")
+    run_sparring.add_argument(
+        "--sandbox",
+        default=DEFAULT_SANDBOX,
+        help=f"codex CLI --sandbox value (default: {DEFAULT_SANDBOX})",
+    )
+    run_sparring.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the bounded sparring prompt without invoking any provider",
+    )
+    run_sparring.set_defaults(func=_cmd_run_sparring)
 
     return parser
 
