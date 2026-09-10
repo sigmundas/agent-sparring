@@ -1,4 +1,3 @@
-import os
 import subprocess
 import tempfile
 import unittest
@@ -6,7 +5,7 @@ from pathlib import Path
 
 import conftest_path  # noqa: F401
 
-from agent_sparring.concurrency import LOCK_FILENAME
+from agent_sparring.concurrency import worktree_lock
 from agent_sparring.providers import ProviderError, StageAgentResult
 from agent_sparring.stage import Stage
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
@@ -59,13 +58,16 @@ class StageAgentRunTests(unittest.TestCase):
         adapter = _FakeAdapter(
             start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False)
         )
-        run_result = run_stage_agent(self.stage, self.sparring_dir, self.repo, adapter)
+        run_result = run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
 
         self.assertEqual(len(adapter.start_calls), 1)
         self.assertEqual(adapter.resume_calls, [])
         self.assertFalse(run_result.resumed)
         self.assertEqual(run_result.result.session_id, "sess-1")
         self.assertIn("Do the thing.", run_result.prompt)
+        self.assertIn("feature/x", run_result.prompt)
 
         self.assertEqual(self.stage.read_state().implementation_session_id, "sess-1")
 
@@ -74,9 +76,13 @@ class StageAgentRunTests(unittest.TestCase):
             start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False),
             resume_result=StageAgentResult(session_id="sess-1", text="ok again", is_error=False),
         )
-        run_stage_agent(self.stage, self.sparring_dir, self.repo, adapter)
+        run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
 
-        run_result = run_stage_agent(self.stage, self.sparring_dir, self.repo, adapter)
+        run_result = run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
 
         self.assertTrue(run_result.resumed)
         self.assertEqual(len(adapter.resume_calls), 1)
@@ -88,10 +94,14 @@ class StageAgentRunTests(unittest.TestCase):
             start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False),
             raise_on_resume=ProviderError("boom"),
         )
-        run_stage_agent(self.stage, self.sparring_dir, self.repo, adapter)
+        run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
 
         with self.assertRaises(StageAgentRunError):
-            run_stage_agent(self.stage, self.sparring_dir, self.repo, adapter)
+            run_stage_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
 
     def test_refuses_to_run_on_main(self):
         _run_git(self.repo, "checkout", "-q", "main")
@@ -99,16 +109,9 @@ class StageAgentRunTests(unittest.TestCase):
             start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False)
         )
         with self.assertRaises(StageAgentRunError):
-            run_stage_agent(self.stage, self.sparring_dir, self.repo, adapter)
-        self.assertEqual(adapter.start_calls, [])
-
-    def test_refuses_when_stage_already_locked_by_live_process(self):
-        (self.stage.directory / LOCK_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
-        adapter = _FakeAdapter(
-            start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False)
-        )
-        with self.assertRaises(StageAgentRunError):
-            run_stage_agent(self.stage, self.sparring_dir, self.repo, adapter)
+            run_stage_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
         self.assertEqual(adapter.start_calls, [])
 
     def test_expected_branch_mismatch_refuses_without_invoking_provider(self):
@@ -119,6 +122,70 @@ class StageAgentRunTests(unittest.TestCase):
             run_stage_agent(
                 self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/other"
             )
+        self.assertEqual(adapter.start_calls, [])
+
+    def test_missing_expected_branch_is_refused_up_front(self):
+        adapter = _FakeAdapter(
+            start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False)
+        )
+        for bad in (None, "", "   "):
+            with self.assertRaises(StageAgentRunError):
+                run_stage_agent(
+                    self.stage, self.sparring_dir, self.repo, adapter, expected_branch=bad
+                )
+        self.assertEqual(adapter.start_calls, [])
+
+    def test_resume_returning_a_different_session_id_is_refused(self):
+        adapter = _FakeAdapter(
+            start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False),
+            resume_result=StageAgentResult(session_id="sess-DIFFERENT", text="?", is_error=False),
+        )
+        run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
+
+        with self.assertRaises(StageAgentRunError):
+            run_stage_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
+
+        # The recorded identity must not have been silently replaced.
+        self.assertEqual(self.stage.read_state().implementation_session_id, "sess-1")
+
+    def test_successful_run_regenerates_handoff_from_real_git_context(self):
+        adapter = _FakeAdapter(
+            start_result=StageAgentResult(
+                session_id="sess-1", text="Implemented the widget.", is_error=False
+            )
+        )
+        run_result = run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
+
+        handoff_on_disk = self.stage.read_handoff()
+        self.assertEqual(handoff_on_disk, run_result.handoff)
+        self.assertIn("Implemented the widget.", handoff_on_disk)
+        self.assertIn("feature/x", handoff_on_disk)
+        self.assertIn("(not recorded)", handoff_on_disk)  # test/build evidence: never invented
+
+    def test_two_stages_targeting_the_same_worktree_cannot_both_hold_ownership(self):
+        other_stage = Stage.resolve(self.sparring_dir, "stage-2").create()
+        (other_stage.directory / "brief.md").write_text(
+            "# Stage brief: stage-2\n\n## Goal\n\nDo another thing.\n", encoding="utf-8"
+        )
+        adapter = _FakeAdapter(
+            start_result=StageAgentResult(session_id="sess-2", text="ok", is_error=False)
+        )
+
+        with worktree_lock(self.repo):
+            with self.assertRaises(StageAgentRunError):
+                run_stage_agent(
+                    other_stage,
+                    self.sparring_dir,
+                    self.repo,
+                    adapter,
+                    expected_branch="feature/x",
+                )
         self.assertEqual(adapter.start_calls, [])
 
 

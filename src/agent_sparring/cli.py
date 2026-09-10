@@ -158,7 +158,10 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
         if args.dry_run:
             state = stage.read_state()
             prompt = build_stage_prompt(
-                stage, sparring_dir, resume=state.implementation_session_id is not None
+                stage,
+                sparring_dir,
+                resume=state.implementation_session_id is not None,
+                expected_branch=args.expected_branch,
             )
             print(prompt)
             return 0
@@ -284,8 +287,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_stage.add_argument(
         "--expected-branch",
-        default=None,
-        help="refuse to run unless the repo is on this branch",
+        required=True,
+        help=(
+            "the branch this unattended run is meant to modify; required, and "
+            "included in the stage prompt so the agent is told not to switch "
+            "branches"
+        ),
     )
     run_stage.add_argument(
         "--provider",

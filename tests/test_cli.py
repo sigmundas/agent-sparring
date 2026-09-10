@@ -262,6 +262,8 @@ class CliRunStageTests(unittest.TestCase):
                 "stage-1",
                 "--repo-root",
                 str(self.repo),
+                "--expected-branch",
+                "feature/x",
                 "--dry-run",
             ]
         )
@@ -276,6 +278,8 @@ class CliRunStageTests(unittest.TestCase):
                 "no-such-stage",
                 "--repo-root",
                 str(self.repo),
+                "--expected-branch",
+                "feature/x",
                 "--dry-run",
             ]
         )
@@ -293,6 +297,8 @@ class CliRunStageTests(unittest.TestCase):
                 "stage-1",
                 "--repo-root",
                 str(self.repo),
+                "--expected-branch",
+                "feature/x",
                 "--claude-executable",
                 "/nonexistent/claude-should-not-be-invoked",
             ]
@@ -310,11 +316,30 @@ class CliRunStageTests(unittest.TestCase):
                 "stage-1",
                 "--repo-root",
                 str(self.repo),
+                "--expected-branch",
+                "feature/x",
                 "--provider",
                 "codex",
             ]
         )
         self.assertEqual(exit_code, 1)
+
+    def test_run_stage_without_expected_branch_is_rejected_by_argparse(self):
+        main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+
+        with self.assertRaises(SystemExit) as ctx:
+            main(
+                [
+                    "--sparring-dir",
+                    str(self.sparring_dir),
+                    "run-stage",
+                    "stage-1",
+                    "--repo-root",
+                    str(self.repo),
+                    "--dry-run",
+                ]
+            )
+        self.assertNotEqual(ctx.exception.code, 0)
 
 
 if __name__ == "__main__":
