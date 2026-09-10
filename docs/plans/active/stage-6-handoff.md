@@ -512,7 +512,7 @@ while calling in):
 
 - Base for this round: `c8ef2c7ce609bf2214a252fb3b4c1c38961ff486` (round 2's
   implementation candidate; `529389d` on top of it was documentation-only)
-- Round-3 candidate SHA: recorded below after the push
+- Round-3 candidate SHA: `1f58ba5c8d8edfa85f8453864bafedaad0fb0119`
 - Branch: `feature/sparring-v2`, pushed to `origin`
 
 One finding, resolved. All prior Stage 6 semantics preserved unchanged:
