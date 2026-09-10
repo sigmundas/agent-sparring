@@ -233,5 +233,89 @@ class CliHandoffAndSparringTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
 
 
+class CliRunStageTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name) / "repo"
+        self.repo.mkdir(parents=True)
+        _run_git(self.repo, "init", "-q", "-b", "main")
+        _run_git(self.repo, "config", "user.email", "test@example.com")
+        _run_git(self.repo, "config", "user.name", "Test")
+        (self.repo / "f.txt").write_text("hi\n", encoding="utf-8")
+        _run_git(self.repo, "add", "f.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "base")
+        _run_git(self.repo, "checkout", "-q", "-b", "feature/x")
+        self.sparring_dir = self.repo / ".sparring"
+
+    def test_dry_run_prints_prompt_without_invoking_any_provider(self):
+        main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+        (self.sparring_dir / "stages" / "stage-1" / "brief.md").write_text(
+            "# Stage brief: stage-1\n\n## Goal\n\nBuild the widget.\n", encoding="utf-8"
+        )
+
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(self.sparring_dir),
+                "run-stage",
+                "stage-1",
+                "--repo-root",
+                str(self.repo),
+                "--dry-run",
+            ]
+        )
+        self.assertEqual(exit_code, 0)
+
+    def test_run_stage_missing_stage_fails(self):
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(self.sparring_dir),
+                "run-stage",
+                "no-such-stage",
+                "--repo-root",
+                str(self.repo),
+                "--dry-run",
+            ]
+        )
+        self.assertEqual(exit_code, 1)
+
+    def test_run_stage_refuses_on_main_before_invoking_provider(self):
+        main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+        _run_git(self.repo, "checkout", "-q", "main")
+
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(self.sparring_dir),
+                "run-stage",
+                "stage-1",
+                "--repo-root",
+                str(self.repo),
+                "--claude-executable",
+                "/nonexistent/claude-should-not-be-invoked",
+            ]
+        )
+        self.assertEqual(exit_code, 1)
+
+    def test_run_stage_unsupported_provider_fails_cleanly(self):
+        main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(self.sparring_dir),
+                "run-stage",
+                "stage-1",
+                "--repo-root",
+                str(self.repo),
+                "--provider",
+                "codex",
+            ]
+        )
+        self.assertEqual(exit_code, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
