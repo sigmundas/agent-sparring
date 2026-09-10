@@ -39,6 +39,19 @@ recovery (retry, rollback, silently continuing) for such a failure -- that
 would contradict the branch-guard/worktree-lock/read-only-integrity checks
 those functions already perform.
 
+A stage-agent turn that itself raised no exception but whose provider
+reported ``is_error=true`` in its own machine-readable output (e.g.
+``ClaudeCliAdapter``'s parsed ``StageAgentResult.is_error``) is treated the
+same way: the loop stops with :class:`LoopError` before ever invoking the
+sparring agent, rather than sending a provider-reported failed
+implementation turn to the sparrer as though it had succeeded. This
+mirrors the standalone ``run-stage`` CLI command, which already treats
+``is_error=true`` as failure. The provider-issued
+``implementation_session_id`` that ``run_stage_agent`` already recorded in
+``state.json`` before returning is left untouched (not discarded), so a
+later, deliberate retry can resume the same provider context; no automatic
+retry/recovery is attempted here.
+
 A small, configurable runaway limit (``max_send_back_cycles``) bounds how
 many SEND_BACK verdicts this loop will act on before refusing to continue
 further, raising :class:`LoopRunawayError`. This is deliberately not a
@@ -149,8 +162,11 @@ def run_unattended_loop(
     :class:`LoopError` if either the stage-agent or sparring-agent turn
     itself fails (branch guard, worktree lock, provider error, read-only
     integrity violation, session-identity mismatch, or unparseable
-    verdict) -- this module never invents recovery for those; it stops
-    cleanly and lets the caller decide what to do next.
+    verdict), or if the stage agent's own turn completed without raising
+    but its provider reported ``is_error=true`` -- in that last case the
+    sparring agent is never invoked for that cycle. This module never
+    invents recovery for any of these; it stops cleanly and lets the
+    caller decide what to do next.
     """
 
     if max_send_back_cycles < 1:
@@ -173,6 +189,24 @@ def run_unattended_loop(
             )
         except StageAgentRunError as exc:
             raise LoopError(f"stage-agent turn failed: {exc}") from exc
+
+        if stage_run.result.is_error:
+            # The provider's own machine-readable output reported this turn
+            # as failed (mirrors the standalone `run-stage` CLI command,
+            # which already treats is_error=true as failure). An
+            # unattended loop must not hand a provider-reported failed
+            # implementation turn to the sparrer as though it succeeded.
+            # run_stage_agent has already recorded the provider-issued
+            # implementation_session_id in state.json before returning --
+            # that is left untouched here (not discarded) so a later,
+            # deliberate retry can resume the same provider context. No
+            # automatic retry/recovery is attempted.
+            raise LoopError(
+                f"stage-agent turn for stage {stage.stage_id!r} reported "
+                f"is_error=true (session {stage_run.result.session_id!r}); "
+                "refusing to send a failed implementation turn to the "
+                "sparrer"
+            )
 
         try:
             sparring_run = run_sparring_agent(

@@ -269,12 +269,23 @@ Example:
     [sparring]
     default_mode = "local-auto"
 
+    [stage]
+    self_check = false
+
 Provider ids are explicit adapter ids (e.g. `claude-cli`, `codex-cli`), not
 bare vendor names: a vendor may later have more than one adapter (CLI vs
 API/SDK), and the id in config must say which one is meant. This is a
 canonical-vocabulary decision, not a registry: adding a new provider still
 means adding a new adapter module and a matching CLI/config branch, not
 registering a new string.
+
+`[stage] self_check` (Stage 5) is optional and defaults to `false`. When
+`true`, the stage prompt gains one additional prose section asking the
+implementation agent to inspect its own work (failure between steps,
+resume/retry behavior, stale state, provider/runtime differences,
+concurrency issues, ways invariants can be bypassed) before finishing its
+turn. It is prose only: no workflow state, no checklist fields, no
+pass/fail gate. Independent sparring still runs afterward regardless.
 
 Only values that software actually needs belong here.
 

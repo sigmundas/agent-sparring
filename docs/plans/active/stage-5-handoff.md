@@ -2,12 +2,16 @@
 
 Date: 2026-09-10
 
-## Branch state
+This handoff covers two rounds, both on `feature/sparring-v2`: the initial
+Stage 5 implementation and a follow-up round resolving one behavioral
+finding and one documentation-consistency issue found afterward. See
+"Round 2" below for that round's own branch/candidate state and fixes.
+
+## Branch state (round 1, initial implementation)
 
 - Base SHA: `79342f79b7213f1ac5c0692bb151a43e0022166c` (verified as the exact
   HEAD of `feature/sparring-v2` before starting; no divergence)
-- Candidate SHA: recorded below after commit/push (see "Verification" for
-  the exact command sequence used)
+- Candidate SHA: `1ffe1eb400bfd3a3187ab1fe13296f7f87f828d8`
 - Branch: `feature/sparring-v2`, pushed to `origin`
 
 ## Files changed
@@ -304,14 +308,11 @@ adversarial brief or costly, non-deterministic real-model behavior to
 trigger reliably, and would not exercise any code the fake-adapter tests
 don't already cover).
 
-## Known limitations / unresolved questions
+## Known limitations / unresolved questions (round 1, superseded/updated by round 2 below)
 
-- The loop's own error path is a thin wrapper (`LoopError`/
-  `LoopRunawayError`) around Stage 3/4's existing error types; it does not
-  add any new integrity check of its own. Everything Stage 3/4's handoffs
-  already documented as a known limitation (e.g. the `(branch, HEAD, dirty
-  paths)` fingerprint not detecting an edit-then-restore) is unchanged and
-  still applies here.
+- ~~The loop ignores a provider-reported `is_error=true` on an otherwise
+  non-raising stage-agent turn and proceeds to sparring as though it
+  succeeded~~ -- fixed by round 2's fix 1.
 - `LoopResult.cycles`/`LoopCycleRecord` are returned in-memory only; they
   are not persisted anywhere. A caller that wants a durable multi-cycle
   history beyond the latest `sparring.md` exchange has none from this
@@ -325,3 +326,104 @@ don't already cover).
   `test_stage_agent.py`, not by the live smoke test.
 - Stage 6 (acceptance/freeze) remains explicitly out of scope and was not
   started.
+
+## Round 2: is_error handling + plan documentation
+
+- Base for this round: `1ffe1eb400bfd3a3187ab1fe13296f7f87f828d8` (round 1's
+  implementation candidate)
+- Round-2 candidate SHA: recorded after commit/push below
+- Branch: `feature/sparring-v2`, pushed to `origin`
+
+Two items, both resolved:
+
+### Fix 1 -- stop the loop when the stage provider reports is_error=true
+
+`ClaudeCliAdapter.StageAgentResult.is_error` reflects the provider's own
+machine-readable output (parsed straight from `claude`'s JSON, per
+`providers/claude_cli.py`). The standalone `run-stage` CLI command already
+treats `is_error=true` as failure (its exit code is `1 if
+run_result.result.is_error else 0`), but `run_unattended_loop` previously
+ignored it entirely and proceeded straight to `run_sparring_agent` as
+though the turn had succeeded -- sending a provider-reported failed
+implementation turn to the sparrer.
+
+`run_unattended_loop` now checks `stage_run.result.is_error` immediately
+after `run_stage_agent` returns (only reachable when `run_stage_agent`
+itself did not raise) and, if true, raises `LoopError` before ever calling
+`run_sparring_agent`. `run_stage_agent` has already recorded the real
+provider-issued `implementation_session_id` in `state.json` before
+returning in this path (unchanged from Stage 3) -- the fix does not touch
+or discard that recorded id, so a later, deliberate retry can resume the
+same provider context. No automatic retry/recovery was added.
+
+Regression: `test_stage_provider_reported_is_error_stops_loop_before_sparring`
+in `tests/test_loop.py`. Uses a `_ScriptedStageAdapter` scripted to return
+`StageAgentResult(session_id="impl-sess", is_error=True)` on its first
+call (a new `is_error_at` parameter on that fake, analogous to its existing
+`fail_at`). Asserts: `run_unattended_loop` raises `LoopError`; the sparring
+adapter's `start`/`resume` are never called; `stage.read_state()
+.implementation_session_id == "impl-sess"` (the real returned id, not
+discarded).
+
+### Fix 2 -- document self_check in the canonical plan
+
+`self_check` is generic project configuration now (Stage 5's actual
+implementation), not merely a Stage-5-implementation-note detail buried in
+this handoff. Updated
+`docs/plans/active/2026-09-10-agent-sparring-foundation.md`'s
+`project.toml` example (the "Machine-readable configuration" section) to
+add:
+
+    [stage]
+    self_check = false
+
+immediately followed by a short paragraph: optional, defaults to `false`;
+when `true` the stage prompt gains one prose section asking the
+implementation agent to self-inspect (failure between steps, resume/retry
+behavior, stale state, provider/runtime differences, concurrency issues,
+ways invariants can be bypassed) before finishing its turn; no workflow
+state, no checklist fields, no pass/fail gate; independent sparring still
+runs afterward regardless. No new configuration keys or CLI flags were
+added alongside this -- it is documentation only, matching the existing
+implementation exactly (field name `self_check`, unchanged).
+
+### Files changed (round 2)
+
+Production code (modified):
+- `src/agent_sparring/loop.py` -- fix 1 (the `is_error` check plus updated
+  module/function docstrings)
+
+Documentation (modified):
+- `docs/plans/active/2026-09-10-agent-sparring-foundation.md` -- fix 2
+- `docs/plans/active/stage-5-handoff.md` -- this round's own record
+
+Tests (modified):
+- `tests/test_loop.py` -- fix 1 regression, plus the `is_error_at` fake
+  adapter parameter it needed (+1 test)
+
+Production code changed: **yes**. Tests changed: **yes**.
+
+### Verification (round 2)
+
+```
+cd /Users/sigmundas/Documents/Code/agent-sparring/tests
+for f in test_*.py; do python3 "$f"; done
+```
+
+All 16 test modules pass (`OK`), including the new regression in
+`test_loop.py` (now 12 tests in that module). `git diff --check`: clean.
+
+No new live smoke test was run in this round: fix 1 is exercised entirely
+through the fake-adapter regression above (a real `claude` CLI call that
+deterministically reports `is_error=true` is not something round 1's live
+smoke test setup can reliably trigger on demand), and fix 2 is
+documentation-only with no runtime behavior change at all.
+
+## Known limitations / unresolved questions (round 2)
+
+- `LoopResult.cycles`/`LoopCycleRecord` are still returned in-memory only;
+  unchanged from round 1.
+- No `.sparring/project.toml`/`PROJECT.md` exists yet for this repo itself;
+  unchanged from round 1 (Stage 7 in the plan is the Sporely pilot).
+- Stage 6 (acceptance/freeze) remains explicitly out of scope and was not
+  started in this round either.

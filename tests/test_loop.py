@@ -39,9 +39,16 @@ class _ScriptedStageAdapter:
     scripted to raise :class:`ProviderError` on a given (1-indexed) call
     number."""
 
-    def __init__(self, *, session_id: str = "impl-sess", fail_at: int | None = None):
+    def __init__(
+        self,
+        *,
+        session_id: str = "impl-sess",
+        fail_at: int | None = None,
+        is_error_at: int | None = None,
+    ):
         self.session_id = session_id
         self.fail_at = fail_at
+        self.is_error_at = is_error_at
         self.start_calls: list[str] = []
         self.resume_calls: list[tuple[str, str]] = []
         self._call_count = 0
@@ -51,14 +58,16 @@ class _ScriptedStageAdapter:
         self.start_calls.append(prompt)
         if self.fail_at == self._call_count:
             raise ProviderError("stage provider boom")
-        return StageAgentResult(session_id=self.session_id, text="did it", is_error=False)
+        is_error = self.is_error_at == self._call_count
+        return StageAgentResult(session_id=self.session_id, text="did it", is_error=is_error)
 
     def resume(self, session_id: str, prompt: str) -> StageAgentResult:
         self._call_count += 1
         self.resume_calls.append((session_id, prompt))
         if self.fail_at == self._call_count:
             raise ProviderError("stage provider boom")
-        return StageAgentResult(session_id=self.session_id, text="did more", is_error=False)
+        is_error = self.is_error_at == self._call_count
+        return StageAgentResult(session_id=self.session_id, text="did more", is_error=is_error)
 
 
 class _ScriptedSparringAdapter:
@@ -332,6 +341,34 @@ class UnattendedLoopTests(unittest.TestCase):
         self.assertEqual(len(stage_adapter.start_calls), 1)
         self.assertEqual(stage_adapter.resume_calls, [])
         self.assertIsNone(self.stage.read_state().sparring_session_id)
+
+    def test_stage_provider_reported_is_error_stops_loop_before_sparring(self):
+        # ClaudeCliAdapter's StageAgentResult.is_error reflects the
+        # provider's own machine-readable output; a turn that completes
+        # without raising but reports is_error=true must not be sent to
+        # the sparrer as though it succeeded.
+        stage_adapter = _ScriptedStageAdapter(session_id="impl-sess", is_error_at=1)
+        sparring_adapter = _ScriptedSparringAdapter([_verdict_text("READY", "ok")])
+
+        with self.assertRaises(LoopError):
+            run_unattended_loop(
+                self.stage,
+                self.sparring_dir,
+                self.repo,
+                stage_adapter,
+                sparring_adapter,
+                expected_branch="feature/x",
+            )
+
+        # The sparring agent must never see a failed implementation turn.
+        self.assertEqual(sparring_adapter.start_calls, [])
+        self.assertEqual(sparring_adapter.resume_calls, [])
+
+        # The real provider-issued implementation session id, already
+        # recorded by run_stage_agent before the loop's is_error check
+        # runs, must not be discarded -- a later deliberate retry can
+        # resume it.
+        self.assertEqual(self.stage.read_state().implementation_session_id, "impl-sess")
 
     def test_second_send_back_cycle_after_first_failure_type_is_not_attempted(self):
         # A stage agent that fails on its SECOND call (the resumed turn)
