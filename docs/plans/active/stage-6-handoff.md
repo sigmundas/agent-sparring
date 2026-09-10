@@ -6,7 +6,12 @@ Date: 2026-09-10
 
 - Base SHA: `c182d7584603739ee043b3d64691ed06da2613cf` (verified as the exact
   pushed HEAD of `feature/sparring-v2` before starting; no divergence)
-- Candidate SHA: recorded at the end of this document after the push
+- Candidate SHA: `2d5b967eaad017ed5e27e26d6ae505d54a742650` — all Stage 6
+  production code and tests. This handoff document is then updated by one
+  documentation-only follow-up commit (the current branch HEAD), which
+  touches no code; review the implementation at the SHA above, and note
+  that `accept-candidate` on this repo would itself require freezing the
+  actual branch HEAD.
 - Branch: `feature/sparring-v2`, pushed to `origin`
 
 ## Files changed
