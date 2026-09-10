@@ -57,6 +57,34 @@ class SparringPromptTests(unittest.TestCase):
         )
         self.assertIn("deferred", prompt)
 
+    def test_needs_you_prompt_asks_for_a_standard_reason_category(self):
+        """The prompt must ask for one of the plan's five standard human-break
+        categories in ``needs_you_reason``.
+
+        Exercised by the Stage 7 pilot: ``sparring_exchange`` renders that
+        field under a literal "Reason category:" label and
+        ``templates.NOTES_TEMPLATE`` tells the reader to name a category, but
+        the prompt only ever asked for a free-text "short reason". Both real
+        NEEDS_YOU verdicts in the pilot therefore printed prose under a label
+        promising a category, and the standard categories never surfaced --
+        the second was plainly DEVICE/MANUAL CHECK and never said so.
+
+        Prompt-only by design: the category stays prose, and
+        :mod:`agent_sparring.routing` deliberately does not model it as
+        machine state.
+        """
+
+        prompt = build_sparring_prompt(self.stage, self.sparring_dir, resume=False)
+
+        for category in (
+            "PRODUCT/PREFERENCE",
+            "UI/VISUAL CHECK",
+            "DEVICE/MANUAL CHECK",
+            "EXTERNAL CONDITION",
+            "SCOPE EXPANSION",
+        ):
+            self.assertIn(category, prompt)
+
     def test_resume_includes_previous_sparring_exchange(self):
         record_sparring(
             self.stage,

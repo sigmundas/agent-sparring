@@ -30,7 +30,9 @@ nothing else (no markdown fences, no extra prose around it):
 
     {"action": "SEND_BACK" | "READY" | "NEEDS_YOU" | "ESCALATE",
      "summary": "<one short paragraph -- the routing headline>",
-     "needs_you_reason": "<short reason, or null if action is not NEEDS_YOU>",
+     "needs_you_reason": "<one of the standard categories below, then a
+                   short reason -- e.g. \\"DEVICE/MANUAL CHECK -- needs a real
+                   Android device\\". null if action is not NEEDS_YOU>",
      "findings": "<the real technical explanation -- what you actually
                    found, checked, and why; this is what makes SEND_BACK/
                    NEEDS_YOU/ESCALATE useful, and can also give a READY
@@ -45,7 +47,18 @@ resumed stage-agent turn, to the same stage agent.
 
 - SEND_BACK: a bounded implementation issue for the same stage agent to fix.
 - READY: no unresolved implementation issue requiring another stage-agent pass.
-- NEEDS_YOU: a concrete human choice/check/action is required.
+- NEEDS_YOU: a concrete human choice/check/action is required. Start
+  ``needs_you_reason`` with whichever of these standard categories fits, so
+  the human can see at a glance what kind of attention is wanted:
+
+      PRODUCT/PREFERENCE     choose between valid behaviors
+      UI/VISUAL CHECK        look at layout, contrast, appearance
+      DEVICE/MANUAL CHECK    run it on real hardware, offline, a real session
+      EXTERNAL CONDITION     wait on a store/deploy/third-party state
+      SCOPE EXPANSION        approve work beyond this stage's scope
+
+  Then give the short reason. If none of the five fits, say so plainly and
+  describe the category rather than forcing one.
 - ESCALATE: this deserves a stronger/different sparring environment (e.g.
   GPT web chat) rather than being decided inside this automatic exchange.
 
