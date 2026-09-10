@@ -55,9 +55,13 @@ def run_stage_agent(
     Records the provider's own returned session id in state.json and
     regenerates handoff.md from the provider's result and actual git
     context (never invented test evidence). On the stage's first run, the
-    pre-turn HEAD is recorded as the stage's ``base_sha`` so the handoff can
-    show the stage's accumulated changes; that base is preserved across
-    later SEND_BACK/resume turns, never re-resolved.
+    pre-turn HEAD is resolved and persisted to state.json as the stage's
+    ``base_sha`` *before* the provider gets control, so a provider that
+    modifies the repo and then fails does not lose the true stage baseline.
+    That base is preserved across later SEND_BACK/resume turns and never
+    re-resolved or moved forward, even after a failed turn — it represents
+    where implementation for this stage began, so any changes from a
+    failed/partial turn are correctly still included against it.
 
     Immediately after the provider returns, the branch is re-checked: a
     provider can run arbitrary git commands, so a successful-looking turn
@@ -95,6 +99,12 @@ def run_stage_agent(
                     base_sha = resolve_commit(repo_root, "HEAD", label="stage base")
                 except GitContextError as exc:
                     raise StageAgentRunError(str(exc)) from exc
+                # Persist the stage's baseline before the provider gets
+                # control: if the provider modifies the repo and then fails,
+                # the true stage baseline (where implementation began) must
+                # not be lost.
+                state.base_sha = base_sha
+                stage.write_state(state)
 
             prompt = build_stage_prompt(
                 stage,
@@ -124,9 +134,9 @@ def run_stage_agent(
                     f"provider turn left the worktree off the expected branch: {exc}"
                 ) from exc
 
+            # state.base_sha was already persisted above (before the provider
+            # ran) if this was the first run; it is never moved forward here.
             state.implementation_session_id = result.session_id
-            if state.base_sha is None:
-                state.base_sha = base_sha
             stage.write_state(state)
 
             try:

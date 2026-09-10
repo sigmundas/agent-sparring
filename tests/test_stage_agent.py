@@ -60,6 +60,27 @@ class _CommittingAdapter:
         return StageAgentResult(session_id=self.session_id, text="did more", is_error=False)
 
 
+class _CommittingThenFailingAdapter:
+    """A fake provider that makes a real commit, then raises ProviderError."""
+
+    def __init__(self, repo: Path, *, filename: str):
+        self.repo = repo
+        self.filename = filename
+        self.start_calls = []
+        self.resume_calls = []
+
+    def start(self, prompt: str) -> StageAgentResult:
+        self.start_calls.append(prompt)
+        (self.repo / self.filename).write_text("partial change\n", encoding="utf-8")
+        _run_git(self.repo, "add", self.filename)
+        _run_git(self.repo, "commit", "-q", "-m", f"partial: add {self.filename}")
+        raise ProviderError("provider crashed mid-turn")
+
+    def resume(self, session_id: str, prompt: str) -> StageAgentResult:
+        self.resume_calls.append((session_id, prompt))
+        raise ProviderError("provider crashed mid-turn")
+
+
 class _BranchSwitchingAdapter:
     """A fake provider that checks out a different branch during its turn."""
 
@@ -300,6 +321,40 @@ class StageAgentRunTests(unittest.TestCase):
             )
         # The identity recorded by the prior successful run must be untouched.
         self.assertEqual(self.stage.read_state().implementation_session_id, "sess-1")
+
+    def test_base_sha_survives_a_failed_first_turn_and_handoff_includes_its_change(self):
+        base_sha_a = _head_sha(self.repo)
+
+        failing_adapter = _CommittingThenFailingAdapter(self.repo, filename="partial.txt")
+        with self.assertRaises(StageAgentRunError):
+            run_stage_agent(
+                self.stage,
+                self.sparring_dir,
+                self.repo,
+                failing_adapter,
+                expected_branch="feature/x",
+            )
+
+        # The commit made during the failed turn is real and not rolled back.
+        self.assertNotEqual(_head_sha(self.repo), base_sha_a)
+        # But the stage's baseline must still be the pre-turn HEAD.
+        self.assertEqual(self.stage.read_state().base_sha, base_sha_a)
+
+        succeeding_adapter = _FakeAdapter(
+            start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False)
+        )
+        run_result = run_stage_agent(
+            self.stage,
+            self.sparring_dir,
+            self.repo,
+            succeeding_adapter,
+            expected_branch="feature/x",
+        )
+
+        # base_sha must not have moved forward past the failed attempt.
+        self.assertEqual(self.stage.read_state().base_sha, base_sha_a)
+        self.assertIn(base_sha_a, run_result.handoff)
+        self.assertIn("partial.txt", run_result.handoff)
 
 
 if __name__ == "__main__":
