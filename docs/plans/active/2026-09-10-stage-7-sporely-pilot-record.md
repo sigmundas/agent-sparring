@@ -174,3 +174,318 @@ did exactly that.
 ### Cases covered
 
 - **Case 1** again, cleanly and with zero human involvement end to end.
+
+---
+
+## Stage 3 — `stage-finds-incremental-pagination-render`
+
+**Task (real).** Stage 2 of the repository's own active plan,
+`docs/plans/active/2026-09-09-finds-smooth-pagination.md`, which the plan
+itself names as the next action. Ordinary Finds pagination rebuilt the whole
+list on every page (`list.innerHTML = html`), destroying already-visible cards
+and images and forcing the media loader to repaint — the white-thumbnail frame
+and scroll stall reported from device QA. Plus the in-scope detail-return bug:
+the back handler unconditionally called `loadFinds()`, discarding pages 2+ so
+scroll restore clamped to page-1 height.
+
+**This is the stage that tests the success criterion**, and it passed it.
+
+**Route sequence — one `run-loop` invocation, three cycles, no human relay:**
+
+```text
+stage agent  -> b609404  -> sparring -> SEND_BACK (3 findings)
+same agent   -> 654502f  -> sparring -> SEND_BACK (1 finding)
+same agent   -> d20aef3  -> sparring -> NEEDS_YOU (DEVICE/MANUAL CHECK)
+```
+
+`outcome=NEEDS_YOU cycles=3 send_back_count=2`. I carried nothing between the
+two agents at any point.
+
+**Candidate.** `d20aef3a335d8cd0c92ccebf9325d5bea00e241e`, base `1059821…`.
+Three files; the first commit alone was +1259/−303 across `finds.js`,
+`find_detail.js`, and `finds.test.js`.
+
+**Session reuse.** Worked across all three cycles — same
+`implementation_session_id` `d11e1195-…` and `sparring_session_id`
+`01a08d64-…` throughout, which is what made the corrections same-session rather
+than a fresh agent re-deriving context each time.
+
+**Sparring quality — the strongest evidence in the pilot.** The three
+first-round findings were real, specific, and *reproduced in memory before
+being reported*, each with the exact resulting symptom:
+
+1. **Ordering mismatch reaching the destructive fallback.** Server pagination
+   orders by date/created_at/id but the merge sorts by `captured_at`, so valid
+   rows need not form a suffix and `_appendFindsPage` fell back to a full
+   `_applyFilter` during ordinary load-more. Demonstrated by changing one
+   first-page `captured_at` to an earlier date: page two produced a full-list
+   replacement, destroyed the old card, and fetched image batches of 20 then 21
+   ids.
+2. **Unidentified-species key cannot survive real HTML.** The internal key
+   starts with `U+0000` and was emitted directly into `data-species-key`. Real
+   HTML parsing replaces NUL with `U+FFFD`, so dataset equality against the
+   original key fails in a browser and silently invokes a full render — while
+   the test harness's fake parser preserves NUL and hides it. This is precisely
+   the class of defect unit tests cannot catch and a device would show, and it
+   was found by reasoning about the difference between the fake parser and a
+   real one.
+3. **Feed page incorporation not serialized.** `loadingMore` cleared before
+   awaited profile enrichment, so another scroll could append the following
+   page first. Reproduced by holding page-two profile lookup: date groups came
+   out September 3, September 1, September 2.
+
+**NEEDS_YOU quality.** Correct and precisely scoped: it named the exact plan
+scenarios needing hardware (A/B thumbnail persistence across page boundaries,
+E sort/view transitions during loading, H detail return beyond page one,
+I refresh-then-paginate) and asked for the device/WebView version to be
+recorded. It explicitly said visible smoothness and absence of flashing were
+not established. That is a human break worth stopping for.
+
+**Orchestrator verification** (writable environment): `npm test` 1275 tests,
+1233 pass, **6 fail** (only the six Deno suites), 36 skipped; `npm run build`
+pass; `npx eslint .` 0 errors; `git diff --check` clean. The sparrer's reported
+22 failures were its own sandbox EPERM on temporary fixtures, exactly as it
+said — confirming its self-assessment was honest rather than optimistic.
+
+**Acceptance.** Frozen at `d20aef3` (status `frozen`, pushed ref verified) and
+deliberately **not accepted**: the Android/WebView QA genuinely cannot be run
+from this workstation. The gate distinguishing `frozen` from `accepted` did
+exactly the right thing here.
+
+**Human interventions actually required.** One, and a legitimate one: the
+device QA. It remains outstanding.
+
+### Defect 2 — NEEDS_YOU reason never named a category (fixed)
+
+`sparring_exchange.render_sparring` prints `needs_you_reason` under a literal
+`Reason category:` label, and `templates.NOTES_TEMPLATE` tells the reader to
+name a category — but the sparring prompt only ever asked for a free-text
+"short reason". Both real NEEDS_YOU verdicts in this pilot therefore printed
+prose under a label promising a category, and the plan's five standard
+human-break categories never surfaced. The Stage 3 case was plainly
+DEVICE/MANUAL CHECK and never said so.
+
+**Fix:** `0385eee` — the prompt now asks the sparrer to begin
+`needs_you_reason` with whichever of the five standard categories fits, and to
+say so plainly if none does. Prompt text only; `routing.py` still deliberately
+does not model the category as machine state, so no workflow state was added.
+Suite 247 → 248 passing.
+
+### Cases covered
+
+- **Case 2** — SEND_BACK → same implementation session → correction → same
+  sparring session → READY-equivalent progress. Yes.
+- **Case 3** — several unattended correction cycles. Yes: three cycles, two
+  SEND_BACKs, one invocation.
+- **Case 5** — NEEDS_YOU for a genuine device/manual check. Yes.
+
+---
+
+## Stage 4 — `stage-anchor-rot-hardening`
+
+**Task (real).** Generalize the Stage 2 fix to the four remaining test files
+that anchor on a literal declaration and slice a window after it
+(`capability-gates`, `connectivity-loss`, `sync-queue`, `screens/review` —
+88 `indexOf` calls between them, not all of them anchors). Real value: each of
+those can silently stop covering what it was written to cover.
+
+**Route sequence.** `run-loop` → stage agent → `4c0caac` → sparring →
+**SEND_BACK** (2 findings) → same agent → `5786136` → sparring → **READY** →
+freeze → accept. `cycles=2 send_back_count=1`. No human relay.
+
+**Candidate.** `57861367f96b1c02b6b11b2a8835c735977607d9`. A shared
+`src/anchor-slice.js` helper plus conversions across four test files
+(+371/−155), then a two-file correction.
+
+**Case 8 — project-specific implementation subagent: yes, genuinely.** The
+stage agent dispatched `sporely-implementer` four times, one per file package,
+after deciding the shared-helper contract itself. Verified from the provider
+session transcript (`ba99979a-…`), not from the agent's prose.
+
+Worth recording that this was the *only* stage of four that delegated. Stages
+1–3 made zero subagent calls — including Stage 3, whose brief explicitly said
+delegating the mapping to `Explore` was appropriate and which touched a
+2865-line file. So `claude -p` stage agents in this setup do not reach for
+subagents merely because they are invited to; the work has to actually split
+into packages. That is a reasonable behavior, not a defect, but it means a
+project cannot assume delegation will happen just because PROJECT.md documents
+it.
+
+**Sparring quality — the delegation payoff.** Both SEND_BACK findings were
+about claims the delegated work had produced, and both were right:
+
+1. **A false "already-stale anchor" finding.** The stage agent reported a stale
+   anchor in `sync-queue.test.js`. The sparrer showed it was not one:
+   `'await insertObservationImage('` is the *forbidden* substring of an
+   absence assertion, not a slice anchor. For an absence assertion a missing
+   literal means the invariant is holding — the opposite of the dead coverage
+   a missing literal implies for a presence assertion. The correction
+   reintroduced the call in a probe copy to prove the assertion is live, and
+   replaced the misleading comment. The assertion itself was left untouched.
+2. **A regression test that did not discriminate its own bug.** The new
+   `sliceBetweenAnchors` test used an end literal occurring only *after* the
+   start anchor, so a globally-searching (buggy) implementation returns the
+   same answer and the test passes either way. The correction uses the same
+   `END` literal before and after the anchor, and was verified red against a
+   deliberately global probe helper and green against the real one.
+
+Finding 2 is the more valuable of the two: a regression test that passes
+against the bug it claims to catch is worse than no test, and nothing in the
+automated suite could have surfaced it.
+
+**Orchestrator verification:** `npm test` 1285 tests, 1243 pass, 6 fail (Deno
+only), 36 skipped; build pass; eslint 0 errors; clean tree.
+
+**Accepted** at `5786136`.
+
+### Cases covered
+
+- **Case 8** — a stage using a legitimate project-specific implementation
+  subagent. Yes.
+- **Case 2** again — SEND_BACK → same session → correction → READY.
+
+---
+
+## Practical friction
+
+**Setup burden: low.** Two files, and the only non-obvious step was git
+hygiene. The acceptance gate exempts only *the current stage's own* five
+artifact files from its clean-worktree check, so once a second stage exists,
+leftover artifacts from other stages block a freeze. `.sparring/stages/` had to
+be gitignored, with `project.toml` and `PROJECT.md` tracked. That is a
+reasonable design (the narrow exemption is what stops "everything under
+sparring_dir is exempt"), but it is not discoverable — a project will hit it on
+its second stage, not its first, and the error will name an unrelated stage's
+files. Worth one line in whatever setup documentation Stage 8 produces.
+
+**`[commands]` and `[sparring].default_mode` are declared but unused.** Both
+are parsed, validated, and printed by `check-config`, and consumed by no
+workflow code anywhere. The commands actually reached the agents as prose in
+`PROJECT.md`, which is what made them effective. Not fixed: the plan asks for
+project.toml to hold what software needs, and these currently qualify as
+neither harmful nor load-bearing. Flagging rather than removing, because
+removing them is a config-schema decision, not a pilot decision.
+
+**Prompts were not missing project context.** The assembled stage prompt was
+310 lines / 14.5 KB with `PROJECT.md` injected in full on both sides. The
+baseline-failures section earned its place immediately: every stage report
+correctly distinguished the six Deno failures from real regressions, and none
+of the four stages ever claimed a pre-existing failure as its own or tried to
+fix one. Injecting the same `PROJECT.md` into both the stage and sparring
+prompt is what let the sparrer check claims against project rules rather than
+generic good practice.
+
+One cosmetic wart: the brief's own `# Stage brief: …` H1 lands underneath the
+prompt's `## Stage brief`, so heading levels collide. Harmless.
+
+**Session resume: reliable, 5 for 5.** Both session ids were unchanged across
+every resumed turn — the three-cycle Stage 3 run and the two-cycle Stage 4 run
+included — and a fresh stage correctly got a fresh pair. No id was ever
+invented or lost.
+
+**Provider CLI behavior: no surprises, two notes.**
+
+- `claude -p --output-format json` and `codex exec ... resume` both behaved as
+  the adapters document. Nested `claude -p` from inside a Claude Code session
+  works fine.
+- `ClaudeCliAdapter.timeout_seconds` defaults to `None` and no CLI flag exposes
+  it, so a wedged provider would hang an unattended loop indefinitely. It did
+  not happen in four runs, so this is an observation, not a defect — but a
+  genuinely unattended overnight run has no upper bound today.
+- The sparrer ran on Node 25.8.2 while the project pins Node 22. It said so
+  every time, unprompted, which is the right behavior — but it means sparrer
+  test results are never authoritative for this project even when the sandbox
+  does let a command run.
+
+**Did NEEDS_YOU / ESCALATE stop at the right time?** After Defect 1 was fixed,
+yes. Three of four stages reached READY with no human involvement at all; the
+one NEEDS_YOU was a real device check that genuinely blocks acceptance. Before
+the fix, no — the loop stopped for an environment limitation, which would have
+made Stage 5 useless in practice.
+
+**Is the output understandable without reading framework internals?** Mostly
+yes. `sparring.md` reads as a review: findings, one routing outcome, and a
+deferred list. Two rough edges: every non-selected action section is printed
+with "(not applicable)", which is four-fifths noise; and the action section
+repeats only the one-line `summary`, so the real content always lives up in
+"Finding / discussion" and the "## SEND BACK TO STAGE" heading never actually
+contains the instruction being sent back. Neither blocked anything, and I
+would not change them without more evidence.
+
+**Did V2 start recreating V1 bureaucracy?** No. `state.json` stayed at five
+fields across all four stages. No review-attempt counters, no verdict
+identities, no amendment protocol, no front-matter parsing. Both defects found
+were fixed with prose in one prompt and zero new machine state — which is
+itself the strongest signal that the architecture is holding. The one place
+pressure exists is the NEEDS_YOU category, and it was deliberately kept as
+prose rather than promoted to an enum.
+
+---
+
+## Cases not yet exercised
+
+**Case 4 — NEEDS_YOU for a genuine product/preference decision.** Not
+exercised. No product or preference question actually arose in four stages:
+three were test-infrastructure work with a single defensible outcome, and
+Stage 3's open questions were all correctness or device-visibility, not
+preference. `sporely-web`'s one documented pending product decision (whether
+APK/AAB size justifies a dedicated R8 shrinking test release, in `PLAN.md`) is
+a release-management call with no implementation stage attached, so putting a
+stage in front of it would have been staging a case rather than finding one.
+The mechanism is not in doubt — NEEDS_YOU routing works, proven by Stage 3 —
+only this particular category is unproven.
+
+**Case 7 — ESCALATE producing a packet for web/manual sparring.** No genuine
+ESCALATE verdict arose. Nothing in four stages exceeded what the local sparrer
+could decide; the one thing it could not decide, it correctly routed to
+NEEDS_YOU instead, which was the right call. Manufacturing an escalation would
+have proved nothing about routing.
+
+The *packet mechanism* was verified directly, on the real Stage 3 candidate:
+`handoff --self-contained` produced 2656 lines / 126 KB containing stage goal,
+claims, git identity, changed files, test evidence, open/deferred checks,
+previous unresolved sparring findings, and the embedded diff — every element
+the plan requires. The thin form of the same handoff is 12.8 KB. So a web
+packet is pasteable, though 126 KB (~30k tokens) for a 1259-insertion stage is
+near the practical edge of a chat window; a larger stage would need the thin
+form plus repository access rather than the self-contained form.
+
+What remains unproven for case 7 is only the routing decision itself — whether
+a sparrer chooses ESCALATE when it should, rather than grinding on or
+over-escalating.
+
+---
+
+## Verdict on Stage 8 readiness
+
+The success criterion in the plan is that this sequence needs no human relay:
+
+```text
+implementation agent finishes -> sparrer finds a bounded issue ->
+implementation agent fixes it -> sparrer checks again -> another issue is
+fixed -> sparrer says READY
+```
+
+Stage 3 ran exactly that shape for three cycles and Stage 4 for two, each from
+a single command, with the human appearing only for a real device check. That
+criterion is met on real work, not on a rehearsal.
+
+Supporting evidence: four real stages on a live product repository, three
+accepted at exact pushed SHAs, one correctly frozen-not-accepted pending
+hardware; six SHAs total; two genuine generic defects found, fixed with
+prompt-only changes, and confirmed effective on later stages; suite 246 → 248.
+The sparring was not ceremonial — it caught a NUL-vs-U+FFFD DOM bug invisible
+to the test harness, a regression test that passed against its own bug, and a
+false finding produced by delegated work.
+
+Against that: cases 4 and 7 are unexercised, and the two provider-level
+observations (no adapter timeout, sparrer on the wrong Node) are real but were
+not blocking.
+
+**Recommendation: V2 is ready for Stage 8.** The unexercised cases are gaps in
+coverage, not known problems, and neither depends on V1 continuing to exist —
+V1 has no ESCALATE or product-decision machinery that would fill them. Nothing
+in the pilot required falling back to V1, and V1 was never touched.
+
+V1 remains untouched and read-only. Retirement is Stage 8's decision, not this
+record's.
