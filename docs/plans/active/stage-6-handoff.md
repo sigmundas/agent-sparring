@@ -508,4 +508,169 @@ while calling in):
   partial check work happens under a lock that might be released and
   re-acquired mid-function.
 
+## Round 3: serialize the sparring agent's state.json write with acceptance
+
+- Base for this round: `c8ef2c7ce609bf2214a252fb3b4c1c38961ff486` (round 2's
+  implementation candidate; `529389d` on top of it was documentation-only)
+- Round-3 candidate SHA: recorded below after the push
+- Branch: `feature/sparring-v2`, pushed to `origin`
+
+One finding, resolved. All prior Stage 6 semantics preserved unchanged:
+exact per-stage dirty allowlist, accept-time dirty re-check, freeze/accept
+serialization with the worktree lock, exact pushed-SHA freeze, stale-HEAD
+refusal, same-SHA reconsideration, no dummy commits, explicit acceptance.
+
+### The finding
+
+`run_stage_agent` and `freeze_candidate`/`accept_candidate` already
+serialize on `agent_sparring.concurrency.worktree_lock`, but
+`run_sparring_agent` did not:
+
+    state = stage.read_state()          # e.g. reads FROZEN
+    ... a potentially long provider turn, unlocked ...
+    state.sparring_session_id = ...     # mutates the object read above
+    stage.write_state(state)            # writes the WHOLE object back
+
+If a concurrent `accept_candidate` completed a real FROZEN -> ACCEPTED
+transition during that unlocked window, the sparring turn's final
+`write_state` would overwrite it with the stale `status=FROZEN` object it
+read before the provider turn started — silently reversing acceptance. The
+same argument applies to a concurrent `freeze_candidate` being reversed back
+to `WORKING`.
+
+### The fix
+
+Chose the smaller of the two options the task offered: hold the existing
+worktree lock for the *entire* local sparring turn, rather than trying to
+detect-and-merge a lifecycle change that happened mid-turn. `run_loop.py`
+already runs stage and sparring turns strictly sequentially, and a
+concurrent implementation write during the sparring fingerprint window was
+already fatal to that turn (the read-only integrity check would catch it)
+— so widening the sparring turn's lock scope to match costs nothing new in
+the normal unattended-loop path.
+
+`run_sparring_agent` is now a thin wrapper: it opens
+`with worktree_lock(repo_root):` around everything from the initial
+`stage.read_state()` through the final `write_state` (delegated to a new
+`_run_sparring_agent_locked`), and wraps a contended
+`WorktreeLockError` as `SparringAgentRunError` before the provider is ever
+invoked. This is the same lock `run_stage_agent`/`freeze_candidate`/
+`accept_candidate` already use, keyed the same way (`repo_root`'s resolved
+identity) — no second lock system. Since `run_sparring_agent` acquires and
+fully releases its own lock per call (never nested inside another
+`worktree_lock` block from this codebase), and `run_unattended_loop` calls
+`run_stage_agent` then `run_sparring_agent` sequentially, there is no
+deadlock risk: it is acquire → release → acquire → release, never
+acquire → acquire.
+
+Separately, the final write no longer reuses the `state` object read at the
+top of the turn: it re-reads `state.json` immediately before writing,
+mutates only `sparring_session_id` on that fresh read, and writes it back.
+Under the new full-turn lock this is not strictly needed for correctness
+(nothing else can write while the lock is held), but it makes the "always
+write current state, never a stale pre-turn snapshot" guarantee explicit in
+the code rather than relying solely on lock-scope reasoning, and it is what
+correctly preserves `status=ACCEPTED`/`candidate_sha` when sparring is run
+against an already-accepted stage (a case that was, and remains,
+explicitly permitted — no ACCEPTED guard was added to `run_sparring_agent`,
+unlike `run_stage_agent`'s).
+
+Nothing about the Codex OS-level read-only sandbox or the existing
+before/after repository-fingerprint integrity check changed: the lock
+addresses the state.json *write*, which was never something the read-only
+sandbox was responsible for in the first place.
+
+### Regressions
+
+New module `tests/test_sparring_acceptance_concurrency.py` (4 tests), using
+lock coordination rather than timing sleeps: a fake sparring adapter's
+`start()` — invoked from inside `run_sparring_agent` while it still holds
+the worktree lock — reentrantly attempts the "concurrent" freeze/accept
+call in the same process and captures what happens, proving the
+interleaving is actually impossible rather than merely improbable.
+
+1. `test_sparring_turn_from_frozen_cannot_reverse_a_concurrent_acceptance`
+   — freezes a candidate, then runs sparring with an adapter whose `start()`
+   reentrantly calls `accept_candidate`; asserts that reentrant call raises
+   `AcceptanceError` (lock contention), the sparring turn itself completes
+   normally and leaves status exactly `FROZEN` (never touched, never
+   reversed), and a real `accept_candidate` afterward succeeds and is not
+   clobbered by anything the sparring turn wrote.
+2. `test_sparring_turn_from_working_cannot_reverse_a_concurrent_freeze` —
+   same pattern starting from `WORKING`, with the reentrant call being
+   `freeze_candidate`; asserts the reentrant freeze is refused, status stays
+   `WORKING` through the sparring turn, and a real freeze afterward succeeds
+   normally.
+3. `test_sparring_an_accepted_stage_preserves_accepted_status_and_sha` —
+   freezes and accepts a stage, then runs a plain (non-reentrant) sparring
+   turn against it; asserts sparring completes, records its session id and
+   `sparring.md`, and `status`/`candidate_sha` remain exactly `ACCEPTED`/the
+   accepted SHA.
+4. `test_send_back_then_ready_loop_completes_without_deadlock` — runs
+   `run_unattended_loop` through a SEND_BACK cycle then a READY cycle with
+   the new locking in place; asserts it completes with `outcome=READY` and
+   two cycles, proving the sequential stage-then-sparring lock
+   acquire/release introduces no deadlock.
+
+### Files changed (round 3)
+
+Production code (modified):
+- `src/agent_sparring/sparring_agent.py` — `run_sparring_agent` split into
+  a lock-acquiring wrapper plus `_run_sparring_agent_locked`; the final
+  `write_state` now re-reads state immediately before writing instead of
+  reusing the turn-start object; module/function docstrings updated
+
+Tests (new):
+- `tests/test_sparring_acceptance_concurrency.py` (4 tests)
+
+Production code changed: **yes**. Tests changed: **yes**.
+
+### Verification (round 3)
+
+```
+cd /Users/sigmundas/Documents/Code/agent-sparring/tests
+for f in test_*.py; do python3 "$f"; done
+```
+
+All 18 test modules pass (`OK`) — 246 tests total (round 2's 242 plus the 4
+new in `test_sparring_acceptance_concurrency.py`). `git diff --check`
+(staged): clean.
+
+### Live disposable-repo check (round 3, performed)
+
+Run against a third throwaway repo with a real bare local remote, created
+under the session scratchpad and deleted afterwards; `git status --short`
+on this candidate repo immediately after cleanup showed only the intended
+round-3 changes.
+
+1. Froze a real candidate, then ran `run_sparring_agent` with an adapter
+   whose `start()` reentrantly called the real `accept_candidate` against
+   the same stage/repo: the reentrant call raised
+   `AcceptanceError: ... already locked by another live implementation
+   process ...`; the sparring turn itself completed with `READY` and left
+   `state.json` at `status=frozen` with the original candidate SHA and the
+   sparring session id recorded; a real `accept_candidate` run immediately
+   afterward succeeded, producing `status=accepted` with the same candidate
+   SHA and the sparring session id from the earlier turn intact.
+2. Froze and accepted a fresh stage, then ran a plain sparring turn against
+   it (`READY`, "post-acceptance sanity check"): `state.json` after the
+   turn showed `status=accepted` with the original candidate SHA unchanged,
+   plus the new sparring session id — confirming sparring an accepted stage
+   is permitted and non-destructive.
+
+### Deliberate deviations (round 3)
+
+- Chose "lock the whole sparring turn" over a detect-and-merge scheme (the
+  task explicitly allowed either); it is the smaller change, requires no
+  new merge logic, and costs nothing in the normal sequential
+  `run-loop` path.
+- The accept-time-style dirty re-check added in round 2 was **not**
+  duplicated into `run_sparring_agent` — the sparrer never writes (enforced
+  by the existing before/after fingerprint check), so there is nothing for
+  it to re-check; only `freeze_candidate`/`accept_candidate`, which
+  transition lifecycle status, need that check.
+- No ACCEPTED guard was added to `run_sparring_agent` (deliberately unlike
+  `run_stage_agent`'s): sparring an accepted stage remains explicitly
+  permitted, per the task's requirement 3.
+
 Do not begin Stage 7 / the Sporely pilot.

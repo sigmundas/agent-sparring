@@ -40,6 +40,35 @@ human-readable ``findings``/``deferred`` prose (see
 :class:`~agent_sparring.routing.RoutingResult` itself stays tiny -- the
 detailed findings are passed to :func:`~agent_sparring.sparring_exchange.
 record_sparring` separately, never folded into routing/workflow state.
+
+The entire turn -- from reading ``state.json`` through the final
+``write_state`` -- runs inside :func:`agent_sparring.concurrency.
+worktree_lock`, the same one-writer-per-worktree lock
+:func:`agent_sparring.stage_agent.run_stage_agent` and
+:mod:`agent_sparring.acceptance`'s ``freeze_candidate``/``accept_candidate``
+already use. Without this, a sparring turn that read a FROZEN (or WORKING)
+state before a long provider call could still be holding that now-stale
+``StageState`` object when a concurrent ``accept_candidate``/
+``freeze_candidate`` call completed a real lifecycle transition in between,
+and the sparring turn's own final write would silently reverse it (e.g.
+ACCEPTED -> FROZEN, or FROZEN -> WORKING) purely because it started first.
+Holding the lock for the whole turn makes that interleaving impossible: a
+concurrent freeze/accept attempted during an in-progress sparring turn is
+refused immediately (lock contention), not raced. This is not a new lock
+system -- it is the existing lock, reused, and it does not weaken the
+Codex OS-level read-only sandbox or the read-only integrity check below in
+any way; it only prevents this module's own ``state.json`` write from
+interleaving with another writer's.
+
+Sparring an already-ACCEPTED stage remains explicitly permitted (no status
+guard is added here, unlike :func:`agent_sparring.stage_agent.
+run_stage_agent`'s ACCEPTED guard): the sparrer never writes application
+code, so reviewing an accepted candidate is harmless and sometimes useful.
+The final write re-reads ``state.json`` immediately before writing (rather
+than reusing the object read at the start of the turn) and mutates only
+``sparring_session_id`` on it, so ``status``/``candidate_sha`` -- ACCEPTED
+or otherwise -- are always whatever they currently are, never a stale
+snapshot from before the (possibly long) provider turn.
 """
 
 from __future__ import annotations
@@ -49,6 +78,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import (
     GitContextError,
     current_branch,
@@ -168,6 +198,14 @@ def run_sparring_agent(
     branch identity and does not ban reviewing ``main``/``master``, since
     the sparrer never writes.
 
+    The entire turn runs inside :func:`~agent_sparring.concurrency.
+    worktree_lock` -- the same lock a stage-agent turn and an
+    acceptance operation use -- so this turn's eventual ``state.json``
+    write can never interleave with (and silently reverse) a concurrent
+    freeze/accept/implementation turn on the same worktree. A contended
+    lock raises :class:`SparringAgentRunError` immediately, before the
+    provider is ever invoked, and touches nothing.
+
     Records the provider's own returned session id in state.json and
     refuses to silently replace it if a resume call returns a different id
     (mirrors :func:`agent_sparring.stage_agent.run_stage_agent`). Parses the
@@ -175,21 +213,21 @@ def run_sparring_agent(
     separate human-readable findings, and (re)writes ``sparring.md`` from
     both.
 
-    Raises :class:`SparringAgentRunError` if: ``expected_branch`` is
-    missing/blank; the worktree is not on ``expected_branch`` before the
-    turn (provider is never invoked in this case); the provider turn left
-    the repository modified or switched branches (read-only contract
-    violated -- checked after *every* attempted turn, including one where
-    the provider itself raised, returned a mismatched resume session id, or
-    returned an unparseable verdict; a repository-integrity violation is
-    reported ahead of any of those, since a provider that both failed and
-    wrote to the repository is the more important condition to surface);
-    the provider itself fails (and the repository was not touched); the
-    provider's final message is not a usable routing verdict; or, on
-    resume, the provider returns a different session id than the one it
-    was asked to resume. In every raised case, the sparring result is not
-    recorded: neither ``sparring_session_id`` nor ``sparring.md`` is
-    updated.
+    Raises :class:`SparringAgentRunError` if: the worktree lock is
+    contended; ``expected_branch`` is missing/blank; the worktree is not on
+    ``expected_branch`` before the turn (provider is never invoked in this
+    case); the provider turn left the repository modified or switched
+    branches (read-only contract violated -- checked after *every*
+    attempted turn, including one where the provider itself raised,
+    returned a mismatched resume session id, or returned an unparseable
+    verdict; a repository-integrity violation is reported ahead of any of
+    those, since a provider that both failed and wrote to the repository is
+    the more important condition to surface); the provider itself fails
+    (and the repository was not touched); the provider's final message is
+    not a usable routing verdict; or, on resume, the provider returns a
+    different session id than the one it was asked to resume. In every
+    raised case, the sparring result is not recorded: neither
+    ``sparring_session_id`` nor ``sparring.md`` is updated.
     """
 
     if not expected_branch or not expected_branch.strip():
@@ -198,6 +236,25 @@ def run_sparring_agent(
             "repo-aware sparring run must know which branch it is meant to review"
         )
 
+    try:
+        with worktree_lock(repo_root):
+            return _run_sparring_agent_locked(
+                stage, sparring_dir, repo_root, adapter, expected_branch=expected_branch
+            )
+    except WorktreeLockError as exc:
+        raise SparringAgentRunError(
+            f"cannot run the sparring agent for stage {stage.stage_id!r}: {exc}"
+        ) from exc
+
+
+def _run_sparring_agent_locked(
+    stage: Stage,
+    sparring_dir: Path,
+    repo_root: Path,
+    adapter: SparringAgentAdapter,
+    *,
+    expected_branch: str,
+) -> SparringAgentRunResult:
     state = stage.read_state()
     resume_id = state.sparring_session_id
 
@@ -268,8 +325,22 @@ def run_sparring_agent(
     # and the verdict parse above all happen before this point; a
     # failed/refused turn must not record a session id or overwrite
     # sparring.md.
-    state.sparring_session_id = result.session_id
-    stage.write_state(state)
+    #
+    # Re-read state.json here rather than reusing the `state` object read
+    # at the top of this turn: although the worktree lock held for this
+    # entire function already rules out a concurrent freeze/accept/
+    # implementation write actually interleaving, re-reading immediately
+    # before this write is what makes that guarantee explicit in the code
+    # -- the fields written are always whatever is currently on disk
+    # (status, candidate_sha, base_sha, implementation_session_id), with
+    # only sparring_session_id changed. This is what lets sparring finish
+    # after a stage was accepted mid-turn (impossible under the lock, but
+    # this stays correct even if that lock scope ever narrows) without
+    # reverting status or candidate_sha: they are read fresh, not carried
+    # forward from a snapshot taken before the provider turn.
+    current_state = stage.read_state()
+    current_state.sparring_session_id = result.session_id
+    stage.write_state(current_state)
 
     sparring_content = record_sparring(stage, routing, findings=findings_text)
 
