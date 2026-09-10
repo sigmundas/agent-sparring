@@ -12,6 +12,11 @@ import argparse
 import sys
 from pathlib import Path
 
+from agent_sparring.acceptance import (
+    AcceptanceError,
+    accept_candidate,
+    freeze_candidate,
+)
 from agent_sparring.config import (
     CONFIG_FILENAME,
     ProjectConfigError,
@@ -352,6 +357,51 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolved_stage(args: argparse.Namespace, sparring_dir: Path) -> Stage:
+    stage = Stage.resolve(sparring_dir, args.stage_id)
+    if not stage.exists():
+        raise StageError(f"stage {args.stage_id!r} does not exist at {stage.directory}")
+    return stage
+
+
+def _cmd_freeze_candidate(args: argparse.Namespace) -> int:
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        stage = _resolved_stage(args, sparring_dir)
+        result = freeze_candidate(
+            stage, sparring_dir, repo_root, expected_branch=args.expected_branch
+        )
+    except (StageError, AcceptanceError, ProjectConfigError, GitContextError) as exc:
+        print(f"could not freeze candidate: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"frozen candidate: {result.candidate_sha}")
+    print(f"branch: {result.branch}")
+    print(f"pushed: {result.push_detail}")
+    if result.ignored_dirty_paths:
+        print(
+            "ignored workflow-artifact changes under "
+            f"{sparring_dir}: {', '.join(result.ignored_dirty_paths)}"
+        )
+    return 0
+
+
+def _cmd_accept_candidate(args: argparse.Namespace) -> int:
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        stage = _resolved_stage(args, sparring_dir)
+        result = accept_candidate(stage, repo_root, expected_branch=args.expected_branch)
+    except (StageError, AcceptanceError, ProjectConfigError, GitContextError) as exc:
+        print(f"could not accept candidate: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"accepted candidate: {result.candidate_sha}")
+    print(f"branch: {result.branch}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sparring")
     parser.add_argument(
@@ -582,6 +632,47 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_loop.set_defaults(func=_cmd_run_loop)
+
+    repo_root_help = (
+        "repository root; overrides project.toml's [repo].root if set "
+        "(default: [repo].root from project.toml, resolved against the "
+        "project root, else the parent of --sparring-dir)"
+    )
+
+    freeze = subparsers.add_parser(
+        "freeze-candidate",
+        help=(
+            "freeze the repository's exact current HEAD as this stage's "
+            "acceptance candidate (requires a clean, pushed worktree)"
+        ),
+    )
+    freeze.add_argument("stage_id")
+    freeze.add_argument("--repo-root", default=None, help=repo_root_help)
+    freeze.add_argument(
+        "--expected-branch",
+        required=True,
+        help=(
+            "the branch this candidate belongs to; required, verified "
+            "against the worktree and used for the pushed/reachable check"
+        ),
+    )
+    freeze.set_defaults(func=_cmd_freeze_candidate)
+
+    accept = subparsers.add_parser(
+        "accept-candidate",
+        help=(
+            "accept exactly this stage's frozen candidate; refuses as stale "
+            "if HEAD has moved since the freeze"
+        ),
+    )
+    accept.add_argument("stage_id")
+    accept.add_argument("--repo-root", default=None, help=repo_root_help)
+    accept.add_argument(
+        "--expected-branch",
+        required=True,
+        help="the branch the frozen candidate belongs to; required",
+    )
+    accept.set_defaults(func=_cmd_accept_candidate)
 
     return parser
 

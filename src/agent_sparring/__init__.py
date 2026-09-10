@@ -5,6 +5,14 @@ behavior. Project knowledge lives in project-local ``.sparring/project.toml``
 and ``.sparring/PROJECT.md`` files, loaded by :mod:`agent_sparring.config`.
 """
 
+from agent_sparring.acceptance import (
+    AcceptanceError,
+    AcceptanceResult,
+    FreezeResult,
+    StaleCandidateError,
+    accept_candidate,
+    freeze_candidate,
+)
 from agent_sparring.config import (
     ProjectConfig,
     ProjectConfigError,
@@ -25,6 +33,12 @@ from agent_sparring.stage import (
 )
 
 __all__ = [
+    "AcceptanceError",
+    "AcceptanceResult",
+    "FreezeResult",
+    "StaleCandidateError",
+    "accept_candidate",
+    "freeze_candidate",
     "ProjectConfig",
     "ProjectConfigError",
     "load_project_config",

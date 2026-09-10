@@ -7,7 +7,7 @@ import conftest_path  # noqa: F401
 
 from agent_sparring.concurrency import worktree_lock
 from agent_sparring.providers import ProviderError, StageAgentResult
-from agent_sparring.stage import Stage
+from agent_sparring.stage import Stage, StageStatus
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 
 
@@ -383,6 +383,42 @@ class StageAgentRunTests(unittest.TestCase):
             self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
         )
         self.assertNotIn("Self-check", run_result.prompt)
+
+    def test_refuses_to_run_against_an_accepted_stage(self):
+        # The acceptance gate is hard: an ACCEPTED stage must not be
+        # treated as ordinary WORKING state and mutated by another
+        # unattended implementation turn.
+        state = self.stage.read_state()
+        state.status = StageStatus.ACCEPTED
+        state.candidate_sha = _head_sha(self.repo)
+        self.stage.write_state(state)
+
+        adapter = _FakeAdapter(
+            start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False)
+        )
+        with self.assertRaises(StageAgentRunError):
+            run_stage_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
+        self.assertEqual(adapter.start_calls, [])
+        self.assertEqual(self.stage.read_state().status, StageStatus.ACCEPTED)
+
+    def test_frozen_stage_may_still_receive_a_correction_turn(self):
+        # Only ACCEPTED is guarded; a FROZEN candidate may legitimately get
+        # one more correction turn, and the resulting HEAD move is caught
+        # as a stale candidate at acceptance time instead.
+        state = self.stage.read_state()
+        state.status = StageStatus.FROZEN
+        state.candidate_sha = _head_sha(self.repo)
+        self.stage.write_state(state)
+
+        adapter = _FakeAdapter(
+            start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False)
+        )
+        run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
+        self.assertEqual(len(adapter.start_calls), 1)
 
 
 if __name__ == "__main__":

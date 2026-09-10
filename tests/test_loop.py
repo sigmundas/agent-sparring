@@ -14,7 +14,7 @@ from agent_sparring.loop import (
 )
 from agent_sparring.providers import ProviderError, SparringAgentResult, StageAgentResult
 from agent_sparring.routing import RoutingAction
-from agent_sparring.stage import Stage
+from agent_sparring.stage import Stage, StageStatus
 
 
 def _run_git(repo: Path, *args: str) -> None:
@@ -393,6 +393,31 @@ class UnattendedLoopTests(unittest.TestCase):
         # The sparring agent must not have been invoked a second time.
         self.assertEqual(len(sparring_adapter.start_calls), 1)
         self.assertEqual(sparring_adapter.resume_calls, [])
+
+    def test_loop_refuses_to_run_against_an_accepted_stage(self):
+        # The acceptance gate applies to the unattended loop too: it
+        # inherits run_stage_agent's guard rather than re-implementing one.
+        state = self.stage.read_state()
+        state.status = StageStatus.ACCEPTED
+        state.candidate_sha = "0" * 40
+        self.stage.write_state(state)
+
+        stage_adapter = _ScriptedStageAdapter()
+        sparring_adapter = _ScriptedSparringAdapter([_verdict_text("READY", "looks good")])
+
+        with self.assertRaises(LoopError):
+            run_unattended_loop(
+                self.stage,
+                self.sparring_dir,
+                self.repo,
+                stage_adapter,
+                sparring_adapter,
+                expected_branch="feature/x",
+            )
+
+        self.assertEqual(stage_adapter.start_calls, [])
+        self.assertEqual(sparring_adapter.start_calls, [])
+        self.assertEqual(self.stage.read_state().status, StageStatus.ACCEPTED)
 
 
 if __name__ == "__main__":

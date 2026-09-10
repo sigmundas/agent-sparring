@@ -17,6 +17,20 @@ from pathlib import Path
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
+def is_full_sha(value: object) -> bool:
+    """Is ``value`` exactly a full 40-hex-character commit id?
+
+    Says nothing about whether such a commit exists in any repository (use
+    :func:`resolve_commit` for that) — only that the string is shaped like a
+    full, unabbreviated SHA. Exposed so callers holding a *recorded* sha
+    (e.g. an acceptance candidate read back from ``state.json``) can reject
+    a malformed value with their own message instead of feeding garbage to
+    git.
+    """
+
+    return isinstance(value, str) and _FULL_SHA_RE.match(value) is not None
+
+
 class GitContextError(RuntimeError):
     """Raised when git context cannot be gathered for a repo/revision."""
 

@@ -19,7 +19,7 @@ from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import GitContextError, resolve_commit
 from agent_sparring.handoff import generate_handoff
 from agent_sparring.providers import ProviderError, StageAgentAdapter, StageAgentResult
-from agent_sparring.stage import Stage
+from agent_sparring.stage import Stage, StageStatus
 from agent_sparring.stage_prompt import build_stage_prompt
 
 
@@ -74,7 +74,10 @@ def run_stage_agent(
     that actually left the worktree off ``expected_branch`` (e.g. on
     main/master) is treated as a failure, not silently accepted.
 
-    Raises :class:`StageAgentRunError` if: the branch guard refuses the run
+    Raises :class:`StageAgentRunError` if: the stage is already ACCEPTED
+    (the acceptance gate is hard — an accepted stage is not ordinary
+    WORKING state for an unattended implementation turn to mutate); the
+    branch guard refuses the run
     (before or after the provider turn); the worktree is already locked by
     another live process; the provider itself fails; or, on resume, the
     provider returns a different session id than the one it was asked to
@@ -96,6 +99,22 @@ def run_stage_agent(
     try:
         with worktree_lock(repo_root):
             state = stage.read_state()
+
+            # Acceptance is the hard gate (see agent_sparring.acceptance):
+            # an ACCEPTED stage must not be treated as ordinary WORKING and
+            # quietly mutated by another unattended implementation turn.
+            # Only ACCEPTED is refused: a FROZEN stage may legitimately
+            # receive one more correction turn, and the resulting HEAD move
+            # is caught as a stale candidate at acceptance time rather than
+            # needing a second guard here.
+            if state.status is StageStatus.ACCEPTED:
+                raise StageAgentRunError(
+                    f"stage {stage.stage_id!r} is ACCEPTED at "
+                    f"{state.candidate_sha}; refusing an unattended "
+                    "implementation turn against an accepted stage. Further "
+                    "work belongs to a new stage."
+                )
+
             resume_id = state.implementation_session_id
 
             if state.base_sha is not None:

@@ -535,5 +535,80 @@ class CliRunSparringTests(unittest.TestCase):
         self.assertIn("could not launch", stderr.getvalue())
 
 
+class CliAcceptanceTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+
+        self.remote = root / "remote.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(self.remote)], check=True, capture_output=True
+        )
+        self.repo = root / "repo"
+        self.repo.mkdir(parents=True)
+        _run_git(self.repo, "init", "-q", "-b", "main")
+        _run_git(self.repo, "config", "user.email", "test@example.com")
+        _run_git(self.repo, "config", "user.name", "Test")
+        _run_git(self.repo, "remote", "add", "origin", str(self.remote))
+        (self.repo / "f.txt").write_text("hi\n", encoding="utf-8")
+        _run_git(self.repo, "add", "f.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "base")
+        _run_git(self.repo, "checkout", "-q", "-b", "feature/x")
+        _run_git(self.repo, "push", "-q", "-u", "origin", "feature/x")
+        self.candidate_sha = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        self.sparring_dir = self.repo / ".sparring"
+        with contextlib.redirect_stdout(io.StringIO()):
+            created = main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+        self.assertEqual(created, 0)
+
+    def _invoke(self, command: str) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "--sparring-dir",
+                    str(self.sparring_dir),
+                    command,
+                    "stage-1",
+                    "--repo-root",
+                    str(self.repo),
+                    "--expected-branch",
+                    "feature/x",
+                ]
+            )
+        return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def test_freeze_then_accept_end_to_end(self):
+        exit_code, stdout, _stderr = self._invoke("freeze-candidate")
+        self.assertEqual(exit_code, 0)
+        self.assertIn(self.candidate_sha, stdout)
+
+        exit_code, stdout, _stderr = self._invoke("accept-candidate")
+        self.assertEqual(exit_code, 0)
+        self.assertIn(self.candidate_sha, stdout)
+
+    def test_accept_without_freeze_exits_nonzero(self):
+        exit_code, _stdout, stderr = self._invoke("accept-candidate")
+        self.assertEqual(exit_code, 1)
+        self.assertIn("could not accept candidate", stderr)
+
+    def test_accept_after_head_moves_exits_nonzero_as_stale(self):
+        self.assertEqual(self._invoke("freeze-candidate")[0], 0)
+        (self.repo / "extra.txt").write_text("more\n", encoding="utf-8")
+        _run_git(self.repo, "add", "extra.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "moved on")
+
+        exit_code, _stdout, stderr = self._invoke("accept-candidate")
+        self.assertEqual(exit_code, 1)
+        self.assertIn("stale", stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
