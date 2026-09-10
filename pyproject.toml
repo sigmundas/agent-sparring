@@ -1,0 +1,12 @@
+[project]
+name = "sparring-v2"
+version = "0.1.0"
+description = "Generic stage/sparring primitives for Sparring V2"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
