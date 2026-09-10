@@ -291,7 +291,7 @@ Exercised through the real CLI (`freeze-candidate`/`accept-candidate`):
 
 - Base for this round: `2d5b967eaad017ed5e27e26d6ae505d54a742650` (round 1's
   implementation candidate; `bee52b1` on top of it was documentation-only)
-- Round-2 candidate SHA: recorded below after the push
+- Round-2 candidate SHA: `c8ef2c7ce609bf2214a252fb3b4c1c38961ff486`
 - Branch: `feature/sparring-v2`, pushed to `origin`
 
 Three findings, all resolved. All original Stage 6 semantics are preserved:
