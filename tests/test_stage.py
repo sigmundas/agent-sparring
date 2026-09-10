@@ -120,6 +120,18 @@ class StageStateRoundTripTests(unittest.TestCase):
             with self.assertRaises(StageError):
                 stage.read_state()
 
+    def test_non_string_sha_field_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sparring_dir = Path(tmp)
+            stage = Stage.resolve(sparring_dir, "stage-1")
+            stage.directory.mkdir(parents=True)
+            (stage.directory / "state.json").write_text(
+                '{"status": "working", "base_sha": 12345}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(StageError):
+                stage.read_state()
+
     def test_state_json_does_not_duplicate_stage_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             sparring_dir = Path(tmp)

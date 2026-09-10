@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Generic stage/sparring primitives for agent-sparring"
 requires-python = ">=3.11"
 
+[project.scripts]
+sparring = "agent_sparring.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

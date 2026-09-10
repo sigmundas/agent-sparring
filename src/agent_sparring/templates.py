@@ -67,6 +67,14 @@ SPARRING_TEMPLATE = """\
 product/preference, UI/visual check, device/manual check, external
 condition, or scope expansion.)
 
+## ESCALATE
+
+(Why this deserves a different/stronger sparring environment, if any.)
+
+## READY
+
+(Why no further stage-agent pass is needed, if applicable.)
+
 ## Deferred
 
 (Checks deferred with what/why/when-required.)

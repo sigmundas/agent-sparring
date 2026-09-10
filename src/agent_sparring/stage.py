@@ -72,6 +72,24 @@ def validate_stage_id(stage_id: str) -> str:
     return stage_id
 
 
+def _optional_str_field(payload: dict[str, Any], key: str) -> str | None:
+    """A ``str | None`` field read from machine-ingested JSON.
+
+    Raises :class:`StageError` for a present-but-wrong-typed value (e.g. a
+    number where downstream code, such as git context gathering, requires a
+    string) instead of silently coercing or misrepresenting it.
+    """
+
+    if key not in payload:
+        return None
+    value = payload[key]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise StageError(f"state.json field {key!r} must be a string or null, got {value!r}")
+    return value
+
+
 @dataclass
 class StageState:
     """The smallest machine state needed by later stages.
@@ -101,10 +119,12 @@ class StageState:
         status = StageStatus.from_str(str(status_raw))
         return cls(
             status=status,
-            implementation_session_id=payload.get("implementation_session_id"),
-            sparring_session_id=payload.get("sparring_session_id"),
-            base_sha=payload.get("base_sha"),
-            candidate_sha=payload.get("candidate_sha"),
+            implementation_session_id=_optional_str_field(
+                payload, "implementation_session_id"
+            ),
+            sparring_session_id=_optional_str_field(payload, "sparring_session_id"),
+            base_sha=_optional_str_field(payload, "base_sha"),
+            candidate_sha=_optional_str_field(payload, "candidate_sha"),
         )
 
 
