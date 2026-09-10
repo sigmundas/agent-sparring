@@ -28,9 +28,32 @@ capability probe. Summary of what was actually confirmed on this machine:
 - ``--output-schema`` requires a strict JSON Schema: every key under
   ``properties`` must also appear in ``required`` (an optional field is
   expressed as a nullable type, not by omitting it from ``required``).
+- ``codex exec resume`` does **not** accept the top-level ``--sandbox``
+  flag at all (``codex exec resume --help`` never lists it, and passing it
+  is a hard CLI parse error: "unexpected argument '--sandbox' found").
+  Worse, a live end-to-end smoke test during Stage 4's review round showed
+  that a resumed session *without* any sandbox override defaults to a
+  writable sandbox -- a real write via the model's shell tool succeeded
+  after ``codex exec resume <id> --json ...`` with no ``--sandbox``. The
+  fix, also verified live: ``-c sandbox_mode="read-only"`` (a config
+  override, not the ``--sandbox`` flag) is accepted by *both* ``codex exec``
+  and ``codex exec resume`` and enforces the same OS-level read-only
+  sandbox in both. This adapter therefore always passes
+  ``-c sandbox_mode="<value>"``, never ``--sandbox``, for both start and
+  resume.
 - The VS Code Codex extension was not assumed to be programmatically
   controllable and was not used or probed further once this CLI's headless
   ``exec``/``exec resume`` surface was confirmed sufficient.
+
+This adapter always runs with ``--sandbox read-only``: that is what makes
+it a genuinely read-only sparrer rather than a prompt-only promise (see
+above -- a write attempt actually fails at the OS level). A writable
+sandbox would turn the sparrer into a contributor to the candidate, which
+per the project plan's independence principle forfeits that sparrer's
+authority to give independent acceptance -- a distinct, not-yet-built mode.
+There is deliberately no supported way to opt into a writable sandbox here;
+:meth:`CodexCliAdapter.__post_init__` refuses construction outright if
+``sandbox`` is anything other than ``"read-only"``.
 
 This module is the only place that knows any of the above. Generic
 orchestration code talks to the :class:`~agent_sparring.providers.
@@ -52,10 +75,14 @@ DEFAULT_EXECUTABLE = "codex"
 DEFAULT_SANDBOX = "read-only"
 
 # Every property must be listed in "required" (Codex's strict-schema
-# requirement, verified above); the optional field is expressed as a
-# nullable type rather than omitted from "required". Deliberately excludes
-# a free-form "details" property: RoutingResult.details defaults to {} when
-# absent from the parsed payload.
+# requirement, verified above); an optional field is expressed as a
+# nullable type rather than omitted from "required". "findings"/"deferred"
+# carry the detailed human-readable prose sparring.md needs (a real
+# technical explanation for SEND_BACK/NEEDS_YOU/ESCALATE, or a useful READY
+# rationale) -- kept separate from the tiny routing verdict
+# (action/summary/needs_you_reason) so RoutingResult itself stays tiny; see
+# agent_sparring.sparring_agent._build_routing_result /
+# _extract_findings, which split this envelope back apart.
 VERDICT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -65,8 +92,10 @@ VERDICT_SCHEMA: dict[str, Any] = {
         },
         "summary": {"type": "string"},
         "needs_you_reason": {"type": ["string", "null"]},
+        "findings": {"type": "string"},
+        "deferred": {"type": ["string", "null"]},
     },
-    "required": ["action", "summary", "needs_you_reason"],
+    "required": ["action", "summary", "needs_you_reason", "findings", "deferred"],
     "additionalProperties": False,
 }
 
@@ -113,6 +142,21 @@ class CodexCliAdapter:
     # call.
     supports_resume: bool = True
 
+    def __post_init__(self) -> None:
+        # Read-only is not a passthrough knob (see module docstring): a
+        # writable sandbox would silently turn this into a contributor
+        # sparrer, which is out of scope for Stage 4. Refuse at
+        # construction time rather than letting a caller quietly configure
+        # it away.
+        if self.sandbox != DEFAULT_SANDBOX:
+            raise ProviderError(
+                f"CodexCliAdapter only supports sandbox={DEFAULT_SANDBOX!r} "
+                f"(got {self.sandbox!r}); a writable sandbox would make the "
+                "sparrer a contributor to the candidate, forfeiting its "
+                "independent acceptance authority -- that is a distinct, "
+                "not-yet-built mode, not a configuration option here"
+            )
+
     def start(self, prompt: str) -> SparringAgentResult:
         return self._invoke(prompt, resume_session_id=None)
 
@@ -136,9 +180,16 @@ class CodexCliAdapter:
         args = [self.executable, "exec"]
         if resume_session_id:
             args += ["resume", resume_session_id]
+        # Verified live (see module docstring): "codex exec resume" rejects
+        # the top-level --sandbox flag outright, and -- without any
+        # override -- does not inherit the original session's read-only
+        # sandbox either. "-c sandbox_mode=..." is accepted by, and
+        # verified to enforce read-only on, both "codex exec" and
+        # "codex exec resume", so it is used uniformly for both instead of
+        # --sandbox.
         args += [
-            "--sandbox",
-            self.sandbox,
+            "-c",
+            f'sandbox_mode="{self.sandbox}"',
             "--json",
             "--output-schema",
             str(schema_path),

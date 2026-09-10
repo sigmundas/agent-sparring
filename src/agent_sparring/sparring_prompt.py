@@ -29,8 +29,19 @@ Give your final message as a single JSON object matching this shape and
 nothing else (no markdown fences, no extra prose around it):
 
     {"action": "SEND_BACK" | "READY" | "NEEDS_YOU" | "ESCALATE",
-     "summary": "<one paragraph, human-readable>",
-     "needs_you_reason": "<short reason, or null if action is not NEEDS_YOU>"}
+     "summary": "<one short paragraph -- the routing headline>",
+     "needs_you_reason": "<short reason, or null if action is not NEEDS_YOU>",
+     "findings": "<the real technical explanation -- what you actually
+                   found, checked, and why; this is what makes SEND_BACK/
+                   NEEDS_YOU/ESCALATE useful, and can also give a READY
+                   rationale beyond the one-line summary>",
+     "deferred": "<what is deferred, why, and when it becomes required, or
+                   null if nothing is deferred>"}
+
+``summary`` is a short routing headline, not the whole story: put the real
+detail -- what you inspected, what you found, why it matters -- in
+``findings``. Both fields are shown to the human and, on the next
+resumed stage-agent turn, to the same stage agent.
 
 - SEND_BACK: a bounded implementation issue for the same stage agent to fix.
 - READY: no unresolved implementation issue requiring another stage-agent pass.

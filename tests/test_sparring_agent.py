@@ -10,15 +10,32 @@ from agent_sparring.providers import ProviderError, SparringAgentResult
 from agent_sparring.routing import RoutingAction
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.stage import Stage
+from agent_sparring.stage_prompt import build_stage_prompt
 
 
 def _run_git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
 
 
-def _verdict_text(action: str, summary: str, needs_you_reason: str | None = None) -> str:
+def _verdict_text(
+    action: str,
+    summary: str,
+    needs_you_reason: str | None = None,
+    *,
+    findings: str | None = None,
+    deferred: str | None = None,
+) -> str:
+    # findings defaults to summary so existing call sites that only care
+    # about the tiny routing fields don't need to change; tests that care
+    # about findings being distinct human-readable prose pass it explicitly.
     return json.dumps(
-        {"action": action, "summary": summary, "needs_you_reason": needs_you_reason}
+        {
+            "action": action,
+            "summary": summary,
+            "needs_you_reason": needs_you_reason,
+            "findings": findings if findings is not None else summary,
+            "deferred": deferred,
+        }
     )
 
 
@@ -74,6 +91,33 @@ class _WritingAdapter:
             text=_verdict_text("READY", "looks fine"),
             is_error=False,
         )
+
+
+class _BranchSwitchingAdapter:
+    """A fake provider that checks out a different branch during its turn --
+    a read-only sparrer must never leave the worktree on a different
+    branch than the one it was asked to review."""
+
+    def __init__(self, repo: Path, target_branch: str, *, session_id: str = "sess-1"):
+        self.repo = repo
+        self.target_branch = target_branch
+        self.session_id = session_id
+        self.start_calls = []
+
+    def _switch(self) -> SparringAgentResult:
+        _run_git(self.repo, "checkout", "-q", self.target_branch)
+        return SparringAgentResult(
+            session_id=self.session_id,
+            text=_verdict_text("READY", "switched"),
+            is_error=False,
+        )
+
+    def start(self, prompt: str) -> SparringAgentResult:
+        self.start_calls.append(prompt)
+        return self._switch()
+
+    def resume(self, session_id: str, prompt: str) -> SparringAgentResult:
+        return self._switch()
 
 
 class SparringAgentRunTests(unittest.TestCase):
@@ -227,17 +271,113 @@ class SparringAgentRunTests(unittest.TestCase):
             )
         )
         with self.assertRaises(SparringAgentRunError):
-            run_sparring_agent(self.stage, self.sparring_dir, self.repo, adapter)
+            run_sparring_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
         self.assertEqual(adapter.start_calls, [])
 
-    def test_expected_branch_is_optional(self):
+    def test_missing_expected_branch_is_refused_up_front(self):
         adapter = _FakeAdapter(
             start_result=SparringAgentResult(
                 session_id="thread-1", text=_verdict_text("READY", "ok"), is_error=False
             )
         )
-        run_result = run_sparring_agent(self.stage, self.sparring_dir, self.repo, adapter)
-        self.assertEqual(run_result.routing.action, RoutingAction.READY)
+        for bad in (None, "", "   "):
+            with self.assertRaises(SparringAgentRunError):
+                run_sparring_agent(
+                    self.stage, self.sparring_dir, self.repo, adapter, expected_branch=bad
+                )
+        self.assertEqual(adapter.start_calls, [])
+
+    def test_wrong_branch_refuses_before_invoking_provider(self):
+        adapter = _FakeAdapter(
+            start_result=SparringAgentResult(
+                session_id="thread-1", text=_verdict_text("READY", "ok"), is_error=False
+            )
+        )
+        with self.assertRaises(SparringAgentRunError):
+            run_sparring_agent(
+                self.stage,
+                self.sparring_dir,
+                self.repo,
+                adapter,
+                expected_branch="feature/other",
+            )
+        self.assertEqual(adapter.start_calls, [])
+        self.assertIsNone(self.stage.read_state().sparring_session_id)
+
+    def test_branch_changed_during_turn_is_refused_and_not_recorded(self):
+        adapter = _BranchSwitchingAdapter(self.repo, "main")
+        with self.assertRaises(SparringAgentRunError):
+            run_sparring_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
+        self.assertIsNone(self.stage.read_state().sparring_session_id)
+        self.assertNotIn("switched", self.stage.read_sparring())
+
+    def test_send_back_findings_and_summary_both_reach_sparring_md_and_next_stage_prompt(self):
+        summary = "Fix the off-by-one in paginate()."
+        findings = (
+            "paginate() computes end = start + page_size - 1 but slices with "
+            "[start:end], silently dropping the last item of every page; "
+            "this is why the reported total count in the API response is "
+            "off by exactly one page boundary in the integration test."
+        )
+        verdict = _verdict_text("SEND_BACK", summary, findings=findings)
+        adapter = _FakeAdapter(
+            start_result=SparringAgentResult(session_id="thread-1", text=verdict, is_error=False)
+        )
+
+        run_result = run_sparring_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
+
+        # RoutingResult itself stays tiny -- just the routing headline.
+        self.assertEqual(run_result.routing.summary, summary)
+        self.assertEqual(run_result.routing.action, RoutingAction.SEND_BACK)
+
+        sparring_md = self.stage.read_sparring()
+        self.assertIn(summary, sparring_md)
+        self.assertIn(findings, sparring_md)
+
+        # The next resumed stage-agent turn must see both through the
+        # existing Stage 3 mechanism (build_stage_prompt embeds sparring.md
+        # verbatim on resume).
+        next_prompt = build_stage_prompt(
+            self.stage, self.sparring_dir, resume=True, expected_branch="feature/x"
+        )
+        self.assertIn(summary, next_prompt)
+        self.assertIn(findings, next_prompt)
+
+    def test_missing_findings_field_is_refused(self):
+        adapter = _FakeAdapter(
+            start_result=SparringAgentResult(
+                session_id="thread-1",
+                text=json.dumps(
+                    {"action": "READY", "summary": "ok", "needs_you_reason": None}
+                ),
+                is_error=False,
+            )
+        )
+        with self.assertRaises(SparringAgentRunError):
+            run_sparring_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
+        self.assertIsNone(self.stage.read_state().sparring_session_id)
+
+    def test_deferred_reaches_sparring_md_deferred_section(self):
+        verdict = _verdict_text(
+            "READY", "ready to accept", deferred="Load test deferred until Stage 5"
+        )
+        adapter = _FakeAdapter(
+            start_result=SparringAgentResult(session_id="thread-1", text=verdict, is_error=False)
+        )
+
+        run_sparring_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
+
+        self.assertIn("Load test deferred until Stage 5", self.stage.read_sparring())
 
 
 if __name__ == "__main__":

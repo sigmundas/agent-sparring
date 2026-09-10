@@ -261,13 +261,20 @@ Example:
     build = "npm run build"
 
     [agents.stage]
-    provider = "claude"
+    provider = "claude-cli"
 
     [agents.sparring]
-    provider = "codex"
+    provider = "codex-cli"
 
     [sparring]
     default_mode = "local-auto"
+
+Provider ids are explicit adapter ids (e.g. `claude-cli`, `codex-cli`), not
+bare vendor names: a vendor may later have more than one adapter (CLI vs
+API/SDK), and the id in config must say which one is meant. This is a
+canonical-vocabulary decision, not a registry: adding a new provider still
+means adding a new adapter module and a matching CLI/config branch, not
+registering a new string.
 
 Only values that software actually needs belong here.
 

@@ -24,7 +24,8 @@ from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
     ClaudeCliAdapter,
 )
-from agent_sparring.providers.codex_cli import DEFAULT_SANDBOX, CodexCliAdapter
+from agent_sparring.providers import ProviderError
+from agent_sparring.providers.codex_cli import CodexCliAdapter
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.sparring_exchange import record_sparring
@@ -235,16 +236,25 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
                 f"unsupported sparring agent provider {provider!r}; only 'codex-cli' is "
                 "implemented so far"
             )
+        # No --sandbox override is exposed here: CodexCliAdapter always
+        # runs read-only (see providers/codex_cli.py) and refuses
+        # construction with anything else, so there is no writable-sandbox
+        # escape hatch for this adapter.
         adapter = CodexCliAdapter(
             repo_root=repo_root,
             executable=args.codex_executable,
-            sandbox=args.sandbox,
             model=args.model,
         )
         run_result = run_sparring_agent(
             stage, sparring_dir, repo_root, adapter, expected_branch=args.expected_branch
         )
-    except (StageError, SparringAgentRunError, ProjectConfigError, GitContextError) as exc:
+    except (
+        StageError,
+        SparringAgentRunError,
+        ProjectConfigError,
+        GitContextError,
+        ProviderError,
+    ) as exc:
         print(f"could not run sparring agent: {exc}", file=sys.stderr)
         return 1
 
@@ -398,8 +408,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_sparring.add_argument(
         "--expected-branch",
-        default=None,
-        help="the branch the candidate lives on; included in the prompt if given",
+        required=True,
+        help=(
+            "the branch this sparring run is meant to review; required, and "
+            "verified against the actual worktree before and after the "
+            "provider turn (matches --expected-branch on run-stage)"
+        ),
     )
     run_sparring.add_argument(
         "--provider",
@@ -415,11 +429,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="codex CLI executable to invoke (default: codex)",
     )
     run_sparring.add_argument("--model", default=None, help="model override for the provider")
-    run_sparring.add_argument(
-        "--sandbox",
-        default=DEFAULT_SANDBOX,
-        help=f"codex CLI --sandbox value (default: {DEFAULT_SANDBOX})",
-    )
+    # No --sandbox flag: CodexCliAdapter always runs read-only and refuses
+    # any other sandbox at construction time (see providers/codex_cli.py).
     run_sparring.add_argument(
         "--dry-run",
         action="store_true",

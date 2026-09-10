@@ -18,6 +18,24 @@ def _jsonl(*events: dict) -> str:
     return "\n".join(json.dumps(event) for event in events) + "\n"
 
 
+def _sandbox_config_value(args: list[str]) -> str:
+    """The value passed via ``-c sandbox_mode="..."`` in ``args``.
+
+    Real ``codex exec resume`` rejects the top-level ``--sandbox`` flag
+    outright (verified live) and, without any override, does not even
+    inherit the original session's read-only sandbox -- a real write
+    succeeded during a live smoke test. ``-c sandbox_mode=...`` is the
+    fix, verified live to work for both ``codex exec`` and
+    ``codex exec resume``, so the adapter always uses it instead of
+    ``--sandbox``.
+    """
+
+    idx = args.index("-c")
+    raw = args[idx + 1]
+    assert raw.startswith("sandbox_mode="), raw
+    return raw[len("sandbox_mode=") :].strip('"')
+
+
 class CodexCliAdapterStartTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -59,8 +77,8 @@ class CodexCliAdapterStartTests(unittest.TestCase):
         args = captured["args"]
         self.assertEqual(args[0], "codex")
         self.assertEqual(args[1], "exec")
-        self.assertIn("--sandbox", args)
-        self.assertEqual(args[args.index("--sandbox") + 1], "read-only")
+        self.assertNotIn("--sandbox", args)  # rejected by real "codex exec resume"
+        self.assertEqual(_sandbox_config_value(args), "read-only")
         self.assertIn("--json", args)
         self.assertIn("--output-schema", args)
         self.assertIn("-o", args)
@@ -92,20 +110,49 @@ class CodexCliAdapterStartTests(unittest.TestCase):
             schema["properties"]["action"]["enum"],
             ["SEND_BACK", "READY", "NEEDS_YOU", "ESCALATE"],
         )
+        # Detailed human-readable prose lives in "findings"/"deferred",
+        # separate from the tiny routing verdict fields.
+        self.assertIn("findings", schema["properties"])
+        self.assertIn("deferred", schema["properties"])
 
-    def test_sandbox_and_model_are_configurable(self):
+    def test_model_is_configurable(self):
         stdout = _jsonl({"type": "thread.started", "thread_id": "t1"}, {"type": "turn.completed"})
         runner, captured = self._make_runner(stdout, write_output="{}")
 
-        adapter = CodexCliAdapter(
-            repo_root=self.repo_root, runner=runner, sandbox="workspace-write", model="o3"
-        )
+        adapter = CodexCliAdapter(repo_root=self.repo_root, runner=runner, model="o3")
         adapter.start("hello")
 
         args = captured["args"]
-        self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
         self.assertIn("--model", args)
         self.assertIn("o3", args)
+
+    def test_default_sandbox_is_read_only(self):
+        stdout = _jsonl({"type": "thread.started", "thread_id": "t1"}, {"type": "turn.completed"})
+        runner, captured = self._make_runner(stdout, write_output="{}")
+
+        adapter = CodexCliAdapter(repo_root=self.repo_root, runner=runner)
+        adapter.start("hello")
+
+        args = captured["args"]
+        self.assertNotIn("--sandbox", args)
+        self.assertEqual(_sandbox_config_value(args), "read-only")
+
+    def test_workspace_write_sandbox_is_refused_at_construction(self):
+        # Stage 4 finding: there must be no escape hatch to a writable
+        # sandbox for the normal read-only sparring adapter. This must be
+        # refused outright, not silently exercised as supported behavior.
+        with self.assertRaises(ProviderError):
+            CodexCliAdapter(
+                repo_root=self.repo_root, runner=lambda *a, **k: None, sandbox="workspace-write"
+            )
+
+    def test_danger_full_access_sandbox_is_refused_at_construction(self):
+        with self.assertRaises(ProviderError):
+            CodexCliAdapter(
+                repo_root=self.repo_root,
+                runner=lambda *a, **k: None,
+                sandbox="danger-full-access",
+            )
 
 
 class CodexCliAdapterResumeTests(unittest.TestCase):
@@ -152,6 +199,13 @@ class CodexCliAdapterResumeTests(unittest.TestCase):
         args = captured["args"]
         self.assertEqual(args[:2], ["codex", "exec"])
         self.assertEqual(args[2:4], ["resume", "thread-abc"])
+        # Stage 4 finding from a live smoke test: "codex exec resume"
+        # rejects the top-level --sandbox flag outright, and does not
+        # inherit the original session's read-only sandbox on its own --
+        # a real write succeeded without this. -c sandbox_mode=... is the
+        # verified fix, and must be present here too.
+        self.assertNotIn("--sandbox", args)
+        self.assertEqual(_sandbox_config_value(args), "read-only")
 
     def test_resume_rejects_empty_session_id_without_invoking_runner(self):
         called = []

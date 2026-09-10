@@ -1,3 +1,5 @@
+import contextlib
+import io
 import subprocess
 import tempfile
 import unittest
@@ -341,6 +343,36 @@ class CliRunStageTests(unittest.TestCase):
             )
         self.assertNotEqual(ctx.exception.code, 0)
 
+    def test_run_stage_configured_claude_cli_provider_id_is_accepted(self):
+        # The documented project.toml provider id ("claude-cli") must be
+        # accepted, not rejected as "unsupported provider" -- proves the
+        # documented provider vocabulary (see the canonical plan) matches
+        # what the CLI actually accepts.
+        main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+        (self.sparring_dir / "project.toml").write_text(
+            'project = "x"\n\n[agents.stage]\nprovider = "claude-cli"\n', encoding="utf-8"
+        )
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "--sparring-dir",
+                    str(self.sparring_dir),
+                    "run-stage",
+                    "stage-1",
+                    "--repo-root",
+                    str(self.repo),
+                    "--expected-branch",
+                    "feature/x",
+                    "--claude-executable",
+                    "/nonexistent/claude-should-not-exist",
+                ]
+            )
+        self.assertEqual(exit_code, 1)
+        self.assertNotIn("unsupported stage agent provider", stderr.getvalue())
+        self.assertIn("could not launch", stderr.getvalue())
+
 
 class CliRunSparringTests(unittest.TestCase):
     def setUp(self):
@@ -387,6 +419,8 @@ class CliRunSparringTests(unittest.TestCase):
                 "no-such-stage",
                 "--repo-root",
                 str(self.repo),
+                "--expected-branch",
+                "feature/x",
                 "--dry-run",
             ]
         )
@@ -403,6 +437,8 @@ class CliRunSparringTests(unittest.TestCase):
                 "stage-1",
                 "--repo-root",
                 str(self.repo),
+                "--expected-branch",
+                "feature/x",
                 "--provider",
                 "claude-cli",
             ]
@@ -421,11 +457,82 @@ class CliRunSparringTests(unittest.TestCase):
                 "stage-1",
                 "--repo-root",
                 str(self.repo),
+                "--expected-branch",
+                "feature/x",
                 "--codex-executable",
                 "/nonexistent/codex-should-not-be-invoked",
             ]
         )
         self.assertEqual(exit_code, 1)
+
+    def test_run_sparring_without_expected_branch_is_rejected_by_argparse(self):
+        main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+
+        with self.assertRaises(SystemExit) as ctx:
+            main(
+                [
+                    "--sparring-dir",
+                    str(self.sparring_dir),
+                    "run-sparring",
+                    "stage-1",
+                    "--repo-root",
+                    str(self.repo),
+                    "--dry-run",
+                ]
+            )
+        self.assertNotEqual(ctx.exception.code, 0)
+
+    def test_run_sparring_refuses_wrong_branch_before_invoking_provider(self):
+        main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+
+        exit_code = main(
+            [
+                "--sparring-dir",
+                str(self.sparring_dir),
+                "run-sparring",
+                "stage-1",
+                "--repo-root",
+                str(self.repo),
+                "--expected-branch",
+                "feature/other",
+                "--codex-executable",
+                "/nonexistent/codex-should-not-be-invoked",
+            ]
+        )
+        self.assertEqual(exit_code, 1)
+
+    def test_run_sparring_configured_codex_cli_provider_id_is_accepted(self):
+        # The documented project.toml provider id ("codex-cli") must be
+        # accepted, not rejected as "unsupported provider" -- proves the
+        # documented provider vocabulary (see the canonical plan) matches
+        # what the CLI actually accepts.
+        main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+        (self.sparring_dir / "project.toml").write_text(
+            'project = "x"\n\n[agents.sparring]\nprovider = "codex-cli"\n', encoding="utf-8"
+        )
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "--sparring-dir",
+                    str(self.sparring_dir),
+                    "run-sparring",
+                    "stage-1",
+                    "--repo-root",
+                    str(self.repo),
+                    "--expected-branch",
+                    "feature/x",
+                    "--codex-executable",
+                    "/nonexistent/codex-should-not-be-invoked",
+                ]
+            )
+        self.assertEqual(exit_code, 1)
+        # It must have gotten past provider resolution and attempted to
+        # actually launch the (nonexistent) executable, not been rejected
+        # as an unsupported provider id.
+        self.assertNotIn("unsupported sparring agent provider", stderr.getvalue())
+        self.assertIn("could not launch", stderr.getvalue())
 
 
 if __name__ == "__main__":
