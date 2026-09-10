@@ -1,4 +1,4 @@
-# Sparring V2
+# Sparring
 
 Date: 2026-09-10
 
@@ -39,7 +39,28 @@ replace independent sparring.
 ---
 
 ## Principles
+## Orchestration ownership
 
+The orchestrator, not an AI agent, owns top-level agent lifecycle.
+
+- Only the orchestrator starts/resumes the stage agent and sparring agent.
+- Provider adapters must obtain session/process identity from the provider or
+  process itself; never trust an agent's prose claim that it launched another
+  agent.
+- There is at most one top-level implementation writer for a stage/worktree at
+  a time.
+- Implementation agents may use bounded specialist subagents, but may not
+  create another top-level stage agent or sparrer.
+- Prevent two implementation agents from concurrently modifying the same
+  working tree. A simple execution lock/worktree ownership mechanism is enough.
+- Before an implementation run, verify the expected feature branch. Do not
+  permit an unattended stage agent to commit directly to main.
+- Sparring is read-only by default. If a sparrer is explicitly allowed to edit,
+  it becomes a contributor and loses independent acceptance authority for that
+  candidate.
+- Routing decisions come from machine-readable artifacts/process results, not
+  claims such as "I dispatched another agent".
+  
 ### 1. Sparring, not review
 
 Sparring is conversational and iterative.
