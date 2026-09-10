@@ -20,6 +20,7 @@ from agent_sparring.config import (
 )
 from agent_sparring.git_context import GitContextError
 from agent_sparring.handoff import generate_handoff
+from agent_sparring.loop import DEFAULT_MAX_SEND_BACK_CYCLES, LoopError, run_unattended_loop
 from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
     ClaudeCliAdapter,
@@ -138,17 +139,33 @@ def _cmd_record_sparring(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_stage_provider(args: argparse.Namespace, sparring_dir: Path) -> str:
-    """Precedence: explicit --provider > configured [agents.stage].provider >
+def _resolve_stage_provider(explicit_provider: str | None, sparring_dir: Path) -> str:
+    """Precedence: explicit override > configured [agents.stage].provider >
     ``claude-cli`` (the initial default, per the project plan)."""
 
-    if args.provider:
-        return args.provider
+    if explicit_provider:
+        return explicit_provider
     if (sparring_dir / CONFIG_FILENAME).is_file():
         config = load_project_config(sparring_dir)
         if config.stage_agent_provider:
             return config.stage_agent_provider
     return "claude-cli"
+
+
+def _resolve_self_check(sparring_dir: Path) -> bool:
+    """Whether the stage prompt should include the optional self-check
+    section, per project.toml's ``[stage] self_check`` (default false).
+
+    Config-only by design: there is deliberately no CLI flag for this (see
+    the project plan's Stage 5 self-check note) -- a project either wants
+    it on for every unattended run or does not, and toggling it per
+    invocation would not simplify anything here.
+    """
+
+    if (sparring_dir / CONFIG_FILENAME).is_file():
+        config = load_project_config(sparring_dir)
+        return config.stage_self_check
+    return False
 
 
 def _cmd_run_stage(args: argparse.Namespace) -> int:
@@ -159,6 +176,8 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
         if not stage.exists():
             raise StageError(f"stage {args.stage_id!r} does not exist at {stage.directory}")
 
+        self_check = _resolve_self_check(sparring_dir)
+
         if args.dry_run:
             state = stage.read_state()
             prompt = build_stage_prompt(
@@ -166,11 +185,12 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
                 sparring_dir,
                 resume=state.implementation_session_id is not None,
                 expected_branch=args.expected_branch,
+                self_check=self_check,
             )
             print(prompt)
             return 0
 
-        provider = _resolve_stage_provider(args, sparring_dir)
+        provider = _resolve_stage_provider(args.provider, sparring_dir)
         if provider != "claude-cli":
             raise StageError(
                 f"unsupported stage agent provider {provider!r}; only 'claude-cli' is "
@@ -183,7 +203,12 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
             model=args.model,
         )
         run_result = run_stage_agent(
-            stage, sparring_dir, repo_root, adapter, expected_branch=args.expected_branch
+            stage,
+            sparring_dir,
+            repo_root,
+            adapter,
+            expected_branch=args.expected_branch,
+            self_check=self_check,
         )
     except (StageError, StageAgentRunError, ProjectConfigError, GitContextError) as exc:
         print(f"could not run stage agent: {exc}", file=sys.stderr)
@@ -198,12 +223,12 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
     return 1 if run_result.result.is_error else 0
 
 
-def _resolve_sparring_provider(args: argparse.Namespace, sparring_dir: Path) -> str:
-    """Precedence: explicit --provider > configured [agents.sparring].provider
+def _resolve_sparring_provider(explicit_provider: str | None, sparring_dir: Path) -> str:
+    """Precedence: explicit override > configured [agents.sparring].provider
     > ``codex-cli`` (the initial default, per the Stage 4 capability probe)."""
 
-    if args.provider:
-        return args.provider
+    if explicit_provider:
+        return explicit_provider
     if (sparring_dir / CONFIG_FILENAME).is_file():
         config = load_project_config(sparring_dir)
         if config.sparring_agent_provider:
@@ -230,7 +255,7 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
             print(prompt)
             return 0
 
-        provider = _resolve_sparring_provider(args, sparring_dir)
+        provider = _resolve_sparring_provider(args.provider, sparring_dir)
         if provider != "codex-cli":
             raise StageError(
                 f"unsupported sparring agent provider {provider!r}; only 'codex-cli' is "
@@ -262,6 +287,66 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
     print(
         f"session_id={run_result.result.session_id} resumed={run_result.resumed} "
         f"action={run_result.routing.action.value}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_run_loop(args: argparse.Namespace) -> int:
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        stage = Stage.resolve(sparring_dir, args.stage_id)
+        if not stage.exists():
+            raise StageError(f"stage {args.stage_id!r} does not exist at {stage.directory}")
+
+        self_check = _resolve_self_check(sparring_dir)
+
+        stage_provider = _resolve_stage_provider(args.stage_provider, sparring_dir)
+        if stage_provider != "claude-cli":
+            raise StageError(
+                f"unsupported stage agent provider {stage_provider!r}; only "
+                "'claude-cli' is implemented so far"
+            )
+        stage_adapter = ClaudeCliAdapter(
+            repo_root=repo_root,
+            executable=args.claude_executable,
+            permission_mode=args.permission_mode,
+            model=args.stage_model,
+        )
+
+        sparring_provider = _resolve_sparring_provider(args.sparring_provider, sparring_dir)
+        if sparring_provider != "codex-cli":
+            raise StageError(
+                f"unsupported sparring agent provider {sparring_provider!r}; only "
+                "'codex-cli' is implemented so far"
+            )
+        # No --sandbox override is exposed here either, for the same reason
+        # as run-sparring: CodexCliAdapter has no sandbox field at all.
+        sparring_adapter = CodexCliAdapter(
+            repo_root=repo_root,
+            executable=args.codex_executable,
+            model=args.sparring_model,
+        )
+
+        loop_result = run_unattended_loop(
+            stage,
+            sparring_dir,
+            repo_root,
+            stage_adapter,
+            sparring_adapter,
+            expected_branch=args.expected_branch,
+            max_send_back_cycles=args.max_send_back_cycles,
+            self_check=self_check,
+        )
+    except (StageError, LoopError, ProjectConfigError, GitContextError, ProviderError) as exc:
+        print(f"could not run unattended loop: {exc}", file=sys.stderr)
+        return 1
+
+    print(loop_result.routing.summary)
+    print(
+        f"outcome={loop_result.outcome.value} cycles={len(loop_result.cycles)} "
+        f"send_back_count={loop_result.send_back_count}",
         file=sys.stderr,
     )
     return 0
@@ -437,6 +522,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the bounded sparring prompt without invoking any provider",
     )
     run_sparring.set_defaults(func=_cmd_run_sparring)
+
+    run_loop = subparsers.add_parser(
+        "run-loop",
+        help="run the unattended stage<->sparring loop for a stage until READY/NEEDS_YOU/ESCALATE",
+    )
+    run_loop.add_argument("stage_id")
+    run_loop.add_argument(
+        "--repo-root",
+        default=None,
+        help=(
+            "repository root; overrides project.toml's [repo].root if set "
+            "(default: [repo].root from project.toml, resolved against the "
+            "project root, else the parent of --sparring-dir)"
+        ),
+    )
+    run_loop.add_argument(
+        "--expected-branch",
+        required=True,
+        help="the branch this unattended loop is meant to modify and review; required",
+    )
+    run_loop.add_argument(
+        "--stage-provider",
+        default=None,
+        help="stage agent provider override (default: project.toml's [agents.stage].provider, else claude-cli)",
+    )
+    run_loop.add_argument(
+        "--sparring-provider",
+        default=None,
+        help="sparring agent provider override (default: project.toml's [agents.sparring].provider, else codex-cli)",
+    )
+    run_loop.add_argument(
+        "--claude-executable",
+        default="claude",
+        help="claude CLI executable to invoke (default: claude)",
+    )
+    run_loop.add_argument(
+        "--codex-executable",
+        default="codex",
+        help="codex CLI executable to invoke (default: codex)",
+    )
+    run_loop.add_argument("--stage-model", default=None, help="model override for the stage agent")
+    run_loop.add_argument(
+        "--sparring-model", default=None, help="model override for the sparring agent"
+    )
+    run_loop.add_argument(
+        "--permission-mode",
+        default=DEFAULT_PERMISSION_MODE,
+        help=f"claude CLI --permission-mode value (default: {DEFAULT_PERMISSION_MODE})",
+    )
+    run_loop.add_argument(
+        "--max-send-back-cycles",
+        type=int,
+        default=DEFAULT_MAX_SEND_BACK_CYCLES,
+        help=(
+            "runaway limit: stop with an error after this many SEND_BACK "
+            f"cycles without reaching READY/NEEDS_YOU/ESCALATE (default: "
+            f"{DEFAULT_MAX_SEND_BACK_CYCLES})"
+        ),
+    )
+    run_loop.set_defaults(func=_cmd_run_loop)
 
     return parser
 

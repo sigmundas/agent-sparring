@@ -39,6 +39,7 @@ class ProjectConfig:
     stage_agent_provider: str | None = None
     sparring_agent_provider: str | None = None
     default_sparring_mode: str | None = None
+    stage_self_check: bool = False
 
     def command(self, name: str) -> str | None:
         """Return a configured project command by name, if any."""
@@ -65,6 +66,15 @@ def _optional_str(table: Mapping[str, Any], key: str, *, where: str) -> str | No
         raise ProjectConfigError(
             f"{where} field '{key}' must be a non-empty string if present"
         )
+    return value
+
+
+def _optional_bool(table: Mapping[str, Any], key: str, *, where: str) -> bool | None:
+    if key not in table:
+        return None
+    value = table[key]
+    if not isinstance(value, bool):
+        raise ProjectConfigError(f"{where} field '{key}' must be a boolean if present")
     return value
 
 
@@ -124,6 +134,9 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
         sparring_table, "default_mode", where=f"{source} [sparring]"
     )
 
+    stage_table = _optional_table(table, "stage", where=source)
+    self_check = _optional_bool(stage_table, "self_check", where=f"{source} [stage]")
+
     return ProjectConfig(
         project=project_name,
         repo_root=repo_root,
@@ -131,6 +144,7 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
         stage_agent_provider=stage_provider,
         sparring_agent_provider=sparring_provider,
         default_sparring_mode=default_mode,
+        stage_self_check=self_check if self_check is not None else False,
     )
 
 

@@ -71,6 +71,39 @@ class StagePromptTests(unittest.TestCase):
         )
         self.assertNotIn("Project context", prompt)
 
+    def test_self_check_false_omits_section(self):
+        prompt = build_stage_prompt(
+            self.stage,
+            self.sparring_dir,
+            resume=False,
+            expected_branch="feature/x",
+            self_check=False,
+        )
+        self.assertNotIn("Self-check", prompt)
+
+    def test_self_check_defaults_to_false(self):
+        prompt = build_stage_prompt(
+            self.stage, self.sparring_dir, resume=False, expected_branch="feature/x"
+        )
+        self.assertNotIn("Self-check", prompt)
+
+    def test_self_check_true_includes_section_with_all_checkpoints(self):
+        prompt = build_stage_prompt(
+            self.stage,
+            self.sparring_dir,
+            resume=False,
+            expected_branch="feature/x",
+            self_check=True,
+        )
+        self.assertIn("Self-check", prompt)
+        self.assertIn("failure between steps", prompt)
+        self.assertIn("resume/retry behavior", prompt)
+        self.assertIn("stale or partially written state", prompt)
+        self.assertIn("provider/runtime differences", prompt)
+        self.assertIn("concurrency issues", prompt)
+        self.assertIn("invariants can be bypassed", prompt)
+        self.assertIn("exercise the real tool", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

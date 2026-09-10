@@ -81,6 +81,22 @@ class ParseProjectConfigTests(unittest.TestCase):
         config = parse_project_config('project = "anything-goes"\n')
         self.assertEqual(config.project, "anything-goes")
 
+    def test_self_check_defaults_to_false_when_absent(self):
+        config = parse_project_config(MINIMAL_TOML)
+        self.assertFalse(config.stage_self_check)
+
+    def test_self_check_true_is_parsed(self):
+        config = parse_project_config('project = "x"\n\n[stage]\nself_check = true\n')
+        self.assertTrue(config.stage_self_check)
+
+    def test_self_check_false_is_parsed(self):
+        config = parse_project_config('project = "x"\n\n[stage]\nself_check = false\n')
+        self.assertFalse(config.stage_self_check)
+
+    def test_self_check_non_boolean_fails(self):
+        with self.assertRaises(ProjectConfigError):
+            parse_project_config('project = "x"\n\n[stage]\nself_check = "yes"\n')
+
 
 class LoadProjectConfigFilesystemTests(unittest.TestCase):
     def test_load_project_config_from_directory(self):

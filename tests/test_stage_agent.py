@@ -356,6 +356,34 @@ class StageAgentRunTests(unittest.TestCase):
         self.assertIn(base_sha_a, run_result.handoff)
         self.assertIn("partial.txt", run_result.handoff)
 
+    def test_self_check_true_reaches_prompt_but_not_state_json(self):
+        adapter = _FakeAdapter(
+            start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False)
+        )
+        run_result = run_stage_agent(
+            self.stage,
+            self.sparring_dir,
+            self.repo,
+            adapter,
+            expected_branch="feature/x",
+            self_check=True,
+        )
+
+        self.assertIn("Self-check", run_result.prompt)
+        # self_check is prose-only: it must never become machine-readable
+        # workflow state.
+        state_payload = self.stage.read_state().to_dict()
+        self.assertNotIn("self_check", state_payload)
+
+    def test_self_check_defaults_to_false_and_omits_prompt_section(self):
+        adapter = _FakeAdapter(
+            start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False)
+        )
+        run_result = run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
+        self.assertNotIn("Self-check", run_result.prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

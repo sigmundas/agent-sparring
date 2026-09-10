@@ -43,6 +43,7 @@ def run_stage_agent(
     adapter: StageAgentAdapter,
     *,
     expected_branch: str,
+    self_check: bool = False,
 ) -> StageAgentRunResult:
     """Start or resume the stage agent for one turn.
 
@@ -51,6 +52,11 @@ def run_stage_agent(
     acceptable stand-in for that. It is enforced by the branch guard and
     included in the stage prompt so the agent is told not to switch
     branches.
+
+    ``self_check`` (default false) is forwarded to :func:`build_stage_prompt`
+    verbatim; see that function for what it adds. It never becomes machine
+    state here — it is not recorded in ``state.json`` and does not change
+    any control flow in this function.
 
     Records the provider's own returned session id in state.json and
     regenerates handoff.md from the provider's result and actual git
@@ -111,6 +117,7 @@ def run_stage_agent(
                 sparring_dir,
                 resume=resume_id is not None,
                 expected_branch=expected_branch,
+                self_check=self_check,
             )
             try:
                 if resume_id:

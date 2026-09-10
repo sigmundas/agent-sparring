@@ -22,13 +22,25 @@ from agent_sparring.stage import Stage, StageError
 
 
 def build_stage_prompt(
-    stage: Stage, sparring_dir: Path, *, resume: bool, expected_branch: str
+    stage: Stage,
+    sparring_dir: Path,
+    *,
+    resume: bool,
+    expected_branch: str,
+    self_check: bool = False,
 ) -> str:
     """Assemble the bounded prompt for one stage-agent turn.
 
     Always includes the branch the agent must stay on, the stage brief, and
     (if present) PROJECT.md. When ``resume`` is true (a same-session
     follow-up), also includes the full current ``sparring.md`` content.
+
+    ``self_check`` (project config ``[stage] self_check = true``, default
+    false) adds one prose section asking the implementation agent to
+    inspect its own work before finishing its turn. This is deliberately
+    lightweight: no new machine-readable workflow state, no checklist
+    fields, no pass/fail gate. Independent sparring still runs afterward
+    regardless of what this section asks for.
     """
 
     parts = [
@@ -58,6 +70,27 @@ def build_stage_prompt(
             "## Latest sparring exchange",
             "",
             sparring_text or "(no sparring.md available)",
+        ]
+
+    if self_check:
+        parts += [
+            "",
+            "## Self-check",
+            "",
+            "Before finishing this turn, inspect your own implementation for:",
+            "",
+            "- failure between steps;",
+            "- resume/retry behavior;",
+            "- stale or partially written state;",
+            "- provider/runtime differences;",
+            "- concurrency issues;",
+            "- ways important invariants can be bypassed.",
+            "",
+            "Where this stage depends on external-tool behavior, exercise the "
+            "real tool when practical rather than assume its contract. Fix "
+            "issues you find before handing off, and report what you checked "
+            "or deliberately deferred. This is a self-check, not a substitute "
+            "for independent sparring, which still runs afterward.",
         ]
 
     parts += [
