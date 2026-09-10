@@ -331,7 +331,8 @@ don't already cover).
 
 - Base for this round: `1ffe1eb400bfd3a3187ab1fe13296f7f87f828d8` (round 1's
   implementation candidate)
-- Round-2 candidate SHA: recorded after commit/push below
+- Round-2 candidate SHA: `9087bd3` (full SHA: see `git log -1` on
+  `feature/sparring-v2` after this push)
 - Branch: `feature/sparring-v2`, pushed to `origin`
 
 Two items, both resolved:
