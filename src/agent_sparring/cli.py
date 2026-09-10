@@ -3,7 +3,7 @@
 This is intentionally minimal: config validation and stage skeleton
 creation, so the primitives above have an obvious entry point. Building a
 full command surface (invocation, sparring, acceptance, loops) is later
-work per the V2 plan.
+work.
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ import argparse
 import sys
 from pathlib import Path
 
-from sparring_v2.config import ProjectConfigError, load_project_config, load_project_markdown
-from sparring_v2.stage import Stage, StageError
+from agent_sparring.config import ProjectConfigError, load_project_config, load_project_markdown
+from agent_sparring.stage import Stage, StageError
 
 
 def _cmd_check_config(args: argparse.Namespace) -> int:
@@ -47,7 +47,7 @@ def _cmd_new_stage(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sparring-v2")
+    parser = argparse.ArgumentParser(prog="sparring")
     parser.add_argument(
         "--sparring-dir",
         default=".sparring",

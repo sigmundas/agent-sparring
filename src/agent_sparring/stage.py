@@ -23,7 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from sparring_v2 import templates
+from agent_sparring import templates
 
 STAGES_DIRNAME = "stages"
 STATE_FILENAME = "state.json"
@@ -40,10 +40,10 @@ class StageError(ValueError):
 
 
 class StageStatus(str, Enum):
-    """Minimal stage lifecycle. Deliberately small; see V2 plan section 3."""
+    """Minimal stage lifecycle. Deliberately small; see the project plan."""
 
     WORKING = "working"
-    ACCEPTANCE = "acceptance"
+    FROZEN = "frozen"  # a candidate is prepared for the later hard acceptance gate
     ACCEPTED = "accepted"
 
     @classmethod
@@ -74,15 +74,16 @@ def validate_stage_id(stage_id: str) -> str:
 
 @dataclass
 class StageState:
-    """The smallest machine state needed by later V2 stages.
+    """The smallest machine state needed by later stages.
 
-    No V1 workflow states (changes_requested, review_attempt, ancillary
-    states, migration states, immutable intermediate verdicts) are
-    represented here. See the V2 plan section "Minimal state" for the
-    rationale.
+    Stage identity is not duplicated here: it comes from the stage's
+    directory (``.sparring/stages/<stage-id>/``), which ``Stage`` itself
+    owns. No V1 workflow states (changes_requested, review_attempt,
+    ancillary states, migration states, immutable intermediate verdicts) are
+    represented here either. See the project plan's "Minimal state" section
+    for the rationale.
     """
 
-    stage_id: str
     status: StageStatus = StageStatus.WORKING
     implementation_session_id: str | None = None
     sparring_session_id: str | None = None
@@ -96,12 +97,9 @@ class StageState:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "StageState":
-        if "stage_id" not in payload:
-            raise StageError("state is missing required field 'stage_id'")
         status_raw = payload.get("status", StageStatus.WORKING.value)
         status = StageStatus.from_str(str(status_raw))
         return cls(
-            stage_id=payload["stage_id"],
             status=status,
             implementation_session_id=payload.get("implementation_session_id"),
             sparring_session_id=payload.get("sparring_session_id"),
@@ -159,7 +157,7 @@ class Stage:
 
         state_path = self.directory / STATE_FILENAME
         if not state_path.is_file():
-            self.write_state(StageState(stage_id=self.stage_id))
+            self.write_state(StageState())
 
         for filename, template in (
             (BRIEF_FILENAME, templates.BRIEF_TEMPLATE),
@@ -188,10 +186,6 @@ class Stage:
         return StageState.from_dict(payload)
 
     def write_state(self, state: StageState) -> None:
-        if state.stage_id != self.stage_id:
-            raise StageError(
-                f"state stage_id {state.stage_id!r} does not match stage {self.stage_id!r}"
-            )
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / STATE_FILENAME
         path.write_text(

@@ -36,58 +36,43 @@ class RoutingAction(str, Enum):
             ) from exc
 
 
-class NeedsYouReason(str, Enum):
-    """Broad human-interruption reason categories.
-
-    These categories are informational only; they must not become workflow
-    states in their own right.
-    """
-
-    PRODUCT_PREFERENCE = "product_preference"
-    UI_VISUAL_CHECK = "ui_visual_check"
-    DEVICE_MANUAL_CHECK = "device_manual_check"
-    EXTERNAL_CONDITION = "external_condition"
-    SCOPE_EXPANSION = "scope_expansion"
-
-    @classmethod
-    def from_str(cls, value: str) -> "NeedsYouReason":
-        try:
-            return cls(value)
-        except ValueError as exc:
-            valid = ", ".join(member.value for member in cls)
-            raise RoutingResultError(
-                f"unknown NEEDS_YOU reason {value!r}; expected one of: {valid}"
-            ) from exc
+# Recommended human-break categories for NEEDS_YOU, per the project plan:
+# product/preference, UI/visual check, device/manual check, external
+# condition, scope expansion. These are documentation conventions for
+# sparring.md prose, not a closed set enforced here — the router only cares
+# that the action is NEEDS_YOU, not which category (if any) was chosen.
+NEEDS_YOU_REASON_CATEGORIES = (
+    "product_preference",
+    "ui_visual_check",
+    "device_manual_check",
+    "external_condition",
+    "scope_expansion",
+)
 
 
 @dataclass(frozen=True)
 class RoutingResult:
     """A tiny, machine-readable sparring routing outcome.
 
-    ``needs_you_reason`` is only meaningful (and required) when
-    ``action`` is ``NEEDS_YOU``. Detailed findings/tests/checks are not
-    encoded here; they belong in the human-readable sparring.md.
+    ``needs_you_reason`` is optional, freeform metadata (see
+    ``NEEDS_YOU_REASON_CATEGORIES`` for suggested values) — it is never
+    required or validated against a closed set. Detailed findings/tests/
+    checks are not encoded here; they belong in the human-readable
+    sparring.md.
     """
 
     action: RoutingAction
     summary: str
-    needs_you_reason: NeedsYouReason | None = None
+    needs_you_reason: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.action, RoutingAction):
             raise RoutingResultError(f"action must be a RoutingAction, got {self.action!r}")
-        if not self.summary or not self.summary.strip():
+        if not isinstance(self.summary, str) or not self.summary.strip():
             raise RoutingResultError("summary must be a non-empty string")
-        if self.action is RoutingAction.NEEDS_YOU:
-            if self.needs_you_reason is None:
-                raise RoutingResultError(
-                    "NEEDS_YOU requires a needs_you_reason"
-                )
-        elif self.needs_you_reason is not None:
-            raise RoutingResultError(
-                "needs_you_reason is only valid when action is NEEDS_YOU"
-            )
+        if self.needs_you_reason is not None and not isinstance(self.needs_you_reason, str):
+            raise RoutingResultError("needs_you_reason must be a string if present")
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -95,7 +80,7 @@ class RoutingResult:
             "summary": self.summary,
         }
         if self.needs_you_reason is not None:
-            payload["needs_you_reason"] = self.needs_you_reason.value
+            payload["needs_you_reason"] = self.needs_you_reason
         if self.details:
             payload["details"] = dict(self.details)
         return payload
@@ -110,8 +95,7 @@ class RoutingResult:
             raise RoutingResultError("routing result is missing 'summary'")
         summary = payload["summary"]
 
-        reason_raw = payload.get("needs_you_reason")
-        reason = NeedsYouReason.from_str(str(reason_raw)) if reason_raw is not None else None
+        reason = payload.get("needs_you_reason")
 
         details = payload.get("details") or {}
         if not isinstance(details, Mapping):

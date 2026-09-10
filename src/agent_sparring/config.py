@@ -1,6 +1,6 @@
 """Generic project configuration loading.
 
-A project supplies two distinct kinds of configuration, per the V2 plan:
+A project supplies two distinct kinds of configuration, per the project plan:
 
 - ``.sparring/project.toml``: machine-readable configuration, parsed by this
   module into a small :class:`ProjectConfig`.
@@ -30,7 +30,7 @@ class ProjectConfigError(ValueError):
 class ProjectConfig:
     """Minimal machine-readable project configuration.
 
-    Only fields that generic V2 code actually needs are represented here.
+    Only fields that generic code actually needs are represented here.
     """
 
     project: str

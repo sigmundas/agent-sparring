@@ -1,23 +1,23 @@
-"""Sparring V2: a small, generic stage/sparring primitive library.
+"""agent_sparring: a small, generic stage/sparring primitive library.
 
 This package intentionally contains no project-specific (e.g. Sporely)
 behavior. Project knowledge lives in project-local ``.sparring/project.toml``
-and ``.sparring/PROJECT.md`` files, loaded by :mod:`sparring_v2.config`.
+and ``.sparring/PROJECT.md`` files, loaded by :mod:`agent_sparring.config`.
 """
 
-from sparring_v2.config import (
+from agent_sparring.config import (
     ProjectConfig,
     ProjectConfigError,
     load_project_config,
     load_project_markdown,
 )
-from sparring_v2.routing import (
-    NeedsYouReason,
+from agent_sparring.routing import (
+    NEEDS_YOU_REASON_CATEGORIES,
     RoutingAction,
     RoutingResult,
     RoutingResultError,
 )
-from sparring_v2.stage import (
+from agent_sparring.stage import (
     Stage,
     StageError,
     StageState,
@@ -29,7 +29,7 @@ __all__ = [
     "ProjectConfigError",
     "load_project_config",
     "load_project_markdown",
-    "NeedsYouReason",
+    "NEEDS_YOU_REASON_CATEGORIES",
     "RoutingAction",
     "RoutingResult",
     "RoutingResultError",

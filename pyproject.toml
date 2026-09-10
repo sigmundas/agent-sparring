@@ -1,7 +1,7 @@
 [project]
-name = "sparring-v2"
+name = "agent-sparring"
 version = "0.1.0"
-description = "Generic stage/sparring primitives for Sparring V2"
+description = "Generic stage/sparring primitives for agent-sparring"
 requires-python = ">=3.11"
 
 [tool.setuptools.packages.find]

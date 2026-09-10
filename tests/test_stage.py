@@ -1,10 +1,11 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import conftest_path  # noqa: F401
 
-from sparring_v2.stage import (
+from agent_sparring.stage import (
     Stage,
     StageError,
     StageState,
@@ -47,7 +48,6 @@ class StageSkeletonTests(unittest.TestCase):
             self.assertTrue(stage.exists())
 
             state = stage.read_state()
-            self.assertEqual(state.stage_id, "stage-1")
             self.assertEqual(state.status, StageStatus.WORKING)
             self.assertIsNone(state.base_sha)
             self.assertIsNone(state.candidate_sha)
@@ -80,8 +80,7 @@ class StageStateRoundTripTests(unittest.TestCase):
             stage = Stage.resolve(sparring_dir, "stage-1").create()
 
             state = StageState(
-                stage_id="stage-1",
-                status=StageStatus.ACCEPTANCE,
+                status=StageStatus.FROZEN,
                 implementation_session_id="impl-abc",
                 sparring_session_id="spar-xyz",
                 base_sha="deadbeef",
@@ -91,13 +90,6 @@ class StageStateRoundTripTests(unittest.TestCase):
 
             reloaded = stage.read_state()
             self.assertEqual(reloaded, state)
-
-    def test_write_state_rejects_mismatched_stage_id(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            sparring_dir = Path(tmp)
-            stage = Stage.resolve(sparring_dir, "stage-1").create()
-            with self.assertRaises(StageError):
-                stage.write_state(StageState(stage_id="other-stage"))
 
     def test_read_state_missing_file_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -122,11 +114,18 @@ class StageStateRoundTripTests(unittest.TestCase):
             stage = Stage.resolve(sparring_dir, "stage-1")
             stage.directory.mkdir(parents=True)
             (stage.directory / "state.json").write_text(
-                '{"stage_id": "stage-1", "status": "changes_requested"}',
+                '{"status": "changes_requested"}',
                 encoding="utf-8",
             )
             with self.assertRaises(StageError):
                 stage.read_state()
+
+    def test_state_json_does_not_duplicate_stage_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sparring_dir = Path(tmp)
+            stage = Stage.resolve(sparring_dir, "stage-1").create()
+            raw = json.loads((stage.directory / "state.json").read_text(encoding="utf-8"))
+            self.assertNotIn("stage_id", raw)
 
     def test_human_readable_artifacts_survive_state_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,7 +135,7 @@ class StageStateRoundTripTests(unittest.TestCase):
             stage.write_handoff("handoff content")
             stage.write_sparring("sparring content")
 
-            stage.write_state(StageState(stage_id="stage-1", status=StageStatus.ACCEPTED))
+            stage.write_state(StageState(status=StageStatus.ACCEPTED))
 
             self.assertEqual(stage.read_notes(), "important evidence")
             self.assertEqual(stage.read_handoff(), "handoff content")

@@ -2,8 +2,8 @@ import unittest
 
 import conftest_path  # noqa: F401
 
-from sparring_v2.routing import (
-    NeedsYouReason,
+from agent_sparring.routing import (
+    NEEDS_YOU_REASON_CATEGORIES,
     RoutingAction,
     RoutingResult,
     RoutingResultError,
@@ -23,9 +23,11 @@ class RoutingActionTests(unittest.TestCase):
 
 
 class NeedsYouReasonTests(unittest.TestCase):
-    def test_all_categories_exist(self):
+    def test_recommended_categories_documented(self):
+        # These are documentation conventions only, not an enforced closed
+        # set — see the module-level comment on NEEDS_YOU_REASON_CATEGORIES.
         self.assertEqual(
-            {r.value for r in NeedsYouReason},
+            set(NEEDS_YOU_REASON_CATEGORIES),
             {
                 "product_preference",
                 "ui_visual_check",
@@ -35,9 +37,23 @@ class NeedsYouReasonTests(unittest.TestCase):
             },
         )
 
-    def test_unknown_reason_refused(self):
+    def test_needs_you_accepts_reason_outside_recommended_categories(self):
+        # The router only cares that the action is NEEDS_YOU, not which
+        # reason category (if any) was chosen.
+        result = RoutingResult(
+            action=RoutingAction.NEEDS_YOU,
+            summary="need a call on something unlisted",
+            needs_you_reason="something_unlisted",
+        )
+        self.assertEqual(result.needs_you_reason, "something_unlisted")
+
+    def test_needs_you_reason_must_be_string_if_present(self):
         with self.assertRaises(RoutingResultError):
-            NeedsYouReason.from_str("random_reason")
+            RoutingResult(
+                action=RoutingAction.NEEDS_YOU,
+                summary="pick one of two UX flows",
+                needs_you_reason=123,
+            )
 
 
 class RoutingResultConstructionTests(unittest.TestCase):
@@ -54,29 +70,29 @@ class RoutingResultConstructionTests(unittest.TestCase):
         result = RoutingResult(action=RoutingAction.ESCALATE, summary="needs stronger sparring")
         self.assertEqual(result.action, RoutingAction.ESCALATE)
 
-    def test_needs_you_requires_reason(self):
-        with self.assertRaises(RoutingResultError):
-            RoutingResult(action=RoutingAction.NEEDS_YOU, summary="pick one of two UX flows")
+    def test_needs_you_without_reason_is_allowed(self):
+        # needs_you_reason is optional lightweight metadata, not required
+        # for NEEDS_YOU to be a legal action.
+        result = RoutingResult(action=RoutingAction.NEEDS_YOU, summary="pick one of two UX flows")
+        self.assertIsNone(result.needs_you_reason)
 
     def test_needs_you_with_reason(self):
         result = RoutingResult(
             action=RoutingAction.NEEDS_YOU,
             summary="pick one of two UX flows",
-            needs_you_reason=NeedsYouReason.PRODUCT_PREFERENCE,
+            needs_you_reason="product_preference",
         )
-        self.assertEqual(result.needs_you_reason, NeedsYouReason.PRODUCT_PREFERENCE)
-
-    def test_reason_only_valid_for_needs_you(self):
-        with self.assertRaises(RoutingResultError):
-            RoutingResult(
-                action=RoutingAction.READY,
-                summary="all good",
-                needs_you_reason=NeedsYouReason.SCOPE_EXPANSION,
-            )
+        self.assertEqual(result.needs_you_reason, "product_preference")
 
     def test_empty_summary_refused(self):
         with self.assertRaises(RoutingResultError):
             RoutingResult(action=RoutingAction.READY, summary="   ")
+
+    def test_non_string_summary_refused_cleanly(self):
+        # Regression: a malformed summary must raise RoutingResultError, not
+        # an AttributeError from calling .strip() on a non-string.
+        with self.assertRaises(RoutingResultError):
+            RoutingResult(action=RoutingAction.READY, summary=123)
 
 
 class RoutingResultSerializationTests(unittest.TestCase):
@@ -94,7 +110,7 @@ class RoutingResultSerializationTests(unittest.TestCase):
         result = RoutingResult(
             action=RoutingAction.NEEDS_YOU,
             summary="verify on device",
-            needs_you_reason=NeedsYouReason.DEVICE_MANUAL_CHECK,
+            needs_you_reason="device_manual_check",
         )
         payload = result.to_dict()
         reloaded = RoutingResult.from_dict(payload)
@@ -107,6 +123,10 @@ class RoutingResultSerializationTests(unittest.TestCase):
     def test_from_dict_unknown_action_refused(self):
         with self.assertRaises(RoutingResultError):
             RoutingResult.from_dict({"action": "MAYBE", "summary": "x"})
+
+    def test_from_dict_non_string_summary_refused_cleanly(self):
+        with self.assertRaises(RoutingResultError):
+            RoutingResult.from_dict({"action": "READY", "summary": 123})
 
     def test_schema_stays_tiny_no_finding_list_required(self):
         # Detailed findings belong in sparring.md, not this schema; the

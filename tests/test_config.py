@@ -4,7 +4,7 @@ from pathlib import Path
 
 import conftest_path  # noqa: F401  (adds src/ to sys.path)
 
-from sparring_v2.config import (
+from agent_sparring.config import (
     ProjectConfigError,
     load_project_config,
     load_project_markdown,
