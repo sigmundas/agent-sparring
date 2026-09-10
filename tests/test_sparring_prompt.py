@@ -33,6 +33,30 @@ class SparringPromptTests(unittest.TestCase):
         self.assertIn("read-only", prompt)
         self.assertNotIn("Your previous sparring exchange", prompt)
 
+    def test_unrunnable_checks_are_directed_to_deferred_not_needs_you(self):
+        """A check the read-only sparrer cannot execute must be routed to the
+        ``deferred`` field, not treated as a human decision.
+
+        Exercised by the Stage 7 pilot: the sparrer could not run `npm test`
+        (its OS-enforced read-only sandbox refused the runner's temporary
+        directories) or `npm run build`, and returned NEEDS_YOU for that
+        reason alone -- while also filling in `deferred`, which contradicts
+        itself. The candidate was in fact correct and complete. Without this
+        guidance the loop stops for the human on essentially every stage
+        whose brief asks for full-suite or build evidence.
+        """
+
+        self.stage.write_handoff("# Handoff: stage-1\n\nCandidate commit abc123.\n")
+        prompt = build_sparring_prompt(self.stage, self.sparring_dir, resume=False)
+
+        self.assertIn("Checks you cannot run yourself", prompt)
+        self.assertIn(
+            "Being unable to reproduce a check yourself is NOT by itself a "
+            "reason to choose NEEDS_YOU.",
+            " ".join(prompt.split()),
+        )
+        self.assertIn("deferred", prompt)
+
     def test_resume_includes_previous_sparring_exchange(self):
         record_sparring(
             self.stage,

@@ -50,7 +50,32 @@ resumed stage-agent turn, to the same stage agent.
   GPT web chat) rather than being decided inside this automatic exchange.
 
 You may inspect the repository (e.g. git log/diff/status, reading files)
-but must not modify it."""
+but must not modify it.
+
+## Checks you cannot run yourself
+
+Your sandbox is read-only, and that is enforced by the operating system,
+not by convention. Commands that need to write will fail with permission
+errors: builds that emit artifacts, test runners that create temporary
+directories, anything installing dependencies. Those failures describe your
+environment, not a defect in the candidate. Your own runtime may also
+differ from the project's (a different language/tool version), so a result
+you do obtain may not be the project's result.
+
+Being unable to reproduce a check yourself is NOT by itself a reason to
+choose NEEDS_YOU. Instead:
+
+- put it in ``deferred`` -- what is unverified, why you could not verify it,
+  and when it becomes required;
+- then choose the action the code review itself warrants, treating the
+  stage agent's reported evidence as a claim you have not independently
+  confirmed and saying so in ``findings``.
+
+Reserve NEEDS_YOU for something a human must actually decide or do: a
+product/preference choice between valid behaviors, a visual or UI judgement,
+a device/manual check, an external condition to wait on, or a scope
+expansion to approve. "Someone should re-run the suite where it can write
+files" is a deferred check, not a human decision."""
 
 
 def build_sparring_prompt(
