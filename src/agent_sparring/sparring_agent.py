@@ -78,6 +78,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_sparring.activity import ActivityEmitter
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import (
     GitContextError,
@@ -178,6 +179,17 @@ def _parse_verdict(text: str) -> tuple[RoutingResult, str]:
     return routing, findings
 
 
+def _sparrer_emitter(stage: Stage, adapter: object) -> ActivityEmitter:
+    """Observational emitter for the sparring side; see
+    :func:`agent_sparring.stage_agent._stage_emitter` for the same
+    provider-id convention and the same non-authority rule."""
+
+    provider = getattr(adapter, "provider_id", None)
+    return stage.activity_log().bind(
+        "sparrer", provider=provider if isinstance(provider, str) else None
+    )
+
+
 def run_sparring_agent(
     stage: Stage,
     sparring_dir: Path,
@@ -273,6 +285,12 @@ def _run_sparring_agent_locked(
             f"{before_branch!r}; refusing to spar against the wrong branch"
         )
 
+    # Observational telemetry only: emitted alongside the existing checks,
+    # never consulted by them. Failure summaries are fixed phrases.
+    activity = _sparrer_emitter(stage, adapter)
+    resumed = resume_id is not None
+    activity.emit("sparring.started", resumed=resumed, session_id=resume_id)
+
     result: SparringAgentResult | None = None
     provider_error: ProviderError | None = None
     try:
@@ -300,14 +318,21 @@ def _run_sparring_agent_locked(
         )
         if provider_error is not None:
             detail += f"; the provider also failed: {provider_error}"
+        activity.emit(
+            "sparring.failed", resumed=resumed, summary="read-only contract violated"
+        )
         raise SparringAgentRunError(detail)
 
     if provider_error is not None:
+        activity.emit("sparring.failed", resumed=resumed, summary="provider error")
         raise SparringAgentRunError(str(provider_error))
 
     assert result is not None  # provider_error is None, so the call above succeeded
 
     if resume_id and result.session_id != resume_id:
+        activity.emit(
+            "sparring.failed", resumed=resumed, summary="session identity mismatch"
+        )
         raise SparringAgentRunError(
             f"provider was asked to resume session {resume_id!r} but returned "
             f"session {result.session_id!r}; refusing to silently replace the "
@@ -317,6 +342,12 @@ def _run_sparring_agent_locked(
     try:
         routing, findings_text = _parse_verdict(result.text)
     except RoutingResultError as exc:
+        activity.emit(
+            "sparring.failed",
+            resumed=resumed,
+            session_id=result.session_id,
+            summary="unusable routing verdict",
+        )
         raise SparringAgentRunError(
             f"provider's final message was not a usable routing verdict: {exc}"
         ) from exc
@@ -343,6 +374,16 @@ def _run_sparring_agent_locked(
     stage.write_state(current_state)
 
     sparring_content = record_sparring(stage, routing, findings=findings_text)
+
+    # The verdict is already authoritative in sparring.md / the returned
+    # RoutingResult; this line merely mirrors it for observers.
+    activity.emit(
+        "verdict",
+        resumed=resumed,
+        session_id=result.session_id,
+        action=routing.action.value,
+        summary=routing.summary,
+    )
 
     return SparringAgentRunResult(
         result=result,

@@ -68,6 +68,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_sparring.activity import truncate
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import (
     DirtyEntry,
@@ -79,6 +80,7 @@ from agent_sparring.git_context import (
     verify_pushed,
 )
 from agent_sparring.stage import (
+    ACTIVITY_FILENAME,
     BRIEF_FILENAME,
     HANDOFF_FILENAME,
     NOTES_FILENAME,
@@ -93,7 +95,8 @@ from agent_sparring.stage import (
 # The only paths ever exempted from the "no unrepresented dirty changes"
 # checks below: this stage's own artifact files, which agent_sparring
 # itself rewrites on every stage/sparring turn (see stage.py's Stage.create/
-# write_state/write_handoff/write_sparring/write_notes). These are workflow
+# write_state/write_handoff/write_sparring/write_notes, plus the
+# observational activity.jsonl appended by every turn). These are workflow
 # bookkeeping and evidence, deliberately outside candidate identity -- never
 # application/test/config code. The exemption is an explicit allowlist of
 # exact filenames, not a subtree/prefix rule: naming a directory
@@ -106,6 +109,7 @@ _STAGE_ARTIFACT_FILENAMES = (
     NOTES_FILENAME,
     HANDOFF_FILENAME,
     SPARRING_FILENAME,
+    ACTIVITY_FILENAME,
 )
 
 
@@ -302,11 +306,33 @@ def freeze_candidate(
 
     try:
         with worktree_lock(repo_root):
-            return _freeze_candidate_locked(stage, repo_root, expected_branch=expected_branch)
+            frozen = _freeze_candidate_locked(stage, repo_root, expected_branch=expected_branch)
     except WorktreeLockError as exc:
-        raise AcceptanceError(
+        error = AcceptanceError(
             f"cannot freeze a candidate for stage {stage.stage_id!r}: {exc}"
-        ) from exc
+        )
+        _emit_refusal(stage, "freeze", error)
+        raise error from exc
+    except AcceptanceError as exc:
+        _emit_refusal(stage, "freeze", exc)
+        raise
+    stage.activity_log().emit("gate", "candidate.frozen", sha=frozen.candidate_sha)
+    return frozen
+
+
+def _emit_refusal(stage: Stage, operation: str, exc: AcceptanceError) -> None:
+    """Mirror a refusal into the observational activity stream.
+
+    Called only from ``except`` blocks that then re-raise the *original*
+    exception unchanged; ``ActivityLog.emit`` itself never raises, so
+    telemetry can neither mask nor replace the refusal.
+    """
+
+    stage.activity_log().emit(
+        "gate",
+        "gate.refused",
+        summary=truncate(f"{operation} refused: {exc}"),
+    )
 
 
 def _freeze_candidate_locked(
@@ -413,11 +439,20 @@ def accept_candidate(
 
     try:
         with worktree_lock(repo_root):
-            return _accept_candidate_locked(stage, repo_root, expected_branch=expected_branch)
+            accepted = _accept_candidate_locked(
+                stage, repo_root, expected_branch=expected_branch
+            )
     except WorktreeLockError as exc:
-        raise AcceptanceError(
+        error = AcceptanceError(
             f"cannot accept the candidate for stage {stage.stage_id!r}: {exc}"
-        ) from exc
+        )
+        _emit_refusal(stage, "accept", error)
+        raise error from exc
+    except AcceptanceError as exc:
+        _emit_refusal(stage, "accept", exc)
+        raise
+    stage.activity_log().emit("gate", "candidate.accepted", sha=accepted.candidate_sha)
+    return accepted
 
 
 def _accept_candidate_locked(

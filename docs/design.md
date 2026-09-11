@@ -330,6 +330,7 @@ Project-local layout:
                 state.json
                 handoff.md
                 sparring.md
+                activity.jsonl
 
 Each file has one responsibility:
 
@@ -348,7 +349,54 @@ sparring.md
 state.json
     Only minimal machine state needed by the driver.
 
+activity.jsonl
+    Append-only observational telemetry. Never read by the driver.
+
 Do not encode project knowledge in state.json.
+
+---
+
+# Activity stream
+
+`activity.jsonl` exists so a person or a UI can watch a stage while it runs.
+It is disposable: nothing in orchestration reads it, so deleting, corrupting
+or making it unwritable changes no routing, lifecycle, acceptance, resume or
+session decision. A write failure is silent and disables further writes for
+that log instance; it never raises, prints or changes an exit code. The file
+is one of the stage's own artifacts for the acceptance gate's dirty-tree
+exemption, so telemetry cannot make a candidate dirty.
+
+One JSON object per line, schema version 1, with a fixed envelope
+
+    {"v": 1, "ts": "<UTC ISO 8601>", "actor": "...", "event": "..."}
+
+and a small closed set of optional fields used only when genuinely known:
+`provider`, `session_id`, `model`, `summary`, `action`, `cycle`, `sha`,
+`tool`, `path`, `kind`, `exit_code`, `resumed`, `parent_id`, `tool_use_id`.
+Anything else passed to the writer is dropped. No prompt text, reasoning,
+tool input or output, diff, replacement string or shell command text is ever
+recorded.
+
+Actors and events:
+
+    stage    turn.started, turn.finished, turn.failed, handoff.ready
+             (orchestration) and session.started, tool.call, file.edited,
+             command.started, command.finished, subagent.started,
+             provider.result (translated from the implementation provider)
+    sparrer  sparring.started, sparring.failed, verdict (orchestration) and
+             session.started, tool.call, file.changed, command.started,
+             command.finished, subagent.started, provider.result,
+             provider.error (translated from the sparring provider)
+    loop     loop.started, loop.send_back, loop.stopped, loop.runaway
+    gate     candidate.frozen, candidate.accepted, gate.refused
+
+Provider events come from the providers' own structured output, consumed
+line by line while the process runs (Claude Code `--output-format
+stream-json --verbose`, Codex `--json`). The final provider result is still
+parsed exactly as before; the stream is a side channel. A subagent is
+recorded only when the provider states one (a Claude `Task`/`Agent` tool
+call, a Codex `collab_tool_call` item), never inferred. Model and session
+ids are recorded only when the provider output states them.
 
 ---
 

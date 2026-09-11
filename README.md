@@ -100,6 +100,11 @@ sparring run-loop <stage-id> --repo-root . --expected-branch feature/x
 conversation rather than restarting one. It stops on `READY`, `NEEDS_YOU` or
 `ESCALATE`.
 
+While it runs, `.sparring/stages/<stage-id>/activity.jsonl` receives one
+line per observable event (turn started, file edited, command finished,
+verdict, ...). It is telemetry for watching a stage, never an input to the
+workflow; see the "Activity stream" section of `docs/design.md`.
+
 Then, for a candidate you are satisfied with:
 
 ```sh

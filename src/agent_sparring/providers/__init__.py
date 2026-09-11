@@ -9,12 +9,32 @@ Concrete adapters (e.g. Claude Code CLI) live in sibling modules.
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, runtime_checkable
+from pathlib import Path
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+
+from agent_sparring.providers.subprocess_runner import LineSink
 
 
 class ProviderError(RuntimeError):
     """Raised when a provider invocation fails or returns unusable output."""
+
+
+# The injectable process runner every CLI adapter uses:
+#
+#     runner(args, cwd, timeout_seconds, on_line) -> CompletedProcess[str]
+#
+# ``on_line`` receives each stdout line (without its newline) while the
+# child is still running, or is ``None`` when nobody is listening. A runner
+# is free to ignore it (the final ``CompletedProcess`` is still what the
+# adapter parses); a test fake that never calls it simply produces no live
+# provider telemetry. The default implementation is
+# :func:`agent_sparring.providers.subprocess_runner.run_streaming`.
+Runner = Callable[
+    [list[str], Path, "float | None", "LineSink | None"],
+    "subprocess.CompletedProcess[str]",
+]
 
 
 @dataclass(frozen=True)
@@ -92,7 +112,9 @@ class SparringAgentAdapter(Protocol):
 
 
 __all__ = [
+    "LineSink",
     "ProviderError",
+    "Runner",
     "StageAgentResult",
     "StageAgentAdapter",
     "SparringAgentResult",

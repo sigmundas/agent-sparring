@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_sparring.activity import ActivityEmitter
 from agent_sparring.branch_guard import BranchGuardError, ensure_branch_for_unattended_run
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import GitContextError, resolve_commit
@@ -34,6 +35,22 @@ class StageAgentRunResult:
     branch: str
     prompt: str
     handoff: str
+
+
+def _stage_emitter(stage: Stage, adapter: object) -> ActivityEmitter:
+    """The observational emitter for this stage's implementation side.
+
+    Telemetry only (see :mod:`agent_sparring.activity`): nothing below reads
+    it back, and a failed write never raises. The provider id is taken from
+    the adapter's own ``provider_id`` attribute when it has one; a fake or
+    third-party adapter without it simply produces events with no provider
+    field.
+    """
+
+    provider = getattr(adapter, "provider_id", None)
+    return stage.activity_log().bind(
+        "stage", provider=provider if isinstance(provider, str) else None
+    )
 
 
 def run_stage_agent(
@@ -138,15 +155,27 @@ def run_stage_agent(
                 expected_branch=expected_branch,
                 self_check=self_check,
             )
+
+            # Observational telemetry only: emitted alongside the existing
+            # control flow, never consulted by it. Failure summaries are
+            # fixed phrases, not exception text (which can carry provider
+            # stdout).
+            activity = _stage_emitter(stage, adapter)
+            resumed = resume_id is not None
+            activity.emit("turn.started", resumed=resumed, session_id=resume_id)
             try:
                 if resume_id:
                     result = adapter.resume(resume_id, prompt)
                 else:
                     result = adapter.start(prompt)
             except ProviderError as exc:
+                activity.emit("turn.failed", resumed=resumed, summary="provider error")
                 raise StageAgentRunError(str(exc)) from exc
 
             if resume_id and result.session_id != resume_id:
+                activity.emit(
+                    "turn.failed", resumed=resumed, summary="session identity mismatch"
+                )
                 raise StageAgentRunError(
                     f"provider was asked to resume session {resume_id!r} but "
                     f"returned session {result.session_id!r}; refusing to "
@@ -156,6 +185,12 @@ def run_stage_agent(
             try:
                 ensure_branch_for_unattended_run(repo_root, expected_branch=expected_branch)
             except BranchGuardError as exc:
+                activity.emit(
+                    "turn.failed",
+                    resumed=resumed,
+                    session_id=result.session_id,
+                    summary="worktree left the expected branch",
+                )
                 raise StageAgentRunError(
                     f"provider turn left the worktree off the expected branch: {exc}"
                 ) from exc
@@ -164,6 +199,12 @@ def run_stage_agent(
             # ran) if this was the first run; it is never moved forward here.
             state.implementation_session_id = result.session_id
             stage.write_state(state)
+            activity.emit(
+                "turn.finished",
+                resumed=resumed,
+                session_id=result.session_id,
+                summary="provider reported is_error=true" if result.is_error else None,
+            )
 
             try:
                 handoff = generate_handoff(
@@ -176,6 +217,7 @@ def run_stage_agent(
                 )
             except GitContextError as exc:
                 raise StageAgentRunError(str(exc)) from exc
+            activity.emit("handoff.ready", session_id=result.session_id)
     except WorktreeLockError as exc:
         raise StageAgentRunError(str(exc)) from exc
 

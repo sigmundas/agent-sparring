@@ -28,10 +28,11 @@ from agent_sparring.handoff import generate_handoff
 from agent_sparring.loop import DEFAULT_MAX_SEND_BACK_CYCLES, LoopError, run_unattended_loop
 from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
+    PROVIDER_ID as CLAUDE_PROVIDER_ID,
     ClaudeCliAdapter,
 )
 from agent_sparring.providers import ProviderError
-from agent_sparring.providers.codex_cli import CodexCliAdapter
+from agent_sparring.providers.codex_cli import PROVIDER_ID as CODEX_PROVIDER_ID, CodexCliAdapter
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.sparring_exchange import record_sparring
@@ -206,6 +207,7 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
             executable=args.claude_executable,
             permission_mode=args.permission_mode,
             model=args.model,
+            activity=stage.activity_log().bind("stage", provider=CLAUDE_PROVIDER_ID),
         )
         run_result = run_stage_agent(
             stage,
@@ -274,6 +276,7 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
             repo_root=repo_root,
             executable=args.codex_executable,
             model=args.model,
+            activity=stage.activity_log().bind("sparrer", provider=CODEX_PROVIDER_ID),
         )
         run_result = run_sparring_agent(
             stage, sparring_dir, repo_root, adapter, expected_branch=args.expected_branch
@@ -313,11 +316,15 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
                 f"unsupported stage agent provider {stage_provider!r}; only "
                 "'claude-cli' is implemented so far"
             )
+        # Both adapters append to the same per-stage activity.jsonl (see
+        # agent_sparring.activity): observational only, never read back.
+        activity_log = stage.activity_log()
         stage_adapter = ClaudeCliAdapter(
             repo_root=repo_root,
             executable=args.claude_executable,
             permission_mode=args.permission_mode,
             model=args.stage_model,
+            activity=activity_log.bind("stage", provider=CLAUDE_PROVIDER_ID),
         )
 
         sparring_provider = _resolve_sparring_provider(args.sparring_provider, sparring_dir)
@@ -332,6 +339,7 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             repo_root=repo_root,
             executable=args.codex_executable,
             model=args.sparring_model,
+            activity=activity_log.bind("sparrer", provider=CODEX_PROVIDER_ID),
         )
 
         loop_result = run_unattended_loop(

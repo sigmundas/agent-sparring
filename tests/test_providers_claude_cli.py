@@ -1,10 +1,13 @@
+import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import conftest_path  # noqa: F401
 
+from agent_sparring.activity import ActivityLog
 from agent_sparring.providers import ProviderError
 from agent_sparring.providers.claude_cli import ClaudeCliAdapter
 
@@ -22,7 +25,7 @@ class ClaudeCliAdapterStartTests(unittest.TestCase):
     def test_start_builds_expected_args_and_parses_session_id(self):
         captured = {}
 
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             captured["args"] = args
             captured["cwd"] = cwd
             return _fake_result(0, '{"session_id": "abc-123", "result": "done", "is_error": false}')
@@ -41,7 +44,8 @@ class ClaudeCliAdapterStartTests(unittest.TestCase):
                 "-p",
                 "do the thing",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "--permission-mode",
                 "acceptEdits",
             ],
@@ -50,7 +54,7 @@ class ClaudeCliAdapterStartTests(unittest.TestCase):
     def test_start_never_passes_resume_flag(self):
         captured = {}
 
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             captured["args"] = args
             return _fake_result(0, '{"session_id": "x", "result": "", "is_error": false}')
 
@@ -61,7 +65,7 @@ class ClaudeCliAdapterStartTests(unittest.TestCase):
     def test_model_and_extra_args_are_included(self):
         captured = {}
 
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             captured["args"] = args
             return _fake_result(0, '{"session_id": "x", "result": "", "is_error": false}')
 
@@ -87,7 +91,7 @@ class ClaudeCliAdapterResumeTests(unittest.TestCase):
     def test_resume_passes_session_id_and_returns_same_id(self):
         captured = {}
 
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             captured["args"] = args
             return _fake_result(0, '{"session_id": "abc-123", "result": "ok", "is_error": false}')
 
@@ -101,7 +105,7 @@ class ClaudeCliAdapterResumeTests(unittest.TestCase):
     def test_resume_rejects_empty_session_id_without_invoking_runner(self):
         called = []
 
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             called.append(True)
             return _fake_result(0, "{}")
 
@@ -113,7 +117,7 @@ class ClaudeCliAdapterResumeTests(unittest.TestCase):
     def test_resume_of_unknown_session_raises_provider_error(self):
         # Verified against a real claude CLI: resuming an unknown session id
         # exits non-zero and prints a plain-text error, not JSON.
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             return _fake_result(
                 1, "No conversation found with session ID: 00000000-0000-0000-0000-000000000000"
             )
@@ -131,7 +135,7 @@ class ClaudeCliAdapterParsingFailureTests(unittest.TestCase):
         self.repo_root = Path(self._tmp.name)
 
     def test_non_json_output_raises_provider_error(self):
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             return _fake_result(0, "not json at all")
 
         adapter = ClaudeCliAdapter(repo_root=self.repo_root, runner=runner)
@@ -139,7 +143,7 @@ class ClaudeCliAdapterParsingFailureTests(unittest.TestCase):
             adapter.start("hi")
 
     def test_missing_session_id_raises_provider_error(self):
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             return _fake_result(0, '{"result": "done", "is_error": false}')
 
         adapter = ClaudeCliAdapter(repo_root=self.repo_root, runner=runner)
@@ -147,7 +151,7 @@ class ClaudeCliAdapterParsingFailureTests(unittest.TestCase):
             adapter.start("hi")
 
     def test_json_array_output_raises_provider_error(self):
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             return _fake_result(0, "[1, 2, 3]")
 
         adapter = ClaudeCliAdapter(repo_root=self.repo_root, runner=runner)
@@ -155,7 +159,7 @@ class ClaudeCliAdapterParsingFailureTests(unittest.TestCase):
             adapter.start("hi")
 
     def test_launch_failure_raises_provider_error(self):
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             raise FileNotFoundError("no such executable")
 
         adapter = ClaudeCliAdapter(repo_root=self.repo_root, runner=runner)
@@ -163,13 +167,321 @@ class ClaudeCliAdapterParsingFailureTests(unittest.TestCase):
             adapter.start("hi")
 
     def test_is_error_true_is_surfaced_not_raised(self):
-        def runner(args, cwd, timeout_seconds):
+        def runner(args, cwd, timeout_seconds, on_line=None):
             return _fake_result(0, '{"session_id": "x", "result": "oops", "is_error": true}')
 
         adapter = ClaudeCliAdapter(repo_root=self.repo_root, runner=runner)
         result = adapter.start("hi")
         self.assertTrue(result.is_error)
         self.assertEqual(result.text, "oops")
+
+
+
+def _jsonl(*events: dict) -> str:
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+def _read_events(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+_SECRET_PROMPT = "PROMPT-TEXT-MUST-NOT-LEAK"
+_SECRET_OLD = "OLD-STRING-MUST-NOT-LEAK"
+_SECRET_NEW = "NEW-STRING-MUST-NOT-LEAK"
+_SECRET_CMD = "pytest -q --token=COMMAND-TEXT-MUST-NOT-LEAK"
+_SECRET_OUT = "TOOL-OUTPUT-MUST-NOT-LEAK 12 passed"
+
+
+def _stream_fixture(*, with_model: bool = True, session_id: str = "abc-123") -> str:
+    init = {"type": "system", "subtype": "init", "session_id": session_id, "cwd": "/repo"}
+    if with_model:
+        init["model"] = "claude-fable-5-1"
+    return _jsonl(
+        init,
+        {
+            "type": "assistant",
+            "session_id": session_id,
+            "parent_tool_use_id": None,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Let me edit."},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_edit",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "src/statistics.py",
+                            "old_string": _SECRET_OLD,
+                            "new_string": _SECRET_NEW,
+                        },
+                    },
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "session_id": session_id,
+            "parent_tool_use_id": None,
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_edit", "content": "ok"}
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "session_id": session_id,
+            "parent_tool_use_id": None,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_bash",
+                        "name": "Bash",
+                        "input": {"command": _SECRET_CMD, "description": "run tests"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "session_id": session_id,
+            "parent_tool_use_id": None,
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_bash", "content": _SECRET_OUT}
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "session_id": session_id,
+            "parent_tool_use_id": None,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_read", "name": "Read",
+                     "input": {"file_path": "src/other.py"}}
+                ],
+            },
+        },
+        {"type": "stream_event", "session_id": session_id,
+         "event": {"type": "content_block_delta", "delta": {"text": "partial"}}},
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "done",
+            "session_id": session_id,
+            "num_turns": 4,
+            "total_cost_usd": 0.01,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        },
+    )
+
+
+class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo_root = Path(self._tmp.name)
+        self.activity_path = self.repo_root / "activity.jsonl"
+        self.emitter = ActivityLog(self.activity_path).bind("stage", provider="claude-cli")
+
+    def _streaming_runner(self, stdout: str, *, returncode: int = 0):
+        """A fake runner that feeds stdout to on_line line by line, as the
+        real streaming runner does, then returns the completed process."""
+
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            if on_line is not None:
+                for line in stdout.splitlines():
+                    on_line(line)
+            return _fake_result(returncode, stdout)
+
+        return runner
+
+    def test_jsonl_output_yields_the_same_final_result_as_the_single_object(self):
+        adapter = ClaudeCliAdapter(
+            repo_root=self.repo_root, runner=self._streaming_runner(_stream_fixture())
+        )
+        result = adapter.start(_SECRET_PROMPT)
+
+        self.assertEqual(result.session_id, "abc-123")
+        self.assertEqual(result.text, "done")
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.raw["type"], "result")
+        self.assertEqual(result.raw["num_turns"], 4)
+
+    def test_jsonl_without_a_result_line_raises_provider_error(self):
+        stdout = _jsonl({"type": "system", "subtype": "init", "session_id": "x"})
+        adapter = ClaudeCliAdapter(repo_root=self.repo_root, runner=self._streaming_runner(stdout))
+        with self.assertRaises(ProviderError):
+            adapter.start("hi")
+
+    def test_jsonl_result_with_is_error_true_is_surfaced_not_raised(self):
+        stdout = _jsonl(
+            {"type": "system", "subtype": "init", "session_id": "x"},
+            {"type": "result", "subtype": "error_during_execution", "is_error": True,
+             "result": "oops", "session_id": "x"},
+        )
+        adapter = ClaudeCliAdapter(repo_root=self.repo_root, runner=self._streaming_runner(stdout))
+        result = adapter.start("hi")
+        self.assertTrue(result.is_error)
+        self.assertEqual(result.text, "oops")
+
+    def test_translator_emits_semantic_events_only(self):
+        adapter = ClaudeCliAdapter(
+            repo_root=self.repo_root,
+            runner=self._streaming_runner(_stream_fixture()),
+            activity=self.emitter,
+        )
+        adapter.start(_SECRET_PROMPT)
+
+        events = _read_events(self.activity_path)
+        self.assertEqual(
+            [e["event"] for e in events],
+            ["session.started", "file.edited", "command.started", "command.finished",
+             "tool.call", "provider.result"],
+        )
+        session = events[0]
+        self.assertEqual((session["session_id"], session["model"], session["provider"]),
+                         ("abc-123", "claude-fable-5-1", "claude-cli"))
+        edited = events[1]
+        self.assertEqual((edited["tool"], edited["path"]), ("Edit", "src/statistics.py"))
+        self.assertEqual(set(edited) - {"v", "ts", "actor", "event", "provider"}, {"tool", "path"})
+        started, finished = events[2], events[3]
+        self.assertEqual((started["tool"], started["tool_use_id"]), ("Bash", "toolu_bash"))
+        self.assertEqual(finished["tool_use_id"], "toolu_bash")
+        self.assertEqual(events[4]["tool"], "Read")
+        self.assertEqual(events[5]["summary"], "success, 4 turn(s)")
+
+    def test_forbidden_content_never_reaches_the_activity_log(self):
+        adapter = ClaudeCliAdapter(
+            repo_root=self.repo_root,
+            runner=self._streaming_runner(_stream_fixture()),
+            activity=self.emitter,
+        )
+        adapter.start(_SECRET_PROMPT)
+
+        text = self.activity_path.read_text(encoding="utf-8")
+        for secret in (_SECRET_PROMPT, _SECRET_OLD, _SECRET_NEW, _SECRET_CMD, _SECRET_OUT,
+                       "partial", "Let me edit.", "run tests", "12 passed"):
+            self.assertNotIn(secret, text)
+        for key in ("command", "old_string", "new_string", "input", "content", "usage",
+                    "total_cost_usd"):
+            self.assertNotIn(f'"{key}"', text)
+
+    def test_model_and_session_only_when_supplied(self):
+        adapter = ClaudeCliAdapter(
+            repo_root=self.repo_root,
+            runner=self._streaming_runner(_stream_fixture(with_model=False)),
+            activity=self.emitter,
+        )
+        adapter.start("hi")
+        session = _read_events(self.activity_path)[0]
+        self.assertEqual(session["event"], "session.started")
+        self.assertNotIn("model", session)
+        self.assertEqual(session["session_id"], "abc-123")
+
+        # No init line at all: no session.started, and nothing invented.
+        self.activity_path.unlink()
+        stdout = _jsonl({"type": "result", "subtype": "success", "is_error": False,
+                         "result": "x", "session_id": "s"})
+        ClaudeCliAdapter(
+            repo_root=self.repo_root, runner=self._streaming_runner(stdout), activity=self.emitter
+        ).start("hi")
+        names = [e["event"] for e in _read_events(self.activity_path)]
+        self.assertEqual(names, ["provider.result"])
+
+    def test_subagent_detection_is_conservative(self):
+        stdout = _jsonl(
+            {"type": "system", "subtype": "init", "session_id": "s"},
+            # A nested message alone (parent_tool_use_id set) is NOT a new
+            # subagent: it is just attributed to its parent.
+            {"type": "assistant", "session_id": "s", "parent_tool_use_id": "toolu_parent",
+             "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Grep",
+                                      "input": {"pattern": "x"}}]}},
+            # An actual Task tool call IS a subagent start.
+            {"type": "assistant", "session_id": "s", "parent_tool_use_id": None,
+             "message": {"content": [{"type": "tool_use", "id": "toolu_task", "name": "Task",
+                                      "input": {"description": "explore",
+                                                "prompt": "SUBAGENT-PROMPT-MUST-NOT-LEAK",
+                                                "subagent_type": "Explore"}}]}},
+            {"type": "result", "subtype": "success", "is_error": False, "result": "x",
+             "session_id": "s"},
+        )
+        ClaudeCliAdapter(
+            repo_root=self.repo_root, runner=self._streaming_runner(stdout), activity=self.emitter
+        ).start("hi")
+
+        events = _read_events(self.activity_path)
+        names = [e["event"] for e in events]
+        self.assertEqual(names, ["session.started", "tool.call", "subagent.started",
+                                 "provider.result"])
+        nested = events[1]
+        self.assertEqual((nested["tool"], nested["parent_id"]), ("Grep", "toolu_parent"))
+        subagent = events[2]
+        self.assertEqual((subagent["tool"], subagent["tool_use_id"]), ("Task", "toolu_task"))
+        self.assertNotIn("parent_id", subagent)
+        text = self.activity_path.read_text(encoding="utf-8")
+        self.assertNotIn("SUBAGENT-PROMPT", text)
+        self.assertNotIn("Explore", text)
+        self.assertNotIn("explore", text)
+
+    def test_malformed_lines_and_translator_errors_do_not_break_the_turn(self):
+        stdout = "garbage\n[1,2]\n" + _jsonl(
+            {"type": "assistant", "message": "not-a-dict"},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": 5}]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+            {"type": "result", "subtype": "success", "is_error": False, "result": "ok",
+             "session_id": "s"},
+        )
+        result = ClaudeCliAdapter(
+            repo_root=self.repo_root, runner=self._streaming_runner(stdout), activity=self.emitter
+        ).start("hi")
+        self.assertEqual(result.text, "ok")
+        self.assertEqual([e["event"] for e in _read_events(self.activity_path)],
+                         ["provider.result"])
+
+    def test_no_activity_emitter_means_no_telemetry_and_no_behavior_change(self):
+        adapter = ClaudeCliAdapter(
+            repo_root=self.repo_root, runner=self._streaming_runner(_stream_fixture())
+        )
+        result = adapter.start("hi")
+        self.assertEqual(result.session_id, "abc-123")
+        self.assertFalse(self.activity_path.exists())
+
+    def test_default_runner_streams_a_fake_executable(self):
+        # A fake "claude": a script that prints stream-json lines with a
+        # pause between them, so the run genuinely exercises the streaming
+        # default runner end to end without any real provider.
+        script = self.repo_root / "fake-claude.py"
+        script.write_text(
+            "import sys, time\n"
+            f"lines = {_stream_fixture().splitlines()!r}\n"
+            "for line in lines:\n"
+            "    print(line, flush=True)\n"
+            "    time.sleep(0.02)\n",
+            encoding="utf-8",
+        )
+        wrapper = self.repo_root / "fake-claude"
+        wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {script} \"$@\"\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+
+        adapter = ClaudeCliAdapter(
+            repo_root=self.repo_root, executable=str(wrapper), activity=self.emitter
+        )
+        result = adapter.start("hi")
+        self.assertEqual(result.session_id, "abc-123")
+        self.assertEqual(result.text, "done")
+        self.assertEqual([e["event"] for e in _read_events(self.activity_path)][:2],
+                         ["session.started", "file.edited"])
 
 
 if __name__ == "__main__":

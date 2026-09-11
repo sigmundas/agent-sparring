@@ -177,7 +177,13 @@ def run_unattended_loop(
     cycle_records: list[LoopCycleRecord] = []
     send_back_count = 0
 
+    # Observational telemetry only (see agent_sparring.activity): mirrors
+    # the routing decisions taken below, never influences them.
+    activity = stage.activity_log().bind("loop")
+    activity.emit("loop.started")
+
     while True:
+        cycle = len(cycle_records) + 1
         try:
             stage_run = run_stage_agent(
                 stage,
@@ -188,6 +194,7 @@ def run_unattended_loop(
                 self_check=self_check,
             )
         except StageAgentRunError as exc:
+            activity.emit("loop.stopped", cycle=cycle, summary="stage-agent turn failed")
             raise LoopError(f"stage-agent turn failed: {exc}") from exc
 
         if stage_run.result.is_error:
@@ -201,6 +208,9 @@ def run_unattended_loop(
             # that is left untouched here (not discarded) so a later,
             # deliberate retry can resume the same provider context. No
             # automatic retry/recovery is attempted.
+            activity.emit(
+                "loop.stopped", cycle=cycle, summary="stage-agent turn reported is_error"
+            )
             raise LoopError(
                 f"stage-agent turn for stage {stage.stage_id!r} reported "
                 f"is_error=true (session {stage_run.result.session_id!r}); "
@@ -217,6 +227,7 @@ def run_unattended_loop(
                 expected_branch=expected_branch,
             )
         except SparringAgentRunError as exc:
+            activity.emit("loop.stopped", cycle=cycle, summary="sparring-agent turn failed")
             raise LoopError(f"sparring-agent turn failed: {exc}") from exc
 
         cycle_records.append(
@@ -231,6 +242,7 @@ def run_unattended_loop(
         if action == RoutingAction.SEND_BACK:
             send_back_count += 1
             if send_back_count > max_send_back_cycles:
+                activity.emit("loop.runaway", cycle=cycle, action=action.value)
                 raise LoopRunawayError(
                     f"exceeded the configured runaway limit of "
                     f"{max_send_back_cycles} SEND_BACK cycle(s) for stage "
@@ -238,8 +250,15 @@ def run_unattended_loop(
                     "or ESCALATE; stopping cleanly rather than continuing "
                     "unbounded"
                 )
+            activity.emit(
+                "loop.send_back",
+                cycle=cycle,
+                action=action.value,
+                summary="resuming the same stage and sparring sessions",
+            )
             continue
 
+        activity.emit("loop.stopped", cycle=cycle, action=action.value)
         return LoopResult(
             outcome=action,
             routing=sparring_run.routing,

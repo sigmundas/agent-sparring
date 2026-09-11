@@ -1,6 +1,8 @@
 import contextlib
 import io
+import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -612,3 +614,163 @@ class CliAcceptanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CliRunLoopActivityStreamTests(unittest.TestCase):
+    """End to end through the real CLI, the real streaming runner and both
+    real adapters, against fake ``claude``/``codex`` executables (small
+    scripts printing canned structured output) -- no provider quota."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.repo = root / "repo"
+        self.repo.mkdir(parents=True)
+        _run_git(self.repo, "init", "-q", "-b", "main")
+        _run_git(self.repo, "config", "user.email", "test@example.com")
+        _run_git(self.repo, "config", "user.name", "Test")
+        (self.repo / "f.txt").write_text("hi\n", encoding="utf-8")
+        _run_git(self.repo, "add", "f.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "base")
+        _run_git(self.repo, "checkout", "-q", "-b", "feature/x")
+        self.sparring_dir = self.repo / ".sparring"
+        main(["--sparring-dir", str(self.sparring_dir), "new-stage", "stage-1"])
+        self.stage_dir = self.sparring_dir / "stages" / "stage-1"
+
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.claude = self._script(
+            "fake-claude",
+            """
+import json, sys, time
+sid = "impl-1"
+lines = [
+    {"type": "system", "subtype": "init", "session_id": sid, "model": "fake-model"},
+    {"type": "assistant", "session_id": sid, "parent_tool_use_id": None,
+     "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Edit",
+                              "input": {"file_path": "f.txt", "old_string": "OLD-LEAK",
+                                        "new_string": "NEW-LEAK"}}]}},
+    {"type": "assistant", "session_id": sid, "parent_tool_use_id": None,
+     "message": {"content": [{"type": "tool_use", "id": "t2", "name": "Bash",
+                              "input": {"command": "pytest -q CMD-LEAK"}}]}},
+    {"type": "user", "session_id": sid, "parent_tool_use_id": None,
+     "message": {"content": [{"type": "tool_result", "tool_use_id": "t2",
+                              "content": "OUTPUT-LEAK 3 passed"}]}},
+    {"type": "result", "subtype": "success", "is_error": False, "result": "implemented",
+     "session_id": sid, "num_turns": 3},
+]
+for line in lines:
+    print(json.dumps(line), flush=True)
+    time.sleep(0.01)
+""",
+        )
+        self.codex = self._script(
+            "fake-codex",
+            """
+import json, sys, time, os
+args = sys.argv[1:]
+out = args[args.index("-o") + 1]
+counter = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex-calls")
+n = int(open(counter).read()) if os.path.exists(counter) else 0
+open(counter, "w").write(str(n + 1))
+action = "SEND_BACK" if n == 0 else "READY"
+verdict = {"action": action, "summary": f"verdict {n}", "needs_you_reason": None,
+           "findings": "FINDINGS-LEAK", "deferred": None}
+lines = [
+    {"type": "thread.started", "thread_id": "thread-1"},
+    {"type": "turn.started"},
+    {"type": "item.completed", "item": {"id": "r", "type": "reasoning", "text": "REASONING-LEAK"}},
+    {"type": "item.started", "item": {"id": "c", "type": "command_execution",
+                                      "command": "git status CMD-LEAK", "status": "in_progress"}},
+    {"type": "item.completed", "item": {"id": "c", "type": "command_execution",
+                                        "command": "git status CMD-LEAK",
+                                        "aggregated_output": "OUTPUT-LEAK", "exit_code": 0,
+                                        "status": "completed"}},
+    {"type": "item.completed", "item": {"id": "m", "type": "agent_message",
+                                        "text": json.dumps(verdict)}},
+    {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 2}},
+]
+for line in lines:
+    print(json.dumps(line), flush=True)
+    time.sleep(0.01)
+open(out, "w").write(json.dumps(verdict))
+""",
+        )
+
+    def _script(self, name: str, body: str) -> Path:
+        script = self.bin / f"{name}.py"
+        script.write_text(body.lstrip("\n"), encoding="utf-8")
+        wrapper = self.bin / name
+        wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {script} \"$@\"\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def _events(self) -> list[dict]:
+        path = self.stage_dir / "activity.jsonl"
+        return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l]
+
+    def test_run_loop_streams_provider_and_lifecycle_events(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "--sparring-dir", str(self.sparring_dir),
+                    "run-loop", "stage-1",
+                    "--repo-root", str(self.repo),
+                    "--expected-branch", "feature/x",
+                    "--claude-executable", str(self.claude),
+                    "--codex-executable", str(self.codex),
+                ]
+            )
+        self.assertEqual(exit_code, 0, stderr.getvalue())
+        self.assertIn("outcome=READY cycles=2 send_back_count=1", stderr.getvalue())
+
+        state = json.loads((self.stage_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["implementation_session_id"], "impl-1")
+        self.assertEqual(state["sparring_session_id"], "thread-1")
+
+        names = [f"{e['actor']}:{e['event']}" for e in self._events()]
+        expected_cycle = [
+            "stage:turn.started",
+            "stage:session.started",
+            "stage:file.edited",
+            "stage:command.started",
+            "stage:command.finished",
+            "stage:provider.result",
+            "stage:turn.finished",
+            "stage:handoff.ready",
+            "sparrer:sparring.started",
+            "sparrer:session.started",
+            "sparrer:command.started",
+            "sparrer:command.finished",
+            "sparrer:provider.result",
+            "sparrer:verdict",
+        ]
+        self.assertEqual(
+            names,
+            ["loop:loop.started"] + expected_cycle + ["loop:loop.send_back"]
+            + expected_cycle + ["loop:loop.stopped"],
+        )
+
+        events = self._events()
+        sessions = [e for e in events if e["event"] == "session.started"]
+        self.assertEqual([s["provider"] for s in sessions],
+                         ["claude-cli", "codex-cli", "claude-cli", "codex-cli"])
+        self.assertEqual((sessions[0]["session_id"], sessions[0]["model"]),
+                         ("impl-1", "fake-model"))
+        self.assertNotIn("model", sessions[1])
+        self.assertEqual([e["path"] for e in events if e["event"] == "file.edited"],
+                         ["f.txt", "f.txt"])
+        self.assertEqual([e["action"] for e in events if e["event"] == "verdict"],
+                         ["SEND_BACK", "READY"])
+        second_turn = [e for e in events if e["event"] == "turn.started"][1]
+        self.assertEqual((second_turn["resumed"], second_turn["session_id"]), (True, "impl-1"))
+        second_sparring = [e for e in events if e["event"] == "sparring.started"][1]
+        self.assertEqual((second_sparring["resumed"], second_sparring["session_id"]),
+                         (True, "thread-1"))
+
+        text = (self.stage_dir / "activity.jsonl").read_text(encoding="utf-8")
+        for leak in ("OLD-LEAK", "NEW-LEAK", "CMD-LEAK", "OUTPUT-LEAK", "REASONING-LEAK",
+                     "FINDINGS-LEAK", "3 passed", "Do the thing", "Stage brief"):
+            self.assertNotIn(leak, text)

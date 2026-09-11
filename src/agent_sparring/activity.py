@@ -1,0 +1,187 @@
+"""Append-only observational activity stream (``activity.jsonl``).
+
+This module is telemetry, not workflow state. Per the project plan ("an
+optional append-only activity log may exist for observability, but it must
+not become the authority controlling which workflow transitions are
+legal"), nothing in orchestration reads the activity log to decide routing,
+lifecycle status, acceptance, resume behavior, candidate identity, or
+provider session identity. Deleting, corrupting, or making the log
+unwritable leaves every orchestration outcome unchanged; the tests in
+``tests/test_activity_non_authority.py`` prove that behaviorally.
+
+Consequently this module offers no read API at all, and :meth:`ActivityLog.
+emit` never raises: the first write failure silently disables that log
+instance for the rest of the process. No warning is printed and no exit
+code changes -- telemetry failure is not an orchestration event.
+
+Event shape (schema version 1). Every line is one JSON object with a
+fixed envelope::
+
+    {"v": 1, "ts": "<UTC ISO 8601>", "actor": "...", "event": "..."}
+
+plus, only when genuinely applicable, a small closed set of semantic fields
+(see :data:`OPTIONAL_FIELDS`). Anything outside that set is dropped before
+the line is written, so a caller cannot smuggle a raw provider payload,
+prompt text, tool output, or shell command text into the log by accident.
+Prompt text, chain-of-thought, tool inputs/outputs, diffs, and command
+strings are never fields here by design.
+
+This module deliberately imports nothing from the stage/loop/provider
+modules: provider adapters emit through an :class:`ActivityEmitter` and
+know nothing about stage directories or lifecycle semantics.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping
+
+SCHEMA_VERSION = 1
+
+# Actor vocabulary. "stage" is the implementation side (both its provider's
+# own events and the stage-turn lifecycle), "sparrer" the sparring side,
+# "loop" the unattended router's control decisions, "gate" the acceptance
+# gate (freeze/accept).
+ACTORS = ("stage", "sparrer", "loop", "gate")
+
+# The only semantic fields an event may carry beyond the envelope. Closed
+# on purpose: adding a field is a schema decision, not a call-site
+# convenience. In particular there is no field for command text, tool
+# input, tool output, prompt text, or arbitrary provider payloads.
+OPTIONAL_FIELDS = frozenset(
+    {
+        "provider",  # adapter id, e.g. "claude-cli"
+        "session_id",  # provider-issued session/thread id
+        "model",  # only when the provider's own output states it
+        "summary",  # one short human-readable line; never universally required
+        "action",  # routing action, on a verdict
+        "cycle",  # 1-based unattended-loop cycle number
+        "sha",  # full commit id, on acceptance-gate events
+        "tool",  # provider tool name, e.g. "Edit", "Bash", "shell"
+        "path",  # repo path a file event is about (never its contents)
+        "kind",  # semantic change kind when the provider states it (add/update/delete)
+        "exit_code",  # process exit status when the provider reports it
+        "resumed",  # whether a turn resumed an existing provider session
+        "parent_id",  # provider-established parent tool-use id for nested-agent activity
+        "tool_use_id",  # provider-issued id of the tool call an event is about
+    }
+)
+
+SUMMARY_MAX_CHARS = 200
+
+
+def _utc_now_iso() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def truncate(text: str, limit: int = SUMMARY_MAX_CHARS) -> str:
+    """Clamp a human-readable one-liner to ``limit`` characters."""
+
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
+def _clean_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only allowed, non-None fields, with the summary clamped."""
+
+    cleaned: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key not in OPTIONAL_FIELDS or value is None:
+            continue
+        if key == "summary":
+            value = truncate(str(value))
+        cleaned[key] = value
+    return cleaned
+
+
+@dataclass
+class ActivityLog:
+    """One append-only JSONL activity file.
+
+    ``emit`` never raises. After the first failed write (unwritable path, a
+    directory where the file should be, disk full, ...) the instance marks
+    itself disabled and every later emit is a silent no-op. There is
+    intentionally no method that reads the file.
+    """
+
+    path: Path
+    disabled: bool = False
+
+    def emit(self, actor: str, event: str, **fields: Any) -> None:
+        if self.disabled:
+            return
+        try:
+            record: dict[str, Any] = {
+                "v": SCHEMA_VERSION,
+                "ts": _utc_now_iso(),
+                "actor": str(actor),
+                "event": str(event),
+            }
+            record.update(_clean_fields(fields))
+            line = (
+                json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
+                + "\n"
+            )
+            data = line.encode("utf-8")
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+        except Exception:
+            # Telemetry failure is silent and non-fatal by decision: no
+            # exception into orchestration, no stderr warning, no exit-code
+            # change. Just stop trying for this instance.
+            self.disabled = True
+
+    def bind(self, actor: str, *, provider: str | None = None) -> "ActivityEmitter":
+        return ActivityEmitter(log=self, actor=actor, provider=provider)
+
+
+@dataclass(frozen=True)
+class ActivityEmitter:
+    """A view onto an :class:`ActivityLog` with the actor (and optionally
+    the provider id) fixed, so a provider adapter can emit its own events
+    without knowing which stage, role, or file it is serving."""
+
+    log: ActivityLog
+    actor: str
+    provider: str | None = None
+
+    def emit(self, event: str, **fields: Any) -> None:
+        if self.provider is not None and "provider" not in fields:
+            fields["provider"] = self.provider
+        self.log.emit(self.actor, event, **fields)
+
+
+def emit(emitter: ActivityEmitter | None, event: str, **fields: Any) -> None:
+    """Emit through ``emitter`` if there is one; a ``None`` emitter is silent.
+
+    Small convenience so adapters can write ``emit(self.activity, ...)``
+    without a None check at every call site.
+    """
+
+    if emitter is not None:
+        emitter.emit(event, **fields)
+
+
+__all__ = [
+    "ACTORS",
+    "ActivityEmitter",
+    "ActivityLog",
+    "OPTIONAL_FIELDS",
+    "SCHEMA_VERSION",
+    "SUMMARY_MAX_CHARS",
+    "emit",
+    "truncate",
+]

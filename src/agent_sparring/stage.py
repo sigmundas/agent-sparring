@@ -8,6 +8,7 @@ Conceptually, a project-local stage lives at::
         state.json
         handoff.md
         sparring.md
+        activity.jsonl   (observational only; see agent_sparring.activity)
 
 This module resolves stage directories safely, creates a new stage skeleton,
 and reads/writes the minimal machine state as JSON. It does not implement any
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_sparring import templates
+from agent_sparring.activity import ActivityLog
 
 STAGES_DIRNAME = "stages"
 STATE_FILENAME = "state.json"
@@ -31,6 +33,9 @@ BRIEF_FILENAME = "brief.md"
 NOTES_FILENAME = "notes.md"
 HANDOFF_FILENAME = "handoff.md"
 SPARRING_FILENAME = "sparring.md"
+# Append-only observational telemetry. Never read by orchestration; not
+# created by Stage.create (it appears on first emit, if writable).
+ACTIVITY_FILENAME = "activity.jsonl"
 
 _STAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -212,6 +217,21 @@ class Stage:
             json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    # -- observational activity stream -------------------------------------
+
+    def activity_path(self) -> Path:
+        return self.directory / ACTIVITY_FILENAME
+
+    def activity_log(self) -> ActivityLog:
+        """A write-only handle onto this stage's ``activity.jsonl``.
+
+        Orchestration code opens the log through this method and only ever
+        emits to it; there is no corresponding reader anywhere in the
+        package (see :mod:`agent_sparring.activity`).
+        """
+
+        return ActivityLog(self.activity_path())
 
     # -- human-readable artifacts ------------------------------------------
 

@@ -66,6 +66,18 @@ otherwise -- to select anything else. A future contributor-sparrer mode
 (one that legitimately edits and forfeits independent acceptance
 authority) would be a distinct adapter/mode, not a flag on this one.
 
+Activity stream: the same ``--json`` JSONL this adapter already parses for
+its final result is also consumed line by line while ``codex`` runs, and
+translated into observational events (see :class:`_CodexStreamTranslator`
+and :mod:`agent_sparring.activity`). Item vocabulary follows Codex's
+``exec_events`` (``command_execution``, ``file_change``, ``mcp_tool_call``,
+``collab_tool_call``, ``web_search``, ``agent_message``, ``reasoning``,
+``todo_list``, ``error``; the installed 0.153.4 binary carries all of these
+names). Only semantic facts are recorded: never ``reasoning``/
+``agent_message`` text, ``aggregated_output``, command strings, MCP
+arguments/results, or raw events. The final parse below is unchanged and
+does not depend on anything the translator does.
+
 This module is the only place that knows any of the above. Generic
 orchestration code talks to the :class:`~agent_sparring.providers.
 SparringAgentAdapter` protocol, not to ``codex`` flags directly.
@@ -78,12 +90,15 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from agent_sparring.providers import ProviderError, SparringAgentResult
+from agent_sparring.activity import ActivityEmitter, emit
+from agent_sparring.providers import ProviderError, Runner, SparringAgentResult
+from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 
 DEFAULT_EXECUTABLE = "codex"
 DEFAULT_SANDBOX = "read-only"
+PROVIDER_ID = "codex-cli"
 
 # Verified live (see module docstring): "codex exec resume" rejects the
 # top-level --sandbox flag outright, and without any override does not
@@ -119,21 +134,123 @@ VERDICT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-Runner = Callable[[list[str], Path, "float | None"], "subprocess.CompletedProcess[str]"]
-
-
 def _default_runner(
-    args: list[str], cwd: Path, timeout_seconds: float | None
+    args: list[str], cwd: Path, timeout_seconds: float | None, on_line: LineSink | None
 ) -> "subprocess.CompletedProcess[str]":
-    return subprocess.run(
-        args,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
-        stdin=subprocess.DEVNULL,
-    )
+    return run_streaming(args, cwd, timeout_seconds, on_line, stdin_devnull=True)
+
+
+def _str_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+class _CodexStreamTranslator:
+    """Turns ``codex exec --json`` lines into activity events.
+
+    Observational only. Emits nothing for ``reasoning``, ``agent_message``,
+    ``todo_list`` and ``item.updated`` progress, and never reads
+    ``aggregated_output``, ``command``, ``arguments``, ``result``, ``prompt``
+    or any error message text.
+    """
+
+    def __init__(self, emitter: ActivityEmitter | None) -> None:
+        self._emitter = emitter
+        self._started_items: set[str] = set()
+
+    def feed(self, line: str) -> None:
+        if self._emitter is None:
+            return
+        line = line.strip()
+        if not line:
+            return
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        if kind == "thread.started":
+            emit(
+                self._emitter,
+                "session.started",
+                session_id=_str_or_none(event.get("thread_id")),
+            )
+        elif kind in ("item.started", "item.completed"):
+            item = event.get("item")
+            if isinstance(item, dict):
+                self._item(kind, item)
+        elif kind == "turn.completed":
+            emit(self._emitter, "provider.result", summary=self._usage_summary(event))
+        elif kind in ("turn.failed", "error"):
+            # The provider reported a failure. Its message text is not
+            # recorded here; the adapter's final parse raises with it.
+            emit(self._emitter, "provider.error")
+
+    @staticmethod
+    def _usage_summary(event: dict[str, Any]) -> str | None:
+        usage = event.get("usage")
+        if not isinstance(usage, dict):
+            return None
+        parts = []
+        for key, label in (("input_tokens", "in"), ("output_tokens", "out")):
+            value = usage.get(key)
+            if isinstance(value, int):
+                parts.append(f"{label}={value}")
+        return f"tokens {' '.join(parts)}" if parts else None
+
+    def _item(self, kind: str, item: dict[str, Any]) -> None:
+        item_type = item.get("type")
+        item_id = _str_or_none(item.get("id")) or ""
+        started = kind == "item.started"
+        completed = kind == "item.completed"
+
+        if item_type == "command_execution":
+            if started:
+                self._started_items.add(item_id)
+                emit(self._emitter, "command.started", tool="shell")
+            elif completed:
+                exit_code = item.get("exit_code")
+                emit(
+                    self._emitter,
+                    "command.finished",
+                    tool="shell",
+                    exit_code=exit_code if isinstance(exit_code, int) else None,
+                )
+        elif item_type == "file_change":
+            if not completed:
+                return
+            changes = item.get("changes")
+            if not isinstance(changes, list):
+                return
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                emit(
+                    self._emitter,
+                    "file.changed",
+                    path=_str_or_none(change.get("path")),
+                    kind=_str_or_none(change.get("kind")),
+                )
+        elif item_type == "mcp_tool_call":
+            if started or (completed and item_id not in self._started_items):
+                self._started_items.add(item_id)
+                server = _str_or_none(item.get("server"))
+                tool = _str_or_none(item.get("tool"))
+                name = f"{server}:{tool}" if server and tool else (tool or server)
+                emit(self._emitter, "tool.call", tool=name)
+        elif item_type == "collab_tool_call":
+            # Codex's own multi-agent item: the provider states that a
+            # collaboration tool ran. Only the tool name is recorded (never
+            # the prompt or agent states).
+            if started or (completed and item_id not in self._started_items):
+                self._started_items.add(item_id)
+                emit(self._emitter, "subagent.started", tool=_str_or_none(item.get("tool")))
+        elif item_type == "web_search":
+            if started or (completed and item_id not in self._started_items):
+                self._started_items.add(item_id)
+                emit(self._emitter, "tool.call", tool="web_search")
+        # agent_message, reasoning, todo_list, error: deliberately ignored.
 
 
 @dataclass
@@ -158,6 +275,11 @@ class CodexCliAdapter:
     model: str | None = None
     timeout_seconds: float | None = None
     runner: Runner = field(default=_default_runner)
+    # Optional observational emitter; None means no telemetry, nothing else
+    # changes. Never consulted by the final parse.
+    activity: ActivityEmitter | None = None
+
+    provider_id: str = PROVIDER_ID
 
     # Confirmed by direct probe (see module docstring): codex exec resume
     # continues the same thread. A future provider that cannot resume should
@@ -213,8 +335,11 @@ class CodexCliAdapter:
             output_path = Path(tmp_dir) / "last_message.txt"
 
             args = self._build_args(prompt, resume_session_id, schema_path, output_path)
+            translator = _CodexStreamTranslator(self.activity)
             try:
-                result = self.runner(args, self.repo_root, self.timeout_seconds)
+                result = self.runner(
+                    args, self.repo_root, self.timeout_seconds, translator.feed
+                )
             except OSError as exc:
                 raise ProviderError(f"could not launch {self.executable!r}: {exc}") from exc
             except subprocess.TimeoutExpired as exc:
@@ -294,4 +419,10 @@ class CodexCliAdapter:
         )
 
 
-__all__ = ["CodexCliAdapter", "DEFAULT_EXECUTABLE", "DEFAULT_SANDBOX", "VERDICT_SCHEMA"]
+__all__ = [
+    "CodexCliAdapter",
+    "DEFAULT_EXECUTABLE",
+    "DEFAULT_SANDBOX",
+    "PROVIDER_ID",
+    "VERDICT_SCHEMA",
+]
