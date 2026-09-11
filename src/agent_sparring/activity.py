@@ -37,7 +37,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 
 SCHEMA_VERSION = 1
@@ -89,6 +89,92 @@ def truncate(text: str, limit: int = SUMMARY_MAX_CHARS) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)] + "…"
+
+
+def _split_lexical(raw: str) -> tuple[bool, str, list[str], bool]:
+    """Split a path string lexically into (is_absolute, anchor, parts,
+    windows_flavour), collapsing ``.`` and ``..`` without touching the
+    filesystem. A ``..`` that climbs above the start is kept so the caller
+    can detect an escape."""
+
+    windows = bool(PureWindowsPath(raw).drive) or "\\" in raw
+    pure = PureWindowsPath(raw) if windows else PurePosixPath(raw)
+    anchor = pure.anchor
+    parts: list[str] = []
+    for part in pure.parts[1:] if anchor else pure.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts and parts[-1] != "..":
+                parts.pop()
+            else:
+                parts.append("..")
+            continue
+        parts.append(part)
+    return bool(anchor), anchor, parts, windows
+
+
+def _root_candidates(repo_root: Path) -> list[tuple[str, list[str], bool]]:
+    """Lexical forms of the repository root to match a provider path
+    against: as given (made absolute against the process cwd if relative)
+    and, when it differs, its real path -- so a provider that reports
+    ``/private/tmp/...`` for a root given as ``/tmp/...`` still matches.
+    Only the root directory is looked up, never the target file."""
+
+    candidates: list[str] = []
+    try:
+        candidates.append(os.path.abspath(str(repo_root)))
+    except Exception:
+        pass
+    try:
+        real = os.path.realpath(str(repo_root))
+        if real not in candidates:
+            candidates.append(real)
+    except Exception:
+        pass
+    result = []
+    for text in candidates:
+        is_abs, anchor, parts, windows = _split_lexical(text)
+        if is_abs:
+            result.append((anchor, parts, windows))
+    return result
+
+
+def repo_relative_path(raw: object, repo_root: Path) -> str | None:
+    """Normalize a provider-reported file path for telemetry.
+
+    Returns the path relative to ``repo_root`` with ``/`` separators, or
+    ``None`` when the path cannot be shown to lie inside the repository:
+    an absolute path under a different root, a relative path escaping via
+    ``..``, the root itself, or anything unparseable. An absolute path is
+    therefore never persisted verbatim -- telemetry drops the field rather
+    than leak local filesystem layout. Purely lexical: the target file is
+    never resolved or read.
+    """
+
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    is_abs, anchor, parts, windows = _split_lexical(raw)
+
+    if not is_abs:
+        if not parts or parts[0] == "..":
+            return None
+        return "/".join(parts)
+
+    def _key(part: str) -> str:
+        return part.lower() if windows else part
+
+    for root_anchor, root_parts, root_windows in _root_candidates(repo_root):
+        if root_windows != windows:
+            continue
+        if _key(root_anchor) != _key(anchor):
+            continue
+        if len(parts) <= len(root_parts):
+            continue
+        if [_key(p) for p in parts[: len(root_parts)]] != [_key(p) for p in root_parts]:
+            continue
+        return "/".join(parts[len(root_parts) :])
+    return None
 
 
 def _clean_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
@@ -183,5 +269,6 @@ __all__ = [
     "SCHEMA_VERSION",
     "SUMMARY_MAX_CHARS",
     "emit",
+    "repo_relative_path",
     "truncate",
 ]

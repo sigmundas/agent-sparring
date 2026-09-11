@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent_sparring.activity import ActivityEmitter, emit
+from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
 from agent_sparring.providers import ProviderError, Runner, StageAgentResult
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 
@@ -77,11 +77,14 @@ class _ClaudeStreamTranslator:
     Observational only: every method swallows its own errors (the runner
     also guards the callback), never touches the final result, and records
     no prompt text, tool inputs beyond a file path, tool results, or
-    partial-message deltas.
+    partial-message deltas. File paths are persisted repo-relative via
+    :func:`agent_sparring.activity.repo_relative_path` (Claude reports
+    absolute paths); a path outside ``repo_root`` is omitted, never leaked.
     """
 
-    def __init__(self, emitter: ActivityEmitter | None) -> None:
+    def __init__(self, emitter: ActivityEmitter | None, repo_root: Path) -> None:
         self._emitter = emitter
+        self._repo_root = repo_root
         self._tool_names: dict[str, str] = {}
 
     def feed(self, line: str) -> None:
@@ -112,7 +115,7 @@ class _ClaudeStreamTranslator:
             return
         emit(
             self._emitter,
-            "session.started",
+            "session.observed",
             session_id=_str_or_none(message.get("session_id")),
             model=_str_or_none(message.get("model")),
         )
@@ -140,7 +143,7 @@ class _ClaudeStreamTranslator:
             tool_input = raw_input if isinstance(raw_input, dict) else {}
 
             if name in _FILE_EDIT_TOOLS:
-                path = next(
+                raw_path = next(
                     (
                         _str_or_none(tool_input.get(key))
                         for key in _FILE_PATH_KEYS
@@ -148,7 +151,13 @@ class _ClaudeStreamTranslator:
                     ),
                     None,
                 )
-                emit(self._emitter, "file.changed", tool=name, path=path, parent_id=parent_id)
+                emit(
+                    self._emitter,
+                    "file.changed",
+                    tool=name,
+                    path=repo_relative_path(raw_path, self._repo_root),
+                    parent_id=parent_id,
+                )
             elif name in _SHELL_TOOLS:
                 emit(
                     self._emitter,
@@ -267,7 +276,7 @@ class ClaudeCliAdapter:
 
     def _invoke(self, prompt: str, resume_session_id: str | None) -> StageAgentResult:
         args = self._build_args(prompt, resume_session_id)
-        translator = _ClaudeStreamTranslator(self.activity)
+        translator = _ClaudeStreamTranslator(self.activity, self.repo_root)
         try:
             result = self.runner(args, self.repo_root, self.timeout_seconds, translator.feed)
         except OSError as exc:

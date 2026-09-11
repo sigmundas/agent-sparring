@@ -380,11 +380,11 @@ recorded.
 Actors and events:
 
     stage    turn.started, turn.finished, turn.failed, handoff.ready
-             (orchestration) and session.started, tool.call, file.changed,
+             (orchestration) and session.observed, tool.call, file.changed,
              command.started, command.finished, subagent.started,
              provider.result (translated from the implementation provider)
     sparrer  sparring.started, sparring.failed, verdict (orchestration) and
-             session.started, tool.call, file.changed, command.started,
+             session.observed, tool.call, file.changed, command.started,
              command.finished, subagent.started, provider.result,
              provider.error (translated from the sparring provider)
     loop     loop.started, loop.send_back, loop.stopped, loop.runaway
@@ -397,6 +397,15 @@ parsed exactly as before; the stream is a side channel. A subagent is
 recorded only when the provider states one (a Claude `Task`/`Agent` tool
 call, a Codex `collab_tool_call` item), never inferred. Model and session
 ids are recorded only when the provider output states them.
+`session.observed` means the provider stream established this session or
+thread identity during this turn; it does not claim the session is new
+(Claude Code emits its init line on resumed turns too). Whether a turn
+started or resumed a session is what the orchestration's `turn.started`
+and `sparring.started` lines say, via `resumed`.
+
+File paths in `file.changed` are repository-relative with `/` separators.
+A provider path outside the repository, or one that escapes it via `..`,
+is omitted rather than recorded; an absolute path never appears verbatim.
 
 ---
 

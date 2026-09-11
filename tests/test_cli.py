@@ -733,7 +733,7 @@ open(out, "w").write(json.dumps(verdict))
         names = [f"{e['actor']}:{e['event']}" for e in self._events()]
         expected_cycle = [
             "stage:turn.started",
-            "stage:session.started",
+            "stage:session.observed",
             "stage:file.changed",
             "stage:command.started",
             "stage:command.finished",
@@ -741,7 +741,7 @@ open(out, "w").write(json.dumps(verdict))
             "stage:turn.finished",
             "stage:handoff.ready",
             "sparrer:sparring.started",
-            "sparrer:session.started",
+            "sparrer:session.observed",
             "sparrer:command.started",
             "sparrer:command.finished",
             "sparrer:provider.result",
@@ -754,7 +754,7 @@ open(out, "w").write(json.dumps(verdict))
         )
 
         events = self._events()
-        sessions = [e for e in events if e["event"] == "session.started"]
+        sessions = [e for e in events if e["event"] == "session.observed"]
         self.assertEqual([s["provider"] for s in sessions],
                          ["claude-cli", "codex-cli", "claude-cli", "codex-cli"])
         self.assertEqual((sessions[0]["session_id"], sessions[0]["model"]),

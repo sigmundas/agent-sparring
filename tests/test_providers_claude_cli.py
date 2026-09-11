@@ -346,7 +346,7 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         events = _read_events(self.activity_path)
         self.assertEqual(
             [e["event"] for e in events],
-            ["session.started", "file.changed", "command.started", "command.finished",
+            ["session.observed", "file.changed", "command.started", "command.finished",
              "tool.call", "provider.result"],
         )
         session = events[0]
@@ -385,11 +385,11 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         )
         adapter.start("hi")
         session = _read_events(self.activity_path)[0]
-        self.assertEqual(session["event"], "session.started")
+        self.assertEqual(session["event"], "session.observed")
         self.assertNotIn("model", session)
         self.assertEqual(session["session_id"], "abc-123")
 
-        # No init line at all: no session.started, and nothing invented.
+        # No init line at all: no session.observed, and nothing invented.
         self.activity_path.unlink()
         stdout = _jsonl({"type": "result", "subtype": "success", "is_error": False,
                          "result": "x", "session_id": "s"})
@@ -422,7 +422,7 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
 
         events = _read_events(self.activity_path)
         names = [e["event"] for e in events]
-        self.assertEqual(names, ["session.started", "tool.call", "subagent.started",
+        self.assertEqual(names, ["session.observed", "tool.call", "subagent.started",
                                  "provider.result"])
         nested = events[1]
         self.assertEqual((nested["tool"], nested["parent_id"]), ("Grep", "toolu_parent"))
@@ -481,7 +481,60 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         self.assertEqual(result.session_id, "abc-123")
         self.assertEqual(result.text, "done")
         self.assertEqual([e["event"] for e in _read_events(self.activity_path)][:2],
-                         ["session.started", "file.changed"])
+                         ["session.observed", "file.changed"])
+
+
+
+class ClaudeCliAdapterPathNormalizationTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo_root = Path(self._tmp.name) / "repo"
+        self.repo_root.mkdir()
+        self.activity_path = Path(self._tmp.name) / "activity.jsonl"
+        self.emitter = ActivityLog(self.activity_path).bind("stage", provider="claude-cli")
+
+    def _run(self, *file_paths: str):
+        blocks = [
+            {"type": "tool_use", "id": f"t{i}", "name": "Write",
+             "input": {"file_path": fp, "content": "CONTENT-MUST-NOT-LEAK"}}
+            for i, fp in enumerate(file_paths)
+        ]
+        stdout = _jsonl(
+            {"type": "system", "subtype": "init", "session_id": "s"},
+            {"type": "assistant", "session_id": "s", "parent_tool_use_id": None,
+             "message": {"content": blocks}},
+            {"type": "result", "subtype": "success", "is_error": False, "result": "ok",
+             "session_id": "s"},
+        )
+
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            for line in stdout.splitlines():
+                on_line(line)
+            return _fake_result(0, stdout)
+
+        ClaudeCliAdapter(repo_root=self.repo_root, runner=runner, activity=self.emitter).start("hi")
+        return [e for e in _read_events(self.activity_path) if e["event"] == "file.changed"]
+
+    def test_absolute_in_repo_path_is_persisted_repo_relative(self):
+        # Verified live: Claude's Write/Edit tools report absolute paths.
+        (event,) = self._run(str(self.repo_root / "src" / "statistics.py"))
+        self.assertEqual(event["path"], "src/statistics.py")
+        text = self.activity_path.read_text(encoding="utf-8")
+        self.assertNotIn(str(self.repo_root), text)
+        self.assertNotIn(str(Path.home()), text)
+
+    def test_outside_repo_path_is_omitted_not_leaked(self):
+        outside = Path(self._tmp.name) / "elsewhere" / "notes.txt"
+        home = Path.home() / "private.txt"
+        events = self._run(str(outside), str(home), "../escape.txt")
+        self.assertEqual(len(events), 3)
+        for event in events:
+            self.assertNotIn("path", event)
+            self.assertEqual(event["tool"], "Write")
+        text = self.activity_path.read_text(encoding="utf-8")
+        for leak in ("elsewhere", "private.txt", "escape.txt", str(Path.home()), self._tmp.name):
+            self.assertNotIn(leak, text)
 
 
 if __name__ == "__main__":

@@ -444,7 +444,7 @@ class CodexCliAdapterStreamingTests(unittest.TestCase):
         events = _read_events(self.activity_path)
         self.assertEqual(
             [e["event"] for e in events],
-            ["session.started", "command.started", "command.finished", "tool.call",
+            ["session.observed", "command.started", "command.finished", "tool.call",
              "file.changed", "file.changed", "subagent.started", "tool.call",
              "provider.result"],
         )
@@ -490,7 +490,7 @@ class CodexCliAdapterStreamingTests(unittest.TestCase):
         # behavior) -- only the activity log does not.
         self.assertIn("ERROR-TEXT-MUST-NOT-LEAK", str(ctx.exception))
         events = _read_events(self.activity_path)
-        self.assertEqual([e["event"] for e in events], ["session.started", "provider.error"])
+        self.assertEqual([e["event"] for e in events], ["session.observed", "provider.error"])
         self.assertNotIn("ERROR-TEXT", self.activity_path.read_text(encoding="utf-8"))
 
     def test_completed_only_items_still_yield_one_event(self):
@@ -510,7 +510,7 @@ class CodexCliAdapterStreamingTests(unittest.TestCase):
         ).start("hi")
         events = _read_events(self.activity_path)
         self.assertEqual([e["event"] for e in events],
-                         ["session.started", "command.finished", "tool.call", "provider.result"])
+                         ["session.observed", "command.finished", "tool.call", "provider.result"])
         self.assertEqual(events[1]["exit_code"], 2)
         self.assertNotIn("summary", events[3])  # no usage: nothing invented
 
@@ -522,6 +522,47 @@ class CodexCliAdapterStreamingTests(unittest.TestCase):
         result = adapter.start("hi")
         self.assertEqual(result.session_id, "thread-abc")
         self.assertFalse(self.activity_path.exists())
+
+
+
+class CodexCliAdapterPathNormalizationTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo_root = Path(self._tmp.name) / "repo"
+        self.repo_root.mkdir()
+        self.activity_path = Path(self._tmp.name) / "activity.jsonl"
+        self.emitter = ActivityLog(self.activity_path).bind("sparrer", provider="codex-cli")
+
+    def test_file_change_paths_are_repo_relative_or_omitted(self):
+        outside = str(Path(self._tmp.name) / "elsewhere" / "x.py")
+        stdout = _jsonl(
+            {"type": "thread.started", "thread_id": "t1"},
+            {"type": "item.completed", "item": {"id": "f", "type": "file_change", "changes": [
+                {"path": str(self.repo_root / "src" / "a.py"), "kind": "update"},
+                {"path": "src/b.py", "kind": "add"},
+                {"path": outside, "kind": "add"},
+                {"path": "../escape.py", "kind": "delete"},
+            ], "status": "completed"}},
+            {"type": "turn.completed"},
+        )
+        verdict = json.dumps({"action": "READY", "summary": "ok", "needs_you_reason": None,
+                              "findings": "f", "deferred": None})
+
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            Path(args[args.index("-o") + 1]).write_text(verdict, encoding="utf-8")
+            for line in stdout.splitlines():
+                on_line(line)
+            return _fake_result(0, stdout)
+
+        CodexCliAdapter(repo_root=self.repo_root, runner=runner, activity=self.emitter).start("hi")
+        changed = [e for e in _read_events(self.activity_path) if e["event"] == "file.changed"]
+        self.assertEqual([(e.get("path"), e["kind"]) for e in changed],
+                         [("src/a.py", "update"), ("src/b.py", "add"), (None, "add"),
+                          (None, "delete")])
+        text = self.activity_path.read_text(encoding="utf-8")
+        for leak in (str(self.repo_root), "elsewhere", "escape.py", self._tmp.name):
+            self.assertNotIn(leak, text)
 
 
 if __name__ == "__main__":

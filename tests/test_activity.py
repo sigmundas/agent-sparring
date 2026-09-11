@@ -13,6 +13,7 @@ from agent_sparring.activity import (
     SUMMARY_MAX_CHARS,
     ActivityLog,
     emit,
+    repo_relative_path,
     truncate,
 )
 
@@ -121,7 +122,7 @@ class ActivityLogTests(unittest.TestCase):
     def test_bound_emitter_stamps_actor_and_provider(self):
         log = ActivityLog(self.path)
         emitter = log.bind("sparrer", provider="codex-cli")
-        emitter.emit("session.started", session_id="t-1")
+        emitter.emit("session.observed", session_id="t-1")
         emitter.emit("tool.call", tool="shell", provider="override")
 
         first, second = _events(self.path)
@@ -132,6 +133,89 @@ class ActivityLogTests(unittest.TestCase):
     def test_module_level_emit_with_none_emitter_is_silent(self):
         emit(None, "tool.call", tool="Bash")  # must not raise
         self.assertFalse(self.path.exists())
+
+
+
+class RepoRelativePathTests(unittest.TestCase):
+    """Provider-reported file paths are persisted repo-relative with ``/``
+    separators, or omitted (``None``) when they cannot be shown to lie
+    inside the repository. Purely lexical: nothing here exists on disk."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name) / "project"
+        self.repo.mkdir()
+
+    def test_absolute_in_repo_path_becomes_relative(self):
+        self.assertEqual(
+            repo_relative_path(str(self.repo / "src" / "foo.py"), self.repo), "src/foo.py"
+        )
+
+    def test_already_relative_path_is_kept_and_normalized(self):
+        self.assertEqual(repo_relative_path("src/foo.py", self.repo), "src/foo.py")
+        self.assertEqual(repo_relative_path("./src/./foo.py", self.repo), "src/foo.py")
+        self.assertEqual(repo_relative_path("src/sub/../foo.py", self.repo), "src/foo.py")
+
+    def test_nested_path(self):
+        self.assertEqual(
+            repo_relative_path(str(self.repo / "a" / "b" / "c" / "d.txt"), self.repo),
+            "a/b/c/d.txt",
+        )
+
+    def test_dotdot_escape_and_outside_repo_paths_are_omitted(self):
+        self.assertIsNone(repo_relative_path("../secret.txt", self.repo))
+        self.assertIsNone(repo_relative_path("src/../../secret.txt", self.repo))
+        self.assertIsNone(repo_relative_path(str(Path(self._tmp.name) / "other" / "f"), self.repo))
+        self.assertIsNone(repo_relative_path("/etc/passwd", self.repo))
+        self.assertIsNone(repo_relative_path(str(Path.home() / ".ssh" / "id"), self.repo))
+        # A sibling whose name merely starts with the repo name is outside.
+        self.assertIsNone(repo_relative_path(str(self.repo) + "-other/f.py", self.repo))
+        # The root itself is not a file path worth recording.
+        self.assertIsNone(repo_relative_path(str(self.repo), self.repo))
+
+    def test_relative_repo_root_is_resolved_against_cwd_lexically(self):
+        cwd = os.getcwd()
+        os.chdir(self._tmp.name)
+        self.addCleanup(os.chdir, cwd)
+        absolute = os.path.join(os.getcwd(), "project", "src", "foo.py")
+        self.assertEqual(repo_relative_path(absolute, Path("project")), "src/foo.py")
+        self.assertEqual(repo_relative_path(absolute, Path(".") / "project"), "src/foo.py")
+
+    def test_symlinked_root_form_still_matches(self):
+        # macOS reports /private/tmp/... for a root given as /tmp/...; only
+        # the root directory's real path is consulted, never the target.
+        link = Path(self._tmp.name) / "link"
+        try:
+            link.symlink_to(self.repo, target_is_directory=True)
+        except (OSError, NotImplementedError):  # pragma: no cover
+            self.skipTest("symlinks unavailable")
+        real_target = os.path.join(os.path.realpath(self.repo), "src", "foo.py")
+        self.assertEqual(repo_relative_path(real_target, link), "src/foo.py")
+
+    def test_windows_style_paths_normalize_with_forward_slashes(self):
+        # Exercised lexically on every platform: a Windows-flavoured
+        # provider path is matched against a Windows-flavoured root.
+        from unittest import mock
+
+        with mock.patch("agent_sparring.activity.os.path.abspath",
+                        side_effect=lambda p: p), \
+             mock.patch("agent_sparring.activity.os.path.realpath",
+                        side_effect=lambda p: p):
+            root = Path("C:\\work\\project")
+            self.assertEqual(
+                repo_relative_path("C:\\work\\project\\src\\foo.py", root), "src/foo.py"
+            )
+            self.assertEqual(
+                repo_relative_path("c:\\Work\\Project\\src\\foo.py", root), "src/foo.py"
+            )
+            self.assertIsNone(repo_relative_path("D:\\other\\foo.py", root))
+            self.assertIsNone(repo_relative_path("C:\\work\\foo.py", root))
+        self.assertEqual(repo_relative_path("src\\sub\\foo.py", self.repo), "src/sub/foo.py")
+
+    def test_garbage_is_omitted(self):
+        for bad in (None, "", "   ", 42, ["x"]):
+            self.assertIsNone(repo_relative_path(bad, self.repo))
 
 
 if __name__ == "__main__":

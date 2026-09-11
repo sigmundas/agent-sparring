@@ -92,7 +92,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent_sparring.activity import ActivityEmitter, emit
+from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
 from agent_sparring.providers import ProviderError, Runner, SparringAgentResult
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 
@@ -150,11 +150,14 @@ class _CodexStreamTranslator:
     Observational only. Emits nothing for ``reasoning``, ``agent_message``,
     ``todo_list`` and ``item.updated`` progress, and never reads
     ``aggregated_output``, ``command``, ``arguments``, ``result``, ``prompt``
-    or any error message text.
+    or any error message text. File paths are persisted repo-relative via
+    :func:`agent_sparring.activity.repo_relative_path`; a path outside
+    ``repo_root`` is omitted, never leaked.
     """
 
-    def __init__(self, emitter: ActivityEmitter | None) -> None:
+    def __init__(self, emitter: ActivityEmitter | None, repo_root: Path) -> None:
         self._emitter = emitter
+        self._repo_root = repo_root
         self._started_items: set[str] = set()
 
     def feed(self, line: str) -> None:
@@ -173,7 +176,7 @@ class _CodexStreamTranslator:
         if kind == "thread.started":
             emit(
                 self._emitter,
-                "session.started",
+                "session.observed",
                 session_id=_str_or_none(event.get("thread_id")),
             )
         elif kind in ("item.started", "item.completed"):
@@ -229,7 +232,7 @@ class _CodexStreamTranslator:
                 emit(
                     self._emitter,
                     "file.changed",
-                    path=_str_or_none(change.get("path")),
+                    path=repo_relative_path(change.get("path"), self._repo_root),
                     kind=_str_or_none(change.get("kind")),
                 )
         elif item_type == "mcp_tool_call":
@@ -335,7 +338,7 @@ class CodexCliAdapter:
             output_path = Path(tmp_dir) / "last_message.txt"
 
             args = self._build_args(prompt, resume_session_id, schema_path, output_path)
-            translator = _CodexStreamTranslator(self.activity)
+            translator = _CodexStreamTranslator(self.activity, self.repo_root)
             try:
                 result = self.runner(
                     args, self.repo_root, self.timeout_seconds, translator.feed
