@@ -18,6 +18,7 @@ from agent_sparring.plan import (
     PlanRunStatus,
     parse_plan,
     plan_digest,
+    plan_key,
     plan_state_path,
     record_human_evidence,
     resume_plan,
@@ -81,6 +82,12 @@ Trailing prose that belongs to no stage.
 THREE_STAGE_PLAN = PLAN.replace(
     "## Notes", "## Stage 3 — Prefetch and enrichment\n\nPrefetch things.\n\n## Notes"
 )
+
+
+KEY = plan_key("docs/plan.md")
+S1 = f"{KEY}-stage-1-foundation"
+S2 = f"{KEY}-stage-2-incremental-rendering"
+S3 = f"{KEY}-stage-3-prefetch-and-enrichment"
 
 
 class _StageAdapter:
@@ -260,27 +267,27 @@ class PlanRunTests(_PlanRepoTestCase):
         result = self._start(stage_adapter, sparring_adapter)
 
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
-        self.assertEqual([sid for sid, _ in result.accepted], ["stage-1-foundation", "stage-2-incremental-rendering"])
-        s1, s2 = self._stage("stage-1-foundation").read_state(), self._stage("stage-2-incremental-rendering").read_state()
+        self.assertEqual([sid for sid, _ in result.accepted], [S1, S2])
+        s1, s2 = self._stage(S1).read_state(), self._stage(S2).read_state()
         self.assertIs(s1.status, StageStatus.ACCEPTED)
         self.assertIs(s2.status, StageStatus.ACCEPTED)
         self.assertNotEqual(s1.candidate_sha, s2.candidate_sha)
         self.assertEqual(s2.candidate_sha, _head_sha(self.repo))
-        self.assertEqual(dict(result.accepted)["stage-1-foundation"], s1.candidate_sha)
+        self.assertEqual(dict(result.accepted)[S1], s1.candidate_sha)
         # Fresh implementation and sparring sessions per planned stage.
         self.assertEqual(len(stage_adapter.start_calls), 2)
         self.assertEqual(stage_adapter.resume_calls, [])
         self.assertEqual((s1.implementation_session_id, s1.sparring_session_id), ("impl-1", "spar-1"))
         self.assertEqual((s2.implementation_session_id, s2.sparring_session_id), ("impl-2", "spar-2"))
         # The plan section is the stage brief.
-        brief = self._stage("stage-2-incremental-rendering").read_brief()
+        brief = self._stage(S2).read_brief()
         self.assertIn("Stage 2 of 2 from plan `docs/plan.md`", brief)
         self.assertIn("## Stage 2 — Incremental rendering\n\nRender incrementally.", brief)
         self.assertIn("## Stage 2 — Incremental rendering", stage_adapter.start_calls[1])
         self.assertNotIn("Lay the groundwork", stage_adapter.start_calls[1])
         state = self._plan_state()
         self.assertIs(state.status, PlanRunStatus.COMPLETE)
-        self.assertEqual(state.current_stage, "stage-2-incremental-rendering")
+        self.assertEqual(state.current_stage, S2)
 
     def test_send_back_stays_in_stage_one_sessions_then_stage_two_is_fresh(self):
         stage_adapter = _StageAdapter(self.repo)
@@ -293,7 +300,7 @@ class PlanRunTests(_PlanRepoTestCase):
         self.assertEqual([sid for sid, _ in stage_adapter.resume_calls], ["impl-1"])
         self.assertEqual(len(sparring_adapter.start_calls), 2)
         self.assertEqual([sid for sid, _ in sparring_adapter.resume_calls], ["spar-1"])
-        s2 = self._stage("stage-2-incremental-rendering").read_state()
+        s2 = self._stage(S2).read_state()
         self.assertEqual((s2.implementation_session_id, s2.sparring_session_id), ("impl-2", "spar-2"))
 
     def test_needs_you_pauses_without_accepting_or_creating_the_next_stage(self):
@@ -303,16 +310,16 @@ class PlanRunTests(_PlanRepoTestCase):
         result = self._start(stage_adapter, sparring_adapter)
 
         self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.stage_id, "stage-1-foundation")
+        self.assertEqual(result.stage_id, S1)
         self.assertIs(result.routing.action, RoutingAction.NEEDS_YOU)
         self.assertEqual(result.routing.summary, "check it on a device")
-        self.assertIs(self._stage("stage-1-foundation").read_state().status, StageStatus.WORKING)
-        self.assertFalse(self._stage("stage-2-incremental-rendering").exists())
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        self.assertFalse(self._stage(S2).exists())
         self.assertEqual(len(stage_adapter.start_calls), 1)
         self.assertEqual(len(sparring_adapter.start_calls), 1)
         state = self._plan_state()
         self.assertIs(state.status, PlanRunStatus.PAUSED)
-        self.assertEqual((state.current_stage_index, state.current_stage), (0, "stage-1-foundation"))
+        self.assertEqual((state.current_stage_index, state.current_stage), (0, S1))
 
     def test_resume_after_needs_you_adds_evidence_resumes_same_sessions_and_continues(self):
         stage_adapter = _StageAdapter(self.repo)
@@ -322,7 +329,7 @@ class PlanRunTests(_PlanRepoTestCase):
         result = self._resume(stage_adapter, sparring_adapter, evidence="Tested on Pixel 7: resume works after 24h.")
 
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
-        stage1 = self._stage("stage-1-foundation")
+        stage1 = self._stage(S1)
         notes = stage1.read_notes()
         self.assertIn("## Human evidence\n\nTested on Pixel 7", notes)
         # The SAME stage resumed with the SAME provider sessions; no new
@@ -341,7 +348,7 @@ class PlanRunTests(_PlanRepoTestCase):
         self.assertIn("Tested on Pixel 7", sparring_prompt)
         self.assertIn("Tested on Pixel 7", stage1.read_handoff())
         # Stage 2 then proceeded with fresh sessions and the plan completed.
-        s2 = self._stage("stage-2-incremental-rendering").read_state()
+        s2 = self._stage(S2).read_state()
         self.assertEqual((s2.implementation_session_id, s2.sparring_session_id), ("impl-2", "spar-2"))
         self.assertIs(s2.status, StageStatus.ACCEPTED)
         self.assertIs(self._plan_state().status, PlanRunStatus.COMPLETE)
@@ -354,7 +361,7 @@ class PlanRunTests(_PlanRepoTestCase):
 
         self._resume(stage_adapter, sparring_adapter, evidence="Checked; behaves as specified.")
 
-        s1 = self._stage("stage-1-foundation").read_state()
+        s1 = self._stage(S1).read_state()
         self.assertIs(s1.status, StageStatus.ACCEPTED)
         self.assertEqual(s1.candidate_sha, sha_at_pause)
         self.assertEqual(_head_sha(self.repo), sha_at_pause)  # no dummy commit
@@ -377,8 +384,8 @@ class PlanRunTests(_PlanRepoTestCase):
 
         self.assertIs(result.status, PlanRunStatus.PAUSED)
         self.assertIs(result.routing.action, RoutingAction.ESCALATE)
-        self.assertIs(self._stage("stage-1-foundation").read_state().status, StageStatus.WORKING)
-        self.assertFalse(self._stage("stage-2-incremental-rendering").exists())
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        self.assertFalse(self._stage(S2).exists())
         self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
 
     def test_manual_acceptance_of_the_paused_stage_is_advanced_past_on_resume(self):
@@ -389,7 +396,7 @@ class PlanRunTests(_PlanRepoTestCase):
         self._start(stage_adapter, sparring_adapter)
         from agent_sparring.acceptance import accept_candidate, freeze_candidate
 
-        stage1 = self._stage("stage-1-foundation")
+        stage1 = self._stage(S1)
         freeze_candidate(stage1, self.sparring_dir, self.repo, expected_branch="feature/x")
         accept_candidate(stage1, self.repo, expected_branch="feature/x")
 
@@ -398,7 +405,7 @@ class PlanRunTests(_PlanRepoTestCase):
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
         self.assertEqual(stage_adapter.resume_calls, [])  # stage 1 was not re-run
         self.assertEqual(len(stage_adapter.start_calls), 2)
-        self.assertIs(self._stage("stage-2-incremental-rendering").read_state().status, StageStatus.ACCEPTED)
+        self.assertIs(self._stage(S2).read_state().status, StageStatus.ACCEPTED)
 
     def test_freeze_refusal_stops_the_plan_without_advancing(self):
         stage_adapter = _StageAdapter(self.repo, commit=True, push=False)  # unpushed candidate
@@ -408,10 +415,10 @@ class PlanRunTests(_PlanRepoTestCase):
             self._start(stage_adapter, sparring_adapter)
 
         self.assertIn("acceptance gate refused", str(ctx.exception))
-        s1 = self._stage("stage-1-foundation").read_state()
+        s1 = self._stage(S1).read_state()
         self.assertIs(s1.status, StageStatus.WORKING)
         self.assertIsNone(s1.candidate_sha)
-        self.assertFalse(self._stage("stage-2-incremental-rendering").exists())
+        self.assertFalse(self._stage(S2).exists())
         self.assertEqual(len(stage_adapter.start_calls), 1)
         state = self._plan_state()
         self.assertIs(state.status, PlanRunStatus.PAUSED)
@@ -427,9 +434,9 @@ class PlanRunTests(_PlanRepoTestCase):
             with self.assertRaises(PlanRunError):
                 self._start(stage_adapter, sparring_adapter)
 
-        s1 = self._stage("stage-1-foundation").read_state()
+        s1 = self._stage(S1).read_state()
         self.assertIs(s1.status, StageStatus.FROZEN)
-        self.assertFalse(self._stage("stage-2-incremental-rendering").exists())
+        self.assertFalse(self._stage(S2).exists())
         self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
 
     def test_provider_failure_stops_the_plan_without_advancing(self):
@@ -440,10 +447,10 @@ class PlanRunTests(_PlanRepoTestCase):
             self._start(stage_adapter, sparring_adapter)
 
         self.assertEqual(sparring_adapter.start_calls, [])
-        self.assertFalse(self._stage("stage-2-incremental-rendering").exists())
+        self.assertFalse(self._stage(S2).exists())
         state = self._plan_state()
         self.assertIs(state.status, PlanRunStatus.PAUSED)
-        self.assertEqual(state.current_stage, "stage-1-foundation")
+        self.assertEqual(state.current_stage, S1)
 
     def test_runaway_limit_stops_the_plan(self):
         stage_adapter = _StageAdapter(self.repo)
@@ -479,7 +486,7 @@ class PlanRunTests(_PlanRepoTestCase):
         self.assertIn("changed since this run started", str(ctx.exception))
         self.assertEqual(stage_adapter.resume_calls, [])
         self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
-        self.assertNotIn("Human evidence", self._stage("stage-1-foundation").read_notes())
+        self.assertNotIn("Human evidence", self._stage(S1).read_notes())
 
     def test_prose_edits_outside_stages_do_not_block_resume(self):
         stage_adapter = _StageAdapter(self.repo)
@@ -519,14 +526,135 @@ class PlanRunTests(_PlanRepoTestCase):
             self._resume(stage_adapter, _SparringAdapter([READY]))
         self.assertIn("already complete", str(ctx.exception))
 
-    def test_existing_stage_with_a_different_brief_is_refused(self):
-        stage = Stage.resolve(self.sparring_dir, "stage-1-foundation").create()
+    def test_fresh_run_refuses_leftover_stage_with_identical_brief_and_old_state(self):
+        # An earlier run's stage: byte-identical brief, but with recorded
+        # sessions and ACCEPTED status. A fresh run-plan must neither reuse
+        # those sessions nor skip the stage as already accepted.
+        from agent_sparring.plan import PlanStage, render_brief
+
+        stages = parse_plan(PLAN, plan_key=KEY)
+        stage = Stage.resolve(self.sparring_dir, S1).create()
+        stage.write_brief(render_brief("docs/plan.md", stages[0], len(stages)))
+        old = stage.read_state()
+        old.implementation_session_id, old.sparring_session_id = "old-impl", "old-spar"
+        old.status, old.candidate_sha = StageStatus.ACCEPTED, "0" * 40
+        stage.write_state(old)
+        stage_adapter = _StageAdapter(self.repo)
+
+        with self.assertRaises(PlanError) as ctx:
+            self._start(stage_adapter, _SparringAdapter([READY, READY]))
+
+        message = str(ctx.exception)
+        self.assertIn("earlier or abandoned run", message)
+        self.assertIn(str(stage.directory), message)
+        self.assertIn("nothing is deleted automatically", message)
+        self.assertEqual(stage_adapter.start_calls, [])
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(Stage.resolve(self.sparring_dir, S2).exists())
+        self.assertEqual(stage.read_state(), old)  # untouched, not reused, not skipped
+
+    def test_fresh_run_refuses_leftover_stage_with_a_different_brief_too(self):
+        stage = Stage.resolve(self.sparring_dir, S1).create()
         stage.write_brief("# something else\n")
         stage_adapter = _StageAdapter(self.repo)
         with self.assertRaises(PlanError) as ctx:
             self._start(stage_adapter, _SparringAdapter([READY]))
-        self.assertIn("differs", str(ctx.exception))
+        self.assertIn("earlier or abandoned run", str(ctx.exception))
         self.assertEqual(stage_adapter.start_calls, [])
+
+    def test_stage_agent_editing_a_plan_stage_section_blocks_acceptance_and_advance(self):
+        # The implementation turn rewrites (and commits and pushes) a stage
+        # section of the reviewed plan; the sparrer still says READY.
+        class _PlanEditingStageAdapter(_StageAdapter):
+            def _turn(self, session_id):
+                text = self.repo.joinpath("docs/plan.md").read_text(encoding="utf-8")
+                self.repo.joinpath("docs/plan.md").write_text(
+                    text.replace("Render incrementally.", "Render everything at once."), encoding="utf-8"
+                )
+                _run_git(self.repo, "commit", "-q", "-am", "agent edits the plan")
+                _run_git(self.repo, "push", "-q", "origin", "feature/x")
+                return super()._turn(session_id)
+
+        stage_adapter = _PlanEditingStageAdapter(self.repo)
+        sparring_adapter = _SparringAdapter([READY, READY])
+
+        with self.assertRaises(PlanRunError) as ctx:
+            self._start(stage_adapter, sparring_adapter)
+
+        message = str(ctx.exception)
+        self.assertIn("before accepting the candidate", message)
+        self.assertIn("reviewed stage content", message)
+        s1 = self._stage(S1).read_state()
+        self.assertIs(s1.status, StageStatus.WORKING)  # not frozen, not accepted
+        self.assertIsNone(s1.candidate_sha)
+        self.assertFalse(self._stage(S2).exists())
+        self.assertEqual(len(stage_adapter.start_calls), 1)
+        state = self._plan_state()
+        self.assertIs(state.status, PlanRunStatus.PAUSED)
+        self.assertEqual((state.current_stage_index, state.current_stage), (0, S1))
+
+    def test_plan_prose_edit_committed_mid_run_does_not_block_acceptance(self):
+        class _ProseEditingStageAdapter(_StageAdapter):
+            def _turn(self, session_id):
+                text = self.repo.joinpath("docs/plan.md").read_text(encoding="utf-8")
+                self.repo.joinpath("docs/plan.md").write_text(
+                    text.replace("Trailing prose", "Trailing prose, amended"), encoding="utf-8"
+                )
+                _run_git(self.repo, "commit", "-q", "-am", "agent edits non-stage prose")
+                _run_git(self.repo, "push", "-q", "origin", "feature/x")
+                return super()._turn(session_id)
+
+        result = self._start(_ProseEditingStageAdapter(self.repo), _SparringAdapter([READY, READY]))
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+
+    def test_distinct_plan_paths_with_colliding_slugs_get_distinct_state_and_stages(self):
+        # "docs/plan.md" and "docs-plan.md" both slug to "docs-plan-md".
+        other = self.repo / "docs-plan.md"
+        other.write_text(PLAN, encoding="utf-8")
+        _run_git(self.repo, "add", "docs-plan.md")
+        _run_git(self.repo, "commit", "-q", "-m", "second plan")
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        other_state = plan_state_path(self.sparring_dir, "docs-plan.md")
+        self.assertNotEqual(other_state, self.state_path)
+
+        self._start(_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU]))
+        start_plan(
+            other, self.sparring_dir, self.repo, _StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU]),
+            expected_branch="feature/x",
+        )
+
+        self.assertTrue(self.state_path.is_file())
+        self.assertTrue(other_state.is_file())
+        other_s1 = f"{plan_key('docs-plan.md')}-stage-1-foundation"
+        self.assertNotEqual(other_s1, S1)
+        self.assertTrue(self._stage(S1).exists())
+        self.assertTrue(self._stage(other_s1).exists())
+
+    def test_two_plans_with_identical_stage_headings_do_not_share_stage_state(self):
+        other = self.repo / "docs" / "other.md"
+        other.write_text(PLAN, encoding="utf-8")
+        _run_git(self.repo, "add", "docs/other.md")
+        _run_git(self.repo, "commit", "-q", "-m", "other plan")
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+
+        self._start(_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU]))
+        other_stage_adapter = _StageAdapter(self.repo)
+        start_plan(
+            other, self.sparring_dir, self.repo, other_stage_adapter, _SparringAdapter([NEEDS_YOU]),
+            expected_branch="feature/x",
+        )
+
+        other_s1 = self._stage(f"{plan_key('docs/other.md')}-stage-1-foundation")
+        self.assertNotEqual(other_s1.directory, self._stage(S1).directory)
+        # The second plan's stage 1 started a FRESH session (impl-1 of its
+        # own adapter), not the first plan's recorded one, and each stage
+        # directory holds its own state.
+        self.assertEqual(len(other_stage_adapter.start_calls), 1)
+        self.assertEqual(other_stage_adapter.resume_calls, [])
+        self.assertEqual(other_s1.read_state().implementation_session_id, "impl-1")
+        self.assertIn("plan `docs/other.md`", other_s1.read_brief())
+        self.assertIn("plan `docs/plan.md`", self._stage(S1).read_brief())
+        self.assertLessEqual(len(other_s1.stage_id), 128)
 
     def test_refuses_to_start_when_plan_state_would_be_visible_to_git(self):
         (self.repo / ".gitignore").write_text(".sparring/stages/\n", encoding="utf-8")
@@ -548,7 +676,7 @@ class PlanRunTests(_PlanRepoTestCase):
 
         result = self._start(stage_adapter, sparring_adapter)
         self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.stage_id, "stage-3-prefetch-and-enrichment")
+        self.assertEqual(result.stage_id, S3)
         self.assertEqual(len(result.accepted), 2)
         self.assertEqual(self._plan_state().current_stage_index, 2)
 
@@ -583,7 +711,7 @@ class PlanCliTests(_PlanRepoTestCase):
         self.assertIn("findings: check it on a device", out)  # sparring.md findings
         self.assertIn(f"sparring resume-plan {self.plan_path}", out)
         self.assertIn("--evidence", out)
-        self.assertIn("stage 1/2 stage-1-foundation", err)
+        self.assertIn(f"stage 1/2 {S1}", err)
 
     def test_resume_plan_completes_and_prints_accepted_shas(self):
         adapters = (_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU, READY, READY]))
@@ -597,7 +725,7 @@ class PlanCliTests(_PlanRepoTestCase):
         )
         self.assertEqual(code, 0, err)
         self.assertIn("plan complete: docs/plan.md", out)
-        self.assertIn(f"accepted stage-2-incremental-rendering at {_head_sha(self.repo)}", out)
+        self.assertIn(f"accepted {S2} at {_head_sha(self.repo)}", out)
         self.assertIn("recorded human evidence", err)
 
     def test_escalate_output_points_at_the_handoff_and_packet_commands(self):
@@ -608,9 +736,9 @@ class PlanCliTests(_PlanRepoTestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("action: ESCALATE", out)
-        self.assertIn(str(self.sparring_dir / "stages" / "stage-1-foundation" / "handoff.md"), out)
+        self.assertIn(str(self.sparring_dir / "stages" / S1 / "handoff.md"), out)
         self.assertIn("--self-contained", out)
-        self.assertIn("record-sparring stage-1-foundation", out)
+        self.assertIn(f"record-sparring {S1}", out)
 
     def test_malformed_plan_exits_nonzero_before_running(self):
         self.plan_path.write_text("# no stages here\n", encoding="utf-8")

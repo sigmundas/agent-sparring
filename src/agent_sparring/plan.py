@@ -31,7 +31,9 @@ document order. Everything from that heading up to the next level-1 or
 level-2 heading (fenced code blocks excluded) is the stage's section, and
 becomes that stage's ``brief.md`` verbatim, under a two-line header naming
 the plan and position. Stage ids are derived deterministically as
-``stage-<n>-<slugified title>``. Anything that looks like a stage heading
+``<plan key>-stage-<n>-<slugified title>``, where the plan key (see
+:func:`plan_key`) is a short hash of the plan's path, so two plans with the
+same headings never share stage artifacts. Anything that looks like a stage heading
 but does not fit the convention, a gap or duplicate in the numbering, an
 empty section, or a plan with no stages at all is refused before any
 provider is invoked.
@@ -115,15 +117,35 @@ def _slug(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
 
 
-def _stage_id_for(number: int, title: str) -> str:
+def plan_key(label: str) -> str:
+    """A short, deterministic, collision-safe identity for one plan.
+
+    Readable stem plus the first 8 hex digits of the label's SHA-256, e.g.
+    ``foo-3f9a2c1b``. Two distinct plan paths never share a key even when
+    their slugs coincide (``docs/plan.md`` vs ``docs-plan.md``). Used to name
+    the run-state file and to namespace planned stage ids, so two plans that
+    both contain "Stage 1 — Foundation" never share stage artifacts.
+    """
+
+    digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:8]
+    stem = _slug(Path(label).stem)[:32].rstrip("-")
+    return f"{stem}-{digest}" if stem else digest
+
+
+def _stage_id_for(number: int, title: str, plan_key: str | None) -> str:
     base = f"stage-{number}"
+    if plan_key:
+        base = f"{plan_key}-{base}"
     slug = _slug(title)
     stage_id = f"{base}-{slug}"[:128].rstrip("-") if slug else base
     return validate_stage_id(stage_id)
 
 
-def parse_plan(text: str) -> tuple[PlanStage, ...]:
+def parse_plan(text: str, *, plan_key: str | None = None) -> tuple[PlanStage, ...]:
     """Split a reviewed plan into its explicit stages, or refuse.
+
+    ``plan_key`` (see :func:`plan_key`), when given, prefixes every stage id
+    so stages of different plans live in different directories.
 
     Raises :class:`PlanError` for: no stages; a heading that starts with
     ``## Stage`` but does not fit ``## Stage <n> — <title>``; numbering that
@@ -177,7 +199,7 @@ def parse_plan(text: str) -> tuple[PlanStage, ...]:
             PlanStage(
                 number=number,
                 title=title,
-                stage_id=_stage_id_for(number, title),
+                stage_id=_stage_id_for(number, title, plan_key),
                 section="\n".join(section_lines).rstrip() + "\n",
             )
         )
@@ -201,15 +223,15 @@ def _section_end(lines: list[str], start: int) -> int:
 
 
 def plan_digest(stages: tuple[PlanStage, ...]) -> str:
-    """SHA-256 over the parsed stage ids and sections -- the content a run
-    actually executes. Prose outside the stage sections does not count."""
+    """SHA-256 over the parsed stage numbers, titles and sections -- the
+    content a run actually executes. Prose outside the stage sections does
+    not count."""
 
     digest = hashlib.sha256()
     for stage in stages:
-        digest.update(stage.stage_id.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(stage.section.encode("utf-8"))
-        digest.update(b"\0")
+        for part in (str(stage.number), stage.title, stage.section):
+            digest.update(part.encode("utf-8"))
+            digest.update(b"\0")
     return digest.hexdigest()
 
 
@@ -293,7 +315,7 @@ def plan_label(plan_path: Path, repo_root: Path) -> str:
 
 
 def plan_state_path(sparring_dir: Path, label: str) -> Path:
-    return Path(sparring_dir) / PLANS_DIRNAME / f"{_slug(label) or 'plan'}.json"
+    return Path(sparring_dir) / PLANS_DIRNAME / f"{plan_key(label)}.json"
 
 
 # -- running -----------------------------------------------------------------
@@ -311,12 +333,29 @@ class PlanRunResult:
     accepted: tuple[tuple[str, str], ...] = field(default_factory=tuple)  # (stage_id, sha)
 
 
-def _read_plan(plan_path: Path) -> tuple[PlanStage, ...]:
+def _read_plan(plan_path: Path, label: str) -> tuple[PlanStage, ...]:
     try:
         text = plan_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise PlanError(f"cannot read plan {plan_path}: {exc}") from exc
-    return parse_plan(text)
+    return parse_plan(text, plan_key=plan_key(label))
+
+
+def _verify_plan_unchanged(plan_path: Path, state: PlanRunState) -> tuple[PlanStage, ...]:
+    """Re-read the plan from disk and require its stage-section digest to
+    equal the one recorded when the run started. The one check used on
+    resume, before accepting a READY stage, and before advancing -- so a
+    stage section edited (even committed) mid-run is caught, not executed."""
+
+    stages = _read_plan(plan_path, state.plan)
+    if plan_digest(stages) != state.plan_digest:
+        raise PlanError(
+            f"the reviewed stage content of {state.plan} has changed since this run "
+            "started; refusing to continue against a different plan. Restore the stage "
+            "sections as they were, or deliberately start over (see run-plan's refusal "
+            "message for what to remove)."
+        )
+    return stages
 
 
 def _require_state_ignored(repo_root: Path, state_path: Path) -> None:
@@ -356,21 +395,33 @@ def start_plan(
 
     Refuses (:class:`PlanError`, before any provider is invoked) if the plan
     is malformed, if a run for this plan is already recorded (use
-    :func:`resume_plan`), or if the run-state location is not git-ignored.
+    :func:`resume_plan`), if any of this plan's stage directories already
+    exist (a fresh run means fresh stages: old session ids or an old
+    ACCEPTED status must never be inherited or skipped past), or if the
+    run-state location is not git-ignored.
     """
 
     if not expected_branch or not expected_branch.strip():
         raise PlanError("expected_branch is required for a plan run")
 
-    stages = _read_plan(plan_path)
     label = plan_label(plan_path, repo_root)
+    stages = _read_plan(plan_path, label)
     state_path = plan_state_path(sparring_dir, label)
-    if state_path.is_file():
-        existing = PlanRunState.load(state_path)
+    stage_dirs = [Stage.resolve(sparring_dir, s.stage_id).directory for s in stages]
+    leftovers = [str(path) for path in stage_dirs if path.exists()]
+    if state_path.is_file() or leftovers:
+        recorded = ""
+        if state_path.is_file():
+            existing = PlanRunState.load(state_path)
+            recorded = (
+                f" A run is recorded at {state_path} (status {existing.status.value}, "
+                f"current stage {existing.current_stage!r}); use resume-plan to continue it."
+            )
         raise PlanError(
-            f"a plan run for {label} is already recorded at {state_path} "
-            f"(status {existing.status.value}, current stage {existing.current_stage!r}); "
-            "use resume-plan to continue it, or delete that file to abandon it"
+            f"refusing a fresh run of {label}: it already has state from an earlier or "
+            f"abandoned run.{recorded} To genuinely start over, deliberately remove the "
+            f"run-state file {state_path} and this plan's stage directories "
+            f"({', '.join(leftovers) or 'none present'}); nothing is deleted automatically."
         )
     _require_state_ignored(repo_root, state_path)
 
@@ -385,6 +436,7 @@ def start_plan(
     state.save(state_path)
     report(f"plan {label}: {len(stages)} stage(s); run state at {state_path}")
     return _drive(
+        plan_path,
         stages,
         state,
         state_path,
@@ -429,7 +481,6 @@ def resume_plan(
     content no longer matches the digest recorded at start.
     """
 
-    stages = _read_plan(plan_path)
     label = plan_label(plan_path, repo_root)
     state_path = plan_state_path(sparring_dir, label)
     if not state_path.is_file():
@@ -443,12 +494,7 @@ def resume_plan(
             f"plan run for {label} was started for branch {state.expected_branch!r}, "
             f"not {expected_branch!r}; refusing to resume on a different branch"
         )
-    if plan_digest(stages) != state.plan_digest:
-        raise PlanError(
-            f"the stage content of {label} has changed since this run started; refusing "
-            "to resume against a different plan. Restore the stage sections as they "
-            f"were, or abandon this run (delete {state_path}) and start a new one."
-        )
+    stages = _verify_plan_unchanged(plan_path, state)
     if not 0 <= state.current_stage_index < len(stages):
         raise PlanError(
             f"recorded stage index {state.current_stage_index} is out of range for "
@@ -463,6 +509,7 @@ def resume_plan(
         report(f"recorded human evidence in {stage.directory / 'notes.md'}")
 
     return _drive(
+        plan_path,
         stages,
         state,
         state_path,
@@ -490,9 +537,11 @@ def record_human_evidence(stage: Stage, evidence: str) -> None:
 
 def _ensure_stage(sparring_dir: Path, label: str, plan_stage: PlanStage, total: int) -> Stage:
     """Create the planned stage (fresh state.json, so fresh sessions) with
-    the plan section as its brief, or reuse an existing one whose brief is
-    exactly that section. A differing brief is refused: the reviewed plan
-    is the source of truth for what a planned stage is."""
+    the plan section as its brief, or -- within a recorded run, where
+    :func:`start_plan` has already refused any pre-existing stage
+    directories -- continue the existing one whose brief is exactly that
+    section. A differing brief is refused: the reviewed plan is the source
+    of truth for what a planned stage is."""
 
     brief = render_brief(label, plan_stage, total)
     try:
@@ -516,7 +565,23 @@ def _pause(state: PlanRunState, state_path: Path) -> None:
     state.save(state_path)
 
 
+def _require_plan_unchanged(
+    plan_path: Path, state: PlanRunState, state_path: Path, *, before: str
+) -> None:
+    """Mid-run form of :func:`_verify_plan_unchanged`: on a changed (or now
+    unparseable) plan, pause and stop instead of doing ``before``."""
+
+    try:
+        _verify_plan_unchanged(plan_path, state)
+    except PlanError as exc:
+        _pause(state, state_path)
+        raise PlanRunError(
+            f"plan {state.plan} stopped before {before} at stage {state.current_stage!r}: {exc}"
+        ) from exc
+
+
 def _drive(
+    plan_path: Path,
     stages: tuple[PlanStage, ...],
     state: PlanRunState,
     state_path: Path,
@@ -581,8 +646,12 @@ def _drive(
                     accepted=tuple(accepted),
                 )
 
-            # READY: invoke the existing hard gate on the exact pushed SHA.
-            # Any refusal stops the plan; nothing else is ever substituted.
+            # READY: first make sure the reviewed plan the sparrer judged
+            # against is still the plan on disk -- an implementation turn
+            # could have edited and committed a stage section -- then invoke
+            # the existing hard gate on the exact pushed SHA. Any refusal
+            # stops the plan; nothing else is ever substituted.
+            _require_plan_unchanged(plan_path, state, state_path, before="accepting the candidate")
             try:
                 frozen = freeze_candidate(
                     stage, sparring_dir, repo_root, expected_branch=state.expected_branch
@@ -609,6 +678,7 @@ def _drive(
                 accepted=tuple(accepted),
             )
 
+        _require_plan_unchanged(plan_path, state, state_path, before="advancing to the next stage")
         state.current_stage_index += 1
         state.current_stage = stages[state.current_stage_index].stage_id
         state.save(state_path)
@@ -624,6 +694,7 @@ __all__ = [
     "PlanStage",
     "parse_plan",
     "plan_digest",
+    "plan_key",
     "plan_label",
     "plan_state_path",
     "record_human_evidence",

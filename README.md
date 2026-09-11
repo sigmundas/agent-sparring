@@ -165,7 +165,10 @@ Stages are level-2 headings numbered 1..N in document order:
 A hyphen, en dash or colon works as the separator too. Everything from the
 heading to the next `#`/`##` heading is that stage's section, and becomes
 the stage's `brief.md` verbatim; deeper headings belong to the stage. The
-stage id is derived deterministically as `stage-<n>-<slugified title>`.
+stage id is derived deterministically as
+`<plan key>-stage-<n>-<slugified title>`, where the plan key is the plan's
+file stem plus a short hash of its path (for example `foo-3f9a2c1b`), so two
+plans with the same headings never share stage artifacts.
 Nothing is inferred from prose: a plan with no such headings, a heading that
 starts with `## Stage` but does not fit, a numbering gap or duplicate, or an
 empty section is refused before any agent runs. A reviewed plan written
@@ -173,18 +176,27 @@ another way needs a small edit to mark its stages; that is deliberate.
 
 ### Pause and resume
 
-Run position lives in `.sparring/plans/<plan>.json`: the plan, a digest of
-its stage sections, the branch, the current stage and a status
+Run position lives in `.sparring/plans/<plan key>.json`: the plan, a digest
+of its stage sections, the branch, the current stage and a status
 (`running`/`paused`/`complete`). Candidate SHAs, sessions and acceptance
 stay in each stage's own `state.json`.
+
+A fresh `run-plan` means fresh stages. It refuses if a run is already
+recorded or if any of the plan's stage directories already exist, and names
+what an earlier or abandoned run left behind. Nothing is deleted for you: to
+genuinely start over, remove the run-state file *and* those stage directories
+deliberately, otherwise old sessions or an old `accepted` status would be
+inherited.
 
 `--evidence` is appended to the current stage's `notes.md` under
 `## Human evidence`; you can also edit that section by hand. Both agents see
 it on the next turn. The same stage then resumes: an answer never creates a
 new stage, and if no code changed the same SHA is sparred again and can be
-accepted. If the stage content of the plan changed since the run started,
-`resume-plan` refuses rather than run a different plan; prose outside the
-stage sections may change freely.
+accepted. The digest of the plan's stage sections is re-checked on
+`resume-plan`, before every acceptance and before every advance, so a stage
+section edited during a run, even by the implementation agent, even
+committed, pauses the plan instead of being accepted or executed; prose
+outside the stage sections may change freely.
 
 After `ESCALATE`, spar the stage elsewhere with the printed handoff/packet
 commands, then either accept it by hand (`freeze-candidate`,
