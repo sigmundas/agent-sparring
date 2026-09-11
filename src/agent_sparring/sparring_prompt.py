@@ -59,6 +59,17 @@ resumed stage-agent turn, to the same stage agent.
 
   Then give the short reason. If none of the five fits, say so plainly and
   describe the category rather than forcing one.
+
+  For UI/VISUAL CHECK and DEVICE/MANUAL CHECK, ``findings`` must make every
+  required check runnable by a human who does not have the plan open. Never
+  list only scenario letters or names ("run scenarios A, E and H"). For each
+  required check give at least one of, and preferably both when the steps
+  are short:
+
+      - concise step-by-step instructions plus explicit pass/fail criteria,
+        ideally under the plan heading the check comes from;
+      - the exact repo-relative plan path and heading where the full test
+        is defined.
 - ESCALATE: this deserves a stronger/different sparring environment (e.g.
   GPT web chat) rather than being decided inside this automatic exchange.
 

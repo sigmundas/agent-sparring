@@ -85,6 +85,26 @@ class SparringPromptTests(unittest.TestCase):
         ):
             self.assertIn(category, prompt)
 
+    def test_needs_you_prompt_requires_runnable_manual_checks(self):
+        """For UI/VISUAL and DEVICE/MANUAL checks the prompt must forbid bare
+        scenario letters and ask for steps plus pass/fail criteria and/or the
+        exact plan path and heading.
+
+        Exercised by the Stage 7 pilot: the real DEVICE/MANUAL CHECK verdict
+        named the required hardware QA only as plan scenario letters (A/B, E,
+        H, I), which is not actionable for a human reading the routing result
+        without the plan open.
+
+        Prompt-only by design, like the reason category.
+        """
+
+        prompt = build_sparring_prompt(self.stage, self.sparring_dir, resume=False)
+        flat = " ".join(prompt.split())
+
+        self.assertIn("Never list only scenario letters", flat)
+        self.assertIn("step-by-step instructions plus explicit pass/fail criteria", flat)
+        self.assertIn("exact repo-relative plan path and heading", flat)
+
     def test_resume_includes_previous_sparring_exchange(self):
         record_sparring(
             self.stage,
