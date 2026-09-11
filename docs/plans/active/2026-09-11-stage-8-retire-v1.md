@@ -6,6 +6,8 @@ Generic tool: `agent-sparring`, branch `feature/sparring-v2`, base
 Retired system: the Sporely V1 staged workflow at
 `~/Documents/Code/sporely/.sparring`, its own Git repository
 (`sigmundas/sporely-agent-workflow`)
+V1 retirement commit: **`3e41c408e0c528f7e569c9bd71569f3dbd0c4eb4`** on
+`main`, pushed (`0d35901..3e41c40  main -> main`)
 
 V1 was retired outright. No compatibility framework was built, no V1 code was
 migrated into `agent-sparring`, and no old command routes silently to V2.
@@ -77,9 +79,14 @@ hazard, the only piece with no other home, is already stated in
 
 ## Retained from V1, and why
 
-- `prompts/` and `handoffs/` — inert Markdown and JSON kept purely as
-  historical evidence, because the sporely-py plan entries above cite those
-  paths and the citations should keep resolving. Nothing reads or writes them.
+- `prompts/` — inert Markdown and JSON kept purely as historical evidence,
+  because the sporely-py plan entries above cite those paths and the citations
+  should keep resolving. Nothing reads or writes them. This now includes the
+  four `sporely-web` review-result artifacts V1 had left uncommitted; see the
+  commit section below.
+- `handoffs/` — present on disk but **not** under version control: the V1
+  `.gitignore` has always ignored it as transient runtime evidence. It was left
+  exactly as it stands rather than newly committed.
 - Nothing else. No V1 utility was migrated: every primitive worth having
   (Git identity and status gathering, thin and self-contained handoff packets,
   pushed-candidate verification) already exists in V2 from Stages 2 and 6, so
@@ -123,16 +130,24 @@ was introduced.
 
 ## Size
 
+Measured on `main`, which is where the retirement landed. (An earlier commit
+of the same retirement, `826f990`, sits on the unmerged
+`feature/sparring-ancillary-followup` branch, whose copies of eight machinery
+files were larger; its raw numbers were correspondingly bigger and are not the
+figures of record.)
+
 | | Files | Lines |
 | --- | --- | --- |
-| V1 tracked before | 42 | 12,868 |
-| V1 tracked after | 15 | 1,798 |
-| Deleted | 27 | 11,102 |
-| Added (V1 retirement notice) | — | 32 |
-| Added (`agent-sparring/README.md`) | 1 | 116 |
+| V1 tracked at `main` before | 42 | 10,342 |
+| V1 tracked at `main` after | 19 | 2,271 |
+| Deleted | 28 | 8,575 |
+| Added — retained historical evidence | 4 | 467 |
+| Added — V1 retirement notice | — | 37 |
+| Added — `agent-sparring/README.md` | 1 | 116 |
 | Changed elsewhere | 4 | +27 / −8 |
 
-Net: roughly **11,100 lines removed, 175 added**.
+Net: roughly **8,575 lines of workflow machinery removed, 620 added**, of
+which 467 are retained evidence rather than new writing.
 
 ## Verification
 
@@ -152,22 +167,59 @@ Net: roughly **11,100 lines removed, 175 added**.
 5. **Cheap V2 check against sporely-web** — the `check-config` run in (2) is
    that check; no agent-invoking command was run, to avoid disturbing the
    frozen stage.
-6. **Frozen Stage 3 candidate untouched** — `d20aef3a335…` still resolves to
+6. **Remote V1 state, checked against `origin/main` after fetch, not the local
+   worktree** — `origin/main` is `3e41c408e0c528f7e569c9bd71569f3dbd0c4eb4`
+   ("Retire the V1 staged workflow"). Its complete tree is 19 files:
+   `.gitignore`, the retirement `README.md`, and 17 paths under `prompts/`.
+   `git ls-tree -r origin/main` matches nothing for `workflow_transitions`,
+   `select_stage`, `archive_stage`, `review_result`, `run_handoff`,
+   `handoff.py`, `skills/`, `tests/`, `PROMPT_SCHEMA`,
+   `IMPLEMENTATION_PROGRESS`, `web_review` or `sporely-project-knowledge`. The
+   retained `prompts/` evidence is present, including all four newly committed
+   paths, and `git show origin/main:README.md` begins
+   "# Retired — Sporely staged workflow (V1)".
+7. **Frozen Stage 3 candidate untouched** — `d20aef3a335…` still resolves to
    tree `98e878e…` and is still reachable from `feature/sparring-v2-pilot`; its
    `state.json` still reads `"status": "frozen"` with the same base SHA and both
    session ids; all five artifact files retain their pre-session mtimes.
 
+## Committing and pushing the retirement
+
+The retirement is on `main` and pushed. This mattered: the first commit of it
+went onto the checked-out branch, `feature/sparring-ancillary-followup`
+(`826f990`), which is the unmerged ancillary-followup work the foundation plan
+explicitly said not to build on. `main` was left at the pre-retirement V1
+implementation, so V1 was still live for anyone cloning the repository. The
+retirement was redone from `main` instead. `main` and that feature branch had
+identical *file sets* — the branch only modified eight of them — so the
+deletion set was the same either way.
+
+`826f990` remains on its published feature branch untouched; no history was
+rewritten.
+
+**The four formerly-untracked paths were inspected and are now committed**, as
+inert historical evidence:
+
+| Path | Content |
+| --- | --- |
+| `prompts/sporely-web/stage-finds-incremental-pagination-render.md` | 86-line stage prompt |
+| `prompts/sporely-web/completed/stage-finds-server-search-pagination.md` | 365-line completed stage prompt |
+| `prompts/sporely-web/stage-finds-server-search-pagination.review.json` | one recorded verdict |
+| `prompts/sporely-web/completed/review-history/finds-server-search-pagination.jsonl` | five verdicts across five candidate SHAs |
+
+They hold repository/stage names, commit SHAs, verdicts and review prose. A
+scan for credentials, keys, tokens, bearer/JWT material, email addresses and
+phone numbers returned nothing, and there is no personal data in them. Their
+V1 front matter was left byte-identical rather than sanitised — one still reads
+`status: executable` — because it is part of the record and no code exists that
+could act on it. The retirement `README.md` says so explicitly. Nothing was
+made to consume them.
+
 ## Still requires manual cleanup
 
-- Four **untracked** paths remain in the V1 repository:
-  `prompts/sporely-web/stage-finds-incremental-pagination-render.md`,
-  `prompts/sporely-web/stage-finds-server-search-pagination.review.json`,
-  `prompts/sporely-web/completed/stage-finds-server-search-pagination.md`, and
-  `prompts/sporely-web/completed/review-history/`. They are V1 review-result
-  output that was never committed, so deleting them is unrecoverable. Left in
-  place for the user to decide.
 - `~/Documents/Code/sporely` is **not a Git repository**, so the `AGENTS.md` and
-  `CLAUDE.md` edits there are not version-controlled and could not be committed.
+  `CLAUDE.md` edits there remain local guidance only, by decision. No
+  repository was created there.
 - `sporely-py`, `sporely-landing` and `sporely-admin` have no V2 configuration.
   Each needs its own `.sparring/project.toml` and `.sparring/PROJECT.md` written
   fresh, with a verified test baseline, before it can run a stage.
