@@ -17,6 +17,13 @@ project supplies its own machine-readable config and its own prose knowledge.
 pip install -e /path/to/agent-sparring    # provides the `sparring` command
 ```
 
+## Develop
+
+```sh
+uv sync            # creates .venv with the package and pytest
+uv run pytest -q   # runs the test suite
+```
+
 ## Set up a project
 
 Create two files in the repository you want to work on:
