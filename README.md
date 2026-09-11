@@ -72,9 +72,10 @@ The commands that touch Git — `handoff`, `run-*`, `freeze-candidate`,
 Track the two configuration files; ignore the per-stage working artifacts:
 
 ```gitignore
-# agent-sparring per-stage working artifacts
+# agent-sparring working artifacts: per-stage files and plan-run position
 # (.sparring/project.toml and .sparring/PROJECT.md stay tracked)
 .sparring/stages/
+.sparring/plans/
 ```
 
 This is not optional bookkeeping. `freeze-candidate` requires a clean
@@ -83,7 +84,8 @@ deliberately narrow exemption, so that "everything under `.sparring/`" is
 never waved through. Leave `.sparring/stages/` tracked and your first stage
 will still work; the **second** one will fail its freeze with a dirty-worktree
 error naming an unrelated stage's files, which is a confusing way to learn
-this.
+this. `run-plan` checks up front that `.sparring/plans/` is ignored and
+refuses to start otherwise.
 
 ## Run a stage
 
@@ -121,3 +123,70 @@ The individual steps are also available on their own: `run-stage`,
 `run-sparring`, `handoff` (add `--self-contained` for a packet a sparrer
 without repository access can read), and `record-sparring` for a verdict
 reached manually or in a web chat. `sparring --help` lists everything.
+
+## Run a whole plan
+
+A reviewed plan with several bounded stages can run from stage to stage
+without you launching each one:
+
+```text
+reviewed plan
+    -> sparring run-plan docs/plans/foo.md --repo-root . --expected-branch feature/x
+    -> Stage 1: run-loop … READY -> freeze -> accept
+    -> Stage 2: fresh sessions … READY -> freeze -> accept
+    -> Stage 3: … NEEDS_YOU -> plan pauses, prints what is required
+you do the check / make the decision
+    -> sparring resume-plan docs/plans/foo.md --repo-root . --expected-branch feature/x \
+           --evidence "Tested on a Pixel 7: resume after 24h works."
+    -> Stage 3 resumes with the SAME two sessions … READY -> freeze -> accept
+    -> Stage 4 … until the next human gate or the end of the plan
+```
+
+`run-plan` takes the same provider flags as `run-loop`. It stops for
+`NEEDS_YOU`, `ESCALATE`, a provider/integrity failure, a freeze or accept
+refusal, the SEND_BACK runaway limit, and the end of the plan; ordinary
+`READY` is accepted automatically through the existing gate, at the exact
+pushed SHA, with no human confirmation. The gate itself is unchanged: if it
+refuses, the plan stops and nothing is substituted.
+
+### Marking stages in a plan
+
+Stages are level-2 headings numbered 1..N in document order:
+
+```markdown
+## Stage 1 — Foundation
+...
+## Stage 2 — Incremental rendering
+...
+## Stage 3 — Prefetch and enrichment
+...
+```
+
+A hyphen, en dash or colon works as the separator too. Everything from the
+heading to the next `#`/`##` heading is that stage's section, and becomes
+the stage's `brief.md` verbatim; deeper headings belong to the stage. The
+stage id is derived deterministically as `stage-<n>-<slugified title>`.
+Nothing is inferred from prose: a plan with no such headings, a heading that
+starts with `## Stage` but does not fit, a numbering gap or duplicate, or an
+empty section is refused before any agent runs. A reviewed plan written
+another way needs a small edit to mark its stages; that is deliberate.
+
+### Pause and resume
+
+Run position lives in `.sparring/plans/<plan>.json`: the plan, a digest of
+its stage sections, the branch, the current stage and a status
+(`running`/`paused`/`complete`). Candidate SHAs, sessions and acceptance
+stay in each stage's own `state.json`.
+
+`--evidence` is appended to the current stage's `notes.md` under
+`## Human evidence`; you can also edit that section by hand. Both agents see
+it on the next turn. The same stage then resumes: an answer never creates a
+new stage, and if no code changed the same SHA is sparred again and can be
+accepted. If the stage content of the plan changed since the run started,
+`resume-plan` refuses rather than run a different plan; prose outside the
+stage sections may change freely.
+
+After `ESCALATE`, spar the stage elsewhere with the printed handoff/packet
+commands, then either accept it by hand (`freeze-candidate`,
+`accept-candidate`) and `resume-plan` — an already-accepted current stage is
+advanced past — or `resume-plan --evidence` with the external verdict.

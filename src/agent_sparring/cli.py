@@ -12,6 +12,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from agent_sparring.activity import ActivityLog
 from agent_sparring.acceptance import (
     AcceptanceError,
     accept_candidate,
@@ -26,6 +27,14 @@ from agent_sparring.config import (
 from agent_sparring.git_context import GitContextError
 from agent_sparring.handoff import generate_handoff
 from agent_sparring.loop import DEFAULT_MAX_SEND_BACK_CYCLES, LoopError, run_unattended_loop
+from agent_sparring.plan import (
+    PlanError,
+    PlanRunError,
+    PlanRunResult,
+    PlanRunStatus,
+    resume_plan,
+    start_plan,
+)
 from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
     PROVIDER_ID as CLAUDE_PROVIDER_ID,
@@ -300,6 +309,61 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_loop_adapters(
+    args: argparse.Namespace,
+    sparring_dir: Path,
+    repo_root: Path,
+    *,
+    activity_log: ActivityLog | None = None,
+) -> tuple[ClaudeCliAdapter, CodexCliAdapter]:
+    """The stage and sparring adapters for run-loop / run-plan / resume-plan,
+    from the shared provider flags (see :func:`_add_loop_arguments`).
+
+    ``activity_log`` is the stage's observational ``activity.jsonl`` (see
+    :mod:`agent_sparring.activity`); both adapters append their provider
+    stream to it. Observational only, never read back. ``None`` produces
+    adapters that emit no provider telemetry.
+    """
+
+    stage_provider = _resolve_stage_provider(args.stage_provider, sparring_dir)
+    if stage_provider != "claude-cli":
+        raise StageError(
+            f"unsupported stage agent provider {stage_provider!r}; only "
+            "'claude-cli' is implemented so far"
+        )
+    stage_adapter = ClaudeCliAdapter(
+        repo_root=repo_root,
+        executable=args.claude_executable,
+        permission_mode=args.permission_mode,
+        model=args.stage_model,
+        activity=(
+            activity_log.bind("stage", provider=CLAUDE_PROVIDER_ID)
+            if activity_log is not None
+            else None
+        ),
+    )
+
+    sparring_provider = _resolve_sparring_provider(args.sparring_provider, sparring_dir)
+    if sparring_provider != "codex-cli":
+        raise StageError(
+            f"unsupported sparring agent provider {sparring_provider!r}; only "
+            "'codex-cli' is implemented so far"
+        )
+    # No --sandbox override is exposed here either, for the same reason
+    # as run-sparring: CodexCliAdapter has no sandbox field at all.
+    sparring_adapter = CodexCliAdapter(
+        repo_root=repo_root,
+        executable=args.codex_executable,
+        model=args.sparring_model,
+        activity=(
+            activity_log.bind("sparrer", provider=CODEX_PROVIDER_ID)
+            if activity_log is not None
+            else None
+        ),
+    )
+    return stage_adapter, sparring_adapter
+
+
 def _cmd_run_loop(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
     try:
@@ -309,37 +373,10 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             raise StageError(f"stage {args.stage_id!r} does not exist at {stage.directory}")
 
         self_check = _resolve_self_check(sparring_dir)
-
-        stage_provider = _resolve_stage_provider(args.stage_provider, sparring_dir)
-        if stage_provider != "claude-cli":
-            raise StageError(
-                f"unsupported stage agent provider {stage_provider!r}; only "
-                "'claude-cli' is implemented so far"
-            )
-        # Both adapters append to the same per-stage activity.jsonl (see
+        # Both adapters append to this stage's activity.jsonl (see
         # agent_sparring.activity): observational only, never read back.
-        activity_log = stage.activity_log()
-        stage_adapter = ClaudeCliAdapter(
-            repo_root=repo_root,
-            executable=args.claude_executable,
-            permission_mode=args.permission_mode,
-            model=args.stage_model,
-            activity=activity_log.bind("stage", provider=CLAUDE_PROVIDER_ID),
-        )
-
-        sparring_provider = _resolve_sparring_provider(args.sparring_provider, sparring_dir)
-        if sparring_provider != "codex-cli":
-            raise StageError(
-                f"unsupported sparring agent provider {sparring_provider!r}; only "
-                "'codex-cli' is implemented so far"
-            )
-        # No --sandbox override is exposed here either, for the same reason
-        # as run-sparring: CodexCliAdapter has no sandbox field at all.
-        sparring_adapter = CodexCliAdapter(
-            repo_root=repo_root,
-            executable=args.codex_executable,
-            model=args.sparring_model,
-            activity=activity_log.bind("sparrer", provider=CODEX_PROVIDER_ID),
+        stage_adapter, sparring_adapter = _build_loop_adapters(
+            args, sparring_dir, repo_root, activity_log=stage.activity_log()
         )
 
         loop_result = run_unattended_loop(
@@ -363,6 +400,102 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return 0
+
+
+def _report_plan_result(
+    result: PlanRunResult, args: argparse.Namespace, sparring_dir: Path
+) -> None:
+    if result.status is PlanRunStatus.COMPLETE:
+        print(f"plan complete: {result.plan}")
+        for stage_id, sha in result.accepted:
+            print(f"  accepted {stage_id} at {sha}")
+        return
+
+    routing = result.routing
+    assert routing is not None  # a PAUSED result always carries the sparrer's routing
+    stage = Stage.resolve(sparring_dir, result.stage_id)
+    print(f"plan paused: {result.plan}")
+    print(f"stage: {result.stage_id} ({stage.directory})")
+    print(f"action: {routing.action.value}")
+    if routing.needs_you_reason:
+        print(f"reason: {routing.needs_you_reason}")
+    print(f"summary: {routing.summary}")
+    print()
+    print(stage.read_sparring().rstrip())
+    print()
+    resume = (
+        f"sparring resume-plan {args.plan_path} --repo-root {args.repo_root or '.'} "
+        f"--expected-branch {args.expected_branch}"
+    )
+    if routing.action is RoutingAction.ESCALATE:
+        print("To spar this stage elsewhere, build a packet from the current handoff:")
+        print(f"  handoff: {stage.directory / 'handoff.md'}")
+        print(
+            f"  sparring handoff {result.stage_id} --repo-root {args.repo_root or '.'} "
+            "--claims '<claims>' --self-contained"
+        )
+        print(
+            f"  sparring record-sparring {result.stage_id} --action <ACTION> "
+            "--summary '...' --findings '...'"
+        )
+        print("Then either accept by hand (freeze-candidate, accept-candidate) and resume,")
+        print("or resume with the external verdict as evidence:")
+    else:
+        print("When the check/answer above is done, resume the same stage with it:")
+    print(f"  {resume} --evidence '<what you found or decided>'")
+
+
+def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        self_check = _resolve_self_check(sparring_dir)
+        stage_adapter, sparring_adapter = _build_loop_adapters(args, sparring_dir, repo_root)
+
+        def report(message: str) -> None:
+            print(message, file=sys.stderr)
+
+        common = dict(
+            expected_branch=args.expected_branch,
+            max_send_back_cycles=args.max_send_back_cycles,
+            self_check=self_check,
+            report=report,
+        )
+        if resume:
+            result = resume_plan(
+                Path(args.plan_path),
+                sparring_dir,
+                repo_root,
+                stage_adapter,
+                sparring_adapter,
+                evidence=args.evidence,
+                **common,
+            )
+        else:
+            result = start_plan(
+                Path(args.plan_path), sparring_dir, repo_root, stage_adapter, sparring_adapter, **common
+            )
+    except (
+        PlanError,
+        PlanRunError,
+        StageError,
+        ProjectConfigError,
+        GitContextError,
+        ProviderError,
+    ) as exc:
+        print(f"could not {'resume' if resume else 'run'} plan: {exc}", file=sys.stderr)
+        return 1
+
+    _report_plan_result(result, args, sparring_dir)
+    return 0
+
+
+def _cmd_run_plan(args: argparse.Namespace) -> int:
+    return _run_plan_command(args, resume=False)
+
+
+def _cmd_resume_plan(args: argparse.Namespace) -> int:
+    return _run_plan_command(args, resume=True)
 
 
 def _resolved_stage(args: argparse.Namespace, sparring_dir: Path) -> Stage:
@@ -408,6 +541,55 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> int:
     print(f"accepted candidate: {result.candidate_sha}")
     print(f"branch: {result.branch}")
     return 0
+
+
+def _add_loop_arguments(
+    parser: argparse.ArgumentParser, repo_root_help: str, *, branch_help: str
+) -> None:
+    """The flags run-loop, run-plan and resume-plan share: repo root,
+    expected branch, provider selection and the SEND_BACK runaway limit."""
+
+    parser.add_argument("--repo-root", default=None, help=repo_root_help)
+    parser.add_argument("--expected-branch", required=True, help=branch_help)
+    parser.add_argument(
+        "--stage-provider",
+        default=None,
+        help="stage agent provider override (default: project.toml's [agents.stage].provider, else claude-cli)",
+    )
+    parser.add_argument(
+        "--sparring-provider",
+        default=None,
+        help="sparring agent provider override (default: project.toml's [agents.sparring].provider, else codex-cli)",
+    )
+    parser.add_argument(
+        "--claude-executable",
+        default="claude",
+        help="claude CLI executable to invoke (default: claude)",
+    )
+    parser.add_argument(
+        "--codex-executable",
+        default="codex",
+        help="codex CLI executable to invoke (default: codex)",
+    )
+    parser.add_argument("--stage-model", default=None, help="model override for the stage agent")
+    parser.add_argument(
+        "--sparring-model", default=None, help="model override for the sparring agent"
+    )
+    parser.add_argument(
+        "--permission-mode",
+        default=DEFAULT_PERMISSION_MODE,
+        help=f"claude CLI --permission-mode value (default: {DEFAULT_PERMISSION_MODE})",
+    )
+    parser.add_argument(
+        "--max-send-back-cycles",
+        type=int,
+        default=DEFAULT_MAX_SEND_BACK_CYCLES,
+        help=(
+            "runaway limit: stop with an error after this many SEND_BACK "
+            f"cycles without reaching READY/NEEDS_YOU/ESCALATE (default: "
+            f"{DEFAULT_MAX_SEND_BACK_CYCLES})"
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -581,71 +763,63 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_sparring.set_defaults(func=_cmd_run_sparring)
 
-    run_loop = subparsers.add_parser(
-        "run-loop",
-        help="run the unattended stage<->sparring loop for a stage until READY/NEEDS_YOU/ESCALATE",
-    )
-    run_loop.add_argument("stage_id")
-    run_loop.add_argument(
-        "--repo-root",
-        default=None,
-        help=(
-            "repository root; overrides project.toml's [repo].root if set "
-            "(default: [repo].root from project.toml, resolved against the "
-            "project root, else the parent of --sparring-dir)"
-        ),
-    )
-    run_loop.add_argument(
-        "--expected-branch",
-        required=True,
-        help="the branch this unattended loop is meant to modify and review; required",
-    )
-    run_loop.add_argument(
-        "--stage-provider",
-        default=None,
-        help="stage agent provider override (default: project.toml's [agents.stage].provider, else claude-cli)",
-    )
-    run_loop.add_argument(
-        "--sparring-provider",
-        default=None,
-        help="sparring agent provider override (default: project.toml's [agents.sparring].provider, else codex-cli)",
-    )
-    run_loop.add_argument(
-        "--claude-executable",
-        default="claude",
-        help="claude CLI executable to invoke (default: claude)",
-    )
-    run_loop.add_argument(
-        "--codex-executable",
-        default="codex",
-        help="codex CLI executable to invoke (default: codex)",
-    )
-    run_loop.add_argument("--stage-model", default=None, help="model override for the stage agent")
-    run_loop.add_argument(
-        "--sparring-model", default=None, help="model override for the sparring agent"
-    )
-    run_loop.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help=f"claude CLI --permission-mode value (default: {DEFAULT_PERMISSION_MODE})",
-    )
-    run_loop.add_argument(
-        "--max-send-back-cycles",
-        type=int,
-        default=DEFAULT_MAX_SEND_BACK_CYCLES,
-        help=(
-            "runaway limit: stop with an error after this many SEND_BACK "
-            f"cycles without reaching READY/NEEDS_YOU/ESCALATE (default: "
-            f"{DEFAULT_MAX_SEND_BACK_CYCLES})"
-        ),
-    )
-    run_loop.set_defaults(func=_cmd_run_loop)
-
     repo_root_help = (
         "repository root; overrides project.toml's [repo].root if set "
         "(default: [repo].root from project.toml, resolved against the "
         "project root, else the parent of --sparring-dir)"
     )
+
+    run_loop = subparsers.add_parser(
+        "run-loop",
+        help="run the unattended stage<->sparring loop for a stage until READY/NEEDS_YOU/ESCALATE",
+    )
+    run_loop.add_argument("stage_id")
+    _add_loop_arguments(
+        run_loop,
+        repo_root_help,
+        branch_help="the branch this unattended loop is meant to modify and review; required",
+    )
+    run_loop.set_defaults(func=_cmd_run_loop)
+
+    run_plan = subparsers.add_parser(
+        "run-plan",
+        help=(
+            "run a reviewed multi-stage plan unattended: each '## Stage <n> — <title>' "
+            "section becomes a stage; READY freezes and accepts the exact pushed SHA and "
+            "the next stage starts; NEEDS_YOU/ESCALATE/failure pauses"
+        ),
+    )
+    run_plan.add_argument("plan_path", help="path to the reviewed plan Markdown file")
+    _add_loop_arguments(
+        run_plan,
+        repo_root_help,
+        branch_help="the feature branch every stage of this plan must modify; required",
+    )
+    run_plan.set_defaults(func=_cmd_run_plan)
+
+    resume_plan_parser = subparsers.add_parser(
+        "resume-plan",
+        help=(
+            "continue a paused plan run at its current stage, optionally recording the "
+            "human's answer/check result first"
+        ),
+    )
+    resume_plan_parser.add_argument("plan_path", help="path to the same reviewed plan file")
+    _add_loop_arguments(
+        resume_plan_parser,
+        repo_root_help,
+        branch_help="the feature branch the plan run was started for; required",
+    )
+    resume_plan_parser.add_argument(
+        "--evidence",
+        default=None,
+        help=(
+            "the human's answer, manual/device check result, external-condition result "
+            "or scope approval; appended to the current stage's notes.md under "
+            "'## Human evidence' before the same stage resumes"
+        ),
+    )
+    resume_plan_parser.set_defaults(func=_cmd_resume_plan)
 
     freeze = subparsers.add_parser(
         "freeze-candidate",

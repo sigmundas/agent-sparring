@@ -104,6 +104,21 @@ def resolve_commit(repo_root: Path, rev: str, *, label: str = "revision") -> str
     return sha
 
 
+def is_ignored(repo_root: Path, path: Path) -> bool:
+    """Would git ignore ``path`` (which need not exist yet)?
+
+    Exit status 0 from ``git check-ignore`` means ignored, 1 means not
+    ignored; anything else is a real git failure and is raised.
+    """
+
+    result = _run(repo_root, "check-ignore", "-q", "--", str(path))
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise GitContextError(result.stderr.strip() or f"git check-ignore failed for {path}")
+
+
 def _split_nul(raw: str) -> list[str]:
     tokens = raw.split("\0")
     if tokens and tokens[-1] == "":

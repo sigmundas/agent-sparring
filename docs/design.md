@@ -501,6 +501,19 @@ The agents decide WHAT needs doing.
 
 The orchestrator only decides WHERE control goes next.
 
+## Plan runner
+
+`run-plan` / `resume-plan` (`agent_sparring.plan`) is the thin loop outside
+the router: a reviewed plan's `## Stage <n> — <title>` sections become stages
+in order, each with a fresh implementation and sparring session; `READY`
+invokes the existing `freeze_candidate` / `accept_candidate` gate on the exact
+pushed SHA and the next stage starts; `NEEDS_YOU`, `ESCALATE`, any failure and
+the end of the plan stop it. The only state it adds is the run position (plan,
+digest of the stage sections, branch, current stage, status) under
+`.sparring/plans/`. Human evidence goes into the current stage's `notes.md`
+and the same stage resumes. Stage boundaries are a fixed heading convention,
+never inferred.
+
 ---
 
 # History

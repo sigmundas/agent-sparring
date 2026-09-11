@@ -37,6 +37,12 @@ SPARRING_FILENAME = "sparring.md"
 # created by Stage.create (it appears on first emit, if writable).
 ACTIVITY_FILENAME = "activity.jsonl"
 
+# The notes.md heading under which a human's answer/check result/evidence is
+# recorded (by `resume-plan --evidence`, or by hand). Prose only: the handoff
+# and the stage prompt surface this section verbatim to the agents; nothing
+# parses or gates on its content.
+HUMAN_EVIDENCE_HEADING = "## Human evidence"
+
 _STAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -256,6 +262,9 @@ class Stage:
 
     def read_sparring(self) -> str:
         return self._read_text(SPARRING_FILENAME)
+
+    def write_brief(self, content: str) -> None:
+        self._write_text(BRIEF_FILENAME, content)
 
     def write_notes(self, content: str) -> None:
         self._write_text(NOTES_FILENAME, content)

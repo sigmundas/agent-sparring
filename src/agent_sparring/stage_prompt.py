@@ -18,7 +18,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent_sparring.config import load_project_markdown
-from agent_sparring.stage import Stage, StageError
+from agent_sparring.handoff import human_evidence_section
+from agent_sparring.stage import HUMAN_EVIDENCE_HEADING, Stage, StageError
 
 
 def build_stage_prompt(
@@ -70,6 +71,23 @@ def build_stage_prompt(
             "## Latest sparring exchange",
             "",
             sparring_text or "(no sparring.md available)",
+        ]
+
+    # A human's recorded answer/check result (notes.md "## Human evidence",
+    # written by `resume-plan --evidence` or by hand). Shown whenever present
+    # so the agent sees the answer next to the question it follows; absent
+    # for a stage with no such notes, leaving existing prompts unchanged.
+    evidence = human_evidence_section(stage)
+    if evidence:
+        parts += [
+            "",
+            HUMAN_EVIDENCE_HEADING,
+            "",
+            evidence,
+            "",
+            "Treat this as the human's answer to the latest NEEDS_YOU question "
+            "or as recorded manual-check results. If it calls for implementation "
+            "changes, make them; if not, report that no code change is needed.",
         ]
 
     if self_check:

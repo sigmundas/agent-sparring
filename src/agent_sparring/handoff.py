@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_sparring.git_context import ChangedFile, GitContext, gather_git_context, diff_patch
-from agent_sparring.stage import Stage
+from agent_sparring.stage import HUMAN_EVIDENCE_HEADING, Stage
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class HandoffInput:
     test_evidence: str | None = None
 
 
-def _extract_section(text: str, heading: str) -> str | None:
+def extract_section(text: str, heading: str) -> str | None:
     """Best-effort body of a markdown ``## heading`` section.
 
     Returns ``None`` if the heading is missing or its body is still the
@@ -61,7 +61,24 @@ def _open_checks_section(stage: Stage) -> str:
         notes = stage.read_notes()
     except Exception:
         return "(no notes.md available)"
-    return _extract_section(notes, "## Deferred checks") or "(none recorded)"
+    return extract_section(notes, "## Deferred checks") or "(none recorded)"
+
+
+def human_evidence_section(stage: Stage) -> str | None:
+    """The ``## Human evidence`` body of this stage's notes.md, if any.
+
+    This is how a human's answer to a NEEDS_YOU question, or a recorded
+    device/manual check result, reaches both agents on the next turn: the
+    handoff embeds it for the sparrer and the stage prompt embeds it for the
+    stage agent. Absent (``None``) when notes.md is missing or has no such
+    section, so existing handoffs and prompts are unchanged.
+    """
+
+    try:
+        notes = stage.read_notes()
+    except Exception:
+        return None
+    return extract_section(notes, HUMAN_EVIDENCE_HEADING)
 
 
 def _previous_sparring_section(stage: Stage) -> str:
@@ -78,7 +95,7 @@ def _previous_sparring_section(stage: Stage) -> str:
         "## ESCALATE",
         "## Deferred",
     ):
-        body = _extract_section(sparring, heading)
+        body = extract_section(sparring, heading)
         if body:
             parts.append(f"{heading}\n\n{body}")
     return "\n\n".join(parts) if parts else "(none recorded)"
@@ -147,6 +164,11 @@ def render_thin_handoff(stage: Stage, handoff_input: HandoffInput) -> str:
         "## Open / deferred checks",
         "",
         _open_checks_section(stage),
+    ]
+    evidence = human_evidence_section(stage)
+    if evidence:
+        lines += ["", HUMAN_EVIDENCE_HEADING, "", evidence]
+    lines += [
         "",
         "## Previous unresolved sparring findings",
         "",
