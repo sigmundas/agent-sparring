@@ -54,7 +54,7 @@ class ActivityLogTests(unittest.TestCase):
         log = ActivityLog(self.path)
         log.emit(
             "stage",
-            "file.edited",
+            "file.changed",
             path="src/x.py",
             old_string="secret contents",  # not an allowed field
             command="rm -rf /",  # not an allowed field

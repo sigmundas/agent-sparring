@@ -68,7 +68,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_sparring.activity import truncate
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import (
     DirtyEntry,
@@ -325,14 +324,17 @@ def _emit_refusal(stage: Stage, operation: str, exc: AcceptanceError) -> None:
 
     Called only from ``except`` blocks that then re-raise the *original*
     exception unchanged; ``ActivityLog.emit`` itself never raises, so
-    telemetry can neither mask nor replace the refusal.
+    telemetry can neither mask nor replace the refusal. The summary is a
+    fixed orchestration-authored phrase chosen by exception *type* -- the
+    exception message itself (paths, remote details) is never copied into
+    the log.
     """
 
-    stage.activity_log().emit(
-        "gate",
-        "gate.refused",
-        summary=truncate(f"{operation} refused: {exc}"),
-    )
+    if isinstance(exc, StaleCandidateError):
+        summary = f"{operation} refused: stale candidate"
+    else:
+        summary = f"{operation} refused"
+    stage.activity_log().emit("gate", "gate.refused", summary=summary)
 
 
 def _freeze_candidate_locked(

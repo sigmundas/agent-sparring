@@ -1,3 +1,5 @@
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -7,7 +9,7 @@ from pathlib import Path
 
 import conftest_path  # noqa: F401
 
-from agent_sparring.providers.subprocess_runner import run_streaming
+from agent_sparring.providers.subprocess_runner import FINAL_DRAIN_SECONDS, run_streaming
 
 
 def _python(code: str) -> list[str]:
@@ -100,6 +102,92 @@ class RunStreamingTests(unittest.TestCase):
         code = "import sys\nprint(repr(sys.stdin.read()))\n"
         result = run_streaming(_python(code), self.cwd, 10, None, stdin_devnull=True)
         self.assertEqual(result.stdout.strip(), "''")
+
+    def _kill_pid_file(self, pid_file: Path) -> None:
+        """Best-effort cleanup of a descendant whose pid the fake provider
+        recorded, so the test never leaks it."""
+
+        if not pid_file.is_file():
+            return
+        pid = int(pid_file.read_text(encoding="utf-8").strip() or 0)
+        if pid <= 0:
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        if os.name != "posix":  # pragma: no cover - liveness probe is POSIX-only
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def test_returns_promptly_when_a_descendant_keeps_the_pipes_open(self):
+        # The fake provider spawns a descendant that inherits BOTH stdout
+        # and stderr, prints a valid result, and exits. The descendant
+        # sleeps far longer than any acceptable runner return time, so a
+        # runner that waited for pipe EOF would hang until it ended.
+        pid_file = self.cwd / "descendant.pid"
+        code = (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+            "print('{\"type\": \"result\", \"ok\": true}', flush=True)\n"
+            "sys.stderr.write('provider stderr\\n'); sys.stderr.flush()\n"
+        )
+        self.addCleanup(self._kill_pid_file, pid_file)
+        lines: list[str] = []
+
+        started = time.monotonic()
+        result = run_streaming(_python(code), self.cwd, 20, lines.append)
+        elapsed = time.monotonic() - started
+
+        # Returned soon after the provider exited: bounded by the final
+        # drain window plus slack, nowhere near the descendant's lifetime.
+        self.assertLess(elapsed, FINAL_DRAIN_SECONDS + 5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(lines, ['{"type": "result", "ok": true}'])
+        self.assertEqual(result.stdout, '{"type": "result", "ok": true}\n')
+        self.assertEqual(result.stderr, "provider stderr\n")
+        # The descendant really was still alive when the runner returned.
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        self.assertTrue(self._alive(pid))
+
+    def test_timeout_is_enforced_even_when_a_descendant_holds_the_pipes(self):
+        pid_file = self.cwd / "descendant2.pid"
+        code = (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+            "print('working', flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        self.addCleanup(self._kill_pid_file, pid_file)
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_streaming(_python(code), self.cwd, 0.5, None)
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_trailing_partial_line_is_delivered(self):
+        code = "import sys\nsys.stdout.write('no newline at end')\n"
+        lines: list[str] = []
+        result = run_streaming(_python(code), self.cwd, 10, lines.append)
+        self.assertEqual(lines, ["no newline at end"])
+        self.assertEqual(result.stdout, "no newline at end")
+
+    def test_crlf_lines_are_stripped_for_the_callback_but_kept_in_stdout(self):
+        code = "import sys\nsys.stdout.buffer.write(b'a\\r\\nb\\r\\n')\n"
+        lines: list[str] = []
+        result = run_streaming(_python(code), self.cwd, 10, lines.append)
+        self.assertEqual(lines, ["a", "b"])
+        self.assertEqual(result.stdout, "a\r\nb\r\n")
 
 
 if __name__ == "__main__":

@@ -346,7 +346,7 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         events = _read_events(self.activity_path)
         self.assertEqual(
             [e["event"] for e in events],
-            ["session.started", "file.edited", "command.started", "command.finished",
+            ["session.started", "file.changed", "command.started", "command.finished",
              "tool.call", "provider.result"],
         )
         session = events[0]
@@ -481,7 +481,7 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         self.assertEqual(result.session_id, "abc-123")
         self.assertEqual(result.text, "done")
         self.assertEqual([e["event"] for e in _read_events(self.activity_path)][:2],
-                         ["session.started", "file.edited"])
+                         ["session.started", "file.changed"])
 
 
 if __name__ == "__main__":

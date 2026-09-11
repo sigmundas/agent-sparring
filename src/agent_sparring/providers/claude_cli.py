@@ -148,7 +148,7 @@ class _ClaudeStreamTranslator:
                     ),
                     None,
                 )
-                emit(self._emitter, "file.edited", tool=name, path=path, parent_id=parent_id)
+                emit(self._emitter, "file.changed", tool=name, path=path, parent_id=parent_id)
             elif name in _SHELL_TOOLS:
                 emit(
                     self._emitter,

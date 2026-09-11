@@ -517,7 +517,7 @@ class AcceptanceEventTests(unittest.TestCase):
             self._accept()
         self.assertIn("must be frozen", str(ctx.exception))
         self.assertEqual(_names(self.stage), ["gate:gate.refused"])
-        self.assertTrue(_events(self.stage)[0]["summary"].startswith("accept refused: "))
+        self.assertEqual(_events(self.stage)[0]["summary"], "accept refused")
 
         # Stale candidate: the subclass is preserved, not replaced.
         self._freeze()
@@ -528,8 +528,15 @@ class AcceptanceEventTests(unittest.TestCase):
             self._accept()
         names = _names(self.stage)
         self.assertEqual(names, ["gate:gate.refused", "gate:candidate.frozen", "gate:gate.refused"])
+        self.assertEqual(_events(self.stage)[-1]["summary"], "accept refused: stale candidate")
         self.assertEqual(self.stage.read_state().status, StageStatus.FROZEN)
         self.assertEqual(self.stage.read_state().candidate_sha, self.candidate_sha)
+        # The exception text (paths, SHAs, remote detail) never reaches the
+        # log: only fixed phrases and the envelope do.
+        log_text = self.stage.activity_path().read_text(encoding="utf-8")
+        self.assertNotIn("must be frozen", log_text)
+        self.assertNotIn(str(self.repo), log_text)
+        self.assertNotIn("refusing acceptance as stale", log_text)
 
     def test_refusal_with_broken_telemetry_still_raises_the_original_error(self):
         self.stage.activity_path().mkdir()

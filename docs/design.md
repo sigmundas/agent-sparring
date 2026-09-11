@@ -380,7 +380,7 @@ recorded.
 Actors and events:
 
     stage    turn.started, turn.finished, turn.failed, handoff.ready
-             (orchestration) and session.started, tool.call, file.edited,
+             (orchestration) and session.started, tool.call, file.changed,
              command.started, command.finished, subagent.started,
              provider.result (translated from the implementation provider)
     sparrer  sparring.started, sparring.failed, verdict (orchestration) and

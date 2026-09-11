@@ -734,7 +734,7 @@ open(out, "w").write(json.dumps(verdict))
         expected_cycle = [
             "stage:turn.started",
             "stage:session.started",
-            "stage:file.edited",
+            "stage:file.changed",
             "stage:command.started",
             "stage:command.finished",
             "stage:provider.result",
@@ -760,7 +760,7 @@ open(out, "w").write(json.dumps(verdict))
         self.assertEqual((sessions[0]["session_id"], sessions[0]["model"]),
                          ("impl-1", "fake-model"))
         self.assertNotIn("model", sessions[1])
-        self.assertEqual([e["path"] for e in events if e["event"] == "file.edited"],
+        self.assertEqual([e["path"] for e in events if e["event"] == "file.changed"],
                          ["f.txt", "f.txt"])
         self.assertEqual([e["action"] for e in events if e["event"] == "verdict"],
                          ["SEND_BACK", "READY"])
