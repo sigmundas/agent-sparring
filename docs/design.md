@@ -107,7 +107,7 @@ A genuinely new stage gets a fresh implementation context.
 
 ### 3. Agents should communicate without the human acting as courier
 
-The eventual system must support:
+The system supports:
 
     stage agent
         -> handoff
@@ -120,10 +120,8 @@ The eventual system must support:
 
 The shared communication must remain human-readable.
 
-Initially agent invocation may still be manual.
-
-The target is an unattended loop when both agent providers support
-programmatic invocation/resume.
+`run-loop` runs this unattended. The individual steps stay available as
+separate commands, so a stage can still be sparred manually or in a web chat.
 
 ### 4. Human interruption is exceptional
 
@@ -319,7 +317,7 @@ not inside reusable Sparring code or skills.
 
 # Stage artifacts
 
-Target project-local layout:
+Project-local layout:
 
     .sparring/
         project.toml
@@ -333,8 +331,7 @@ Target project-local layout:
                 handoff.md
                 sparring.md
 
-Exact filenames may be refined during implementation, but responsibilities
-must remain separated.
+Each file has one responsibility:
 
 brief.md
     Scope and goal for this stage.
@@ -398,37 +395,28 @@ May contain relevant diffs/patches and additional source context.
 
 Generic orchestration must not assume Claude or Codex semantics everywhere.
 
-Providers should sit behind small adapters/capabilities.
+Providers sit behind two small adapter protocols, one for the stage agent and
+one for the sparrer, each with the same shape:
 
-Conceptually:
+    start(prompt)               -> fresh session
+    resume(session_id, prompt)  -> same session continued
 
-    start_stage()
-    resume_stage()
-    start_sparring()
-    resume_sparring()
-    capture_handoff()
+The session id comes from the provider's own machine-readable output, never
+from agent prose. A provider that cannot resume raises an error rather than
+the caller pretending compatibility exists.
 
-Not every provider must initially support every operation.
-
-The system should expose capabilities rather than constructing fake
-compatibility.
-
-Claude Code CLI can likely support unattended/resumable stage execution.
-
-Codex VS Code may initially remain manually invoked.
-
-A callable local sparrer can later be used for the unattended loop.
+Implemented adapters: Claude Code CLI as the stage agent, Codex CLI as the
+sparrer, invoked in the provider's read-only mode and additionally checked
+for repository changes afterwards.
 
 Web GPT remains an escalation/manual sparring target rather than something the
 local driver assumes it can wake automatically.
 
 ---
 
-# Orchestrator target
+# Orchestrator
 
-The orchestrator should be a small router, not another workflow engine.
-
-Conceptually:
+The orchestrator is a small router, not another workflow engine:
 
     start/resume stage agent
             |
@@ -473,8 +461,10 @@ before the next began:
 5. the unattended `run-loop` router with loop limits;
 6. the acceptance gate: `freeze-candidate` and `accept-candidate` pinned to an
    exact pushed SHA;
-7. a real-project pilot that exercised READY, SEND_BACK, NEEDS_YOU, ESCALATE,
-   same-SHA reacceptance and project-specific subagents;
+7. a real-project pilot that exercised READY, SEND_BACK, NEEDS_YOU, same-SHA
+   reconsideration/acceptance and project-specific subagents, and verified
+   the ESCALATE self-contained packet mechanism (no genuine ESCALATE verdict
+   occurred);
 8. retirement of the project-specific predecessor workflow this tool replaced.
 
 The predecessor was reference material, not the architecture. Its exact-session
