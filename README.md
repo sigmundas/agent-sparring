@@ -3,10 +3,8 @@
 Pairs a stage implementation agent with an independent sparring agent, so the
 two can exchange corrections without a human acting as courier.
 
-The design, principles and stage history live in
-[docs/plans/active/2026-09-10-agent-sparring-foundation.md](docs/plans/active/2026-09-10-agent-sparring-foundation.md).
-The first real-world pilot is recorded in
-[docs/plans/active/2026-09-10-stage-7-sporely-pilot-record.md](docs/plans/active/2026-09-10-stage-7-sporely-pilot-record.md).
+The design, principles and a short build history live in
+[docs/design.md](docs/design.md).
 
 The tool is generic: it contains no knowledge of any particular project. A
 project supplies its own machine-readable config and its own prose knowledge.

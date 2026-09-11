@@ -239,7 +239,8 @@ not become the authority controlling which workflow transitions are legal.
 
 # Generic project separation
 
-The generic Sparring tool must contain no baked-in Sporely application rules.
+The generic Sparring tool must contain no baked-in rules for any particular
+application.
 
 A project supplies two distinct kinds of configuration.
 
@@ -251,7 +252,7 @@ Project-local:
 
 Example:
 
-    project = "sporely-web"
+    project = "my-repo"
 
     [repo]
     root = "."
@@ -311,8 +312,8 @@ This contains project-specific knowledge such as:
 The generic workflow injects this as agent context but does not interpret its
 prose as workflow logic.
 
-Sporely-specific rules belong here or in Sporely's own repository plans, not
-inside reusable Sparring skills.
+Project-specific rules belong here or in the project's own repository plans,
+not inside reusable Sparring code or skills.
 
 ---
 
@@ -356,8 +357,8 @@ Do not encode project knowledge in state.json.
 
 # Handoff
 
-Preserve the strongest idea from V1: the sparrer should receive more than the
-implementation agent's prose report.
+The strongest idea inherited from the predecessor: the sparrer should receive
+more than the implementation agent's prose report.
 
 A handoff should make available:
 
@@ -457,196 +458,33 @@ The orchestrator only decides WHERE control goes next.
 
 ---
 
-# Relationship to V1
-
-V1 is reference material, not the architecture for V2.
-
-Do not base V2 on the unmerged ancillary-followup feature.
-
-Do not port workflow_transitions.py and simplify it incrementally.
-
-Reuse individual functions/ideas only where they genuinely fit V2.
-
-Particularly valuable V1 assets to inspect:
-
-- exact-session handoff capture;
-- Git/test context gathering;
-- thin/self-contained packet concepts;
-- pushed candidate verification;
-- useful agent/repo discovery code.
-
-V1 concepts expected NOT to survive as core V2 mechanisms include:
-
-- changes_requested as a durable routing state;
-- immutable intermediate review verdict identities;
-- review-attempt machinery;
-- candidate-amendment protocol;
-- pre-history review migration;
-- ancillary-descendant classification;
-- repo-specific ancillary path allowlists;
-- workflow state embedded in custom Markdown front matter;
-- standalone acceptance/archive paths;
-- large phrase-based skill contract tests.
-
-Do not delete V1 until V2 has been exercised successfully.
-
----
-
-# Implementation stages
-
-## Stage 1 — Generic V2 skeleton and contract
-
-Create the clean V2 implementation boundary.
-
-Implement only:
-
-- generic project configuration loading;
-- PROJECT.md context loading;
-- minimal stage artifact model;
-- routing outcome model:
-  SEND_BACK / READY / NEEDS_YOU / ESCALATE;
-- minimal serializable state;
-- tests for these primitives;
-- a small generic V2 workflow/CLI namespace or package.
-
-No provider execution yet.
-No autonomous loop yet.
-No V1 migration/deletion yet.
-
-The core code must contain no Sporely-specific behavior.
-
-STOP for sparring.
-
-## Stage 2 — Handoff and sparring exchange
-
-Implement:
-
-- stage handoff generation;
-- sparring.md exchange;
-- thin packet;
-- self-contained packet;
-- Git identity/status/change/test context;
-- readable SEND_BACK/NEEDS_YOU/ESCALATE output.
-
-Salvage V1 handoff code selectively where useful.
-
-STOP for sparring.
-
-## Stage 3 — Stage-agent adapter
-
-Implement a real callable/resumable stage-agent adapter, starting with the
-provider best supported by the user's current setup, likely Claude Code CLI.
-
-Support:
-
-- fresh session for new stage;
-- resume same session for SEND_BACK;
-- bounded stage prompt;
-- reading latest sparring feedback automatically;
-- producing updated handoff.
-
-Keep provider-specific code outside generic workflow logic.
-
-STOP for sparring.
-
-## Stage 4 — Sparring adapter
-
-Implement a callable local sparring adapter where technically feasible.
-
-Probe actual Codex/Claude capabilities rather than assuming the VS Code
-extension is programmatically controllable.
-
-Support:
-
-- fresh sparring context per new stage;
-- resume same sparring context after corrections;
-- repository inspection;
-- structured routing result;
-- human-readable sparring report.
-
-Manual/web sparring remains supported.
-
-STOP for sparring.
-
-## Stage 5 — Unattended loop
-
-Implement the small router:
-
-    stage -> sparring -> SEND_BACK -> stage -> sparring ...
-
-Automatically stop on:
-
-    NEEDS_YOU
-    ESCALATE
-
-Proceed when:
-
-    READY
-
-Add loop limits / obvious runaway protection without building a workflow
-state machine.
-
-STOP for sparring.
-
-## Stage 6 — Acceptance
-
-Implement the small hard gate:
-
-- freeze exact pushed candidate SHA;
-- accept exact candidate;
-- stale acceptance if candidate changes;
-- allow same-SHA reconsideration when evidence changed;
-- no dummy commits.
-
-If sparrer contributed code, require another independent acceptance sparrer by
-convention or minimal metadata only if actually necessary.
-
-STOP for sparring.
-
-## Stage 7 — Sporely pilot
-
-Add project-local:
-
-    .sparring/project.toml
-    .sparring/PROJECT.md
-
-Move Sporely-specific knowledge out of generic code/skills.
-
-Exercise real cases:
-
-1. simple implementation -> READY -> accepted;
-2. SEND_BACK -> same stage agent -> corrected -> READY;
-3. several unattended correction loops;
-4. NEEDS YOU — product decision;
-5. NEEDS YOU — device/manual check;
-6. evidence arrives with no code change -> same SHA -> accepted;
-7. ESCALATE -> web packet -> GPT web sparring;
-8. stage using project-specific implementation subagents.
-
-STOP and evaluate V2 before deleting V1.
-
-## Stage 8 — Retire V1
-
-Only after successful pilot.
-
-Search external callers first.
-
-Delete/simplify obsolete machinery rather than supporting both models forever.
-
-Likely targets include:
-
-- archive_stage.py;
-- old transition engine;
-- duplicate front-matter parsers;
-- old review-result/history routing;
-- ancillary classification;
-- stale progress instructions;
-- task-specific reusable-skill content;
-- unused handoff compatibility modes;
-- excessive prose-contract tests.
-
-Keep reusable V1 utilities only where they reduce V2 code rather than import
-old semantics.
+# History
+
+The tool was built in eight bounded stages during September 2026, each one
+implemented by a stage agent and checked by an independent sparring agent
+before the next began:
+
+1. generic skeleton: config loading, stage artifacts, routing outcomes;
+2. handoff generation and the `sparring.md` exchange, thin and self-contained
+   packets, Git context;
+3. a resumable stage-agent adapter (Claude Code CLI);
+4. a resumable sparring adapter (Codex CLI), with manual and web sparring
+   still supported;
+5. the unattended `run-loop` router with loop limits;
+6. the acceptance gate: `freeze-candidate` and `accept-candidate` pinned to an
+   exact pushed SHA;
+7. a real-project pilot that exercised READY, SEND_BACK, NEEDS_YOU, ESCALATE,
+   same-SHA reacceptance and project-specific subagents;
+8. retirement of the project-specific predecessor workflow this tool replaced.
+
+The predecessor was reference material, not the architecture. Its exact-session
+handoff capture, Git and test context gathering, packet concepts and pushed
+candidate verification carried over as ideas. Its durable review states,
+review-attempt machinery, front-matter workflow state and large prose contract
+tests deliberately did not.
+
+Per-stage handoff and review records are working artifacts. They live in
+`.sparring/stages/` in the project being worked on, not in this repository.
 
 ---
 
