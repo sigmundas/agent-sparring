@@ -93,6 +93,7 @@ refuses to start otherwise.
 cd <repo>
 sparring new-stage <stage-id>    # writes brief.md, notes.md, state.json
 # edit .sparring/stages/<stage-id>/brief.md — scope and goal for this stage
+# or: sparring new-stage <stage-id> --brief-file scope.md   # that Markdown becomes brief.md verbatim
 
 sparring run-loop <stage-id> --repo-root . --expected-branch feature/x
 ```

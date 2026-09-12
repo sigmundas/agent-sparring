@@ -174,8 +174,14 @@ class Stage:
 
     # -- skeleton creation ------------------------------------------------
 
-    def create(self, *, exist_ok: bool = False) -> "Stage":
+    def create(self, *, exist_ok: bool = False, brief: str | None = None) -> "Stage":
         """Create a new stage skeleton with initial state and templates.
+
+        ``brief`` is the initial ``brief.md`` content, written verbatim in
+        place of the template. Like the template it is only written when
+        ``brief.md`` does not exist yet: an existing brief (``exist_ok``) is
+        never overwritten. The caller decides what the brief says; this
+        method only owns *where* it goes and *when* it is written.
 
         Raises :class:`StageError` if the stage already exists and
         ``exist_ok`` is False.
@@ -190,15 +196,18 @@ class Stage:
         if not state_path.is_file():
             self.write_state(StageState())
 
-        for filename, template in (
-            (BRIEF_FILENAME, templates.BRIEF_TEMPLATE),
-            (NOTES_FILENAME, templates.NOTES_TEMPLATE),
-            (HANDOFF_FILENAME, templates.HANDOFF_TEMPLATE),
-            (SPARRING_FILENAME, templates.SPARRING_TEMPLATE),
+        initial_brief = (
+            brief if brief is not None else templates.BRIEF_TEMPLATE.format(stage_id=self.stage_id)
+        )
+        for filename, content in (
+            (BRIEF_FILENAME, initial_brief),
+            (NOTES_FILENAME, templates.NOTES_TEMPLATE.format(stage_id=self.stage_id)),
+            (HANDOFF_FILENAME, templates.HANDOFF_TEMPLATE.format(stage_id=self.stage_id)),
+            (SPARRING_FILENAME, templates.SPARRING_TEMPLATE.format(stage_id=self.stage_id)),
         ):
             path = self.directory / filename
             if not path.is_file():
-                path.write_text(template.format(stage_id=self.stage_id), encoding="utf-8")
+                path.write_text(content, encoding="utf-8")
 
         return self
 

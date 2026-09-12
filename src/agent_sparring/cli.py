@@ -72,8 +72,18 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
 def _cmd_new_stage(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
     try:
+        # The brief is read before anything is created or resolved on disk:
+        # an unreadable file must leave no partially created stage behind.
+        brief: str | None = None
+        if args.brief_file is not None:
+            try:
+                # newline="" keeps the file's own line endings; the brief is verbatim.
+                with open(args.brief_file, encoding="utf-8", newline="") as handle:
+                    brief = handle.read()
+            except (OSError, UnicodeDecodeError) as exc:
+                raise StageError(f"could not read --brief-file {args.brief_file!r}: {exc}") from exc
         stage = Stage.resolve(sparring_dir, args.stage_id)
-        stage.create(exist_ok=args.exist_ok)
+        stage.create(exist_ok=args.exist_ok, brief=brief)
     except StageError as exc:
         print(f"could not create stage: {exc}", file=sys.stderr)
         return 1
@@ -627,6 +637,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--exist-ok",
         action="store_true",
         help="do not fail if the stage directory already exists",
+    )
+    new_stage.add_argument(
+        "--brief-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "UTF-8 Markdown to use verbatim as the initial brief.md instead of the "
+            "template (never overwrites an existing brief.md)"
+        ),
     )
     new_stage.set_defaults(func=_cmd_new_stage)
 

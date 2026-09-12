@@ -582,8 +582,7 @@ def _ensure_stage(sparring_dir: Path, label: str, plan_stage: PlanStage, total: 
     try:
         stage = Stage.resolve(sparring_dir, plan_stage.stage_id)
         if not stage.exists():
-            stage.create()
-            stage.write_brief(brief)
+            stage.create(brief=brief)
         elif stage.read_brief() != brief:
             raise PlanError(
                 f"stage {plan_stage.stage_id!r} already exists at {stage.directory} with a "
