@@ -46,6 +46,29 @@ Plan changes: the SHA-256 of the parsed stage sections (ids + text) is
 recorded when a run starts and re-checked on resume; a plan whose stage
 content changed is refused rather than silently run. Prose outside the
 stage sections may change freely.
+
+Adapters are built per planned stage
+------------------------------------
+
+The runner takes an :data:`AdapterFactory` -- ``make_adapters(stage) ->
+(stage_adapter, sparring_adapter)`` -- and calls it once each time it enters
+a stage for execution, so a caller can bind each stage's provider telemetry
+(see :mod:`agent_sparring.activity`) to that stage's own ``activity.jsonl``
+instead of the first stage's. This module never learns which providers the
+factory builds. Provider session continuity does not depend on any adapter
+*object* surviving: the session ids persisted in each stage's ``state.json``
+are what ``run_stage_agent``/``run_sparring_agent`` pass to ``resume``.
+
+Observational plan events
+-------------------------
+
+The runner mirrors its own decisions into the *current* stage's
+``activity.jsonl`` under the actor ``plan`` (``plan.stage.entered``,
+``plan.stage.accepted``, ``plan.paused``, ``plan.failed``,
+``plan.completed``, ``plan.evidence_recorded``). That stream is telemetry
+only: nothing here reads it back, and the run-state file plus each stage's
+``state.json`` remain the only authority for position, acceptance, pause,
+completion, evidence and sessions.
 """
 
 from __future__ import annotations
@@ -59,6 +82,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_sparring.acceptance import AcceptanceError, accept_candidate, freeze_candidate
+from agent_sparring.activity import ActivityEmitter
 from agent_sparring.git_context import GitContextError, is_ignored
 from agent_sparring.loop import (
     DEFAULT_MAX_SEND_BACK_CYCLES,
@@ -88,6 +112,12 @@ _SECTION_BOUNDARY_RE = re.compile(r"^#{1,2}\s")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 Reporter = Callable[[str], None]
+
+# Builds the (stage_adapter, sparring_adapter) pair for one planned stage.
+# Called once per stage entered for execution; may return the same objects
+# every time (a stage-agnostic caller, or a test) or fresh ones bound to the
+# given stage's activity log. Session continuity never depends on which.
+AdapterFactory = Callable[[Stage], tuple[StageAgentAdapter, SparringAgentAdapter]]
 
 
 class PlanError(ValueError):
@@ -383,8 +413,7 @@ def start_plan(
     plan_path: Path,
     sparring_dir: Path,
     repo_root: Path,
-    stage_adapter: StageAgentAdapter,
-    sparring_adapter: SparringAgentAdapter,
+    make_adapters: AdapterFactory,
     *,
     expected_branch: str,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
@@ -392,6 +421,10 @@ def start_plan(
     report: Reporter = lambda message: None,
 ) -> PlanRunResult:
     """Validate the whole plan, record position at stage 1, and run.
+
+    ``make_adapters`` (an :data:`AdapterFactory`) is called once per stage
+    entered for execution, with that stage, and returns the stage and
+    sparring adapters to drive it with.
 
     Refuses (:class:`PlanError`, before any provider is invoked) if the plan
     is malformed, if a run for this plan is already recorded (use
@@ -442,8 +475,7 @@ def start_plan(
         state_path,
         sparring_dir,
         repo_root,
-        stage_adapter,
-        sparring_adapter,
+        make_adapters,
         max_send_back_cycles=max_send_back_cycles,
         self_check=self_check,
         report=report,
@@ -454,8 +486,7 @@ def resume_plan(
     plan_path: Path,
     sparring_dir: Path,
     repo_root: Path,
-    stage_adapter: StageAgentAdapter,
-    sparring_adapter: SparringAgentAdapter,
+    make_adapters: AdapterFactory,
     *,
     expected_branch: str,
     evidence: str | None = None,
@@ -464,6 +495,9 @@ def resume_plan(
     report: Reporter = lambda message: None,
 ) -> PlanRunResult:
     """Continue a recorded plan run at its current stage.
+
+    ``make_adapters`` is the same per-stage :data:`AdapterFactory` as for
+    :func:`start_plan`.
 
     ``evidence`` (a human's answer, manual-check result, external-condition
     result or scope approval -- one path for all of them) is appended to the
@@ -507,6 +541,8 @@ def resume_plan(
         stage = _ensure_stage(sparring_dir, label, current, len(stages))
         record_human_evidence(stage, evidence)
         report(f"recorded human evidence in {stage.directory / 'notes.md'}")
+        # Observational only: that evidence was recorded, never what it says.
+        _plan_emitter(stage).emit("plan.evidence_recorded")
 
     return _drive(
         plan_path,
@@ -515,8 +551,7 @@ def resume_plan(
         state_path,
         sparring_dir,
         repo_root,
-        stage_adapter,
-        sparring_adapter,
+        make_adapters,
         max_send_back_cycles=max_send_back_cycles,
         self_check=self_check,
         report=report,
@@ -565,8 +600,41 @@ def _pause(state: PlanRunState, state_path: Path) -> None:
     state.save(state_path)
 
 
+def _plan_emitter(stage: Stage) -> ActivityEmitter:
+    """The plan runner's observational emitter into ``stage``'s own
+    ``activity.jsonl`` (see :mod:`agent_sparring.activity`). Write-only and
+    never raising; every ``plan.*`` line below is a mirror of a decision
+    already taken from the run-state file and ``state.json``, never an
+    input to one."""
+
+    return stage.activity_log().bind("plan")
+
+
+def _fail(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    *,
+    why: str,
+    message: str,
+) -> PlanRunError:
+    """Pause the run, mirror ``plan.failed`` with a fixed phrase (``why`` is
+    orchestration-authored; the exception text, which can carry provider
+    output or paths, is never copied into telemetry), and build the
+    :class:`PlanRunError` for the caller to raise."""
+
+    _pause(state, state_path)
+    activity.emit("plan.failed", summary=why)
+    return PlanRunError(message)
+
+
 def _require_plan_unchanged(
-    plan_path: Path, state: PlanRunState, state_path: Path, *, before: str
+    plan_path: Path,
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    *,
+    before: str,
 ) -> None:
     """Mid-run form of :func:`_verify_plan_unchanged`: on a changed (or now
     unparseable) plan, pause and stop instead of doing ``before``."""
@@ -574,9 +642,15 @@ def _require_plan_unchanged(
     try:
         _verify_plan_unchanged(plan_path, state)
     except PlanError as exc:
-        _pause(state, state_path)
-        raise PlanRunError(
-            f"plan {state.plan} stopped before {before} at stage {state.current_stage!r}: {exc}"
+        raise _fail(
+            state,
+            state_path,
+            activity,
+            why="reviewed plan changed",
+            message=(
+                f"plan {state.plan} stopped before {before} at stage "
+                f"{state.current_stage!r}: {exc}"
+            ),
         ) from exc
 
 
@@ -587,8 +661,7 @@ def _drive(
     state_path: Path,
     sparring_dir: Path,
     repo_root: Path,
-    stage_adapter: StageAgentAdapter,
-    sparring_adapter: SparringAgentAdapter,
+    make_adapters: AdapterFactory,
     *,
     max_send_back_cycles: int,
     self_check: bool,
@@ -599,24 +672,65 @@ def _drive(
 
     while True:
         plan_stage = stages[state.current_stage_index]
-        stage = _ensure_stage(sparring_dir, state.plan, plan_stage, total)
+        try:
+            stage = _ensure_stage(sparring_dir, state.plan, plan_stage, total)
+        except PlanError:
+            # The authoritative refusal is unchanged; only mirror it, if the
+            # stage directory is even addressable.
+            try:
+                _plan_emitter(Stage.resolve(sparring_dir, plan_stage.stage_id)).emit(
+                    "plan.failed", summary="planned stage unusable"
+                )
+            except StageError:
+                pass
+            raise
+        activity = _plan_emitter(stage)
         try:
             stage_state = stage.read_state()
         except StageError as exc:
-            _pause(state, state_path)
-            raise PlanRunError(f"plan {state.plan} stopped at {stage.stage_id!r}: {exc}") from exc
+            raise _fail(
+                state,
+                state_path,
+                activity,
+                why="stage state unreadable",
+                message=f"plan {state.plan} stopped at {stage.stage_id!r}: {exc}",
+            ) from exc
 
         if stage_state.status is StageStatus.ACCEPTED:
             # Already through the hard gate (by hand, or by a run that stopped
             # between accept and advance): nothing to run, just move on.
+            activity.emit(
+                "plan.stage.entered",
+                summary=f"Stage {plan_stage.number}/{total}; already accepted, advancing",
+            )
             report(f"stage {plan_stage.number}/{total} {stage.stage_id}: already ACCEPTED at "
                    f"{stage_state.candidate_sha}; advancing")
             accepted.append((stage.stage_id, str(stage_state.candidate_sha)))
         else:
             state.status = PlanRunStatus.RUNNING
             state.save(state_path)
+            activity.emit("plan.stage.entered", summary=f"Stage {plan_stage.number}/{total}")
             report(f"stage {plan_stage.number}/{total} {stage.stage_id}: running the "
                    "implementation <-> sparring loop")
+            # Adapters are built for THIS stage, so a caller can bind their
+            # provider telemetry to this stage's activity.jsonl. Session
+            # continuity comes from state.json's recorded ids, which
+            # run_stage_agent/run_sparring_agent pass to resume(); it does
+            # not depend on the adapter objects from an earlier stage or an
+            # earlier process.
+            try:
+                stage_adapter, sparring_adapter = make_adapters(stage)
+            except Exception as exc:
+                raise _fail(
+                    state,
+                    state_path,
+                    activity,
+                    why="adapter construction failed",
+                    message=(
+                        f"plan {state.plan} stopped at stage {stage.stage_id!r} before any "
+                        f"provider turn: could not build the provider adapters: {exc}"
+                    ),
+                ) from exc
             try:
                 loop_result = run_unattended_loop(
                     stage,
@@ -629,14 +743,20 @@ def _drive(
                     self_check=self_check,
                 )
             except LoopError as exc:
-                _pause(state, state_path)
-                raise PlanRunError(
-                    f"plan {state.plan} stopped at stage {stage.stage_id!r} (not accepted, "
-                    f"not advanced): {exc}"
+                raise _fail(
+                    state,
+                    state_path,
+                    activity,
+                    why="stage loop failed",
+                    message=(
+                        f"plan {state.plan} stopped at stage {stage.stage_id!r} (not accepted, "
+                        f"not advanced): {exc}"
+                    ),
                 ) from exc
 
             if loop_result.outcome is not RoutingAction.READY:
                 _pause(state, state_path)
+                activity.emit("plan.paused", action=loop_result.outcome.value)
                 report(f"stage {stage.stage_id}: {loop_result.outcome.value}; plan paused")
                 return PlanRunResult(
                     status=PlanRunStatus.PAUSED,
@@ -651,25 +771,35 @@ def _drive(
             # could have edited and committed a stage section -- then invoke
             # the existing hard gate on the exact pushed SHA. Any refusal
             # stops the plan; nothing else is ever substituted.
-            _require_plan_unchanged(plan_path, state, state_path, before="accepting the candidate")
+            _require_plan_unchanged(
+                plan_path, state, state_path, activity, before="accepting the candidate"
+            )
             try:
                 frozen = freeze_candidate(
                     stage, sparring_dir, repo_root, expected_branch=state.expected_branch
                 )
                 result = accept_candidate(stage, repo_root, expected_branch=state.expected_branch)
             except AcceptanceError as exc:
-                _pause(state, state_path)
-                raise PlanRunError(
-                    f"plan {state.plan} stopped at stage {stage.stage_id!r}: the sparrer said "
-                    f"READY but the acceptance gate refused ({exc}); the plan did not advance"
+                raise _fail(
+                    state,
+                    state_path,
+                    activity,
+                    why="acceptance gate refused",
+                    message=(
+                        f"plan {state.plan} stopped at stage {stage.stage_id!r}: the sparrer "
+                        f"said READY but the acceptance gate refused ({exc}); the plan did not "
+                        "advance"
+                    ),
                 ) from exc
             report(f"stage {stage.stage_id}: READY; frozen and accepted {result.candidate_sha} "
                    f"({frozen.push_detail})")
             accepted.append((stage.stage_id, result.candidate_sha))
+            activity.emit("plan.stage.accepted", sha=result.candidate_sha)
 
         if state.current_stage_index + 1 >= total:
             state.status = PlanRunStatus.COMPLETE
             state.save(state_path)
+            activity.emit("plan.completed", summary=f"{total} stage(s) accepted")
             report(f"plan {state.plan}: complete; {total} stage(s) accepted")
             return PlanRunResult(
                 status=PlanRunStatus.COMPLETE,
@@ -678,13 +808,16 @@ def _drive(
                 accepted=tuple(accepted),
             )
 
-        _require_plan_unchanged(plan_path, state, state_path, before="advancing to the next stage")
+        _require_plan_unchanged(
+            plan_path, state, state_path, activity, before="advancing to the next stage"
+        )
         state.current_stage_index += 1
         state.current_stage = stages[state.current_stage_index].stage_id
         state.save(state_path)
 
 
 __all__ = [
+    "AdapterFactory",
     "PLANS_DIRNAME",
     "PlanError",
     "PlanRunError",

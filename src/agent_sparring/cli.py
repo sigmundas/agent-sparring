@@ -309,6 +309,26 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
     return 0
 
 
+def _require_loop_providers(args: argparse.Namespace, sparring_dir: Path) -> None:
+    """Refuse (:class:`StageError`) any provider selection the loop commands
+    cannot serve yet. Separate from :func:`_build_loop_adapters` so run-plan
+    can check it once up front, before recording any run state, even though
+    its adapters are built later, per planned stage."""
+
+    stage_provider = _resolve_stage_provider(args.stage_provider, sparring_dir)
+    if stage_provider != "claude-cli":
+        raise StageError(
+            f"unsupported stage agent provider {stage_provider!r}; only "
+            "'claude-cli' is implemented so far"
+        )
+    sparring_provider = _resolve_sparring_provider(args.sparring_provider, sparring_dir)
+    if sparring_provider != "codex-cli":
+        raise StageError(
+            f"unsupported sparring agent provider {sparring_provider!r}; only "
+            "'codex-cli' is implemented so far"
+        )
+
+
 def _build_loop_adapters(
     args: argparse.Namespace,
     sparring_dir: Path,
@@ -325,12 +345,7 @@ def _build_loop_adapters(
     adapters that emit no provider telemetry.
     """
 
-    stage_provider = _resolve_stage_provider(args.stage_provider, sparring_dir)
-    if stage_provider != "claude-cli":
-        raise StageError(
-            f"unsupported stage agent provider {stage_provider!r}; only "
-            "'claude-cli' is implemented so far"
-        )
+    _require_loop_providers(args, sparring_dir)
     stage_adapter = ClaudeCliAdapter(
         repo_root=repo_root,
         executable=args.claude_executable,
@@ -343,12 +358,6 @@ def _build_loop_adapters(
         ),
     )
 
-    sparring_provider = _resolve_sparring_provider(args.sparring_provider, sparring_dir)
-    if sparring_provider != "codex-cli":
-        raise StageError(
-            f"unsupported sparring agent provider {sparring_provider!r}; only "
-            "'codex-cli' is implemented so far"
-        )
     # No --sandbox override is exposed here either, for the same reason
     # as run-sparring: CodexCliAdapter has no sandbox field at all.
     sparring_adapter = CodexCliAdapter(
@@ -450,7 +459,16 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
     try:
         repo_root = _resolve_repo_root(args, sparring_dir)
         self_check = _resolve_self_check(sparring_dir)
-        stage_adapter, sparring_adapter = _build_loop_adapters(args, sparring_dir, repo_root)
+        # Provider selection is checked once, before any run state exists;
+        # the adapters themselves are built per planned stage (below) so
+        # each stage's provider telemetry lands in that stage's own
+        # activity.jsonl -- observational only, never read back.
+        _require_loop_providers(args, sparring_dir)
+
+        def make_adapters(stage: Stage) -> tuple[ClaudeCliAdapter, CodexCliAdapter]:
+            return _build_loop_adapters(
+                args, sparring_dir, repo_root, activity_log=stage.activity_log()
+            )
 
         def report(message: str) -> None:
             print(message, file=sys.stderr)
@@ -466,15 +484,12 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
                 Path(args.plan_path),
                 sparring_dir,
                 repo_root,
-                stage_adapter,
-                sparring_adapter,
+                make_adapters,
                 evidence=args.evidence,
                 **common,
             )
         else:
-            result = start_plan(
-                Path(args.plan_path), sparring_dir, repo_root, stage_adapter, sparring_adapter, **common
-            )
+            result = start_plan(Path(args.plan_path), sparring_dir, repo_root, make_adapters, **common)
     except (
         PlanError,
         PlanRunError,

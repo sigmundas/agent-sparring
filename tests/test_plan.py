@@ -210,6 +210,13 @@ class PlanParsingTests(unittest.TestCase):
         self.assertNotEqual(plan_digest(parse_plan(PLAN.replace("Lay the groundwork", "Dig"))), base)
 
 
+def _fixed(stage_adapter, sparring_adapter):
+    """An AdapterFactory that hands the plan runner the same two (stateful,
+    scripted) adapter objects for every planned stage."""
+
+    return lambda stage: (stage_adapter, sparring_adapter)
+
+
 class _PlanRepoTestCase(unittest.TestCase):
     """A real repo with a real bare remote, the plan committed, and the
     workflow directories git-ignored as the README prescribes."""
@@ -242,13 +249,13 @@ class _PlanRepoTestCase(unittest.TestCase):
 
     def _start(self, stage_adapter, sparring_adapter, **kwargs):
         return start_plan(
-            self.plan_path, self.sparring_dir, self.repo, stage_adapter, sparring_adapter,
+            self.plan_path, self.sparring_dir, self.repo, _fixed(stage_adapter, sparring_adapter),
             expected_branch="feature/x", **kwargs,
         )
 
     def _resume(self, stage_adapter, sparring_adapter, **kwargs):
         return resume_plan(
-            self.plan_path, self.sparring_dir, self.repo, stage_adapter, sparring_adapter,
+            self.plan_path, self.sparring_dir, self.repo, _fixed(stage_adapter, sparring_adapter),
             expected_branch="feature/x", **kwargs,
         )
 
@@ -516,7 +523,8 @@ class PlanRunTests(_PlanRepoTestCase):
         self._start(stage_adapter, _SparringAdapter([NEEDS_YOU]))
         with self.assertRaises(PlanError) as ctx:
             resume_plan(
-                self.plan_path, self.sparring_dir, self.repo, stage_adapter, _SparringAdapter([READY]),
+                self.plan_path, self.sparring_dir, self.repo,
+                _fixed(stage_adapter, _SparringAdapter([READY])),
                 expected_branch="feature/other",
             )
         self.assertIn("different branch", str(ctx.exception))
@@ -619,7 +627,8 @@ class PlanRunTests(_PlanRepoTestCase):
 
         self._start(_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU]))
         start_plan(
-            other, self.sparring_dir, self.repo, _StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU]),
+            other, self.sparring_dir, self.repo,
+            _fixed(_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU])),
             expected_branch="feature/x",
         )
 
@@ -640,7 +649,8 @@ class PlanRunTests(_PlanRepoTestCase):
         self._start(_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU]))
         other_stage_adapter = _StageAdapter(self.repo)
         start_plan(
-            other, self.sparring_dir, self.repo, other_stage_adapter, _SparringAdapter([NEEDS_YOU]),
+            other, self.sparring_dir, self.repo,
+            _fixed(other_stage_adapter, _SparringAdapter([NEEDS_YOU])),
             expected_branch="feature/x",
         )
 

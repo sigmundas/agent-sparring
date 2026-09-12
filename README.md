@@ -149,6 +149,14 @@ refusal, the SEND_BACK runaway limit, and the end of the plan; ordinary
 pushed SHA, with no human confirmation. The gate itself is unchanged: if it
 refuses, the plan stops and nothing is substituted.
 
+Each planned stage gets its own `.sparring/stages/<stage-id>/activity.jsonl`,
+with the same provider stream a direct `run-loop` produces (the adapters are
+rebuilt per stage so the stream follows the stage), plus `plan.*` lines
+saying when the runner entered, accepted, paused on, failed at or completed
+a stage, and when evidence was recorded. That is telemetry for watching the
+run; the plan's position lives in `.sparring/plans/` and is never read from
+`activity.jsonl`.
+
 ### Marking stages in a plan
 
 Stages are level-2 headings numbered 1..N in document order:

@@ -45,8 +45,9 @@ SCHEMA_VERSION = 1
 # Actor vocabulary. "stage" is the implementation side (both its provider's
 # own events and the stage-turn lifecycle), "sparrer" the sparring side,
 # "loop" the unattended router's control decisions, "gate" the acceptance
-# gate (freeze/accept).
-ACTORS = ("stage", "sparrer", "loop", "gate")
+# gate (freeze/accept), "plan" the plan runner walking planned stages
+# (written into whichever stage's log is current).
+ACTORS = ("stage", "sparrer", "loop", "gate", "plan")
 
 # The only semantic fields an event may carry beyond the envelope. Closed
 # on purpose: adding a field is a schema decision, not a call-site

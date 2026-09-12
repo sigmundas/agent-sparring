@@ -389,6 +389,19 @@ Actors and events:
              provider.error (translated from the sparring provider)
     loop     loop.started, loop.send_back, loop.stopped, loop.runaway
     gate     candidate.frozen, candidate.accepted, gate.refused
+    plan     plan.stage.entered, plan.stage.accepted, plan.paused,
+             plan.failed, plan.completed, plan.evidence_recorded
+
+`plan` lines are written by the plan runner into whichever planned stage's
+log is current, in the order things happened: `plan.paused` only for a
+routing stop (`NEEDS_YOU`/`ESCALATE`, with `action`), `plan.failed` for a
+run that stopped on an error (a fixed phrase, never the exception text),
+`plan.evidence_recorded` for the fact that evidence was recorded, never
+what it says. Each planned stage has its own `activity.jsonl`; the plan
+runner builds the provider adapters per stage so their stream lands in that
+stage's file, not the first stage's. None of this is read back: run
+position, acceptance, pause, completion, evidence and sessions come from
+`.sparring/plans/<key>.json` and each stage's `state.json` alone.
 
 Provider events come from the providers' own structured output, consumed
 line by line while the process runs (Claude Code `--output-format
@@ -513,6 +526,15 @@ digest of the stage sections, branch, current stage, status) under
 `.sparring/plans/`. Human evidence goes into the current stage's `notes.md`
 and the same stage resumes. Stage boundaries are a fixed heading convention,
 never inferred.
+
+The runner takes an adapter factory (`make_adapters(stage)`) rather than
+finished adapters and calls it once per stage it enters, so each planned
+stage's provider telemetry is bound to that stage's own `activity.jsonl`;
+the runner itself never learns which providers are behind it. Session
+continuity comes from the ids in `state.json` passed to `resume`, not from
+keeping an adapter object alive across stages or processes. The runner's
+own `plan.*` activity lines (see "Activity stream") are a chronological
+mirror, never an input.
 
 ---
 
