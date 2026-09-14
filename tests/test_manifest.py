@@ -381,6 +381,52 @@ class ManifestAdoptionTests(_ManifestRepoTestCase):
         self.assertIn("impl-old", inherited[0])
         self.assertIn("spar-old", inherited[0])
 
+    def test_adopts_a_stage_whose_plan_section_moved_on_from_its_brief(self):
+        # The real Stage 3D case. The plan's Stage 3D section was rewritten
+        # after the work was done: it now records what was implemented, and
+        # is much longer than the brief the stage was actually started with.
+        # The stage itself still holds that original brief and two live
+        # sessions. Because the caller preserves an already-executed stage's
+        # own brief.md in the manifest (rather than re-extracting the plan
+        # section), the executable content is the contract the work was
+        # really reviewed against -- so --adopt continues it, and neither the
+        # brief nor the plan document has to be rolled back.
+        original = (
+            "# Stage brief: stage-3d-snapshot-v2\n\n"
+            "Stage 3D from plan `docs/plans/active/reported-statistics.md`.\n\n"
+            "Future stage; starts after Stage 3C is accepted.\n"
+        )
+        evolved_plan_section = original + "\n## Implementation record\n\nLanded 2026-09-14.\n"
+        self.assertNotEqual(original, evolved_plan_section)
+        stage = self._existing(
+            "stage-3d-snapshot-v2",
+            brief=original,
+            state=StageState(
+                status=StageStatus.WORKING,
+                implementation_session_id="impl-3d",
+                sparring_session_id="spar-3d",
+            ),
+        )
+        payload = manifest_payload()
+        payload["stages"][0] = _stage_entry(
+            "stage-3c-cloud-schema", "Stage 3C", "Cloud schema", "Add the RPC."
+        )
+        payload["stages"][1]["brief"] = original
+        self.write_manifest(payload)
+        reported: list[str] = []
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+
+        result = self._start(
+            stage_adapter, _SparringAdapter([READY, READY]), adopt=True, report=reported.append
+        )
+
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        # The brief was neither rewritten nor recreated, and the stage's own
+        # sessions carried on.
+        self.assertEqual(stage.read_brief(), original)
+        self.assertEqual([sid for sid, _ in stage_adapter.resume_calls], ["impl-3d"])
+        self.assertTrue(any("stage-3d-snapshot-v2" in line and "inheriting" in line for line in reported))
+
     def test_refuses_a_working_stage_whose_brief_differs(self):
         self._existing(
             "stage-3c-cloud-schema",

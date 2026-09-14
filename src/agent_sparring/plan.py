@@ -662,13 +662,23 @@ def _check_adoption(
       hard gate already, and demanding that a stage accepted months ago be
       briefed byte-identically to today's manifest would refuse exactly the
       sequences worth adopting.
-    - **Not accepted, brief identical to the plan's**: adopt. This is the
+    - **Not accepted, brief identical to the source's**: adopt. This is the
       current stage of a sequence being taken over mid-flight; its recorded
       sessions and candidate continue as they are.
     - **Anything else** -- an unreadable state, a missing brief, or a brief
       that differs: refuse, naming the stage. A stage that has actually run
       against a different brief is not this plan's stage, and silently
       re-briefing it would throw away the context its sessions hold.
+
+    Note what this does *not* require of a manifest. Once a stage has real
+    execution history, its ``brief.md`` is the contract that was actually
+    implemented and reviewed, and the plan section it was extracted from is
+    free to move on -- typically because the plan was rewritten afterwards to
+    record what was built. A caller emitting an adoption manifest is expected
+    to carry such a stage's existing ``brief.md`` verbatim, and only brief
+    stages that do *not* exist yet from the plan's current section. Then this
+    check passes on the truth rather than on a coincidence, and neither the
+    brief nor the plan document has to be rolled back to run the sequence.
 
     Reports every adoption, including what is being inherited, so nothing is
     taken over quietly.
@@ -731,8 +741,10 @@ def _check_adoption(
         raise PlanError(
             "refusing to adopt the existing stages of this plan; the following do not "
             f"match it and would have to be guessed at:\n  - {listed}\n"
-            "Fix the mismatch (align the plan's text with the stage's brief, or remove the "
-            "stage directory deliberately) rather than running against a different brief."
+            "A stage that has already run is defined by its own brief.md, not by what the "
+            "plan says today. Carry that brief verbatim in the plan input (a manifest can), "
+            "or align the plan's text with it, or remove the stage directory deliberately -- "
+            "rather than running a started stage against a different brief."
         )
 
 

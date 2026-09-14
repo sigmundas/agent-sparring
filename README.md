@@ -275,6 +275,18 @@ Each existing stage is checked, and every adoption is reported:
   not this plan's stage, and re-briefing it silently would throw away the
   context its sessions hold.
 
+Note what the second rule compares: the stage's `brief.md` against **the plan
+input's** text for it — not against whatever the plan document says today. A
+stage that has already run is defined by the brief the work was implemented
+and reviewed against, and the plan section it came from is a living document
+that is usually rewritten afterwards to record what was built. So an adoption
+manifest should carry an already-executed stage's existing `brief.md`
+verbatim, and brief only the stages that do not exist yet from the plan's
+current section. One manifest then describes both the preserved history and
+the future execution, and adopting a sequence never requires deleting a stage
+or rolling the plan document back. (The Markdown input has no way to say this,
+so a plan whose sections have moved on is a case for a manifest.)
+
 #### Answering a human gate
 
 `--evidence` is appended to the current stage's `notes.md` under
@@ -358,8 +370,11 @@ coupled migration there, and the sparrer's `READY` depends on both. Pinning
 only the primary commit would let the sibling move between review and
 acceptance, so the stage would claim a candidate set that no longer exists.
 
-A stage may therefore declare sibling repositories — in a manifest stage's
-`repositories`, or directly in its `state.json`:
+A stage may therefore declare sibling repositories. The declaration belongs in
+the plan input — a manifest stage's `repositories` — and the plan runner
+writes it into that stage's `state.json` before anything runs, so the
+standalone `freeze-candidate`/`accept-candidate` commands see the same
+complete candidate set:
 
 ```json
 "repositories": [
@@ -367,6 +382,10 @@ A stage may therefore declare sibling repositories — in a manifest stage's
    "branch": "feature/cloud-transport", "candidate_sha": null}
 ]
 ```
+
+(That is also the on-disk shape, but treat it as the engine's record rather
+than as something to maintain by hand: declare it where the stage is defined,
+and let the run write it. The VS Code extension has a command for this.)
 
 `freeze-candidate` then treats each sibling exactly as it treats the primary
 repository — right branch, clean worktree, commit pushed and reachable — and

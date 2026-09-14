@@ -43,6 +43,22 @@ same protection the Markdown path gets from its stage-section digest.
 
 Unknown keys are refused rather than ignored, so a manifest written against
 a later version of this contract fails loudly instead of being half-read.
+
+Briefs, and what "the plan says" means for a stage already under way
+--------------------------------------------------------------------
+
+``brief`` is the exact ``brief.md`` content the engine will write for a
+stage it creates, and the exact content it requires an existing, started
+stage to already hold (see :func:`agent_sparring.plan._check_adoption`). For
+a stage that has real execution history those are not the same source: its
+``brief.md`` is the contract the work was actually implemented and reviewed
+against, while the plan section it came from is a living document that is
+often rewritten afterwards to record what was built. So a caller emitting an
+*adoption* manifest is expected to carry an already-executed stage's
+existing ``brief.md`` verbatim, and to brief only the stages that do not
+exist yet from the plan's current section. One manifest then describes both
+the preserved history and the future execution, and adopting a sequence
+never requires deleting a stage or rolling the plan document back.
 """
 
 from __future__ import annotations
