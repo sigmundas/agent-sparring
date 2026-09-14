@@ -40,7 +40,7 @@ import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
 from agent_sparring.providers import ProviderError, Runner, StageAgentResult
@@ -80,15 +80,29 @@ class _ClaudeStreamTranslator:
     partial-message deltas. File paths are persisted repo-relative via
     :func:`agent_sparring.activity.repo_relative_path` (Claude reports
     absolute paths); a path outside ``repo_root`` is omitted, never leaked.
+
+    ``on_session`` is the one exception to "observational only", and it is
+    not telemetry: the ``system``/``init`` line is where the CLI announces
+    the session id for this turn, and a caller that must record that
+    identity before the turn ends (see
+    :func:`agent_sparring.stage_agent.run_stage_agent`) has nowhere else to
+    learn it. It is called at most once, with the provider's own id.
     """
 
-    def __init__(self, emitter: ActivityEmitter | None, repo_root: Path) -> None:
+    def __init__(
+        self,
+        emitter: ActivityEmitter | None,
+        repo_root: Path,
+        on_session: "Callable[[str], None] | None" = None,
+    ) -> None:
         self._emitter = emitter
         self._repo_root = repo_root
+        self._on_session = on_session
         self._tool_names: dict[str, str] = {}
+        self._session_announced = False
 
     def feed(self, line: str) -> None:
-        if self._emitter is None:
+        if self._emitter is None and self._on_session is None:
             return
         line = line.strip()
         if not line:
@@ -113,12 +127,16 @@ class _ClaudeStreamTranslator:
     def _system(self, message: dict[str, Any]) -> None:
         if message.get("subtype") != "init":
             return
+        session_id = _str_or_none(message.get("session_id"))
         emit(
             self._emitter,
             "session.observed",
-            session_id=_str_or_none(message.get("session_id")),
+            session_id=session_id,
             model=_str_or_none(message.get("model")),
         )
+        if session_id and self._on_session and not self._session_announced:
+            self._session_announced = True
+            self._on_session(session_id)
 
     @staticmethod
     def _content_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -233,6 +251,13 @@ class ClaudeCliAdapter:
     runner: Runner = field(default=_default_runner)
     activity: ActivityEmitter | None = None
 
+    # Called with the provider's own session id as soon as the CLI announces
+    # it, while the turn is still running. The orchestrator uses it to record
+    # the session identity of a *fresh* turn before that turn can be killed
+    # (see agent_sparring.stage_agent.run_stage_agent); an adapter nobody set
+    # it on behaves exactly as before.
+    on_session_observed: "Callable[[str], None] | None" = None
+
     provider_id: str = PROVIDER_ID
 
     # Claude Code CLI supports both a fresh session and resuming a prior one
@@ -276,7 +301,7 @@ class ClaudeCliAdapter:
 
     def _invoke(self, prompt: str, resume_session_id: str | None) -> StageAgentResult:
         args = self._build_args(prompt, resume_session_id)
-        translator = _ClaudeStreamTranslator(self.activity, self.repo_root)
+        translator = _ClaudeStreamTranslator(self.activity, self.repo_root, self.on_session_observed)
         try:
             result = self.runner(args, self.repo_root, self.timeout_seconds, translator.feed)
         except OSError as exc:

@@ -34,6 +34,35 @@ class _FakeAdapter:
         return self._resume_result
 
 
+class _AnnouncingThenKilledAdapter:
+    """A provider that announces its session id and is then killed mid-turn.
+
+    Stands in for Ctrl-C, a closed terminal or a crash: the CLI reported its
+    ``system``/``init`` line (which is where ``on_session_observed`` fires)
+    and then never produced a result.
+    """
+
+    on_session_observed = None
+
+    def __init__(self, *, session_id: str):
+        self.session_id = session_id
+        self.start_calls = []
+        self.resume_calls = []
+
+    def _announce_then_die(self) -> StageAgentResult:
+        if self.on_session_observed is not None:
+            self.on_session_observed(self.session_id)
+        raise ProviderError("claude was killed before it returned a result")
+
+    def start(self, prompt: str) -> StageAgentResult:
+        self.start_calls.append(prompt)
+        return self._announce_then_die()
+
+    def resume(self, session_id: str, prompt: str) -> StageAgentResult:
+        self.resume_calls.append((session_id, prompt))
+        return self._announce_then_die()
+
+
 class _CommittingAdapter:
     """A fake provider that makes a real commit during its turn."""
 
@@ -419,6 +448,58 @@ class StageAgentRunTests(unittest.TestCase):
             self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
         )
         self.assertEqual(len(adapter.start_calls), 1)
+
+    def test_a_killed_fresh_turn_still_leaves_its_session_recorded(self):
+        # The real failure this guards: a stage agent had been working for an
+        # hour when its terminal was closed. The provider had announced its
+        # session id long before, but state.json only ever learned the id
+        # when a turn *returned*, so the next run had no session to resume
+        # and would have started a second one over the first one's edits.
+        adapter = _AnnouncingThenKilledAdapter(session_id="sess-live")
+
+        with self.assertRaises(StageAgentRunError):
+            run_stage_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
+
+        self.assertEqual(self.stage.read_state().implementation_session_id, "sess-live")
+
+        # And the ordinary next run resumes that same session rather than starting over.
+        resuming = _FakeAdapter(
+            resume_result=StageAgentResult(session_id="sess-live", text="ok", is_error=False)
+        )
+        run_result = run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, resuming, expected_branch="feature/x"
+        )
+        self.assertTrue(run_result.resumed)
+        self.assertEqual(resuming.start_calls, [])
+        self.assertEqual(resuming.resume_calls[0][0], "sess-live")
+
+    def test_a_killed_resume_never_replaces_the_recorded_session(self):
+        # On resume the identity is already known, and the post-turn check is
+        # the single authority on replacing it. An early write must not let a
+        # provider that announced a different session slip past that check.
+        state = self.stage.read_state()
+        state.implementation_session_id = "sess-original"
+        self.stage.write_state(state)
+
+        adapter = _AnnouncingThenKilledAdapter(session_id="sess-other")
+        with self.assertRaises(StageAgentRunError):
+            run_stage_agent(
+                self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+            )
+
+        self.assertEqual(self.stage.read_state().implementation_session_id, "sess-original")
+
+    def test_an_adapter_without_the_hook_is_unaffected(self):
+        # _FakeAdapter has no on_session_observed attribute at all.
+        adapter = _FakeAdapter(
+            start_result=StageAgentResult(session_id="sess-1", text="ok", is_error=False)
+        )
+        run_stage_agent(
+            self.stage, self.sparring_dir, self.repo, adapter, expected_branch="feature/x"
+        )
+        self.assertEqual(self.stage.read_state().implementation_session_id, "sess-1")
 
 
 if __name__ == "__main__":

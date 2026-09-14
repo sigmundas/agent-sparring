@@ -11,8 +11,10 @@ turn. It does not implement any provider itself (see
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from agent_sparring.activity import ActivityEmitter
 from agent_sparring.branch_guard import BranchGuardError, ensure_branch_for_unattended_run
@@ -20,7 +22,7 @@ from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import GitContextError, resolve_commit
 from agent_sparring.handoff import generate_handoff
 from agent_sparring.providers import ProviderError, StageAgentAdapter, StageAgentResult
-from agent_sparring.stage import Stage, StageStatus
+from agent_sparring.stage import Stage, StageState, StageStatus
 from agent_sparring.stage_prompt import build_stage_prompt
 
 
@@ -53,6 +55,53 @@ def _stage_emitter(stage: Stage, adapter: object) -> ActivityEmitter:
     )
 
 
+@contextmanager
+def _session_recorded_early(
+    adapter: StageAgentAdapter, stage: Stage, state: StageState
+) -> "Iterator[None]":
+    """Persist a *fresh* turn's session id the moment the provider announces
+    it, rather than only after the turn returns.
+
+    A killed turn -- Ctrl-C, a closed terminal, a crashed machine -- used to
+    leave ``implementation_session_id`` null even though the provider had
+    long since issued one and the worktree was full of that turn's edits.
+    The only record of the identity was the stage's ``session.observed``
+    telemetry, which the orchestrator deliberately never reads back, so the
+    next run had no choice but to start a second session over the first
+    one's unfinished work. Recording it up front makes an interrupted turn
+    resumable by the ordinary resume path, which is what the rest of this
+    module already assumes.
+
+    Only a fresh turn is recorded this way. On resume the identity is
+    already known, and the post-turn check that the provider returned *that*
+    session (below) stays the single authority on replacing it -- an early
+    write would overwrite the recorded identity before that check could
+    refuse.
+
+    The hook is optional: an adapter without ``on_session_observed`` (a fake,
+    a third-party adapter) is left exactly as it was, and the session id is
+    recorded after the turn as before. Nothing here fails a turn: the write
+    is the same ``stage.write_state`` the post-turn path performs.
+    """
+
+    if not hasattr(adapter, "on_session_observed"):
+        yield
+        return
+
+    def record(session_id: str) -> None:
+        if not session_id or state.implementation_session_id == session_id:
+            return
+        state.implementation_session_id = session_id
+        stage.write_state(state)
+
+    previous = adapter.on_session_observed  # type: ignore[attr-defined]
+    adapter.on_session_observed = record  # type: ignore[attr-defined]
+    try:
+        yield
+    finally:
+        adapter.on_session_observed = previous  # type: ignore[attr-defined]
+
+
 def run_stage_agent(
     stage: Stage,
     sparring_dir: Path,
@@ -77,7 +126,11 @@ def run_stage_agent(
 
     Records the provider's own returned session id in state.json and
     regenerates handoff.md from the provider's result and actual git
-    context (never invented test evidence). On the stage's first run, the
+    context (never invented test evidence). A fresh turn's session id is
+    written as soon as the provider announces it rather than only when the
+    turn returns (see :func:`_session_recorded_early`), so a turn that is
+    killed mid-flight can still be resumed instead of being started over on
+    top of its own unfinished work. On the stage's first run, the
     pre-turn HEAD is resolved and persisted to state.json as the stage's
     ``base_sha`` *before* the provider gets control, so a provider that
     modifies the repo and then fails does not lose the true stage baseline.
@@ -167,7 +220,8 @@ def run_stage_agent(
                 if resume_id:
                     result = adapter.resume(resume_id, prompt)
                 else:
-                    result = adapter.start(prompt)
+                    with _session_recorded_early(adapter, stage, state):
+                        result = adapter.start(prompt)
             except ProviderError as exc:
                 activity.emit("turn.failed", resumed=resumed, summary="provider error")
                 raise StageAgentRunError(str(exc)) from exc

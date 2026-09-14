@@ -449,6 +449,44 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         self.assertEqual([e["event"] for e in _read_events(self.activity_path)],
                          ["provider.result"])
 
+    def test_on_session_observed_fires_from_the_init_line_before_the_result(self):
+        # The hook exists so a caller can record the session identity while
+        # the turn is still running; it must therefore fire from the init
+        # line, not from the final result.
+        seen: list[str] = []
+        stdout = _jsonl(
+            {"type": "system", "subtype": "init", "session_id": "abc-123", "model": "m"},
+            {"type": "result", "is_error": False, "result": "done", "session_id": "abc-123"},
+        )
+
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            for line in stdout.splitlines():
+                on_line(line)
+            # By the time the provider's own result exists, the id was known.
+            self.assertEqual(seen, ["abc-123"])
+            return _fake_result(0, stdout)
+
+        ClaudeCliAdapter(
+            repo_root=self.repo_root, runner=runner, on_session_observed=seen.append
+        ).start("hi")
+        self.assertEqual(seen, ["abc-123"])
+
+    def test_on_session_observed_fires_once_and_without_an_activity_emitter(self):
+        seen: list[str] = []
+        stdout = _jsonl(
+            {"type": "system", "subtype": "init", "session_id": "abc-123"},
+            {"type": "system", "subtype": "init", "session_id": "abc-123"},
+            {"type": "result", "is_error": False, "result": "done", "session_id": "abc-123"},
+        )
+        ClaudeCliAdapter(
+            repo_root=self.repo_root,
+            runner=self._streaming_runner(stdout),
+            on_session_observed=seen.append,
+        ).start("hi")
+
+        self.assertEqual(seen, ["abc-123"])
+        self.assertFalse(self.activity_path.exists())
+
     def test_no_activity_emitter_means_no_telemetry_and_no_behavior_change(self):
         adapter = ClaudeCliAdapter(
             repo_root=self.repo_root, runner=self._streaming_runner(_stream_fixture())
