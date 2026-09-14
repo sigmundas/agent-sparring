@@ -84,8 +84,20 @@ deliberately narrow exemption, so that "everything under `.sparring/`" is
 never waved through. Leave `.sparring/stages/` tracked and your first stage
 will still work; the **second** one will fail its freeze with a dirty-worktree
 error naming an unrelated stage's files, which is a confusing way to learn
-this. `run-plan` checks up front that `.sparring/plans/` is ignored and
-refuses to start otherwise.
+this. `.sparring/plans/` is worse: the plan runner rewrites it at every stage
+boundary, so leaving it visible breaks *every* freeze part-way through a run,
+after the provider turns are already spent.
+
+So check it before you start, not after:
+
+```sh
+sparring check-config
+```
+
+It prints `stage artifacts git-ignored: yes` / `plan-run state git-ignored:
+yes` and exits non-zero, naming the missing `.gitignore` line, if either is
+visible to git. `run-plan` makes the same check up front and refuses to start
+otherwise; the check is never skippable.
 
 ## Run a stage
 
@@ -135,11 +147,12 @@ reviewed plan
     -> sparring run-plan docs/plans/foo.md --repo-root . --expected-branch feature/x
     -> Stage 1: run-loop … READY -> freeze -> accept
     -> Stage 2: fresh sessions … READY -> freeze -> accept
-    -> Stage 3: … NEEDS_YOU -> plan pauses, prints what is required
-you do the check / make the decision
+    -> Stage 3: … NEEDS_YOU -> plan pauses, prints the checks it needs
+you do the checks
     -> sparring resume-plan docs/plans/foo.md --repo-root . --expected-branch feature/x \
            --evidence "Tested on a Pixel 7: resume after 24h works."
-    -> Stage 3 resumes with the SAME two sessions … READY -> freeze -> accept
+    -> Stage 3: the SPARRER resumes against the unchanged candidate
+       … READY -> freeze -> accept
     -> Stage 4 … until the next human gate or the end of the plan
 ```
 
@@ -158,7 +171,57 @@ a stage, and when evidence was recorded. That is telemetry for watching the
 run; the plan's position lives in `.sparring/plans/` and is never read from
 `activity.jsonl`.
 
-### Marking stages in a plan
+### Marking stages in a plan — or handing over an execution manifest
+
+There are two ways to tell `run-plan` what the stages are. The Markdown
+convention below is the built-in one. If your plan does not fit it — labels
+like `3A`/`3B`/`3C`, historical handoff sections that define nothing, a
+sequence already half-executed under other stage ids — the second way is to
+interpret the document yourself and hand over an **execution manifest**:
+
+```sh
+sparring run-plan --manifest .../manifest.json --repo-root . --expected-branch feature/x
+sparring resume-plan --manifest .../manifest.json --repo-root . --expected-branch feature/x
+```
+
+```json
+{
+  "version": 1,
+  "plan_label": "docs/plans/active/foo.md",
+  "source_digest": "sha256:… of the plan document as you read it",
+  "stages": [
+    {
+      "stage_id": "stage-3c-cloud-schema-rpc-and-sync-transport",
+      "label": "Stage 3C",
+      "title": "Cloud schema/RPC and sync transport",
+      "brief": "… the exact brief.md content …",
+      "repositories": [
+        {"name": "sporely-web", "path": "../sporely-web-worktree",
+         "branch": "feature/cloud-transport", "candidate_sha": null}
+      ]
+    }
+  ]
+}
+```
+
+The array order *is* the execution order; labels are display strings and are
+never parsed, so numeric `1..N` is not required in manifest mode. A manifest
+carries no status, position, transition or verdict — those stay in
+`.sparring/plans/` and each stage's `state.json`, exactly as for a Markdown
+plan, and both inputs run through the same code. Unknown fields are refused
+rather than ignored, so a manifest written against a later contract fails
+loudly. `plan_label` is what the run is keyed and reported by, so a manifest
+and the plan it was built from share one managed run.
+
+The digest covers everything executable *and* `source_digest`, so re-emitting
+a manifest from an edited plan refuses to continue an existing run — the same
+protection the Markdown path gets. Re-emitting an unchanged one is stable, so
+a tool may regenerate the file on every invocation.
+
+`repositories` is for a stage whose reviewed candidate spans more than one
+repository; see "Cross-repository candidates" below.
+
+#### The Markdown convention
 
 Stages are level-2 headings numbered 1..N in document order:
 
@@ -181,33 +244,138 @@ plans with the same headings never share stage artifacts.
 Nothing is inferred from prose: a plan with no such headings, a heading that
 starts with `## Stage` but does not fit, a numbering gap or duplicate, or an
 empty section is refused before any agent runs. A reviewed plan written
-another way needs a small edit to mark its stages; that is deliberate.
+another way either needs a small edit to mark its stages, or a manifest.
 
 ### Pause and resume
 
 Run position lives in `.sparring/plans/<plan key>.json`: the plan, a digest
-of its stage sections, the branch, the current stage and a status
-(`running`/`paused`/`complete`). Candidate SHAs, sessions and acceptance
-stay in each stage's own `state.json`.
+of its executable content, the branch, the current stage, which kind of input
+it runs from, and a status (`running`/`paused`/`complete`). Candidate SHAs,
+sessions and acceptance stay in each stage's own `state.json`.
 
 A fresh `run-plan` means fresh stages. It refuses if a run is already
-recorded or if any of the plan's stage directories already exist, and names
-what an earlier or abandoned run left behind. Nothing is deleted for you: to
-genuinely start over, remove the run-state file *and* those stage directories
-deliberately, otherwise old sessions or an old `accepted` status would be
-inherited.
+recorded, or if any of the plan's stage directories already exist, and names
+them. Nothing is deleted for you: to genuinely start over, remove the
+run-state file *and* those stage directories deliberately, otherwise old
+sessions or an old `accepted` status would be inherited.
+
+#### Adopting a sequence that is already under way
+
+`--adopt` is the deliberate way to take over stages that already exist —
+typically a sequence that was driven stage by stage before it was managed.
+Each existing stage is checked, and every adoption is reported:
+
+* **accepted**, with a real candidate commit → adopted and advanced past. Its
+  brief is history and is not compared: the work is already through the hard
+  gate, and a wording change since then cannot affect anything.
+* **not accepted**, brief identical to the plan's → adopted, continuing its
+  recorded sessions and candidate. The report says what is being inherited.
+* **anything else** — unreadable state, missing brief, a brief that differs →
+  refused, naming the stage. A stage that ran against a different brief is
+  not this plan's stage, and re-briefing it silently would throw away the
+  context its sessions hold.
+
+#### Answering a human gate
 
 `--evidence` is appended to the current stage's `notes.md` under
-`## Human evidence`; you can also edit that section by hand. Both agents see
-it on the next turn. The same stage then resumes: an answer never creates a
-new stage, and if no code changed the same SHA is sparred again and can be
-accepted. The digest of the plan's stage sections is re-checked on
-`resume-plan`, before every acceptance and before every advance, so a stage
-section edited during a run, even by the implementation agent, even
-committed, pauses the plan instead of being accepted or executed; prose
+`## Human evidence`; you can also edit that section by hand. That file is the
+one canonical place a human's answer lives — the sparring prompt reads the
+section live and the stage prompt embeds it, so nothing has to be mirrored
+anywhere for either agent to see it.
+
+The same stage then resumes, **at the sparrer**. The human satisfied a review
+gate: the code did not change, the evidence did, and the question is whether
+the reviewer now accepts the same candidate. Starting an implementation turn
+to carry the answer would spend a turn with nothing to implement and move the
+very commit under review. What the sparrer says next decides:
+
+| verdict     | what happens                                                    |
+| ----------- | --------------------------------------------------------------- |
+| `READY`     | freeze and accept at the same SHA, then the next stage starts     |
+| `SEND_BACK` | there *is* work: the ordinary loop takes over from the stage agent |
+| `NEEDS_YOU` | still paused, with the new gate                                    |
+| `ESCALATE`  | still paused                                                       |
+
+An answer never creates a new stage, and with no code change the same SHA is
+simply sparred again — no dummy commit. A stage that has never implemented
+anything has no candidate to spar, so it starts normally instead.
+
+The digest of the plan's executable content is re-checked on `resume-plan`,
+before every acceptance and before every advance, so a stage section edited
+during a run, even by the implementation agent, even committed, pauses the
+plan instead of being accepted or executed; for a Markdown plan, prose
 outside the stage sections may change freely.
 
 After `ESCALATE`, spar the stage elsewhere with the printed handoff/packet
 commands, then either accept it by hand (`freeze-candidate`,
 `accept-candidate`) and `resume-plan` — an already-accepted current stage is
 advanced past — or `resume-plan --evidence` with the external verdict.
+
+## NEEDS_YOU is a structured gate, not a paragraph
+
+A `NEEDS_YOU` verdict must say, machine-readably, what a human has to finish:
+
+```json
+{"action": "NEEDS_YOU",
+ "summary": "...", "needs_you_reason": "...", "findings": "...", "deferred": "...",
+ "human_gate": {
+   "category": "DEVICE_MANUAL_CHECK",
+   "title": "A pre-activation desktop must survive a feed containing snapshot v2",
+   "checks": [
+     {"id": "pre-activation-desktop-v2-feed",
+      "instruction": "Run a desktop build with the feature switched off, sync it against an account whose feed already contains a v2 reference, and open the reference library.",
+      "pass_criteria": "The library loads, the v2 reference appears with its legacy values, and the sync log reports no error or data loss.",
+      "source": "docs/plans/active/foo.md > Stage 3D — Snapshot v2"}
+   ]}}
+```
+
+`category` is one of `PRODUCT_PREFERENCE`, `UI_VISUAL_CHECK`,
+`DEVICE_MANUAL_CHECK`, `EXTERNAL_CONDITION`, `SCOPE_EXPANSION`, `OTHER`.
+`checks` must be non-empty, ids must be unique and are stable across turns so
+a recorded Pass/Fail/Blocked survives the reviewer restating its gate. The
+gate is **required** for `NEEDS_YOU` and must be `null` for every other
+action; a `NEEDS_YOU` without one is an unusable verdict, not a stage whose
+human checks have to be guessed at.
+
+The scope rule matters more than the shape, and it is what the reviewer
+prompt spends its words on: **only work that must be completed before this
+stage may become READY**. Production deployment after acceptance, release-
+owner actions, rollout gates that stay closed until a later release decision,
+future monitoring, and checks the read-only reviewer merely could not run
+itself are all real and all belong in `findings`/`deferred` — not in the
+gate. Listing them as checks asks a human to "pass" work acceptance does not
+depend on.
+
+`sparring.md` carries the gate twice: as readable prose, and as canonical
+JSON behind an `<!-- human-gate:v1 -->` marker, which is what a UI should
+render its controls from. `record-sparring --human-gate-file <path>` supplies
+one for a verdict reached manually or in a web chat.
+
+## Cross-repository candidates
+
+Some stages are genuinely two repositories: a desktop change here and a
+coupled migration there, and the sparrer's `READY` depends on both. Pinning
+only the primary commit would let the sibling move between review and
+acceptance, so the stage would claim a candidate set that no longer exists.
+
+A stage may therefore declare sibling repositories — in a manifest stage's
+`repositories`, or directly in its `state.json`:
+
+```json
+"repositories": [
+  {"name": "sporely-web", "path": "../sporely-web-worktree",
+   "branch": "feature/cloud-transport", "candidate_sha": null}
+]
+```
+
+`freeze-candidate` then treats each sibling exactly as it treats the primary
+repository — right branch, clean worktree, commit pushed and reachable — and
+records the resolved commit as the pin. `accept-candidate` re-verifies every
+pin: a sibling that moved refuses acceptance as stale, and a dirty sibling
+refuses it too. `path` is resolved against the primary repo root when
+relative; a declared `candidate_sha` is an assertion, and freezing refuses if
+the sibling is not exactly there.
+
+That is the whole feature. There is no cross-repository merge, no
+transaction and no remote coordination — the requirement is only that
+acceptance pins and verifies the complete reviewed candidate set.

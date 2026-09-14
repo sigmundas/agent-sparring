@@ -101,11 +101,18 @@ class LoopRunawayError(LoopError):
 
 @dataclass(frozen=True)
 class LoopCycleRecord:
-    """One executed stage-agent-turn + sparring-agent-turn pair."""
+    """One executed stage-agent-turn + sparring-agent-turn pair.
+
+    ``stage_ran`` is false for the single cycle produced by
+    ``start_with="sparring"``: that cycle is one sparring turn against the
+    unchanged candidate and no implementation turn happened, so
+    ``stage_resumed`` says nothing.
+    """
 
     stage_resumed: bool
     sparring_resumed: bool
     routing: RoutingResult
+    stage_ran: bool = True
 
 
 @dataclass(frozen=True)
@@ -138,6 +145,7 @@ def run_unattended_loop(
     expected_branch: str,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
+    start_with: str = "stage",
 ) -> LoopResult:
     """Drive the stage<->sparring loop until a terminal routing action.
 
@@ -147,6 +155,16 @@ def run_unattended_loop(
     ``state.json``, not by this function) followed by exactly one
     sparring-agent turn (same fresh-vs-resume rule, via
     :func:`~agent_sparring.sparring_agent.run_sparring_agent`).
+
+    ``start_with="sparring"`` skips the implementation turn of the *first*
+    cycle only, going straight to the sparrer. That is what a human
+    answering a NEEDS_YOU gate needs: the code did not change, the evidence
+    did, and the question is whether the reviewer now accepts the same
+    candidate. Starting the stage agent to deliver an answer would spend an
+    implementation turn with nothing to implement and would move the
+    candidate. If that sparring turn says SEND_BACK there *is* implementation
+    work, and the loop continues normally from the stage agent; every later
+    cycle is an ordinary full cycle regardless.
 
     On ``SEND_BACK``, the loop counts the cycle against
     ``max_send_back_cycles`` and, if still within the limit, continues:
@@ -173,31 +191,44 @@ def run_unattended_loop(
         raise LoopError(
             f"max_send_back_cycles must be at least 1, got {max_send_back_cycles!r}"
         )
+    if start_with not in ("stage", "sparring"):
+        raise LoopError(f"start_with must be 'stage' or 'sparring', got {start_with!r}")
 
     cycle_records: list[LoopCycleRecord] = []
     send_back_count = 0
+    # Consumed by the first cycle only; every later cycle is a full cycle.
+    skip_stage_turn = start_with == "sparring"
 
     # Observational telemetry only (see agent_sparring.activity): mirrors
     # the routing decisions taken below, never influences them.
     activity = stage.activity_log().bind("loop")
-    activity.emit("loop.started")
+    activity.emit("loop.started", summary="sparring first" if skip_stage_turn else None)
 
     while True:
         cycle = len(cycle_records) + 1
-        try:
-            stage_run = run_stage_agent(
-                stage,
-                sparring_dir,
-                repo_root,
-                stage_adapter,
-                expected_branch=expected_branch,
-                self_check=self_check,
+        if skip_stage_turn:
+            skip_stage_turn = False
+            stage_run = None
+            activity.emit(
+                "loop.sparring_first",
+                cycle=cycle,
+                summary="resuming the sparrer against the unchanged candidate",
             )
-        except StageAgentRunError as exc:
-            activity.emit("loop.stopped", cycle=cycle, summary="stage-agent turn failed")
-            raise LoopError(f"stage-agent turn failed: {exc}") from exc
+        else:
+            try:
+                stage_run = run_stage_agent(
+                    stage,
+                    sparring_dir,
+                    repo_root,
+                    stage_adapter,
+                    expected_branch=expected_branch,
+                    self_check=self_check,
+                )
+            except StageAgentRunError as exc:
+                activity.emit("loop.stopped", cycle=cycle, summary="stage-agent turn failed")
+                raise LoopError(f"stage-agent turn failed: {exc}") from exc
 
-        if stage_run.result.is_error:
+        if stage_run is not None and stage_run.result.is_error:
             # The provider's own machine-readable output reported this turn
             # as failed (mirrors the standalone `run-stage` CLI command,
             # which already treats is_error=true as failure). An
@@ -232,9 +263,10 @@ def run_unattended_loop(
 
         cycle_records.append(
             LoopCycleRecord(
-                stage_resumed=stage_run.resumed,
+                stage_resumed=stage_run.resumed if stage_run is not None else False,
                 sparring_resumed=sparring_run.resumed,
                 routing=sparring_run.routing,
+                stage_ran=stage_run is not None,
             )
         )
 

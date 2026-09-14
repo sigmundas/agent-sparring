@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
+from agent_sparring.human_gate import HumanGate, HumanGateError
+
 
 class RoutingResultError(ValueError):
     """Raised for an unknown/invalid routing action or malformed payload."""
@@ -57,14 +59,23 @@ class RoutingResult:
     ``needs_you_reason`` is optional, freeform metadata (see
     ``NEEDS_YOU_REASON_CATEGORIES`` for suggested values) — it is never
     required or validated against a closed set. Detailed findings/tests/
-    checks are not encoded here; they belong in the human-readable
+    discussion are not encoded here; they belong in the human-readable
     sparring.md.
+
+    ``human_gate`` is the one exception, and it is deliberately narrow: the
+    concrete, runnable things a human must complete **before this stage may
+    become READY** (see :mod:`agent_sparring.human_gate`). It is required
+    when the action is NEEDS_YOU and must be absent otherwise — a stage sent
+    back, ready, or escalated is not waiting on a human check list. Making
+    that list structured is what lets a UI render it without mining prose;
+    everything that is *not* a blocking human check stays prose.
     """
 
     action: RoutingAction
     summary: str
     needs_you_reason: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
+    human_gate: HumanGate | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.action, RoutingAction):
@@ -75,6 +86,21 @@ class RoutingResult:
             raise RoutingResultError("needs_you_reason must be a string if present")
         if not isinstance(self.details, Mapping):
             raise RoutingResultError(f"details must be a mapping, got {self.details!r}")
+        if self.human_gate is not None and not isinstance(self.human_gate, HumanGate):
+            raise RoutingResultError(
+                f"human_gate must be a HumanGate if present, got {self.human_gate!r}"
+            )
+        if self.action is RoutingAction.NEEDS_YOU:
+            if self.human_gate is None:
+                raise RoutingResultError(
+                    "NEEDS_YOU requires a structured human_gate naming what a human must "
+                    "do before this stage can become READY"
+                )
+        elif self.human_gate is not None:
+            raise RoutingResultError(
+                f"human_gate must be null for {self.action.value}; only NEEDS_YOU stops "
+                "the stage on a human check list"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -85,6 +111,8 @@ class RoutingResult:
             payload["needs_you_reason"] = self.needs_you_reason
         if self.details:
             payload["details"] = dict(self.details)
+        if self.human_gate is not None:
+            payload["human_gate"] = self.human_gate.to_dict()
         return payload
 
     @classmethod
@@ -107,9 +135,20 @@ class RoutingResult:
                 f"routing result 'details' must be an object, got {details!r}"
             )
 
+        raw_gate = payload.get("human_gate")
+        gate: HumanGate | None = None
+        if isinstance(raw_gate, HumanGate):
+            gate = raw_gate
+        elif raw_gate is not None:
+            try:
+                gate = HumanGate.from_dict(raw_gate)
+            except HumanGateError as exc:
+                raise RoutingResultError(str(exc)) from exc
+
         return cls(
             action=action,
             summary=summary,
             needs_you_reason=reason,
             details=dict(details),
+            human_gate=gate,
         )

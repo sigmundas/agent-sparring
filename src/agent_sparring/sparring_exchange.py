@@ -9,6 +9,7 @@ the SEND_BACK/NEEDS_YOU/ESCALATE/READY sections already sketched in
 
 from __future__ import annotations
 
+from agent_sparring.human_gate import HUMAN_GATE_MARKER, HumanGate
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.stage import Stage
 
@@ -52,6 +53,9 @@ def render_sparring(stage: Stage, result: RoutingResult, *, findings: str = "") 
                 reason = result.needs_you_reason or "(reason category not recorded)"
                 body = f"{body}\n\nReason category: {reason}"
             lines.append(body)
+            if action is RoutingAction.NEEDS_YOU and result.human_gate is not None:
+                lines.append("")
+                lines.extend(_human_gate_lines(result.human_gate))
         else:
             lines.append("(not applicable)")
         lines.append("")
@@ -62,6 +66,32 @@ def render_sparring(stage: Stage, result: RoutingResult, *, findings: str = "") 
     lines.append(str(deferred).strip() if deferred else "(none recorded)")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _human_gate_lines(gate: HumanGate) -> list[str]:
+    """The gate, twice: readable prose for a person, then the canonical JSON
+    behind :data:`~agent_sparring.human_gate.HUMAN_GATE_MARKER` for anything
+    that renders Pass/Fail/Blocked controls.
+
+    The JSON is what a consumer must read; the prose above it is a
+    convenience for whoever opens sparring.md directly, and is regenerated
+    from the same object, so the two cannot drift. No ``###`` sub-heading is
+    used, so the whole gate stays inside the ``## NEEDS YOU`` section for
+    every section extractor in this package.
+    """
+
+    lines = [
+        f"**Required before this stage can be READY** — {gate.category} — {gate.title}",
+        "",
+    ]
+    for position, check in enumerate(gate.checks, start=1):
+        lines.append(f"{position}. {check.instruction}")
+        lines.append(f"   - Pass when: {check.pass_criteria}")
+        if check.source:
+            lines.append(f"   - Defined in: {check.source}")
+        lines.append(f"   - Check id: `{check.id}`")
+    lines += ["", HUMAN_GATE_MARKER, "", "```json", gate.to_json(), "```"]
+    return lines
 
 
 def record_sparring(stage: Stage, result: RoutingResult, *, findings: str = "") -> str:

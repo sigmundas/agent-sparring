@@ -1,9 +1,11 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import conftest_path  # noqa: F401
 
+from agent_sparring.human_gate import HUMAN_GATE_MARKER, HumanCheck, HumanGate
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import record_sparring, render_sparring
 from agent_sparring.stage import Stage
@@ -31,11 +33,51 @@ class SparringExchangeTests(unittest.TestCase):
             action=RoutingAction.NEEDS_YOU,
             summary="Pick a color scheme",
             needs_you_reason="product_preference",
+            human_gate=HumanGate(
+                category="PRODUCT_PREFERENCE",
+                title="A colour choice blocks this stage",
+                checks=(
+                    HumanCheck(
+                        id="pick-scheme",
+                        instruction="Open the settings screen and choose between the two schemes.",
+                        pass_criteria="One scheme is chosen and recorded.",
+                        source="docs/plan.md > Stage 2",
+                    ),
+                ),
+            ),
         )
         content = render_sparring(self.stage, result)
-        section = content.split("## NEEDS YOU", 1)[1].split("##", 1)[0]
+        section = content.split("## NEEDS YOU", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Pick a color scheme", section)
         self.assertIn("product_preference", section)
+        # Readable prose for a person...
+        self.assertIn("Required before this stage can be READY", section)
+        self.assertIn("Open the settings screen", section)
+        self.assertIn("Pass when: One scheme is chosen", section)
+        self.assertIn("Defined in: docs/plan.md > Stage 2", section)
+        # ...and the canonical JSON any UI renders its controls from.
+        self.assertIn(HUMAN_GATE_MARKER, section)
+        block = section.split(HUMAN_GATE_MARKER, 1)[1].split("```json", 1)[1].split("```", 1)[0]
+        gate = json.loads(block)
+        self.assertEqual(gate["category"], "PRODUCT_PREFERENCE")
+        self.assertEqual([check["id"] for check in gate["checks"]], ["pick-scheme"])
+
+    def test_the_gate_stays_inside_its_own_section(self):
+        # No '###' sub-heading: handoff.py's section extractor stops at any
+        # line starting with '#', so a sub-heading would cut the gate out of
+        # the handoff's "previous sparring findings".
+        result = RoutingResult(
+            action=RoutingAction.NEEDS_YOU,
+            summary="one check",
+            human_gate=HumanGate(
+                category="OTHER",
+                title="t",
+                checks=(HumanCheck(id="a", instruction="do it", pass_criteria="done"),),
+            ),
+        )
+        content = render_sparring(self.stage, result)
+        section = content.split("## NEEDS YOU", 1)[1].split("\n## ", 1)[0]
+        self.assertNotIn("\n#", section.replace("\n## ", ""))
 
     def test_escalate_fills_its_section(self):
         result = RoutingResult(action=RoutingAction.ESCALATE, summary="Needs GPT web review")

@@ -9,6 +9,7 @@ work.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -24,14 +25,21 @@ from agent_sparring.config import (
     load_project_config,
     load_project_markdown,
 )
-from agent_sparring.git_context import GitContextError
+from agent_sparring.git_context import GitContextError, is_ignored
 from agent_sparring.handoff import generate_handoff
 from agent_sparring.loop import DEFAULT_MAX_SEND_BACK_CYCLES, LoopError, run_unattended_loop
+from agent_sparring.human_gate import HumanGate, HumanGateError
+from agent_sparring.manifest import ManifestError
 from agent_sparring.plan import (
+    PLANS_DIRNAME,
     PlanError,
     PlanRunError,
     PlanRunResult,
     PlanRunStatus,
+    load_plan_source,
+    plan_label,
+    plan_state_not_ignored_message,
+    plan_state_path,
     resume_plan,
     start_plan,
 )
@@ -66,6 +74,58 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
     print(f"sparring_agent_provider: {config.sparring_agent_provider}")
     print(f"default_sparring_mode: {config.default_sparring_mode}")
     print(f"PROJECT.md present: {markdown is not None}")
+    return _report_workflow_state_ignored(args, sparring_dir)
+
+
+def _report_workflow_state_ignored(args: argparse.Namespace, sparring_dir: Path) -> int:
+    """Say, before anyone spends a provider turn, whether git can see the two
+    workflow-state directories.
+
+    ``.sparring/stages/`` and ``.sparring/plans/`` are rewritten constantly
+    while a run is in progress, so either of them being visible to git turns
+    every ``freeze-candidate`` into "the working tree holds changes that
+    commit does not represent" -- part-way through a run, after the tokens
+    are spent. The plan runner refuses up front for exactly that reason (see
+    :func:`agent_sparring.plan.plan_state_not_ignored_message`); reporting it
+    here is how a project finds out without having to trip the refusal.
+    """
+
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+    except ProjectConfigError:
+        return 1
+    problems: list[str] = []
+    for what, probe in (
+        ("stage artifacts", sparring_dir / "stages" / "any-stage" / "state.json"),
+        ("plan-run state", sparring_dir / PLANS_DIRNAME / "any-plan.json"),
+    ):
+        try:
+            probe.resolve().relative_to(repo_root.resolve())
+        except ValueError:
+            print(f"{what} git-ignored: not applicable (outside {repo_root})")
+            continue
+        try:
+            ignored = is_ignored(repo_root, probe)
+        except GitContextError as exc:
+            print(f"{what} git-ignored: unknown ({exc})", file=sys.stderr)
+            continue
+        print(f"{what} git-ignored: {'yes' if ignored else 'NO'}")
+        if not ignored:
+            problems.append(what)
+    if problems:
+        print("", file=sys.stderr)
+        print(
+            plan_state_not_ignored_message(
+                repo_root, sparring_dir / PLANS_DIRNAME / "any-plan.json"
+            )
+            if "plan-run state" in problems
+            else (
+                f"stage artifacts under {sparring_dir}/stages/ are not ignored by git; add a "
+                f"line '.sparring/stages/' to {repo_root}/.gitignore"
+            ),
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -149,14 +209,25 @@ def _cmd_record_sparring(args: argparse.Namespace) -> int:
         stage = Stage.resolve(sparring_dir, args.stage_id)
         if not stage.exists():
             raise StageError(f"stage {args.stage_id!r} does not exist at {stage.directory}")
+        gate: HumanGate | None = None
+        if args.human_gate_file:
+            try:
+                gate = HumanGate.from_dict(
+                    json.loads(Path(args.human_gate_file).read_text(encoding="utf-8"))
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise StageError(
+                    f"could not read --human-gate-file {args.human_gate_file!r}: {exc}"
+                ) from exc
         result = RoutingResult(
             action=RoutingAction.from_str(args.action),
             summary=args.summary,
             needs_you_reason=args.needs_you_reason,
             details={"deferred": args.deferred} if args.deferred else {},
+            human_gate=gate,
         )
         content = record_sparring(stage, result, findings=args.findings or "")
-    except (StageError, RoutingResultError) as exc:
+    except (StageError, RoutingResultError, HumanGateError) as exc:
         print(f"could not record sparring outcome: {exc}", file=sys.stderr)
         return 1
     print(content)
@@ -421,6 +492,13 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _plan_input_args(args: argparse.Namespace) -> str:
+    """How this plan run is addressed on the command line, for the copyable
+    resume hint: the manifest flag or the plan's own path."""
+
+    return f"--manifest {args.manifest}" if args.manifest else str(args.plan_path)
+
+
 def _report_plan_result(
     result: PlanRunResult, args: argparse.Namespace, sparring_dir: Path
 ) -> None:
@@ -439,11 +517,20 @@ def _report_plan_result(
     if routing.needs_you_reason:
         print(f"reason: {routing.needs_you_reason}")
     print(f"summary: {routing.summary}")
+    if routing.human_gate is not None:
+        gate = routing.human_gate
+        print()
+        print(f"required before READY ({gate.category}): {gate.title}")
+        for position, check in enumerate(gate.checks, start=1):
+            print(f"  {position}. [{check.id}] {check.instruction}")
+            print(f"     pass when: {check.pass_criteria}")
+            if check.source:
+                print(f"     defined in: {check.source}")
     print()
     print(stage.read_sparring().rstrip())
     print()
     resume = (
-        f"sparring resume-plan {args.plan_path} --repo-root {args.repo_root or '.'} "
+        f"sparring resume-plan {_plan_input_args(args)} --repo-root {args.repo_root or '.'} "
         f"--expected-branch {args.expected_branch}"
     )
     if routing.action is RoutingAction.ESCALATE:
@@ -464,10 +551,24 @@ def _report_plan_result(
     print(f"  {resume} --evidence '<what you found or decided>'")
 
 
+def _plan_source(args: argparse.Namespace, repo_root: Path):
+    """The plan input for run-plan / resume-plan: exactly one of the
+    positional Markdown plan or ``--manifest``."""
+
+    if bool(args.plan_path) == bool(args.manifest):
+        raise PlanError(
+            "give exactly one plan input: the reviewed Markdown plan as a positional "
+            "argument, or --manifest with an execution manifest"
+        )
+    path = Path(args.manifest or args.plan_path)
+    return load_plan_source(path, repo_root, manifest=bool(args.manifest))
+
+
 def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
     sparring_dir = Path(args.sparring_dir)
     try:
         repo_root = _resolve_repo_root(args, sparring_dir)
+        source = _plan_source(args, repo_root)
         self_check = _resolve_self_check(sparring_dir)
         # Provider selection is checked once, before any run state exists;
         # the adapters themselves are built per planned stage (below) so
@@ -491,7 +592,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
         )
         if resume:
             result = resume_plan(
-                Path(args.plan_path),
+                source,
                 sparring_dir,
                 repo_root,
                 make_adapters,
@@ -499,10 +600,13 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
                 **common,
             )
         else:
-            result = start_plan(Path(args.plan_path), sparring_dir, repo_root, make_adapters, **common)
+            result = start_plan(
+                source, sparring_dir, repo_root, make_adapters, adopt=args.adopt, **common
+            )
     except (
         PlanError,
         PlanRunError,
+        ManifestError,
         StageError,
         ProjectConfigError,
         GitContextError,
@@ -627,7 +731,20 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     check_config = subparsers.add_parser(
-        "check-config", help="load and print project.toml / PROJECT.md status"
+        "check-config",
+        help=(
+            "load and print project.toml / PROJECT.md status, and whether git can see the "
+            "workflow-state directories (which would break every freeze mid-run)"
+        ),
+    )
+    check_config.add_argument(
+        "--repo-root",
+        default=None,
+        help=(
+            "repository root; overrides project.toml's [repo].root if set "
+            "(default: [repo].root from project.toml, resolved against the "
+            "project root, else the parent of --sparring-dir)"
+        ),
     )
     check_config.set_defaults(func=_cmd_check_config)
 
@@ -702,6 +819,15 @@ def build_parser() -> argparse.ArgumentParser:
     record_sparring_parser.add_argument("--needs-you-reason", default=None)
     record_sparring_parser.add_argument("--findings", default=None)
     record_sparring_parser.add_argument("--deferred", default=None)
+    record_sparring_parser.add_argument(
+        "--human-gate-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "JSON file holding the structured human gate (category/title/checks) for a "
+            "NEEDS_YOU outcome; required for NEEDS_YOU and refused for every other action"
+        ),
+    )
     record_sparring_parser.set_defaults(func=_cmd_record_sparring)
 
     run_stage = subparsers.add_parser(
@@ -815,15 +941,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_loop.set_defaults(func=_cmd_run_loop)
 
+    manifest_help = (
+        "path to an execution manifest (JSON) instead of a Markdown plan: explicit stage "
+        "ids, labels such as 'Stage 3C', exact briefs and the execution order, produced by "
+        "a caller that already interpreted the plan document"
+    )
+
     run_plan = subparsers.add_parser(
         "run-plan",
         help=(
-            "run a reviewed multi-stage plan unattended: each '## Stage <n> — <title>' "
-            "section becomes a stage; READY freezes and accepts the exact pushed SHA and "
-            "the next stage starts; NEEDS_YOU/ESCALATE/failure pauses"
+            "run a multi-stage plan unattended, from a reviewed Markdown plan (each "
+            "'## Stage <n> — <title>' section becomes a stage) or from --manifest; READY "
+            "freezes and accepts the exact pushed SHA and the next stage starts; "
+            "NEEDS_YOU/ESCALATE/failure pauses"
         ),
     )
-    run_plan.add_argument("plan_path", help="path to the reviewed plan Markdown file")
+    run_plan.add_argument(
+        "plan_path",
+        nargs="?",
+        default=None,
+        help="path to the reviewed plan Markdown file (omit when using --manifest)",
+    )
+    run_plan.add_argument("--manifest", default=None, metavar="PATH", help=manifest_help)
+    run_plan.add_argument(
+        "--adopt",
+        action="store_true",
+        help=(
+            "continue a sequence whose stages already exist on disk instead of refusing "
+            "them: each is checked (ACCEPTED, or an identical brief) and reported, never "
+            "silently inherited"
+        ),
+    )
     _add_loop_arguments(
         run_plan,
         repo_root_help,
@@ -838,7 +986,15 @@ def build_parser() -> argparse.ArgumentParser:
             "human's answer/check result first"
         ),
     )
-    resume_plan_parser.add_argument("plan_path", help="path to the same reviewed plan file")
+    resume_plan_parser.add_argument(
+        "plan_path",
+        nargs="?",
+        default=None,
+        help="path to the same reviewed plan file (omit when using --manifest)",
+    )
+    resume_plan_parser.add_argument(
+        "--manifest", default=None, metavar="PATH", help=manifest_help
+    )
     _add_loop_arguments(
         resume_plan_parser,
         repo_root_help,
@@ -850,10 +1006,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "the human's answer, manual/device check result, external-condition result "
             "or scope approval; appended to the current stage's notes.md under "
-            "'## Human evidence' before the same stage resumes"
+            "'## Human evidence', after which the SPARRER resumes against the unchanged "
+            "candidate (the stage agent is not started to deliver an answer)"
         ),
     )
-    resume_plan_parser.set_defaults(func=_cmd_resume_plan)
+    resume_plan_parser.set_defaults(func=_cmd_resume_plan, adopt=False)
 
     freeze = subparsers.add_parser(
         "freeze-candidate",

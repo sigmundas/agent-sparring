@@ -331,8 +331,11 @@ class AdapterFactoryTests(_PlanActivityCase):
 
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
         # Continuity came from state.json's ids handed to resume(), not from
-        # the adapter objects of the earlier run.
-        self.assertEqual([sid for sid, _ in second_stage.resume_calls], ["impl-1"])
+        # the adapter objects of the earlier run. Evidence resumes the
+        # sparrer, so it is the sparring session that proves the point here;
+        # the stage agent was correctly not asked to deliver the answer.
+        self.assertEqual(second_stage.resume_calls, [])
+        self.assertEqual([sid for sid, _ in second_sparring.resume_calls], ["spar-1"])
         self.assertEqual([sid for sid, _ in second_sparring.resume_calls], ["spar-1"])
         self.assertEqual(second_stage.start_calls[0].count("Stage 2 of 2"), 1)
         s2 = self._s2().read_state()
@@ -357,7 +360,7 @@ class AdapterFactoryTests(_PlanActivityCase):
         entered = [e for e in _plan_events(self._s1()) if e["event"] == "plan.stage.entered"]
         self.assertEqual(
             [e["summary"] for e in entered],
-            ["Stage 1/2", "Stage 1/2; already accepted, advancing"],
+            ["Stage 1 — Foundation (1/2)", "Stage 1 — Foundation (1/2); already accepted, advancing"],
         )
 
     def test_factory_failure_pauses_and_is_mirrored_without_its_text(self):
@@ -401,12 +404,12 @@ class PlanEventChronologyTests(_PlanActivityCase):
         s1_events, s2_events = _plan_events(self._s1()), _plan_events(self._s2())
         self.assertEqual(
             [(e["event"], e.get("summary")) for e in s1_events],
-            [("plan.stage.entered", "Stage 1/2"), ("plan.stage.accepted", None)],
+            [("plan.stage.entered", "Stage 1 — Foundation (1/2)"), ("plan.stage.accepted", None)],
         )
         self.assertEqual(
             [(e["event"], e.get("summary")) for e in s2_events],
             [
-                ("plan.stage.entered", "Stage 2/2"),
+                ("plan.stage.entered", "Stage 2 — Incremental rendering (2/2)"),
                 ("plan.stage.accepted", None),
                 ("plan.completed", "2 stage(s) accepted"),
             ],
@@ -496,7 +499,7 @@ class PlanEventChronologyTests(_PlanActivityCase):
         events = _plan_events(self._s1())
         self.assertEqual(
             [(e["event"], e.get("summary")) for e in events],
-            [("plan.stage.entered", "Stage 1/2"), ("plan.failed", "stage loop failed")],
+            [("plan.stage.entered", "Stage 1 — Foundation (1/2)"), ("plan.failed", "stage loop failed")],
         )
         self.assertNotIn("plan.paused", _names(self._s1()))
         self.assertNotIn("boom", self._s1().activity_path().read_text(encoding="utf-8"))
@@ -511,7 +514,7 @@ class PlanEventChronologyTests(_PlanActivityCase):
         self.assertIn("acceptance gate refused", str(ctx.exception))
         self.assertEqual(
             [(e["event"], e.get("summary")) for e in _plan_events(self._s1())],
-            [("plan.stage.entered", "Stage 1/2"), ("plan.failed", "acceptance gate refused")],
+            [("plan.stage.entered", "Stage 1 — Foundation (1/2)"), ("plan.failed", "acceptance gate refused")],
         )
         # The refusal's own detail (remote names, paths) stays out of the log.
         self.assertNotIn(str(self.remote), self._s1().activity_path().read_text(encoding="utf-8"))
@@ -532,7 +535,7 @@ class PlanEventChronologyTests(_PlanActivityCase):
 
         self.assertEqual(
             [(e["event"], e.get("summary")) for e in _plan_events(self._s1())],
-            [("plan.stage.entered", "Stage 1/2"), ("plan.failed", "reviewed plan changed")],
+            [("plan.stage.entered", "Stage 1 — Foundation (1/2)"), ("plan.failed", "reviewed plan changed")],
         )
 
 
@@ -643,7 +646,7 @@ class NonAuthorityTests(_PlanActivityCase):
             {"actor": "gate", "event": "candidate.frozen", "sha": head},
             {"actor": "gate", "event": "candidate.accepted", "sha": head},
             {"actor": "plan", "event": "plan.stage.accepted", "sha": head},
-            {"actor": "plan", "event": "plan.stage.entered", "summary": "Stage 2/2"},
+            {"actor": "plan", "event": "plan.stage.entered", "summary": "Stage 2 — Incremental rendering (2/2)"},
             {"actor": "plan", "event": "plan.completed", "summary": "2 stage(s) accepted"},
         ]
         with self._s1().activity_path().open("a", encoding="utf-8") as handle:

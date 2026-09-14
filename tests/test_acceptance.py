@@ -13,6 +13,7 @@ from agent_sparring.acceptance import (
     freeze_candidate,
 )
 from agent_sparring.concurrency import worktree_lock
+from agent_sparring.human_gate import HumanCheck, HumanGate
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.stage import Stage, StageStatus
@@ -327,6 +328,17 @@ class AcceptanceTests(unittest.TestCase):
                 action=RoutingAction.NEEDS_YOU,
                 summary="run the device check",
                 needs_you_reason="device_manual_check",
+                human_gate=HumanGate(
+                    category="DEVICE_MANUAL_CHECK",
+                    title="One device check blocks this stage",
+                    checks=(
+                        HumanCheck(
+                            id="device-check",
+                            instruction="Run the build on a real device.",
+                            pass_criteria="It behaves as the brief describes.",
+                        ),
+                    ),
+                ),
             ),
             findings="cannot verify on-device behavior from here",
         )

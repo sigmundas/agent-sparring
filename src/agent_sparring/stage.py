@@ -83,6 +83,66 @@ def validate_stage_id(stage_id: str) -> str:
     return stage_id
 
 
+@dataclass(frozen=True)
+class CandidateRepository:
+    """One *sibling* repository whose reviewed candidate belongs to a stage.
+
+    A stage's candidate normally lives in exactly one repository -- the
+    ``repo_root`` every other operation is made against -- and nothing here
+    is needed. Some stages are genuinely cross-repository: the reviewed work
+    is a desktop change in the primary repository *and* a coupled change in
+    another one, and the sparrer's READY verdict depends on both. Pinning
+    only the primary SHA would let the sibling move between review and
+    acceptance, so acceptance would claim a candidate set that no longer
+    exists.
+
+    This is deliberately the smallest representation that closes that hole:
+    identity, the branch the candidate must be on, and the exact commit.
+    There is no cross-repository merge, no transaction, no dependency graph
+    and no remote coordination -- :mod:`agent_sparring.acceptance` simply
+    resolves each declared sibling at freeze time and re-verifies it at
+    acceptance time, exactly as it already does for the primary repository.
+
+    ``path`` is resolved against the primary ``repo_root`` when relative.
+    ``candidate_sha`` is ``None`` while the sibling is only *declared* (it is
+    whatever the sibling's branch is at); ``freeze_candidate`` fills it in
+    with the resolved HEAD, and from then on it is the pinned candidate. A
+    declaration that already carries a ``candidate_sha`` is an assertion:
+    freezing refuses if the sibling is not exactly there.
+    """
+
+    name: str
+    path: str
+    branch: str
+    candidate_sha: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "path": self.path,
+            "branch": self.branch,
+            "candidate_sha": self.candidate_sha,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "CandidateRepository":
+        if not isinstance(payload, dict):
+            raise StageError(f"a repository entry must be a JSON object, got {payload!r}")
+        for key in ("name", "path", "branch"):
+            value = payload.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise StageError(f"repository entry field {key!r} must be a non-empty string")
+        sha = payload.get("candidate_sha")
+        if sha is not None and not isinstance(sha, str):
+            raise StageError("repository entry field 'candidate_sha' must be a string or null")
+        return cls(
+            name=str(payload["name"]),
+            path=str(payload["path"]),
+            branch=str(payload["branch"]),
+            candidate_sha=sha,
+        )
+
+
 def _optional_str_field(payload: dict[str, Any], key: str) -> str | None:
     """A ``str | None`` field read from machine-ingested JSON.
 
@@ -118,16 +178,31 @@ class StageState:
     sparring_session_id: str | None = None
     base_sha: str | None = None
     candidate_sha: str | None = None
+    # Sibling repositories whose reviewed candidates are part of this stage.
+    # Empty for the ordinary single-repository stage, and absent from
+    # state.json in that case, so existing files are unchanged.
+    repositories: tuple[CandidateRepository, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["status"] = self.status.value
+        if self.repositories:
+            payload["repositories"] = [repo.to_dict() for repo in self.repositories]
+        else:
+            payload.pop("repositories", None)
         return payload
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "StageState":
         status_raw = payload.get("status", StageStatus.WORKING.value)
         status = StageStatus.from_str(str(status_raw))
+        raw_repositories = payload.get("repositories")
+        if raw_repositories is None:
+            repositories: tuple[CandidateRepository, ...] = ()
+        elif isinstance(raw_repositories, list):
+            repositories = tuple(CandidateRepository.from_dict(entry) for entry in raw_repositories)
+        else:
+            raise StageError("state.json field 'repositories' must be a list or null")
         return cls(
             status=status,
             implementation_session_id=_optional_str_field(
@@ -136,6 +211,7 @@ class StageState:
             sparring_session_id=_optional_str_field(payload, "sparring_session_id"),
             base_sha=_optional_str_field(payload, "base_sha"),
             candidate_sha=_optional_str_field(payload, "candidate_sha"),
+            repositories=repositories,
         )
 
 

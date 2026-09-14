@@ -93,6 +93,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
+from agent_sparring.human_gate import HUMAN_GATE_CATEGORIES
 from agent_sparring.providers import ProviderError, Runner, SparringAgentResult
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 
@@ -118,6 +119,41 @@ _SANDBOX_CONFIG_ARG: tuple[str, str] = ("-c", f'sandbox_mode="{DEFAULT_SANDBOX}"
 # (action/summary/needs_you_reason) so RoutingResult itself stays tiny; see
 # agent_sparring.sparring_agent._build_routing_result /
 # _extract_findings, which split this envelope back apart.
+#
+# "human_gate" is the one structured (non-prose) addition: the closed list
+# of what a human must complete before the stage can be READY. It is
+# nullable at the schema level because it must be null for SEND_BACK /
+# READY / ESCALATE; the "NEEDS_YOU implies a gate" half of the contract is
+# stated in the prompt and enforced by RoutingResult, since a JSON schema
+# cannot express "required only when another field has a given value"
+# without a conditional Codex's strict mode does not accept.
+_HUMAN_GATE_SCHEMA: dict[str, Any] = {
+    "type": ["object", "null"],
+    "properties": {
+        "category": {
+            "type": "string",
+            "enum": list(HUMAN_GATE_CATEGORIES),
+        },
+        "title": {"type": "string"},
+        "checks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "pass_criteria": {"type": "string"},
+                    "source": {"type": ["string", "null"]},
+                },
+                "required": ["id", "instruction", "pass_criteria", "source"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["category", "title", "checks"],
+    "additionalProperties": False,
+}
+
 VERDICT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -129,8 +165,16 @@ VERDICT_SCHEMA: dict[str, Any] = {
         "needs_you_reason": {"type": ["string", "null"]},
         "findings": {"type": "string"},
         "deferred": {"type": ["string", "null"]},
+        "human_gate": _HUMAN_GATE_SCHEMA,
     },
-    "required": ["action", "summary", "needs_you_reason", "findings", "deferred"],
+    "required": [
+        "action",
+        "summary",
+        "needs_you_reason",
+        "findings",
+        "deferred",
+        "human_gate",
+    ],
     "additionalProperties": False,
 }
 

@@ -58,6 +58,20 @@ def _verdict_text(action: str, summary: str) -> str:
             "needs_you_reason": None,
             "findings": summary,
             "deferred": None,
+            "human_gate": None
+            if action != "NEEDS_YOU"
+            else {
+                "category": "PRODUCT_PREFERENCE",
+                "title": "A product choice blocks this stage",
+                "checks": [
+                    {
+                        "id": "choose-behaviour",
+                        "instruction": "Decide between behaviour A and behaviour B.",
+                        "pass_criteria": "One of the two is chosen and recorded.",
+                        "source": None,
+                    }
+                ],
+            },
         }
     )
 

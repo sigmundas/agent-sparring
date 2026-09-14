@@ -40,7 +40,23 @@ def _head_sha(repo: Path) -> str:
     ).stdout.strip()
 
 
-def _verdict(action: str, summary: str, *, reason: str | None = None) -> str:
+def human_gate(*, category: str = "DEVICE_MANUAL_CHECK", checks: list[dict] | None = None) -> dict:
+    return {
+        "category": category,
+        "title": "One device check blocks this stage",
+        "checks": checks
+        or [
+            {
+                "id": "android-device",
+                "instruction": "Install the debug build on a real Android device and open the widget.",
+                "pass_criteria": "It renders without a crash.",
+                "source": None,
+            }
+        ],
+    }
+
+
+def _verdict(action: str, summary: str, *, reason: str | None = None, gate: dict | None = None) -> str:
     return json.dumps(
         {
             "action": action,
@@ -48,13 +64,19 @@ def _verdict(action: str, summary: str, *, reason: str | None = None) -> str:
             "needs_you_reason": reason,
             "findings": f"findings: {summary}",
             "deferred": None,
+            "human_gate": gate if action == "NEEDS_YOU" else None,
         }
     )
 
 
 READY = _verdict("READY", "looks good")
 SEND_BACK = _verdict("SEND_BACK", "fix the guard")
-NEEDS_YOU = _verdict("NEEDS_YOU", "check it on a device", reason="DEVICE/MANUAL CHECK -- Android")
+NEEDS_YOU = _verdict(
+    "NEEDS_YOU",
+    "check it on a device",
+    reason="DEVICE/MANUAL CHECK -- Android",
+    gate=human_gate(),
+)
 ESCALATE = _verdict("ESCALATE", "needs a stronger sparrer")
 
 PLAN = """\
@@ -328,7 +350,7 @@ class PlanRunTests(_PlanRepoTestCase):
         self.assertIs(state.status, PlanRunStatus.PAUSED)
         self.assertEqual((state.current_stage_index, state.current_stage), (0, S1))
 
-    def test_resume_after_needs_you_adds_evidence_resumes_same_sessions_and_continues(self):
+    def test_resume_after_needs_you_goes_straight_to_the_sparrer_and_continues(self):
         stage_adapter = _StageAdapter(self.repo)
         sparring_adapter = _SparringAdapter([NEEDS_YOU, READY, READY])
         self._start(stage_adapter, sparring_adapter)
@@ -339,26 +361,81 @@ class PlanRunTests(_PlanRepoTestCase):
         stage1 = self._stage(S1)
         notes = stage1.read_notes()
         self.assertIn("## Human evidence\n\nTested on Pixel 7", notes)
-        # The SAME stage resumed with the SAME provider sessions; no new
-        # stage was created for the answer.
-        self.assertEqual([sid for sid, _ in stage_adapter.resume_calls], ["impl-1"])
+        # The human satisfied a review gate, so the SPARRER resumed against
+        # the unchanged candidate. The stage agent was never asked to deliver
+        # the answer: its only calls are the two fresh starts (stage 1 during
+        # run-plan, stage 2 after stage 1 was accepted).
+        self.assertEqual(stage_adapter.resume_calls, [])
+        self.assertEqual(len(stage_adapter.start_calls), 2)
         self.assertEqual([sid for sid, _ in sparring_adapter.resume_calls], ["spar-1"])
-        self.assertEqual(len(stage_adapter.start_calls), 2)  # stage 1 once, stage 2 once
         s1 = stage1.read_state()
         self.assertEqual((s1.implementation_session_id, s1.sparring_session_id), ("impl-1", "spar-1"))
         self.assertIs(s1.status, StageStatus.ACCEPTED)
-        # Both agents were shown the evidence on the resumed turn.
-        _, stage_prompt = stage_adapter.resume_calls[0]
-        self.assertIn("## Human evidence", stage_prompt)
-        self.assertIn("Tested on Pixel 7", stage_prompt)
+        # The sparrer saw the evidence, read live from notes.md -- nobody had
+        # to mirror it into handoff.md for that to happen.
         _, sparring_prompt = sparring_adapter.resume_calls[0]
+        self.assertIn("## Human evidence", sparring_prompt)
         self.assertIn("Tested on Pixel 7", sparring_prompt)
-        self.assertIn("Tested on Pixel 7", stage1.read_handoff())
         # Stage 2 then proceeded with fresh sessions and the plan completed.
         s2 = self._stage(S2).read_state()
         self.assertEqual((s2.implementation_session_id, s2.sparring_session_id), ("impl-2", "spar-2"))
         self.assertIs(s2.status, StageStatus.ACCEPTED)
         self.assertIs(self._plan_state().status, PlanRunStatus.COMPLETE)
+
+    def test_evidence_then_send_back_resumes_implementation_from_the_stage_agent(self):
+        # The reviewer reads the evidence and finds real implementation work:
+        # the loop must then continue normally, starting with the stage agent.
+        stage_adapter = _StageAdapter(self.repo)
+        sparring_adapter = _SparringAdapter([NEEDS_YOU, SEND_BACK, READY, READY])
+        self._start(stage_adapter, sparring_adapter)
+
+        result = self._resume(stage_adapter, sparring_adapter, evidence="Checked; the empty case is wrong.")
+
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        # One sparring turn first (no implementation turn), then the ordinary
+        # cycle: the same stage session resumed, then the same sparring one.
+        self.assertEqual([sid for sid, _ in stage_adapter.resume_calls], ["impl-1"])
+        self.assertEqual([sid for sid, _ in sparring_adapter.resume_calls], ["spar-1", "spar-1"])
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+
+    def test_evidence_then_needs_you_again_leaves_the_plan_paused(self):
+        stage_adapter = _StageAdapter(self.repo)
+        sparring_adapter = _SparringAdapter([NEEDS_YOU, NEEDS_YOU])
+        self._start(stage_adapter, sparring_adapter)
+
+        result = self._resume(stage_adapter, sparring_adapter, evidence="Ran it; here is what I saw.")
+
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.stage_id, S1)
+        self.assertIs(result.routing.action, RoutingAction.NEEDS_YOU)
+        self.assertEqual(stage_adapter.resume_calls, [])
+        self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
+        self.assertFalse(self._stage(S2).exists())
+
+    def test_evidence_then_escalate_leaves_the_plan_paused(self):
+        stage_adapter = _StageAdapter(self.repo)
+        sparring_adapter = _SparringAdapter([NEEDS_YOU, ESCALATE])
+        self._start(stage_adapter, sparring_adapter)
+
+        result = self._resume(stage_adapter, sparring_adapter, evidence="Answered; still unsure.")
+
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertIs(result.routing.action, RoutingAction.ESCALATE)
+        self.assertEqual(stage_adapter.resume_calls, [])
+
+    def test_evidence_on_a_stage_that_never_implemented_starts_normally(self):
+        # Nothing has been implemented, so there is no candidate to spar:
+        # the ordinary implementation-first loop is right here.
+        stage_adapter = _StageAdapter(self.repo, fail_at=1)
+        with self.assertRaises(PlanRunError):
+            self._start(stage_adapter, _SparringAdapter([]))
+        self.assertIsNone(self._stage(S1).read_state().implementation_session_id)
+
+        recovered = _StageAdapter(self.repo)
+        result = self._resume(recovered, _SparringAdapter([READY, READY]), evidence="Approved the scope.")
+
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        self.assertEqual(len(recovered.start_calls), 2)
 
     def test_same_sha_reconsidered_and_accepted_after_evidence_only(self):
         stage_adapter = _StageAdapter(self.repo)  # never commits
@@ -553,9 +630,9 @@ class PlanRunTests(_PlanRepoTestCase):
             self._start(stage_adapter, _SparringAdapter([READY, READY]))
 
         message = str(ctx.exception)
-        self.assertIn("earlier or abandoned run", message)
+        self.assertIn("already exist", message)
         self.assertIn(str(stage.directory), message)
-        self.assertIn("nothing is deleted automatically", message)
+        self.assertIn("--adopt", message)
         self.assertEqual(stage_adapter.start_calls, [])
         self.assertFalse(self.state_path.exists())
         self.assertFalse(Stage.resolve(self.sparring_dir, S2).exists())
@@ -567,7 +644,7 @@ class PlanRunTests(_PlanRepoTestCase):
         stage_adapter = _StageAdapter(self.repo)
         with self.assertRaises(PlanError) as ctx:
             self._start(stage_adapter, _SparringAdapter([READY]))
-        self.assertIn("earlier or abandoned run", str(ctx.exception))
+        self.assertIn("already exist", str(ctx.exception))
         self.assertEqual(stage_adapter.start_calls, [])
 
     def test_stage_agent_editing_a_plan_stage_section_blocks_acceptance_and_advance(self):
@@ -591,7 +668,7 @@ class PlanRunTests(_PlanRepoTestCase):
 
         message = str(ctx.exception)
         self.assertIn("before accepting the candidate", message)
-        self.assertIn("reviewed stage content", message)
+        self.assertIn("executable content", message)
         s1 = self._stage(S1).read_state()
         self.assertIs(s1.status, StageStatus.WORKING)  # not frozen, not accepted
         self.assertIsNone(s1.candidate_sha)
@@ -692,7 +769,10 @@ class PlanRunTests(_PlanRepoTestCase):
 
         result = self._resume(stage_adapter, sparring_adapter, evidence="approved")
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
-        self.assertEqual([sid for sid, _ in stage_adapter.resume_calls], ["impl-3"])
+        # The evidence resumed the SPARRER, not the stage agent: stage 3's
+        # implementation session was never touched again.
+        self.assertEqual(stage_adapter.resume_calls, [])
+        self.assertEqual([sid for sid, _ in sparring_adapter.resume_calls], ["spar-3"])
         self.assertEqual(len(stage_adapter.start_calls), 3)
 
 

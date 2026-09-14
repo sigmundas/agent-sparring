@@ -2,11 +2,26 @@ import unittest
 
 import conftest_path  # noqa: F401
 
+from agent_sparring.human_gate import HumanCheck, HumanGate
 from agent_sparring.routing import (
     NEEDS_YOU_REASON_CATEGORIES,
     RoutingAction,
     RoutingResult,
     RoutingResultError,
+)
+
+# Every NEEDS_YOU carries one of these: the structured list of what a human
+# must finish before the stage can be READY (see agent_sparring.human_gate).
+GATE = HumanGate(
+    category="PRODUCT_PREFERENCE",
+    title="A product choice blocks this stage",
+    checks=(
+        HumanCheck(
+            id="pick-flow",
+            instruction="Choose between UX flow A and UX flow B.",
+            pass_criteria="One flow is chosen and recorded.",
+        ),
+    ),
 )
 
 
@@ -44,6 +59,7 @@ class NeedsYouReasonTests(unittest.TestCase):
             action=RoutingAction.NEEDS_YOU,
             summary="need a call on something unlisted",
             needs_you_reason="something_unlisted",
+            human_gate=GATE,
         )
         self.assertEqual(result.needs_you_reason, "something_unlisted")
 
@@ -53,6 +69,7 @@ class NeedsYouReasonTests(unittest.TestCase):
                 action=RoutingAction.NEEDS_YOU,
                 summary="pick one of two UX flows",
                 needs_you_reason=123,
+                human_gate=GATE,
             )
 
 
@@ -73,7 +90,11 @@ class RoutingResultConstructionTests(unittest.TestCase):
     def test_needs_you_without_reason_is_allowed(self):
         # needs_you_reason is optional lightweight metadata, not required
         # for NEEDS_YOU to be a legal action.
-        result = RoutingResult(action=RoutingAction.NEEDS_YOU, summary="pick one of two UX flows")
+        result = RoutingResult(
+            action=RoutingAction.NEEDS_YOU,
+            summary="pick one of two UX flows",
+            human_gate=GATE,
+        )
         self.assertIsNone(result.needs_you_reason)
 
     def test_needs_you_with_reason(self):
@@ -81,6 +102,7 @@ class RoutingResultConstructionTests(unittest.TestCase):
             action=RoutingAction.NEEDS_YOU,
             summary="pick one of two UX flows",
             needs_you_reason="product_preference",
+            human_gate=GATE,
         )
         self.assertEqual(result.needs_you_reason, "product_preference")
 
@@ -120,6 +142,7 @@ class RoutingResultSerializationTests(unittest.TestCase):
             action=RoutingAction.NEEDS_YOU,
             summary="verify on device",
             needs_you_reason="device_manual_check",
+            human_gate=GATE,
         )
         payload = result.to_dict()
         reloaded = RoutingResult.from_dict(payload)
@@ -161,6 +184,78 @@ class RoutingResultSerializationTests(unittest.TestCase):
         result = RoutingResult(action=RoutingAction.READY, summary="looks good")
         payload = result.to_dict()
         self.assertEqual(set(payload.keys()), {"action", "summary"})
+
+    def test_human_gate_round_trips_structurally(self):
+        result = RoutingResult(
+            action=RoutingAction.NEEDS_YOU, summary="verify on device", human_gate=GATE
+        )
+        payload = result.to_dict()
+        self.assertEqual(payload["human_gate"]["category"], "PRODUCT_PREFERENCE")
+        self.assertEqual(len(payload["human_gate"]["checks"]), 1)
+        self.assertEqual(RoutingResult.from_dict(payload), result)
+
+
+class HumanGateContractTests(unittest.TestCase):
+    """NEEDS_YOU is the only action that stops on a human check list, and it
+    must say what that list is."""
+
+    def test_needs_you_without_a_gate_is_refused(self):
+        with self.assertRaises(RoutingResultError) as ctx:
+            RoutingResult(action=RoutingAction.NEEDS_YOU, summary="a human must look")
+        self.assertIn("human_gate", str(ctx.exception))
+
+    def test_other_actions_must_not_carry_a_gate(self):
+        for action in (RoutingAction.READY, RoutingAction.SEND_BACK, RoutingAction.ESCALATE):
+            with self.assertRaises(RoutingResultError, msg=action.value):
+                RoutingResult(action=action, summary="x", human_gate=GATE)
+
+    def test_from_dict_builds_the_gate_from_plain_json(self):
+        result = RoutingResult.from_dict(
+            {
+                "action": "NEEDS_YOU",
+                "summary": "one device check",
+                "human_gate": {
+                    "category": "DEVICE_MANUAL_CHECK",
+                    "title": "A device check blocks this stage",
+                    "checks": [
+                        {
+                            "id": "device",
+                            "instruction": "Run it on hardware.",
+                            "pass_criteria": "No crash.",
+                            "source": "docs/plan.md > Stage 3D",
+                        }
+                    ],
+                },
+            }
+        )
+        assert result.human_gate is not None
+        self.assertEqual(result.human_gate.checks[0].source, "docs/plan.md > Stage 3D")
+
+    def test_gate_with_no_checks_is_refused(self):
+        with self.assertRaises(RoutingResultError):
+            RoutingResult.from_dict(
+                {
+                    "action": "NEEDS_YOU",
+                    "summary": "x",
+                    "human_gate": {"category": "OTHER", "title": "t", "checks": []},
+                }
+            )
+
+    def test_unknown_category_is_refused_rather_than_guessed(self):
+        with self.assertRaises(RoutingResultError):
+            RoutingResult.from_dict(
+                {
+                    "action": "NEEDS_YOU",
+                    "summary": "x",
+                    "human_gate": {
+                        "category": "DEPLOYMENT",
+                        "title": "t",
+                        "checks": [
+                            {"id": "a", "instruction": "i", "pass_criteria": "p", "source": None}
+                        ],
+                    },
+                }
+            )
 
 
 if __name__ == "__main__":

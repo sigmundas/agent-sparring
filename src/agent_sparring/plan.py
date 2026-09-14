@@ -1,4 +1,4 @@
-"""The plan-level unattended runner: one reviewed plan, several bounded stages.
+"""The plan-level unattended runner: one plan, several bounded stages.
 
 :mod:`agent_sparring.loop` automates *one* stage (implementation <-> sparring
 until READY/NEEDS_YOU/ESCALATE). This module is the thin outer loop that
@@ -22,30 +22,63 @@ resumed. No dependency graph, no transition table, no AI interpretation of
 the plan, no second state model: candidate identity, session identity and
 acceptance status stay in each stage's own ``state.json``.
 
-Plan convention
----------------
+Two plan inputs, one runner
+---------------------------
 
-Stages are level-2 headings of the form ``## Stage <n> — <title>`` (an
-en dash, hyphen or colon also works as the separator), numbered 1..N in
-document order. Everything from that heading up to the next level-1 or
-level-2 heading (fenced code blocks excluded) is the stage's section, and
-becomes that stage's ``brief.md`` verbatim, under a two-line header naming
-the plan and position. Stage ids are derived deterministically as
-``<plan key>-stage-<n>-<slugified title>``, where the plan key (see
-:func:`plan_key`) is a short hash of the plan's path, so two plans with the
-same headings never share stage artifacts. Anything that looks like a stage heading
-but does not fit the convention, a gap or duplicate in the numbering, an
-empty section, or a plan with no stages at all is refused before any
-provider is invoked.
+The runner takes a :class:`~agent_sparring.plan_model.PlanSource` and never
+learns which kind it got:
+
+- :class:`MarkdownPlanSource` -- the original convention. Stages are level-2
+  headings of the form ``## Stage <n> — <title>`` (an en dash, hyphen or
+  colon also works as the separator), numbered 1..N in document order.
+  Everything from that heading up to the next level-1 or level-2 heading
+  (fenced code blocks excluded) is the stage's section, and becomes that
+  stage's ``brief.md`` verbatim, under a two-line header naming the plan and
+  position. Stage ids are derived deterministically as ``<plan key>-stage-
+  <n>-<slugified title>``, where the plan key (see :func:`plan_key`) is a
+  short hash of the plan's path, so two plans with the same headings never
+  share stage artifacts. Anything that looks like a stage heading but does
+  not fit the convention, a gap or duplicate in the numbering, an empty
+  section, or a plan with no stages at all is refused before any provider is
+  invoked.
+- :class:`~agent_sparring.manifest.ManifestPlanSource` -- an execution
+  manifest (see :mod:`agent_sparring.manifest`) emitted by a caller that
+  already interpreted the human document: explicit stage ids, labels like
+  ``3A``/``3B``/``3C``, exact briefs, and the order. Numeric ``1..N`` labels
+  are not required, because *order* comes from the manifest's array and
+  labels are display only.
+
+Both produce the same ordered :class:`~agent_sparring.plan_model.
+PlannedStage` tuple and feed the same ``_drive``. There is one plan-state
+model, one position, one set of transitions.
 
 READY is still not acceptance: the plan runner is simply the explicit
 orchestration step that invokes the existing hard gate. If freeze or accept
-refuses, the run stops loudly and nothing is substituted or advanced.
+refuses, the run stops loudly and nothing is substituted or advanced. For a
+cross-repository stage the gate freezes and re-verifies the *complete*
+reviewed candidate set (see :class:`~agent_sparring.stage.
+CandidateRepository`), so acceptance cannot claim a stage whose sibling
+candidate moved.
 
-Plan changes: the SHA-256 of the parsed stage sections (ids + text) is
-recorded when a run starts and re-checked on resume; a plan whose stage
-content changed is refused rather than silently run. Prose outside the
-stage sections may change freely.
+Plan changes: the source's own SHA-256 over exactly what it executes
+(Markdown: the parsed stage sections; manifest: the whole executable
+content plus the source document's digest) is recorded when a run starts and
+re-checked on resume, before accepting, and before advancing. Content that
+changed is refused rather than silently run. For a Markdown plan, prose
+outside the stage sections may still change freely.
+
+Answering NEEDS_YOU
+-------------------
+
+``resume-plan --evidence`` records a human's answer in the stage's
+``notes.md`` and then resumes the *sparrer* against the unchanged candidate,
+not the stage agent (``start_with="sparring"``; see
+:func:`~agent_sparring.loop.run_unattended_loop`). The human satisfied a
+review gate; there is nothing to implement, and starting an implementation
+turn to carry the message would move the candidate the reviewer is being
+asked about. If the sparrer then says SEND_BACK there *is* implementation
+work and the ordinary loop takes over from the stage agent; READY accepts
+and advances; NEEDS_YOU and ESCALATE leave the plan paused.
 
 Adapters are built per planned stage
 ------------------------------------
@@ -89,6 +122,8 @@ from agent_sparring.loop import (
     LoopError,
     run_unattended_loop,
 )
+from agent_sparring.manifest import ManifestError, ManifestPlanSource, load_manifest_source
+from agent_sparring.plan_model import PlanSource, PlannedStage, digest_planned_stages
 from agent_sparring.providers import SparringAgentAdapter, StageAgentAdapter
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.stage import (
@@ -298,6 +333,11 @@ class PlanRunState:
     current_stage_index: int
     current_stage: str
     status: PlanRunStatus
+    #: Which plan input this run executes, ``"markdown"`` or ``"manifest"``.
+    #: Absent from state written before manifests existed, and read as
+    #: ``"markdown"`` then; a resume with a different kind is refused, since
+    #: the two describe different execution content for the same plan.
+    source: str = "markdown"
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -314,6 +354,7 @@ class PlanRunState:
                 current_stage_index=int(payload["current_stage_index"]),
                 current_stage=str(payload["current_stage"]),
                 status=PlanRunStatus(str(payload["status"])),
+                source=str(payload.get("source", "markdown")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -348,6 +389,91 @@ def plan_state_path(sparring_dir: Path, label: str) -> Path:
     return Path(sparring_dir) / PLANS_DIRNAME / f"{plan_key(label)}.json"
 
 
+# -- plan sources ------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MarkdownPlanSource:
+    """A :class:`~agent_sparring.plan_model.PlanSource` over a reviewed
+    Markdown plan: the original ``## Stage <n> — <title>`` convention,
+    unchanged.
+
+    ``digest`` is still :func:`plan_digest` over the parsed stage numbers,
+    titles and sections, so a run recorded before manifests existed
+    re-validates against exactly the same value.
+    """
+
+    path: Path
+    label: str
+    parsed: tuple[PlanStage, ...]
+    kind: str = "markdown"
+
+    def digest(self) -> str:
+        return plan_digest(self.parsed)
+
+    def stages(self) -> tuple[PlannedStage, ...]:
+        total = len(self.parsed)
+        return tuple(
+            PlannedStage(
+                position=stage.number,
+                label=str(stage.number),
+                title=stage.title,
+                stage_id=stage.stage_id,
+                brief=render_brief(self.label, stage, total),
+            )
+            for stage in self.parsed
+        )
+
+    def reload(self) -> "MarkdownPlanSource":
+        return load_markdown_source(self.path, self.label)
+
+    def describe(self) -> str:
+        return f"plan {self.label}"
+
+
+def load_markdown_source(plan_path: Path, label: str) -> MarkdownPlanSource:
+    try:
+        text = Path(plan_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PlanError(f"cannot read plan {plan_path}: {exc}") from exc
+    return MarkdownPlanSource(
+        path=Path(plan_path), label=label, parsed=parse_plan(text, plan_key=plan_key(label))
+    )
+
+
+def load_plan_source(path: Path, repo_root: Path, *, manifest: bool = False) -> PlanSource:
+    """Read ``path`` as the plan input the runner will execute.
+
+    ``manifest`` picks the execution-manifest reader; otherwise the file is
+    read as a reviewed Markdown plan. Both are validated in full here,
+    before any run state is written or any provider is invoked.
+    """
+
+    if manifest:
+        try:
+            return load_manifest_source(Path(path))
+        except ManifestError as exc:
+            raise PlanError(str(exc)) from exc
+    return load_markdown_source(Path(path), plan_label(Path(path), Path(repo_root)))
+
+
+def _coerce_source(plan: "Path | str | PlanSource", repo_root: Path) -> PlanSource:
+    """Accept either a ready plan source or a Markdown plan path.
+
+    The path form is the original API and is what every existing caller and
+    test passes; it means "read this as a reviewed Markdown plan".
+    """
+
+    if isinstance(plan, (str, Path)):
+        return load_plan_source(Path(plan), repo_root, manifest=False)
+    return plan
+
+
+def describe_source(source: PlanSource) -> str:
+    describe = getattr(source, "describe", None)
+    return describe() if callable(describe) else f"plan {source.label}"
+
+
 # -- running -----------------------------------------------------------------
 
 
@@ -363,29 +489,20 @@ class PlanRunResult:
     accepted: tuple[tuple[str, str], ...] = field(default_factory=tuple)  # (stage_id, sha)
 
 
-def _read_plan(plan_path: Path, label: str) -> tuple[PlanStage, ...]:
-    try:
-        text = plan_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise PlanError(f"cannot read plan {plan_path}: {exc}") from exc
-    return parse_plan(text, plan_key=plan_key(label))
+def _verify_source_unchanged(source: PlanSource, state: PlanRunState) -> tuple[PlannedStage, ...]:
+    """Re-read the plan input from disk and require its digest to equal the
+    one recorded when the run started. The one check used on resume, before
+    accepting a READY stage, and before advancing -- so execution content
+    edited (even committed) mid-run is caught, not executed."""
 
-
-def _verify_plan_unchanged(plan_path: Path, state: PlanRunState) -> tuple[PlanStage, ...]:
-    """Re-read the plan from disk and require its stage-section digest to
-    equal the one recorded when the run started. The one check used on
-    resume, before accepting a READY stage, and before advancing -- so a
-    stage section edited (even committed) mid-run is caught, not executed."""
-
-    stages = _read_plan(plan_path, state.plan)
-    if plan_digest(stages) != state.plan_digest:
+    fresh = source.reload()
+    if fresh.digest() != state.plan_digest:
         raise PlanError(
-            f"the reviewed stage content of {state.plan} has changed since this run "
-            "started; refusing to continue against a different plan. Restore the stage "
-            "sections as they were, or deliberately start over (see run-plan's refusal "
-            "message for what to remove)."
+            f"the executable content of {state.plan} has changed since this run started; "
+            "refusing to continue against a different plan. Restore it as it was, or "
+            "deliberately start over (see run-plan's refusal message for what to remove)."
         )
-    return stages
+    return fresh.stages()
 
 
 def _require_state_ignored(repo_root: Path, state_path: Path) -> None:
@@ -402,74 +519,121 @@ def _require_state_ignored(repo_root: Path, state_path: Path) -> None:
     except GitContextError as exc:
         raise PlanError(str(exc)) from exc
     if not ignored:
-        raise PlanError(
-            f"plan-run state {state_path} would be visible to git, which would make "
-            "every freeze-candidate refuse the worktree as dirty; add "
-            f"'.sparring/{PLANS_DIRNAME}/' to .gitignore (alongside '.sparring/stages/')"
-        )
+        raise PlanError(plan_state_not_ignored_message(repo_root, state_path))
+
+
+def plan_state_not_ignored_message(repo_root: Path, state_path: Path) -> str:
+    """The one refusal every project hits once, written so it can be fixed
+    without reading the source.
+
+    This check is deliberately loud and deliberately not skippable: a
+    plan-run state file that git can see is written before the first
+    provider turn and rewritten at every stage boundary, so *every*
+    subsequent ``freeze-candidate`` would refuse the worktree as dirty --
+    after spending provider turns. Failing here costs nothing; failing there
+    costs a whole stage.
+    """
+
+    try:
+        shown = Path(state_path).resolve().relative_to(Path(repo_root).resolve()).as_posix()
+    except ValueError:
+        shown = str(state_path)
+    return (
+        f"plan-run state {shown} is not ignored by git. The plan runner rewrites it at "
+        "every stage boundary, so leaving it visible would make every freeze-candidate "
+        "refuse the worktree as dirty part-way through a run.\n"
+        f"Fix: add a line '.sparring/{PLANS_DIRNAME}/' to {repo_root}/.gitignore, next to "
+        "the '.sparring/stages/' line the same workflow already needs. Both are workflow "
+        "bookkeeping; '.sparring/project.toml' and '.sparring/PROJECT.md' stay tracked.\n"
+        "Check it with: sparring check-config"
+    )
 
 
 def start_plan(
-    plan_path: Path,
+    plan: "Path | str | PlanSource",
     sparring_dir: Path,
     repo_root: Path,
     make_adapters: AdapterFactory,
     *,
     expected_branch: str,
+    adopt: bool = False,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
     report: Reporter = lambda message: None,
 ) -> PlanRunResult:
     """Validate the whole plan, record position at stage 1, and run.
 
+    ``plan`` is either a :class:`~agent_sparring.plan_model.PlanSource` or a
+    path to a reviewed Markdown plan (the original form).
+
     ``make_adapters`` (an :data:`AdapterFactory`) is called once per stage
     entered for execution, with that stage, and returns the stage and
     sparring adapters to drive it with.
 
+    ``adopt`` opts in to running a plan whose stages *already exist* on disk
+    -- the migration case, where a sequence was driven stage by stage before
+    it was ever managed. Without it, any pre-existing stage directory refuses
+    the run, because a fresh run means fresh stages and inheriting an old
+    session id or an old ACCEPTED status silently is exactly the accident
+    worth refusing. With it, each existing stage is checked against
+    :func:`_check_adoption`'s rules and every adoption is reported.
+
     Refuses (:class:`PlanError`, before any provider is invoked) if the plan
     is malformed, if a run for this plan is already recorded (use
-    :func:`resume_plan`), if any of this plan's stage directories already
-    exist (a fresh run means fresh stages: old session ids or an old
-    ACCEPTED status must never be inherited or skipped past), or if the
-    run-state location is not git-ignored.
+    :func:`resume_plan`), if a stage directory exists that adoption does not
+    allow, or if the run-state location is not git-ignored.
     """
 
     if not expected_branch or not expected_branch.strip():
         raise PlanError("expected_branch is required for a plan run")
 
-    label = plan_label(plan_path, repo_root)
-    stages = _read_plan(plan_path, label)
+    source = _coerce_source(plan, repo_root)
+    label = source.label
+    stages = source.stages()
     state_path = plan_state_path(sparring_dir, label)
-    stage_dirs = [Stage.resolve(sparring_dir, s.stage_id).directory for s in stages]
-    leftovers = [str(path) for path in stage_dirs if path.exists()]
-    if state_path.is_file() or leftovers:
-        recorded = ""
-        if state_path.is_file():
-            existing = PlanRunState.load(state_path)
-            recorded = (
-                f" A run is recorded at {state_path} (status {existing.status.value}, "
-                f"current stage {existing.current_stage!r}); use resume-plan to continue it."
-            )
+    if state_path.is_file():
+        existing = PlanRunState.load(state_path)
         raise PlanError(
-            f"refusing a fresh run of {label}: it already has state from an earlier or "
-            f"abandoned run.{recorded} To genuinely start over, deliberately remove the "
-            f"run-state file {state_path} and this plan's stage directories "
-            f"({', '.join(leftovers) or 'none present'}); nothing is deleted automatically."
+            f"refusing a fresh run of {label}: a run is already recorded at {state_path} "
+            f"(status {existing.status.value}, current stage {existing.current_stage!r}); "
+            "use resume-plan to continue it. To genuinely start over, deliberately remove "
+            "that file; nothing is deleted automatically."
         )
+
+    leftovers = [
+        stage for stage in stages if Stage.resolve(sparring_dir, stage.stage_id).directory.exists()
+    ]
+    if leftovers and not adopt:
+        listed = ", ".join(
+            str(Stage.resolve(sparring_dir, stage.stage_id).directory) for stage in leftovers
+        )
+        raise PlanError(
+            f"refusing a fresh run of {label}: {len(leftovers)} of its stage directories "
+            f"already exist ({listed}). A fresh run means fresh stages, so old session ids "
+            "and an old ACCEPTED status are never inherited by accident. Either remove "
+            "those directories deliberately, or pass --adopt to continue the existing "
+            "sequence (each stage is then checked and reported, never silently inherited)."
+        )
+    if leftovers:
+        _check_adoption(sparring_dir, stages, leftovers, report=report)
     _require_state_ignored(repo_root, state_path)
 
     state = PlanRunState(
         plan=label,
-        plan_digest=plan_digest(stages),
+        plan_digest=source.digest(),
         expected_branch=expected_branch,
         current_stage_index=0,
         current_stage=stages[0].stage_id,
         status=PlanRunStatus.RUNNING,
+        source=source.kind,
     )
     state.save(state_path)
-    report(f"plan {label}: {len(stages)} stage(s); run state at {state_path}")
+    report(
+        f"{describe_source(source)}: {len(stages)} stage(s) from {source.kind}; "
+        f"run state at {state_path}"
+    )
     return _drive(
-        plan_path,
+        source,
         stages,
         state,
         state_path,
@@ -482,8 +646,98 @@ def start_plan(
     )
 
 
+def _check_adoption(
+    sparring_dir: Path,
+    stages: tuple[PlannedStage, ...],
+    existing: list[PlannedStage],
+    *,
+    report: Reporter,
+) -> None:
+    """Decide, per already-existing stage, whether this run may take it over.
+
+    Three cases, and nothing in between is guessed:
+
+    - **ACCEPTED** with a real candidate: adopt and later advance past it.
+      Its brief is history and is not compared -- the work went through the
+      hard gate already, and demanding that a stage accepted months ago be
+      briefed byte-identically to today's manifest would refuse exactly the
+      sequences worth adopting.
+    - **Not accepted, brief identical to the plan's**: adopt. This is the
+      current stage of a sequence being taken over mid-flight; its recorded
+      sessions and candidate continue as they are.
+    - **Anything else** -- an unreadable state, a missing brief, or a brief
+      that differs: refuse, naming the stage. A stage that has actually run
+      against a different brief is not this plan's stage, and silently
+      re-briefing it would throw away the context its sessions hold.
+
+    Reports every adoption, including what is being inherited, so nothing is
+    taken over quietly.
+    """
+
+    known = {stage.stage_id for stage in existing}
+    problems: list[str] = []
+    for planned in stages:
+        if planned.stage_id not in known:
+            continue
+        stage = Stage.resolve(sparring_dir, planned.stage_id)
+        try:
+            state = stage.read_state()
+        except StageError as exc:
+            problems.append(f"{planned.stage_id}: its state cannot be read ({exc})")
+            continue
+        if state.status is StageStatus.ACCEPTED:
+            if not state.candidate_sha:
+                problems.append(
+                    f"{planned.stage_id}: recorded as ACCEPTED but with no candidate commit"
+                )
+                continue
+            report(
+                f"adopting {planned.display} [{planned.stage_id}]: already ACCEPTED at "
+                f"{state.candidate_sha}; it will be advanced past, not re-run"
+            )
+            continue
+        try:
+            brief = stage.read_brief()
+        except StageError as exc:
+            problems.append(f"{planned.stage_id}: its brief.md cannot be read ({exc})")
+            continue
+        if brief != planned.brief:
+            problems.append(
+                f"{planned.stage_id}: status {state.status.value} and its brief.md differs "
+                "from this plan's text for that stage"
+            )
+            continue
+        inherited = ", ".join(
+            part
+            for part in (
+                f"implementation session {state.implementation_session_id}"
+                if state.implementation_session_id
+                else "",
+                f"sparring session {state.sparring_session_id}"
+                if state.sparring_session_id
+                else "",
+                f"candidate {state.candidate_sha}" if state.candidate_sha else "",
+            )
+            if part
+        )
+        report(
+            f"adopting {planned.display} [{planned.stage_id}]: status "
+            f"{state.status.value}, brief matches; inheriting "
+            f"{inherited or 'no recorded sessions or candidate'}"
+        )
+
+    if problems:
+        listed = "\n  - ".join(problems)
+        raise PlanError(
+            "refusing to adopt the existing stages of this plan; the following do not "
+            f"match it and would have to be guessed at:\n  - {listed}\n"
+            "Fix the mismatch (align the plan's text with the stage's brief, or remove the "
+            "stage directory deliberately) rather than running against a different brief."
+        )
+
+
 def resume_plan(
-    plan_path: Path,
+    plan: "Path | str | PlanSource",
     sparring_dir: Path,
     repo_root: Path,
     make_adapters: AdapterFactory,
@@ -496,26 +750,41 @@ def resume_plan(
 ) -> PlanRunResult:
     """Continue a recorded plan run at its current stage.
 
+    ``plan`` is the same source (or Markdown plan path) the run was started
+    with; resuming with a different *kind* of source is refused.
+
     ``make_adapters`` is the same per-stage :data:`AdapterFactory` as for
     :func:`start_plan`.
 
     ``evidence`` (a human's answer, manual-check result, external-condition
     result or scope approval -- one path for all of them) is appended to the
-    current stage's ``notes.md`` under ``## Human evidence``; the existing
-    handoff/prompt plumbing shows it to both agents. The *same* stage then
-    resumes with its recorded sessions: no new stage is created for an
-    answer, and with no code change the same SHA is simply sparred again.
+    current stage's ``notes.md`` under ``## Human evidence``, which is the
+    one canonical place it lives: the sparring prompt reads that section
+    live (see :func:`~agent_sparring.sparring_prompt.build_sparring_prompt`)
+    and the stage prompt embeds it too, so no caller has to mirror it
+    anywhere to be seen.
+
+    The *same* stage then resumes with its recorded sessions -- and, when
+    that stage has actually been implemented, it resumes at the **sparrer**,
+    not the stage agent. Evidence answers a review gate; the candidate did
+    not change, and an implementation turn asked to deliver a message would
+    move the very commit the reviewer is ruling on. If the sparrer says
+    SEND_BACK there is real work and the ordinary loop takes over from the
+    stage agent. A stage with no implementation session yet has no candidate
+    to spar, so it starts normally.
 
     A current stage that is already ACCEPTED (by hand, after an ESCALATE
     sparred elsewhere, or by a run that stopped between accept and advance)
     is advanced past without running anything.
 
     Refuses (:class:`PlanError`) if no run is recorded, the run is complete,
-    ``expected_branch`` differs from the recorded one, or the plan's stage
-    content no longer matches the digest recorded at start.
+    ``expected_branch`` differs from the recorded one, the source kind
+    differs from the recorded one, or the plan's executable content no
+    longer matches the digest recorded at start.
     """
 
-    label = plan_label(plan_path, repo_root)
+    source = _coerce_source(plan, repo_root)
+    label = source.label
     state_path = plan_state_path(sparring_dir, label)
     if not state_path.is_file():
         raise PlanError(f"no plan run is recorded for {label}; start one with run-plan")
@@ -528,7 +797,13 @@ def resume_plan(
             f"plan run for {label} was started for branch {state.expected_branch!r}, "
             f"not {expected_branch!r}; refusing to resume on a different branch"
         )
-    stages = _verify_plan_unchanged(plan_path, state)
+    if state.source != source.kind:
+        raise PlanError(
+            f"plan run for {label} was started from a {state.source} plan input, not a "
+            f"{source.kind} one; refusing to resume the same run from a different kind of "
+            "input, which would describe different execution content"
+        )
+    stages = _verify_source_unchanged(source, state)
     if not 0 <= state.current_stage_index < len(stages):
         raise PlanError(
             f"recorded stage index {state.current_stage_index} is out of range for "
@@ -536,16 +811,30 @@ def resume_plan(
         )
     _require_state_ignored(repo_root, state_path)
 
+    sparrer_first = False
     if evidence is not None and evidence.strip():
         current = stages[state.current_stage_index]
-        stage = _ensure_stage(sparring_dir, label, current, len(stages))
+        stage = _ensure_stage(sparring_dir, current)
         record_human_evidence(stage, evidence)
         report(f"recorded human evidence in {stage.directory / 'notes.md'}")
         # Observational only: that evidence was recorded, never what it says.
         _plan_emitter(stage).emit("plan.evidence_recorded")
+        try:
+            current_state = stage.read_state()
+        except StageError as exc:
+            raise PlanError(f"cannot read the state of {current.stage_id!r}: {exc}") from exc
+        sparrer_first = (
+            current_state.status is not StageStatus.ACCEPTED
+            and current_state.implementation_session_id is not None
+        )
+        if sparrer_first:
+            report(
+                f"stage {current.stage_id}: resuming the sparrer against the unchanged "
+                "candidate with this evidence; the stage agent is not started"
+            )
 
     return _drive(
-        plan_path,
+        source,
         stages,
         state,
         state_path,
@@ -555,6 +844,7 @@ def resume_plan(
         max_send_back_cycles=max_send_back_cycles,
         self_check=self_check,
         report=report,
+        sparrer_first=sparrer_first,
     )
 
 
@@ -570,28 +860,86 @@ def record_human_evidence(stage: Stage, evidence: str) -> None:
     stage.write_notes(f"{notes}\n\n{entry}\n")
 
 
-def _ensure_stage(sparring_dir: Path, label: str, plan_stage: PlanStage, total: int) -> Stage:
+def _ensure_stage(sparring_dir: Path, planned: PlannedStage) -> Stage:
     """Create the planned stage (fresh state.json, so fresh sessions) with
-    the plan section as its brief, or -- within a recorded run, where
-    :func:`start_plan` has already refused any pre-existing stage
-    directories -- continue the existing one whose brief is exactly that
-    section. A differing brief is refused: the reviewed plan is the source
-    of truth for what a planned stage is."""
+    the plan's brief, or continue the existing one whose brief is exactly
+    that. A differing brief is refused: the plan is the source of truth for
+    what a planned stage is.
 
-    brief = render_brief(label, plan_stage, total)
+    An ACCEPTED stage is the one exception, and it is returned without the
+    brief being compared. Acceptance is terminal: nothing will run for that
+    stage, only the recorded candidate is read, and its brief is a record of
+    how the work was actually briefed at the time. Demanding that it match
+    today's plan text would refuse a completed sequence for a wording change
+    that can no longer affect anything."""
+
     try:
-        stage = Stage.resolve(sparring_dir, plan_stage.stage_id)
+        stage = Stage.resolve(sparring_dir, planned.stage_id)
         if not stage.exists():
-            stage.create(brief=brief)
-        elif stage.read_brief() != brief:
+            stage.create(brief=planned.brief)
+            return stage
+        state = stage.read_state()
+        if state.status is StageStatus.ACCEPTED:
+            return stage
+        if stage.read_brief() != planned.brief:
             raise PlanError(
-                f"stage {plan_stage.stage_id!r} already exists at {stage.directory} with a "
-                "brief.md that differs from this plan's section; refusing to run a planned "
-                "stage against a different brief"
+                f"stage {planned.stage_id!r} already exists at {stage.directory} with a "
+                "brief.md that differs from this plan's text for that stage; refusing to "
+                "run a planned stage against a different brief"
             )
     except StageError as exc:
         raise PlanError(str(exc)) from exc
     return stage
+
+
+def _declare_repositories(stage: Stage, planned: PlannedStage) -> None:
+    """Record this stage's declared sibling repositories in ``state.json``.
+
+    Declaring them here, rather than passing them into the acceptance gate,
+    keeps the gate's contract unchanged and makes the standalone
+    ``freeze-candidate``/``accept-candidate`` commands behave identically:
+    the complete reviewed candidate set is a property of the stage, not of
+    who happens to be driving it. Only the declaration is written -- the
+    pinned commits are the freeze's business (see
+    :func:`agent_sparring.acceptance.freeze_candidate`).
+    """
+
+    declared = tuple(planned.repositories)
+    if not declared:
+        return
+    try:
+        state = stage.read_state()
+    except StageError as exc:
+        raise PlanError(str(exc)) from exc
+    current = tuple(
+        repository.__class__(
+            name=repository.name,
+            path=repository.path,
+            branch=repository.branch,
+            candidate_sha=None,
+        )
+        for repository in state.repositories
+    )
+    if current == declared:
+        return
+    # Re-declaring keeps any commit already pinned for a repository the plan
+    # still declares identically; a changed declaration replaces it, because
+    # a pin from a different declaration is not this stage's candidate set.
+    pinned = {
+        (repository.name, repository.path, repository.branch): repository.candidate_sha
+        for repository in state.repositories
+    }
+    state.repositories = tuple(
+        repository.__class__(
+            name=repository.name,
+            path=repository.path,
+            branch=repository.branch,
+            candidate_sha=repository.candidate_sha
+            or pinned.get((repository.name, repository.path, repository.branch)),
+        )
+        for repository in declared
+    )
+    stage.write_state(state)
 
 
 def _pause(state: PlanRunState, state_path: Path) -> None:
@@ -628,18 +976,19 @@ def _fail(
 
 
 def _require_plan_unchanged(
-    plan_path: Path,
+    source: PlanSource,
     state: PlanRunState,
     state_path: Path,
     activity: ActivityEmitter,
     *,
     before: str,
 ) -> None:
-    """Mid-run form of :func:`_verify_plan_unchanged`: on a changed (or now
-    unparseable) plan, pause and stop instead of doing ``before``."""
+    """Mid-run form of :func:`_verify_source_unchanged`: on changed (or now
+    unreadable) execution content, pause and stop instead of doing
+    ``before``."""
 
     try:
-        _verify_plan_unchanged(plan_path, state)
+        _verify_source_unchanged(source, state)
     except PlanError as exc:
         raise _fail(
             state,
@@ -654,8 +1003,8 @@ def _require_plan_unchanged(
 
 
 def _drive(
-    plan_path: Path,
-    stages: tuple[PlanStage, ...],
+    source: PlanSource,
+    stages: tuple[PlannedStage, ...],
     state: PlanRunState,
     state_path: Path,
     sparring_dir: Path,
@@ -665,14 +1014,24 @@ def _drive(
     max_send_back_cycles: int,
     self_check: bool,
     report: Reporter,
+    sparrer_first: bool = False,
 ) -> PlanRunResult:
+    """Walk the plan's stages from the recorded position until it pauses,
+    fails or completes.
+
+    One loop for both plan inputs and for both entry modes: ``sparrer_first``
+    only changes where the *first* stage entered starts (see
+    :func:`resume_plan`), and is consumed immediately so every later stage
+    runs the ordinary implementation-first loop.
+    """
+
     total = len(stages)
     accepted: list[tuple[str, str]] = []
 
     while True:
         plan_stage = stages[state.current_stage_index]
         try:
-            stage = _ensure_stage(sparring_dir, state.plan, plan_stage, total)
+            stage = _ensure_stage(sparring_dir, plan_stage)
         except PlanError:
             # The authoritative refusal is unchanged; only mirror it, if the
             # stage directory is even addressable.
@@ -695,22 +1054,39 @@ def _drive(
                 message=f"plan {state.plan} stopped at {stage.stage_id!r}: {exc}",
             ) from exc
 
+        position = f"{plan_stage.position}/{total}"
         if stage_state.status is StageStatus.ACCEPTED:
             # Already through the hard gate (by hand, or by a run that stopped
             # between accept and advance): nothing to run, just move on.
             activity.emit(
                 "plan.stage.entered",
-                summary=f"Stage {plan_stage.number}/{total}; already accepted, advancing",
+                summary=f"{plan_stage.display} ({position}); already accepted, advancing",
             )
-            report(f"stage {plan_stage.number}/{total} {stage.stage_id}: already ACCEPTED at "
+            report(f"stage {position} {stage.stage_id}: already ACCEPTED at "
                    f"{stage_state.candidate_sha}; advancing")
             accepted.append((stage.stage_id, str(stage_state.candidate_sha)))
         else:
             state.status = PlanRunStatus.RUNNING
             state.save(state_path)
-            activity.emit("plan.stage.entered", summary=f"Stage {plan_stage.number}/{total}")
-            report(f"stage {plan_stage.number}/{total} {stage.stage_id}: running the "
-                   "implementation <-> sparring loop")
+            # The declared cross-repository candidate set belongs to the
+            # stage, so the acceptance gate finds it wherever it is invoked
+            # from. Written before any provider turn.
+            _declare_repositories(stage, plan_stage)
+            start_with = "sparring" if sparrer_first else "stage"
+            sparrer_first = False  # only the stage this resume entered
+            activity.emit(
+                "plan.stage.entered",
+                summary=f"{plan_stage.display} ({position})"
+                + ("; sparring first" if start_with == "sparring" else ""),
+            )
+            report(
+                f"stage {position} {stage.stage_id}: "
+                + (
+                    "resuming the sparrer against the unchanged candidate"
+                    if start_with == "sparring"
+                    else "running the implementation <-> sparring loop"
+                )
+            )
             # Adapters are built for THIS stage, so a caller can bind their
             # provider telemetry to this stage's activity.jsonl. Session
             # continuity comes from state.json's recorded ids, which
@@ -740,6 +1116,7 @@ def _drive(
                     expected_branch=state.expected_branch,
                     max_send_back_cycles=max_send_back_cycles,
                     self_check=self_check,
+                    start_with=start_with,
                 )
             except LoopError as exc:
                 raise _fail(
@@ -771,7 +1148,7 @@ def _drive(
             # the existing hard gate on the exact pushed SHA. Any refusal
             # stops the plan; nothing else is ever substituted.
             _require_plan_unchanged(
-                plan_path, state, state_path, activity, before="accepting the candidate"
+                source, state, state_path, activity, before="accepting the candidate"
             )
             try:
                 frozen = freeze_candidate(
@@ -792,6 +1169,11 @@ def _drive(
                 ) from exc
             report(f"stage {stage.stage_id}: READY; frozen and accepted {result.candidate_sha} "
                    f"({frozen.push_detail})")
+            for repository in result.repositories:
+                report(
+                    f"stage {stage.stage_id}: sibling candidate {repository.name} "
+                    f"{repository.branch} pinned and verified at {repository.candidate_sha}"
+                )
             accepted.append((stage.stage_id, result.candidate_sha))
             activity.emit("plan.stage.accepted", sha=result.candidate_sha)
 
@@ -808,7 +1190,7 @@ def _drive(
             )
 
         _require_plan_unchanged(
-            plan_path, state, state_path, activity, before="advancing to the next stage"
+            source, state, state_path, activity, before="advancing to the next stage"
         )
         state.current_stage_index += 1
         state.current_stage = stages[state.current_stage_index].stage_id
@@ -818,16 +1200,23 @@ def _drive(
 __all__ = [
     "AdapterFactory",
     "PLANS_DIRNAME",
+    "MarkdownPlanSource",
     "PlanError",
     "PlanRunError",
     "PlanRunResult",
     "PlanRunState",
     "PlanRunStatus",
+    "PlanSource",
     "PlanStage",
+    "PlannedStage",
+    "describe_source",
+    "load_markdown_source",
+    "load_plan_source",
     "parse_plan",
     "plan_digest",
     "plan_key",
     "plan_label",
+    "plan_state_not_ignored_message",
     "plan_state_path",
     "record_human_evidence",
     "render_brief",

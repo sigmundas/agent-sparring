@@ -85,6 +85,7 @@ from agent_sparring.stage import (
     NOTES_FILENAME,
     SPARRING_FILENAME,
     STATE_FILENAME,
+    CandidateRepository,
     Stage,
     StageError,
     StageState,
@@ -133,20 +134,28 @@ class StaleCandidateError(AcceptanceError):
 
 @dataclass(frozen=True)
 class FreezeResult:
-    """What was frozen, and the push evidence it was frozen on."""
+    """What was frozen, and the push evidence it was frozen on.
+
+    ``repositories`` is the pinned sibling candidate set (empty for the
+    ordinary single-repository stage): each declared sibling resolved to the
+    exact commit its branch was at, verified clean and pushed.
+    """
 
     candidate_sha: str
     branch: str
     push_detail: str
     ignored_dirty_paths: tuple[str, ...] = field(default_factory=tuple)
+    repositories: tuple[CandidateRepository, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
 class AcceptanceResult:
-    """The exact candidate that was accepted."""
+    """The exact candidate set that was accepted: the primary commit plus
+    every pinned sibling candidate, each re-verified as still current."""
 
     candidate_sha: str
     branch: str
+    repositories: tuple[CandidateRepository, ...] = field(default_factory=tuple)
 
 
 def _read_state(stage: Stage) -> StageState:
@@ -251,6 +260,144 @@ def _partition_dirty(
         )
         (ignored if _entry_is_exempt(entry, allowed) else blocking).append(description)
     return tuple(blocking), tuple(ignored)
+
+
+# -- sibling repositories -----------------------------------------------------
+
+
+def sibling_root(repo_root: Path, repository: CandidateRepository) -> Path:
+    """Where a declared sibling repository lives: its ``path`` resolved
+    against the primary ``repo_root`` when relative."""
+
+    declared = Path(repository.path)
+    return declared if declared.is_absolute() else (Path(repo_root) / declared).resolve()
+
+
+def _describe(repository: CandidateRepository) -> str:
+    return f"{repository.name!r} ({repository.path})"
+
+
+def _freeze_siblings(
+    repo_root: Path, repositories: tuple[CandidateRepository, ...]
+) -> tuple[CandidateRepository, ...]:
+    """Resolve and pin every declared sibling candidate, or refuse.
+
+    Each sibling gets the same treatment the primary repository already
+    gets, in the same order: it must be on the declared branch, resolve
+    HEAD, hold no dirty changes at all (a sibling holds none of *this*
+    stage's workflow artifacts, so nothing is exempt there), and have that
+    commit reachable from its branch's configured remote. A sibling that
+    declares a ``candidate_sha`` must be exactly at it -- that is the
+    reviewed commit asserted by whoever declared it, and silently pinning a
+    different one would defeat the point.
+
+    Returns the same repositories with ``candidate_sha`` filled in with the
+    resolved HEAD. Raises :class:`AcceptanceError` on the first refusal;
+    nothing is written by this function.
+    """
+
+    pinned: list[CandidateRepository] = []
+    for repository in repositories:
+        root = sibling_root(repo_root, repository)
+        if not (root / ".git").exists():
+            raise AcceptanceError(
+                f"sibling repository {_describe(repository)} does not resolve to a git "
+                f"repository at {root}; refusing to freeze an incomplete candidate set"
+            )
+        try:
+            branch = current_branch(root)
+        except GitContextError as exc:
+            raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
+        if branch != repository.branch:
+            raise AcceptanceError(
+                f"sibling repository {_describe(repository)} is on {branch!r} but its "
+                f"candidate belongs to {repository.branch!r}; refusing to freeze a "
+                "candidate set built from the wrong branch"
+            )
+        try:
+            head = resolve_commit(root, "HEAD", label=f"{repository.name} candidate")
+        except GitContextError as exc:
+            raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
+        if repository.candidate_sha is not None and repository.candidate_sha != head:
+            raise AcceptanceError(
+                f"sibling repository {_describe(repository)} was declared at "
+                f"{repository.candidate_sha} but {branch} is now at {head}; refusing to "
+                "freeze a candidate set that is not the one that was reviewed"
+            )
+        try:
+            dirty = dirty_entries(root, all_untracked=True)
+        except GitContextError as exc:
+            raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
+        if dirty:
+            listed = ", ".join(entry.path for entry in dirty)
+            raise AcceptanceError(
+                f"refusing to freeze {head} as the candidate of sibling repository "
+                f"{_describe(repository)}: its working tree holds changes that commit "
+                f"does not represent ({listed}). Commit or discard them first."
+            )
+        pushed, push_detail = verify_pushed(root, head, branch)
+        if not pushed:
+            raise AcceptanceError(
+                f"refusing to freeze {head} as the candidate of sibling repository "
+                f"{_describe(repository)}: it is not available on the intended remote "
+                f"branch ({push_detail})"
+            )
+        pinned.append(
+            CandidateRepository(
+                name=repository.name,
+                path=repository.path,
+                branch=repository.branch,
+                candidate_sha=head,
+            )
+        )
+    return tuple(pinned)
+
+
+def _verify_siblings(repo_root: Path, repositories: tuple[CandidateRepository, ...]) -> None:
+    """Re-check that every pinned sibling candidate is still exactly what was
+    frozen, mirroring the primary repository's stale-candidate check.
+
+    Raises :class:`StaleCandidateError` when a sibling moved on, and plain
+    :class:`AcceptanceError` when it was never pinned, is on the wrong
+    branch, or its worktree no longer *is* that commit.
+    """
+
+    for repository in repositories:
+        if not is_full_sha(repository.candidate_sha):
+            raise AcceptanceError(
+                f"sibling repository {_describe(repository)} has no pinned candidate "
+                f"({repository.candidate_sha!r}); freeze the candidate set again rather "
+                "than guessing which commit was reviewed"
+            )
+        root = sibling_root(repo_root, repository)
+        try:
+            branch = current_branch(root)
+            head = resolve_commit(root, "HEAD", label=f"{repository.name} HEAD")
+        except GitContextError as exc:
+            raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
+        if branch != repository.branch:
+            raise AcceptanceError(
+                f"sibling repository {_describe(repository)} is on {branch!r} but its "
+                f"frozen candidate belongs to {repository.branch!r}; refusing acceptance"
+            )
+        if head != repository.candidate_sha:
+            raise StaleCandidateError(
+                f"the frozen candidate of sibling repository {_describe(repository)} is "
+                f"{repository.candidate_sha}, but {branch} in {root} is now at {head}; "
+                "refusing acceptance as stale. The complete reviewed candidate set must "
+                "still be the one that was reviewed; nothing was accepted."
+            )
+        try:
+            dirty = dirty_entries(root, all_untracked=True)
+        except GitContextError as exc:
+            raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
+        if dirty:
+            listed = ", ".join(entry.path for entry in dirty)
+            raise AcceptanceError(
+                f"refusing to accept {repository.candidate_sha} for sibling repository "
+                f"{_describe(repository)}: its working tree holds changes that commit does "
+                f"not represent ({listed}), even though HEAD still matches."
+            )
 
 
 def freeze_candidate(
@@ -377,8 +524,14 @@ def _freeze_candidate_locked(
             f"branch ({push_detail})"
         )
 
+    # A cross-repository stage is frozen as a *set*: pinning only the primary
+    # commit would let a reviewed sibling move between review and acceptance.
+    # Refuses before anything is written, like every check above.
+    repositories = _freeze_siblings(repo_root, state.repositories)
+
     state.candidate_sha = candidate_sha
     state.status = StageStatus.FROZEN
+    state.repositories = repositories
     stage.write_state(state)
 
     return FreezeResult(
@@ -386,6 +539,7 @@ def _freeze_candidate_locked(
         branch=branch,
         push_detail=push_detail,
         ignored_dirty_paths=ignored,
+        repositories=repositories,
     )
 
 
@@ -515,10 +669,18 @@ def _accept_candidate_locked(
             "candidate. Commit or discard them first."
         )
 
+    # The same two questions, asked of every pinned sibling candidate: is it
+    # still exactly the commit that was reviewed, and does its worktree still
+    # *be* that commit? A cross-repository stage is accepted as a complete
+    # set or not at all.
+    _verify_siblings(repo_root, state.repositories)
+
     state.status = StageStatus.ACCEPTED
     stage.write_state(state)
 
-    return AcceptanceResult(candidate_sha=frozen_sha, branch=branch)
+    return AcceptanceResult(
+        candidate_sha=frozen_sha, branch=branch, repositories=state.repositories
+    )
 
 
 __all__ = [
@@ -528,4 +690,5 @@ __all__ = [
     "StaleCandidateError",
     "accept_candidate",
     "freeze_candidate",
+    "sibling_root",
 ]

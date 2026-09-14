@@ -143,12 +143,21 @@ def _build_routing_result(payload: dict[str, Any]) -> RoutingResult:
     carried through ``details["deferred"]`` -- the same existing
     human-readable path :func:`agent_sparring.sparring_exchange.
     render_sparring` already reads for its ``## Deferred`` section.
+
+    ``human_gate`` *is* carried through structurally (see
+    :mod:`agent_sparring.human_gate`): it is the closed, runnable list of
+    what a human must complete before this stage can be READY, and
+    :class:`RoutingResult` requires it for NEEDS_YOU and forbids it
+    otherwise. A provider that says NEEDS_YOU without one produces an
+    unusable verdict rather than a stage whose human checks have to be
+    guessed from prose.
     """
 
     routing_payload: dict[str, Any] = {
         "action": payload.get("action"),
         "summary": payload.get("summary"),
         "needs_you_reason": payload.get("needs_you_reason"),
+        "human_gate": payload.get("human_gate"),
     }
     deferred = payload.get("deferred")
     if deferred:

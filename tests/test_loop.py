@@ -21,6 +21,21 @@ def _run_git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
 
 
+def _gate(check_id: str = "device-check") -> dict:
+    return {
+        "category": "DEVICE_MANUAL_CHECK",
+        "title": "A human must run this on real hardware",
+        "checks": [
+            {
+                "id": check_id,
+                "instruction": "Run the build on a real device and open the screen.",
+                "pass_criteria": "It renders and does not crash.",
+                "source": None,
+            }
+        ],
+    }
+
+
 def _verdict_text(action: str, summary: str, *, findings: str | None = None) -> str:
     return json.dumps(
         {
@@ -29,6 +44,7 @@ def _verdict_text(action: str, summary: str, *, findings: str | None = None) -> 
             "needs_you_reason": None,
             "findings": findings if findings is not None else summary,
             "deferred": None,
+            "human_gate": _gate() if action == "NEEDS_YOU" else None,
         }
     )
 
@@ -160,6 +176,66 @@ class UnattendedLoopTests(unittest.TestCase):
         self.assertEqual(sparring_adapter.resume_calls, [])
         self.assertEqual(result.send_back_count, 0)
         self.assertEqual(len(result.cycles), 1)
+
+    def test_start_with_sparring_skips_only_the_first_implementation_turn(self):
+        # What answering a NEEDS_YOU gate needs: the candidate did not change,
+        # so the reviewer rules again on the same commit and the stage agent
+        # is not spent delivering a message.
+        stage_adapter = _ScriptedStageAdapter()
+        sparring_adapter = _ScriptedSparringAdapter([_verdict_text("READY", "the evidence settles it")])
+
+        result = run_unattended_loop(
+            self.stage,
+            self.sparring_dir,
+            self.repo,
+            stage_adapter,
+            sparring_adapter,
+            expected_branch="feature/x",
+            start_with="sparring",
+        )
+
+        self.assertEqual(result.outcome, RoutingAction.READY)
+        self.assertEqual(stage_adapter.start_calls, [])
+        self.assertEqual(stage_adapter.resume_calls, [])
+        self.assertEqual(len(sparring_adapter.start_calls), 1)
+        self.assertEqual(len(result.cycles), 1)
+        self.assertFalse(result.cycles[0].stage_ran)
+
+    def test_start_with_sparring_then_send_back_returns_to_the_stage_agent(self):
+        stage_adapter = _ScriptedStageAdapter()
+        sparring_adapter = _ScriptedSparringAdapter(
+            [_verdict_text("SEND_BACK", "the evidence exposes a gap"), _verdict_text("READY", "fixed")]
+        )
+
+        result = run_unattended_loop(
+            self.stage,
+            self.sparring_dir,
+            self.repo,
+            stage_adapter,
+            sparring_adapter,
+            expected_branch="feature/x",
+            start_with="sparring",
+        )
+
+        self.assertEqual(result.outcome, RoutingAction.READY)
+        self.assertEqual(len(result.cycles), 2)
+        self.assertEqual([cycle.stage_ran for cycle in result.cycles], [False, True])
+        # The second cycle is an ordinary one: the same sessions on both sides.
+        self.assertEqual(len(stage_adapter.start_calls), 1)
+        self.assertEqual(len(sparring_adapter.resume_calls), 1)
+        self.assertEqual(result.send_back_count, 1)
+
+    def test_unknown_start_with_is_refused(self):
+        with self.assertRaises(LoopError):
+            run_unattended_loop(
+                self.stage,
+                self.sparring_dir,
+                self.repo,
+                _ScriptedStageAdapter(),
+                _ScriptedSparringAdapter([]),
+                expected_branch="feature/x",
+                start_with="whenever",
+            )
 
     def test_send_back_resumes_same_implementation_and_sparring_sessions(self):
         stage_adapter = _ScriptedStageAdapter()
