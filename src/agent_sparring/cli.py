@@ -508,12 +508,18 @@ def _report_plan_result(
             print(f"  accepted {stage_id} at {sha}")
         return
 
-    routing = result.routing
-    assert routing is not None  # a PAUSED result always carries the sparrer's routing
+    # A PAUSED result carries either the verdict this run produced or, when
+    # the stage was already stopped for a human before the run reached it,
+    # the one that was already on disk. They print the same way.
+    routing = result.routing or result.recorded
+    assert routing is not None
     stage = Stage.resolve(sparring_dir, result.stage_id)
     print(f"plan paused: {result.plan}")
     print(f"stage: {result.stage_id} ({stage.directory})")
     print(f"action: {routing.action.value}")
+    if result.recorded is not None:
+        print("this stage was already waiting for you; nothing was run and the recorded")
+        print("review is unchanged.")
     if routing.needs_you_reason:
         print(f"reason: {routing.needs_you_reason}")
     print(f"summary: {routing.summary}")

@@ -33,6 +33,9 @@ from agent_sparring.plan import (
     resume_plan,
     start_plan,
 )
+from agent_sparring.human_gate import HumanCheck, HumanGate
+from agent_sparring.routing import RoutingAction, RoutingResult
+from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.stage import Stage, StageState, StageStatus
 from test_plan import (  # noqa: E402  (shared scripted adapters and verdicts)
     NEEDS_YOU,
@@ -440,6 +443,149 @@ class ManifestAdoptionTests(_ManifestRepoTestCase):
         self.assertIn("differs", message)
         # Nothing was started: no run state was recorded.
         self.assertFalse(self.state_path.is_file())
+
+    def _needs_you_sparring(self, stage: Stage, *, structured: bool) -> str:
+        """Put ``stage`` where the real Stage 3D is: reviewed, and stopped on
+        a gate only a person can answer. ``structured`` picks between today's
+        envelope and one recorded before gates were part of it."""
+
+        if structured:
+            record_sparring(
+                stage,
+                RoutingResult(
+                    action=RoutingAction.NEEDS_YOU,
+                    summary="Only the desktop compatibility gate remains.",
+                    needs_you_reason="DEVICE/MANUAL CHECK -- desktop",
+                    human_gate=HumanGate(
+                        category="DEVICE_MANUAL_CHECK",
+                        title="A pre-activation desktop must accept a feed containing v2",
+                        checks=(
+                            HumanCheck(
+                                id="desktop-v2-feed",
+                                instruction="Point a pre-activation desktop at a v2 feed.",
+                                pass_criteria="It consumes the feed without rejecting it.",
+                            ),
+                        ),
+                    ),
+                ),
+                findings="Both repository candidates form a coherent implementation.",
+            )
+        else:
+            stage.write_sparring(
+                "# Sparring: x\n\n## Routing outcome\n\n- Action: `NEEDS_YOU`\n"
+                "- Summary: Only the desktop compatibility gate remains.\n\n"
+                "## NEEDS YOU\n\nVerify a pre-activation desktop can read a v2 feed.\n"
+            )
+        return stage.read_sparring()
+
+    def _paused_at_needs_you(self, *, structured: bool = True) -> tuple[Stage, str]:
+        """Stage 3C accepted, Stage 3D reviewed and waiting for a person --
+        the state a hand-driven sequence is actually in when it is adopted."""
+
+        self._existing(
+            "stage-3c-cloud-schema",
+            brief="# an older, hand-written brief\n",
+            state=StageState(status=StageStatus.ACCEPTED, candidate_sha="a" * 40),
+        )
+        stage = self._existing(
+            "stage-3d-snapshot-v2",
+            brief=manifest_payload()["stages"][1]["brief"],
+            state=StageState(
+                status=StageStatus.WORKING,
+                implementation_session_id="impl-3d",
+                sparring_session_id="spar-3d",
+                base_sha="b" * 40,
+            ),
+        )
+        return stage, self._needs_you_sparring(stage, structured=structured)
+
+    def test_adopting_a_stage_that_already_needs_a_human_keeps_that_pause(self):
+        stage, sparring = self._paused_at_needs_you()
+        before = stage.read_state()
+        reported: list[str] = []
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        sparring_adapter = _SparringAdapter([READY])
+
+        result = self._start(stage_adapter, sparring_adapter, adopt=True, report=reported.append)
+
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.stage_id, "stage-3d-snapshot-v2")
+        # Neither agent was started: there is nothing to implement, and
+        # re-reviewing would throw away the verdict the human is answering.
+        self.assertEqual(stage_adapter.start_calls, [])
+        self.assertEqual(stage_adapter.resume_calls, [])
+        self.assertEqual(sparring_adapter.start_calls, [])
+        self.assertEqual(sparring_adapter.resume_calls, [])
+        # The recorded review, the candidate and both sessions are untouched.
+        self.assertEqual(stage.read_sparring(), sparring)
+        self.assertEqual(stage.read_state(), before)
+        # The accepted history was still walked past, and the run is now a
+        # managed one, paused where the human already was.
+        self.assertEqual(result.accepted, (("stage-3c-cloud-schema", "a" * 40),))
+        state = self._plan_state()
+        self.assertIs(state.status, PlanRunStatus.PAUSED)
+        self.assertEqual(state.current_stage, "stage-3d-snapshot-v2")
+        self.assertTrue(any("already NEEDS_YOU" in line for line in reported))
+
+    def test_the_preserved_pause_carries_the_recorded_gate_verbatim(self):
+        self._paused_at_needs_you()
+
+        result = self._start(_StageAdapter(self.repo), _SparringAdapter([READY]), adopt=True)
+
+        assert result.recorded is not None
+        self.assertIsNone(result.routing, "this run produced no verdict of its own")
+        self.assertIs(result.recorded.action, RoutingAction.NEEDS_YOU)
+        assert result.recorded.human_gate is not None
+        self.assertEqual(
+            [check.id for check in result.recorded.human_gate.checks], ["desktop-v2-feed"]
+        )
+
+    def test_a_pause_recorded_before_structured_gates_is_preserved_too(self):
+        # Backwards compatibility where it matters most: the stage that
+        # actually needs adopting was reviewed before gates were structured.
+        stage, sparring = self._paused_at_needs_you(structured=False)
+        stage_adapter = _StageAdapter(self.repo)
+
+        result = self._start(stage_adapter, _SparringAdapter([READY]), adopt=True)
+
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        assert result.recorded is not None
+        self.assertIs(result.recorded.action, RoutingAction.NEEDS_YOU)
+        self.assertIsNone(result.recorded.human_gate)
+        self.assertEqual(stage_adapter.start_calls, [])
+        self.assertEqual(stage.read_sparring(), sparring)
+
+    def test_answering_the_adopted_pause_resumes_the_sparrer_and_advances(self):
+        # The human's next move is unchanged by the run becoming managed.
+        self._paused_at_needs_you()
+        self._start(_StageAdapter(self.repo), _SparringAdapter([READY]), adopt=True)
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+
+        result = self._resume(
+            stage_adapter, _SparringAdapter([READY]), evidence="Tested on a 1.4 desktop: passed."
+        )
+
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        self.assertEqual(stage_adapter.start_calls, [], "no implementation turn to deliver evidence")
+        self.assertEqual(stage_adapter.resume_calls, [])
+        self.assertIn("Tested on a 1.4 desktop", self._stage("stage-3d-snapshot-v2").read_notes())
+
+    def test_a_recorded_send_back_is_work_to_do_and_the_loop_takes_it(self):
+        self._existing(
+            "stage-3c-cloud-schema",
+            brief=manifest_payload()["stages"][0]["brief"],
+            state=StageState(status=StageStatus.WORKING, implementation_session_id="impl-3c"),
+        )
+        record_sparring(
+            self._stage("stage-3c-cloud-schema"),
+            RoutingResult(action=RoutingAction.SEND_BACK, summary="fix the guard"),
+        )
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+
+        result = self._start(stage_adapter, _SparringAdapter([READY, READY]), adopt=True)
+
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        self.assertEqual([sid for sid, _ in stage_adapter.resume_calls], ["impl-3c"])
 
     def test_refuses_an_accepted_stage_with_no_candidate(self):
         self._existing(

@@ -606,7 +606,9 @@ class PlanRunTests(_PlanRepoTestCase):
             )
         self.assertIn("different branch", str(ctx.exception))
 
-        self._resume(stage_adapter, _SparringAdapter([READY, READY]))
+        # Evidence, because the stage is paused at NEEDS_YOU and a resume
+        # that answers nothing keeps that pause.
+        self._resume(stage_adapter, _SparringAdapter([READY, READY]), evidence="checked")
         with self.assertRaises(PlanError) as ctx:
             self._resume(stage_adapter, _SparringAdapter([READY]))
         self.assertIn("already complete", str(ctx.exception))

@@ -654,7 +654,12 @@ class NonAuthorityTests(_PlanActivityCase):
                 handle.write(json.dumps({"v": 1, "ts": "2026-01-01T00:00:00.000Z", **line}) + "\n")
         before = self._authoritative_snapshot()
 
-        result = self._resume(stage_adapter, _SparringAdapter([SEND_BACK, NEEDS_YOU]))
+        # Evidence, because the stage is paused at NEEDS_YOU: a resume that
+        # answers nothing keeps that pause, and this test is about what the
+        # real sparrer decides once it does run.
+        result = self._resume(
+            stage_adapter, _SparringAdapter([SEND_BACK, NEEDS_YOU]), evidence="checked on device"
+        )
 
         # The real sparrer's SEND_BACK then NEEDS_YOU is what happened: the
         # same stage, not accepted, not advanced, plan not complete.
@@ -667,7 +672,9 @@ class NonAuthorityTests(_PlanActivityCase):
         state = self._plan_state()
         self.assertIs(state.status, PlanRunStatus.PAUSED)
         self.assertEqual((state.current_stage_index, state.current_stage), (0, S1))
-        self.assertEqual([sid for sid, _ in stage_adapter.resume_calls], ["impl-1", "impl-1"])
+        # One implementation turn: the evidence resume starts at the sparrer,
+        # and only its SEND_BACK put the stage agent back to work.
+        self.assertEqual([sid for sid, _ in stage_adapter.resume_calls], ["impl-1"])
         # state.json / the run-state file changed only in ways the real run
         # explains (nothing, here: same stage, same sessions, still paused).
         self.assertEqual(self._authoritative_snapshot(), before)

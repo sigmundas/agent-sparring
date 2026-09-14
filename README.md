@@ -287,6 +287,27 @@ the future execution, and adopting a sequence never requires deleting a stage
 or rolling the plan document back. (The Markdown input has no way to say this,
 so a plan whose sections have moved on is a case for a manifest.)
 
+##### A stage that is already waiting for you keeps waiting
+
+The stage a hand-driven sequence is usually adopted *at* is one that stopped
+for a person: a `NEEDS_YOU` gate, or an `ESCALATE`. Entering it is not
+allowed to answer that question, so the run doesn't try. It adopts the pause
+exactly as it stands — same candidate, same sessions, same `sparring.md`,
+same gate — reports `already NEEDS_YOU and waiting for you`, and stops there
+with the run recorded as paused at that stage. Nothing is run and nothing is
+rewritten, so a human who was midway through a manual check is not asked to
+start over or to produce the gate again.
+
+The way out is the way it always was: `resume-plan --evidence`. The same rule
+applies to a plain `resume-plan` that answers nothing — the pause is a real
+state, not a step to be stepped over. A recorded `SEND_BACK` is the opposite
+case: there is implementation work, so the loop takes it.
+
+A `sparring.md` written before human gates were structured is read too: the
+verdict is what it says, and the gate is simply absent. Anything unreadable
+or unrecognised counts as no recorded verdict at all, because a half-read
+verdict must never decide whether an agent runs.
+
 #### Answering a human gate
 
 `--evidence` is appended to the current stage's `notes.md` under

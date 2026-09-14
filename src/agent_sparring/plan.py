@@ -126,6 +126,7 @@ from agent_sparring.manifest import ManifestError, ManifestPlanSource, load_mani
 from agent_sparring.plan_model import PlanSource, PlannedStage, digest_planned_stages
 from agent_sparring.providers import SparringAgentAdapter, StageAgentAdapter
 from agent_sparring.routing import RoutingAction, RoutingResult
+from agent_sparring.sparring_exchange import RecordedOutcome, read_recorded_outcome
 from agent_sparring.stage import (
     HUMAN_EVIDENCE_HEADING,
     Stage,
@@ -480,13 +481,19 @@ def describe_source(source: PlanSource) -> str:
 @dataclass(frozen=True)
 class PlanRunResult:
     """Where the run ended: COMPLETE (every stage accepted) or PAUSED on
-    ``stage_id`` with the sparrer's NEEDS_YOU/ESCALATE ``routing``."""
+    ``stage_id`` with the sparrer's NEEDS_YOU/ESCALATE ``routing`` -- or with
+    ``recorded``, when the stage was already stopped for a human before this
+    run reached it."""
 
     status: PlanRunStatus
     plan: str
     stage_id: str
     routing: RoutingResult | None = None
     accepted: tuple[tuple[str, str], ...] = field(default_factory=tuple)  # (stage_id, sha)
+    #: Set instead of ``routing`` when the run stopped at a verdict that was
+    #: *already on disk* rather than one it produced -- see
+    #: :func:`_recorded_pause`. The two are never both set.
+    recorded: RecordedOutcome | None = None
 
 
 def _verify_source_unchanged(source: PlanSource, state: PlanRunState) -> tuple[PlannedStage, ...]:
@@ -954,6 +961,27 @@ def _declare_repositories(stage: Stage, planned: PlannedStage) -> None:
     stage.write_state(state)
 
 
+def _recorded_pause(stage: Stage) -> RecordedOutcome | None:
+    """The verdict this stage is already stopped at, when it is one only a
+    person can answer (NEEDS_YOU or ESCALATE); otherwise ``None``.
+
+    This is what lets a sequence be adopted mid-pause. A stage that was
+    driven by hand up to a NEEDS_YOU holds everything that matters -- the
+    candidate, both sessions, and the reviewer's own gate in ``sparring.md``
+    -- and the human's next move is unchanged by the run becoming managed.
+    Re-entering it would either re-implement or re-review, and both would
+    destroy that. A recorded SEND_BACK is the opposite case: there *is*
+    implementation work, so the loop takes it. READY is left to the loop too;
+    the sparrer confirms it on its own terms before the hard gate runs.
+
+    An unreadable or unrecognised ``sparring.md`` yields ``None``: a pause is
+    only preserved on a verdict that could actually be read.
+    """
+
+    outcome = read_recorded_outcome(stage)
+    return outcome if outcome is not None and outcome.awaits_a_human else None
+
+
 def _pause(state: PlanRunState, state_path: Path) -> None:
     state.status = PlanRunStatus.PAUSED
     state.save(state_path)
@@ -1078,6 +1106,35 @@ def _drive(
                    f"{stage_state.candidate_sha}; advancing")
             accepted.append((stage.stage_id, str(stage_state.candidate_sha)))
         else:
+            waiting = None if sparrer_first else _recorded_pause(stage)
+            if waiting is not None:
+                # This stage already stopped for a person, and nothing here
+                # answers that. Running the stage agent would spend a turn on
+                # a question it cannot answer and move the very candidate the
+                # reviewer ruled on; running the sparrer again would throw
+                # away the recorded verdict and ask the human to produce the
+                # gate a second time. So the run adopts the pause exactly as
+                # it stands -- same sessions, same candidate, same
+                # sparring.md -- and the way out is the way it always was:
+                # answer it, with `resume-plan --evidence`.
+                _pause(state, state_path)
+                activity.emit(
+                    "plan.stage.entered",
+                    summary=f"{plan_stage.display} ({position}); already awaiting a human",
+                )
+                activity.emit("plan.paused", summary=f"recorded {waiting.action.value}")
+                report(
+                    f"stage {position} {stage.stage_id}: already {waiting.action.value} and "
+                    "waiting for you; keeping that pause. Nothing was run and the recorded "
+                    "review is unchanged. Answer it with resume-plan --evidence."
+                )
+                return PlanRunResult(
+                    status=PlanRunStatus.PAUSED,
+                    plan=state.plan,
+                    stage_id=stage.stage_id,
+                    recorded=waiting,
+                    accepted=tuple(accepted),
+                )
             state.status = PlanRunStatus.RUNNING
             state.save(state_path)
             # The declared cross-repository candidate set belongs to the
