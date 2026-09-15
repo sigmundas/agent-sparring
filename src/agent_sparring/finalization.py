@@ -78,6 +78,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from agent_sparring.acceptance import STAGE_ARTIFACT_FILENAMES
+from agent_sparring.prompt_capture import PROMPTS_DIRNAME, is_prompt_artifact
 from agent_sparring.git_context import (
     DirtyEntry,
     GitContextError,
@@ -167,13 +168,21 @@ def _is_stage_artifact(repo_root: Path, stage: Stage, path: str) -> bool:
     content?
 
     True only for a repo-relative path of exactly the shape ``<stages
-    root>/<one directory>/<one of the six artifact filenames>``, where the
-    stages root is the one this stage itself lives under
-    (``stage.directory.parent``, never a caller-supplied directory name).
-    Depth and filename are both exact, so this can never widen into a
-    subtree exemption. See the module docstring for why this is one step
-    wider than the acceptance gate's per-stage allowlist and why that does
-    not weaken the gate.
+    root>/<one directory>/<one of the six artifact filenames>``, or one
+    level deeper for a captured prompt: ``<stages root>/<one directory>/
+    prompts/<a filename prompt_capture writes>``. The stages root is the one
+    this stage itself lives under (``stage.directory.parent``, never a
+    caller-supplied directory name). Depth and filename are exact in both
+    shapes, so this can never widen into a subtree exemption -- a stray file
+    in ``prompts/``, or anything nested below it, is still candidate
+    content. See the module docstring for why this is one step wider than
+    the acceptance gate's per-stage allowlist and why that does not weaken
+    the gate.
+
+    Captured prompts belong on this side of the line for the same reason
+    the other artifacts do: a turn writes one every time it runs, including
+    the bounded commit turn itself, so treating them as candidate content
+    would make every finalization refuse itself.
     """
 
     try:
@@ -184,9 +193,13 @@ def _is_stage_artifact(repo_root: Path, stage: Stage, path: str) -> bool:
         return False
     root_parts = rel_root.parts
     parts = PurePosixPath(path).parts
-    if len(parts) != len(root_parts) + 2:
+    if parts[: len(root_parts)] != root_parts:
         return False
-    return parts[: len(root_parts)] == root_parts and parts[-1] in STAGE_ARTIFACT_FILENAMES
+    if len(parts) == len(root_parts) + 2:
+        return parts[-1] in STAGE_ARTIFACT_FILENAMES
+    if len(parts) == len(root_parts) + 3:
+        return parts[-2] == PROMPTS_DIRNAME and is_prompt_artifact(parts[-1])
+    return False
 
 
 def _entry_is_stage_artifact(repo_root: Path, stage: Stage, entry: DirtyEntry) -> bool:

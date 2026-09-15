@@ -14,9 +14,30 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_sparring.config import load_project_markdown
+from agent_sparring.config import CONTEXT_FILENAME, load_project_markdown
 from agent_sparring.handoff import human_evidence_section
-from agent_sparring.stage import HUMAN_EVIDENCE_HEADING, Stage, StageError
+from agent_sparring.prompt_sections import (
+    ROLE_SPARRER,
+    AssembledPrompt,
+    PromptSection,
+    section,
+    sparring_turn_kind,
+)
+from agent_sparring.stage import (
+    BRIEF_FILENAME,
+    HANDOFF_FILENAME,
+    HUMAN_EVIDENCE_HEADING,
+    NOTES_FILENAME,
+    SPARRING_FILENAME,
+    Stage,
+    StageError,
+)
+
+
+def _stage_file(stage: Stage, filename: str) -> str:
+    """A stage artifact's path relative to the ``.sparring`` directory."""
+
+    return f"stages/{stage.stage_id}/{filename}"
 
 _VERDICT_INSTRUCTIONS = """\
 ## Your task
@@ -142,14 +163,15 @@ files" is a deferred check, not a human decision, and must never appear in
 ``human_gate``."""
 
 
-def build_sparring_prompt(
+def assemble_sparring_prompt(
     stage: Stage,
     sparring_dir: Path,
     *,
     resume: bool,
     expected_branch: str | None = None,
     finalization: str | None = None,
-) -> str:
+    evidence_first: bool = False,
+) -> AssembledPrompt:
     """Assemble the bounded prompt for one sparring-agent turn.
 
     Always includes the stage brief, (if present) PROJECT.md, the current
@@ -179,68 +201,145 @@ def build_sparring_prompt(
     :func:`agent_sparring.sparring_agent.run_sparring_agent`, which never
     sends it unless the engine's own path-by-path comparison actually
     passed.
+
+    ``evidence_first`` records that the loop entered at this sparrer against
+    an unchanged candidate because a human just answered a NEEDS_YOU gate.
+    It changes no text -- the human-evidence section below is already driven
+    by notes.md -- and exists only so the captured turn is labelled with
+    what the caller knew and this module could not infer.
+
+    Returns the prompt as ordered, sourced sections (see
+    :mod:`agent_sparring.prompt_sections`);
+    :func:`build_sparring_prompt` is the flat-text view of the same result.
     """
 
-    parts = [f"# Sparring: {stage.stage_id}", ""]
+    parts: list[PromptSection] = [
+        section("Sparring", [f"# Sparring: {stage.stage_id}"])
+    ]
 
     if expected_branch:
-        parts += [
-            "## Branch",
-            "",
-            f"The candidate lives on branch `{expected_branch}`.",
-            "",
-        ]
+        parts.append(
+            section(
+                "Branch",
+                ["## Branch", "", f"The candidate lives on branch `{expected_branch}`."],
+            )
+        )
 
-    parts += ["## Stage brief", "", stage.read_brief().strip()]
+    parts.append(
+        section(
+            "Stage brief",
+            ["## Stage brief", "", stage.read_brief().strip()],
+            source=_stage_file(stage, BRIEF_FILENAME),
+        )
+    )
 
     project_context = load_project_markdown(sparring_dir)
     if project_context and project_context.strip():
-        parts += ["", "## Project context", "", project_context.strip()]
+        parts.append(
+            section(
+                "Project context",
+                ["## Project context", "", project_context.strip()],
+                source=CONTEXT_FILENAME,
+            )
+        )
 
     try:
         handoff_text = stage.read_handoff().strip()
     except StageError:
         handoff_text = ""
-    parts += ["", "## Handoff", "", handoff_text or "(no handoff.md available)"]
+    parts.append(
+        section(
+            "Handoff",
+            ["## Handoff", "", handoff_text or "(no handoff.md available)"],
+            source=_stage_file(stage, HANDOFF_FILENAME),
+        )
+    )
 
     evidence = human_evidence_section(stage)
     if evidence:
-        parts += [
-            "",
-            HUMAN_EVIDENCE_HEADING,
-            "",
-            evidence,
-            "",
-            "This is the human's own answer to your latest NEEDS_YOU gate, or their "
-            "recorded manual-check results, read live from the stage's notes.md. It is "
-            "current as of this turn and supersedes any copy of it inside the handoff "
-            "above. Judge the candidate with it: if it satisfies what you asked for, say "
-            "so and route accordingly rather than asking for it again.",
-        ]
+        # Split for the same reason as in stage_prompt: the evidence is the
+        # human's words out of notes.md, the sentence after it is this
+        # engine's instruction about them, and only one of those two comes
+        # from the file.
+        parts.append(
+            section(
+                "Human evidence",
+                [HUMAN_EVIDENCE_HEADING, "", evidence],
+                source=_stage_file(stage, NOTES_FILENAME),
+            )
+        )
+        parts.append(
+            section(
+                "How to use the human evidence",
+                [
+                    "This is the human's own answer to your latest NEEDS_YOU gate, or their "
+                    "recorded manual-check results, read live from the stage's notes.md. It is "
+                    "current as of this turn and supersedes any copy of it inside the handoff "
+                    "above. Judge the candidate with it: if it satisfies what you asked for, say "
+                    "so and route accordingly rather than asking for it again."
+                ],
+            )
+        )
 
     if finalization and finalization.strip():
-        parts += [
-            "",
-            "## Finalization",
-            "",
-            finalization.strip(),
-        ]
+        parts.append(
+            section("Finalization", ["## Finalization", "", finalization.strip()])
+        )
 
     if resume:
         try:
             sparring_text = stage.read_sparring().strip()
         except StageError:
             sparring_text = ""
-        parts += [
-            "",
-            "## Your previous sparring exchange",
-            "",
-            sparring_text or "(no sparring.md available)",
-        ]
+        parts.append(
+            section(
+                "Your previous sparring exchange",
+                [
+                    "## Your previous sparring exchange",
+                    "",
+                    sparring_text or "(no sparring.md available)",
+                ],
+                source=_stage_file(stage, SPARRING_FILENAME),
+            )
+        )
 
-    parts += ["", _VERDICT_INSTRUCTIONS]
+    parts.append(section("Your task", [_VERDICT_INSTRUCTIONS]))
 
-    return "\n".join(parts).rstrip() + "\n"
+    return AssembledPrompt(
+        role=ROLE_SPARRER,
+        stage_id=stage.stage_id,
+        turn_kind=sparring_turn_kind(
+            resume=resume,
+            evidence_first=evidence_first,
+            finalization=bool(finalization and finalization.strip()),
+        ),
+        resumed=resume,
+        expected_branch=expected_branch,
+        sections=tuple(parts),
+    )
 
 
-__all__ = ["build_sparring_prompt"]
+def build_sparring_prompt(
+    stage: Stage,
+    sparring_dir: Path,
+    *,
+    resume: bool,
+    expected_branch: str | None = None,
+    finalization: str | None = None,
+) -> str:
+    """The flat text of :func:`assemble_sparring_prompt`.
+
+    A one-line wrapper on purpose; see :func:`build_stage_prompt` for why
+    there is deliberately only one assembly path.
+    """
+
+    return assemble_sparring_prompt(
+        stage,
+        sparring_dir,
+        resume=resume,
+        expected_branch=expected_branch,
+        finalization=finalization,
+    ).text
+
+
+__all__ = ["assemble_sparring_prompt", "build_sparring_prompt"]

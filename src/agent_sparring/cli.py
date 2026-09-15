@@ -901,7 +901,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_stage.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the bounded stage prompt without invoking any provider",
+        help=(
+            "print the stage prompt the NEXT turn would be given, without invoking any "
+            "provider. Not a record of a turn that already ran: it re-reads files that "
+            "change between turns, and a stage whose first turn is still in flight "
+            "already has a session id, so it renders as a resume. Every turn's exact "
+            "prompt is captured under the stage's prompts/ directory"
+        ),
     )
     run_stage.set_defaults(func=_cmd_run_stage)
 
@@ -946,7 +952,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_sparring.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the bounded sparring prompt without invoking any provider",
+        help=(
+            "print the sparring prompt the NEXT turn would be given, without invoking "
+            "any provider. Not a record of a turn that already ran; see run-stage "
+            "--dry-run and the stage's prompts/ directory"
+        ),
     )
     run_sparring.set_defaults(func=_cmd_run_sparring)
 

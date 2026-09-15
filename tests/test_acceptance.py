@@ -436,6 +436,41 @@ class NarrowedDirtyExemptionTests(unittest.TestCase):
         self.assertIn("stray_source.py", str(ctx.exception))
         self.assertEqual(stage.read_state().status, StageStatus.WORKING)
 
+    def test_captured_prompts_do_not_block_a_freeze(self):
+        """Every turn writes one, including the commit turn itself, so a
+        captured prompt is workflow bookkeeping like the artifacts beside
+        it -- not unrepresented candidate content."""
+
+        sparring_dir = self.repo / ".sparring"
+        stage = Stage.resolve(sparring_dir, "stage-1").create()
+        captures = stage.directory / "prompts"
+        captures.mkdir(parents=True, exist_ok=True)
+        (captures / "0001-stage-original.md").write_text("# Stage: stage-1\n", encoding="utf-8")
+        (captures / "0002-sparrer-original.md").write_text("# Sparring: stage-1\n", encoding="utf-8")
+        (captures / "index.jsonl").write_text('{"v": 1, "seq": 1}\n', encoding="utf-8")
+
+        result = freeze_candidate(stage, sparring_dir, self.repo, expected_branch="feature/x")
+        self.assertEqual(result.candidate_sha, self.candidate_sha)
+
+    def test_a_stray_file_among_captured_prompts_still_blocks_freeze(self):
+        """The prompts directory is not a subtree exemption: only filenames
+        this engine writes are exempt, and only directly inside it."""
+
+        sparring_dir = self.repo / ".sparring"
+        stage = Stage.resolve(sparring_dir, "stage-1").create()
+        captures = stage.directory / "prompts"
+        (captures / "nested").mkdir(parents=True, exist_ok=True)
+        (captures / "0001-stage-original.md").write_text("# Stage: stage-1\n", encoding="utf-8")
+        (captures / "harvested-secrets.env").write_text("TOKEN=abc\n", encoding="utf-8")
+        (captures / "nested" / "0002-stage-original.md").write_text("nope\n", encoding="utf-8")
+
+        with self.assertRaises(AcceptanceError) as ctx:
+            freeze_candidate(stage, sparring_dir, self.repo, expected_branch="feature/x")
+        message = str(ctx.exception)
+        self.assertIn("harvested-secrets.env", message)
+        self.assertIn("nested/0002-stage-original.md", message)
+        self.assertEqual(stage.read_state().status, StageStatus.WORKING)
+
     def test_non_workflow_file_underneath_sparring_dir_blocks_freeze(self):
         sparring_dir = self.repo / ".sparring"
         stage = Stage.resolve(sparring_dir, "stage-1").create()

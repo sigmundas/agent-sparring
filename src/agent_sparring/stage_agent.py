@@ -23,7 +23,8 @@ from agent_sparring.git_context import GitContextError, resolve_commit
 from agent_sparring.handoff import generate_handoff
 from agent_sparring.providers import ProviderError, StageAgentAdapter, StageAgentResult
 from agent_sparring.stage import Stage, StageState, StageStatus
-from agent_sparring.stage_prompt import build_stage_prompt
+from agent_sparring.prompt_capture import capture_prompt
+from agent_sparring.stage_prompt import assemble_stage_prompt
 
 
 class StageAgentRunError(RuntimeError):
@@ -209,7 +210,7 @@ def run_stage_agent(
                 state.base_sha = base_sha
                 stage.write_state(state)
 
-            prompt = build_stage_prompt(
+            assembled = assemble_stage_prompt(
                 stage,
                 sparring_dir,
                 resume=resume_id is not None,
@@ -217,6 +218,13 @@ def run_stage_agent(
                 self_check=self_check,
                 finalize_only=finalize_only,
             )
+            prompt = assembled.text
+
+            # Captured here, between assembly and the adapter call, so the
+            # bytes on disk are the bytes the provider is about to receive.
+            # capture_prompt never raises: a turn must not fail because its
+            # record could not be written (see agent_sparring.prompt_capture).
+            capture_prompt(stage.directory, assembled)
 
             # Observational telemetry only: emitted alongside the existing
             # control flow, never consulted by it. Failure summaries are

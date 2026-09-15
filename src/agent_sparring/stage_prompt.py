@@ -17,9 +17,34 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_sparring.config import load_project_markdown
+from agent_sparring.config import CONTEXT_FILENAME, load_project_markdown
 from agent_sparring.handoff import human_evidence_section
-from agent_sparring.stage import HUMAN_EVIDENCE_HEADING, Stage, StageError
+from agent_sparring.prompt_sections import (
+    ROLE_STAGE,
+    AssembledPrompt,
+    PromptSection,
+    section,
+    stage_turn_kind,
+)
+from agent_sparring.stage import (
+    BRIEF_FILENAME,
+    HUMAN_EVIDENCE_HEADING,
+    NOTES_FILENAME,
+    SPARRING_FILENAME,
+    Stage,
+    StageError,
+)
+
+
+def _stage_file(stage: Stage, filename: str) -> str:
+    """A stage artifact's path relative to the ``.sparring`` directory.
+
+    This is what a reader needs in order to open the file the section came
+    from, and it stays correct wherever the project's sparring directory
+    happens to live.
+    """
+
+    return f"stages/{stage.stage_id}/{filename}"
 
 
 def _finalization_section(expected_branch: str) -> list[str]:
@@ -36,7 +61,6 @@ def _finalization_section(expected_branch: str) -> list[str]:
     """
 
     return [
-        "",
         "## Finalize this candidate",
         "",
         "This stage's implementation is complete and the sparrer has accepted "
@@ -65,7 +89,7 @@ def _finalization_section(expected_branch: str) -> list[str]:
     ]
 
 
-def build_stage_prompt(
+def assemble_stage_prompt(
     stage: Stage,
     sparring_dir: Path,
     *,
@@ -73,7 +97,7 @@ def build_stage_prompt(
     expected_branch: str,
     self_check: bool = False,
     finalize_only: bool = False,
-) -> str:
+) -> AssembledPrompt:
     """Assemble the bounded prompt for one stage-agent turn.
 
     Always includes the branch the agent must stay on, the stage brief, and
@@ -95,36 +119,56 @@ def build_stage_prompt(
     incoherent. Like ``self_check`` it is never recorded as machine state;
     :mod:`agent_sparring.loop` decides when a turn is one of these, and
     :mod:`agent_sparring.finalization` is what actually holds the turn to it.
+
+    Returns the prompt as ordered, sourced sections (see
+    :mod:`agent_sparring.prompt_sections`);
+    :func:`build_stage_prompt` is the flat-text view of the same result.
     """
 
-    parts = [
-        f"# Stage: {stage.stage_id}",
-        "",
-        "## Branch",
-        "",
-        f"You are operating on branch `{expected_branch}`. Do not switch, "
-        "rename, or create a different branch.",
-        "",
-        "## Stage brief",
-        "",
-        stage.read_brief().strip(),
+    parts: list[PromptSection] = [
+        section("Stage", [f"# Stage: {stage.stage_id}"]),
+        section(
+            "Branch",
+            [
+                "## Branch",
+                "",
+                f"You are operating on branch `{expected_branch}`. Do not switch, "
+                "rename, or create a different branch.",
+            ],
+        ),
+        section(
+            "Stage brief",
+            ["## Stage brief", "", stage.read_brief().strip()],
+            source=_stage_file(stage, BRIEF_FILENAME),
+        ),
     ]
 
     project_context = load_project_markdown(sparring_dir)
     if project_context and project_context.strip():
-        parts += ["", "## Project context", "", project_context.strip()]
+        parts.append(
+            section(
+                "Project context",
+                ["## Project context", "", project_context.strip()],
+                source=CONTEXT_FILENAME,
+            )
+        )
 
     if resume:
         try:
             sparring_text = stage.read_sparring().strip()
         except StageError:
             sparring_text = ""
-        parts += [
-            "",
-            "## Latest sparring exchange",
-            "",
-            sparring_text or "(no sparring.md available)",
-        ]
+        parts.append(
+            section(
+                "Latest sparring exchange",
+                [
+                    "## Latest sparring exchange",
+                    "",
+                    sparring_text or "(no sparring.md available)",
+                ],
+                source=_stage_file(stage, SPARRING_FILENAME),
+            )
+        )
 
     # A human's recorded answer/check result (notes.md "## Human evidence",
     # written by `resume-plan --evidence` or by hand). Shown whenever present
@@ -132,60 +176,115 @@ def build_stage_prompt(
     # for a stage with no such notes, leaving existing prompts unchanged.
     evidence = human_evidence_section(stage)
     if evidence:
-        parts += [
-            "",
-            HUMAN_EVIDENCE_HEADING,
-            "",
-            evidence,
-            "",
-            (
-                "This is what the human verified about the very tree you are about "
-                "to commit, and it is the reason this turn must not change that tree."
+        # Two sections, not one: the evidence is the human's own words out of
+        # notes.md, and the sentence after it is this engine's instruction
+        # about them. Attributing that instruction to notes.md would be a
+        # claim the file does not support.
+        parts.append(
+            section(
+                "Human evidence",
+                [HUMAN_EVIDENCE_HEADING, "", evidence],
+                source=_stage_file(stage, NOTES_FILENAME),
             )
-            if finalize_only
-            else (
-                "Treat this as the human's answer to the latest NEEDS_YOU question "
-                "or as recorded manual-check results. If it calls for implementation "
-                "changes, make them; if not, report that no code change is needed."
-            ),
-        ]
+        )
+        parts.append(
+            section(
+                "How to use the human evidence",
+                [
+                    (
+                        "This is what the human verified about the very tree you are about "
+                        "to commit, and it is the reason this turn must not change that tree."
+                    )
+                    if finalize_only
+                    else (
+                        "Treat this as the human's answer to the latest NEEDS_YOU question "
+                        "or as recorded manual-check results. If it calls for implementation "
+                        "changes, make them; if not, report that no code change is needed."
+                    )
+                ],
+            )
+        )
 
     if finalize_only:
         # No self-check and no scope reminder: both ask for implementation
         # judgement, which is exactly what this turn must not exercise.
-        return "\n".join(parts + _finalization_section(expected_branch)).rstrip() + "\n"
+        parts.append(
+            section("Finalize this candidate", _finalization_section(expected_branch))
+        )
+    else:
+        if self_check:
+            parts.append(
+                section(
+                    "Self-check",
+                    [
+                        "## Self-check",
+                        "",
+                        "Before finishing this turn, inspect your own implementation for:",
+                        "",
+                        "- failure between steps;",
+                        "- resume/retry behavior;",
+                        "- stale or partially written state;",
+                        "- provider/runtime differences;",
+                        "- concurrency issues;",
+                        "- ways important invariants can be bypassed.",
+                        "",
+                        "Where this stage depends on external-tool behavior, exercise the "
+                        "real tool when practical rather than assume its contract. Fix "
+                        "issues you find before handing off, and report what you checked "
+                        "or deliberately deferred. This is a self-check, not a substitute "
+                        "for independent sparring, which still runs afterward.",
+                    ],
+                )
+            )
 
-    if self_check:
-        parts += [
-            "",
-            "## Self-check",
-            "",
-            "Before finishing this turn, inspect your own implementation for:",
-            "",
-            "- failure between steps;",
-            "- resume/retry behavior;",
-            "- stale or partially written state;",
-            "- provider/runtime differences;",
-            "- concurrency issues;",
-            "- ways important invariants can be bypassed.",
-            "",
-            "Where this stage depends on external-tool behavior, exercise the "
-            "real tool when practical rather than assume its contract. Fix "
-            "issues you find before handing off, and report what you checked "
-            "or deliberately deferred. This is a self-check, not a substitute "
-            "for independent sparring, which still runs afterward.",
-        ]
+        parts.append(
+            section(
+                "Scope reminder",
+                [
+                    "## Scope reminder",
+                    "",
+                    "Stay within this stage's bounded goal above. Do not expand scope, "
+                    "start a new stage, or launch another top-level implementation or "
+                    "sparring agent.",
+                ],
+            )
+        )
 
-    parts += [
-        "",
-        "## Scope reminder",
-        "",
-        "Stay within this stage's bounded goal above. Do not expand scope, "
-        "start a new stage, or launch another top-level implementation or "
-        "sparring agent.",
-    ]
-
-    return "\n".join(parts).rstrip() + "\n"
+    return AssembledPrompt(
+        role=ROLE_STAGE,
+        stage_id=stage.stage_id,
+        turn_kind=stage_turn_kind(resume=resume, finalize_only=finalize_only),
+        resumed=resume,
+        expected_branch=expected_branch,
+        sections=tuple(parts),
+    )
 
 
-__all__ = ["build_stage_prompt"]
+def build_stage_prompt(
+    stage: Stage,
+    sparring_dir: Path,
+    *,
+    resume: bool,
+    expected_branch: str,
+    self_check: bool = False,
+    finalize_only: bool = False,
+) -> str:
+    """The flat text of :func:`assemble_stage_prompt`.
+
+    Kept as the prompt-building entry point for callers that only want the
+    string. It is deliberately a one-line wrapper rather than a second
+    implementation: one assembly path means the sections a reader is shown
+    and the bytes a provider receives can never describe different prompts.
+    """
+
+    return assemble_stage_prompt(
+        stage,
+        sparring_dir,
+        resume=resume,
+        expected_branch=expected_branch,
+        self_check=self_check,
+        finalize_only=finalize_only,
+    ).text
+
+
+__all__ = ["assemble_stage_prompt", "build_stage_prompt"]

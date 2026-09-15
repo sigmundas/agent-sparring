@@ -89,7 +89,8 @@ from agent_sparring.git_context import (
 from agent_sparring.providers import ProviderError, SparringAgentAdapter, SparringAgentResult
 from agent_sparring.routing import RoutingResult, RoutingResultError
 from agent_sparring.sparring_exchange import record_sparring
-from agent_sparring.sparring_prompt import build_sparring_prompt
+from agent_sparring.prompt_capture import capture_prompt
+from agent_sparring.sparring_prompt import assemble_sparring_prompt
 from agent_sparring.stage import Stage
 
 
@@ -207,6 +208,7 @@ def run_sparring_agent(
     *,
     expected_branch: str,
     finalization: str | None = None,
+    evidence_first: bool = False,
 ) -> SparringAgentRunResult:
     """Start or resume the sparring agent for one turn.
 
@@ -234,6 +236,13 @@ def run_sparring_agent(
     prompt text and nothing else here: it is not recorded in
     ``state.json``, not written to ``sparring.md``, and changes no check in
     this function.
+
+    ``evidence_first`` says this turn is the loop re-entering at the sparrer
+    against an unchanged candidate because a human just answered a
+    NEEDS_YOU gate. It changes no prompt text and no check; it only labels
+    the captured prompt (see :mod:`agent_sparring.prompt_capture`) with a
+    fact that only the caller knows, since nothing readable from the stage
+    distinguishes that turn from an ordinary resume.
 
     Records the provider's own returned session id in state.json and
     refuses to silently replace it if a resume call returns a different id
@@ -274,6 +283,7 @@ def run_sparring_agent(
                 adapter,
                 expected_branch=expected_branch,
                 finalization=finalization,
+                evidence_first=evidence_first,
             )
     except WorktreeLockError as exc:
         raise SparringAgentRunError(
@@ -289,17 +299,25 @@ def _run_sparring_agent_locked(
     *,
     expected_branch: str,
     finalization: str | None = None,
+    evidence_first: bool = False,
 ) -> SparringAgentRunResult:
     state = stage.read_state()
     resume_id = state.sparring_session_id
 
-    prompt = build_sparring_prompt(
+    assembled = assemble_sparring_prompt(
         stage,
         sparring_dir,
         resume=resume_id is not None,
         expected_branch=expected_branch,
         finalization=finalization,
+        evidence_first=evidence_first,
     )
+    prompt = assembled.text
+
+    # Between assembly and the adapter call, for the same reason as in
+    # stage_agent: what is captured is what is sent, and a capture that
+    # fails never fails the turn.
+    capture_prompt(stage.directory, assembled)
 
     try:
         before_branch, before_head, before_dirty = _repo_fingerprint(repo_root)

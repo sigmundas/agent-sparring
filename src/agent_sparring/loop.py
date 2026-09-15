@@ -331,6 +331,10 @@ def run_unattended_loop(
     while True:
         cycle = len(cycle_records) + 1
         finalizing = pending is not None
+        # Only the first cycle of an evidence resume is the turn that
+        # answers a human; every later cycle is ordinary. Recorded for the
+        # captured prompt's turn kind and nothing else.
+        evidence_first = skip_stage_turn
         if skip_stage_turn:
             skip_stage_turn = False
             stage_run = None
@@ -426,6 +430,7 @@ def run_unattended_loop(
                 sparring_adapter,
                 expected_branch=expected_branch,
                 finalization=finalization_note,
+                evidence_first=evidence_first,
             )
         except SparringAgentRunError as exc:
             activity.emit("loop.stopped", cycle=cycle, summary="sparring-agent turn failed")

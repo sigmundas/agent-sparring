@@ -78,6 +78,7 @@ from agent_sparring.git_context import (
     resolve_commit,
     verify_pushed,
 )
+from agent_sparring.prompt_capture import PROMPTS_DIRNAME, is_prompt_artifact
 from agent_sparring.stage import (
     ACTIVITY_FILENAME,
     BRIEF_FILENAME,
@@ -111,6 +112,13 @@ STAGE_ARTIFACT_FILENAMES = (
     SPARRING_FILENAME,
     ACTIVITY_FILENAME,
 )
+
+# The one artifact that is not a flat file beside the others: every turn's
+# captured prompt lands in this stage's own prompts/ subdirectory (see
+# agent_sparring.prompt_capture). Handled by _is_allowed rather than added
+# here, because the filenames are per-turn and cannot be enumerated -- but
+# handled with the same suspicion: this stage's directory only, no nesting,
+# and only filenames this engine actually writes.
 
 
 class AcceptanceError(RuntimeError):
@@ -204,7 +212,42 @@ def _stage_artifact_allowlist(repo_root: Path, stage: Stage) -> frozenset[str]:
     return frozenset((rel_dir / name).as_posix() for name in STAGE_ARTIFACT_FILENAMES)
 
 
-def _entry_is_exempt(entry: DirtyEntry, allowed: frozenset[str]) -> bool:
+def _prompts_dir_relative(repo_root: Path, stage: Stage) -> str | None:
+    """This stage's ``prompts/`` directory, as a repo-relative posix path."""
+
+    try:
+        rel_dir = stage.directory.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return None
+    return (rel_dir / PROMPTS_DIRNAME).as_posix()
+
+
+def _is_allowed(path: str, allowed: frozenset[str], prompts_dir: str | None) -> bool:
+    """Is one repo-relative path a workflow artifact of this stage?
+
+    Either an exact allowlisted filename, or a captured prompt directly
+    inside this stage's own ``prompts/`` directory. The second case is
+    still not a subtree rule: the directory is computed from
+    ``stage.directory``, and the filename itself must match one this engine
+    writes (see :func:`agent_sparring.prompt_capture.is_prompt_artifact`),
+    so a stray file dropped into ``prompts/`` -- or anything at all in a
+    nested directory below it -- still blocks the freeze.
+    """
+
+    if path in allowed:
+        return True
+    if prompts_dir is None:
+        return False
+    prefix = f"{prompts_dir}/"
+    if not path.startswith(prefix):
+        return False
+    name = path[len(prefix) :]
+    return "/" not in name and is_prompt_artifact(name)
+
+
+def _entry_is_exempt(
+    entry: DirtyEntry, allowed: frozenset[str], prompts_dir: str | None
+) -> bool:
     """Is this one status entry entirely accounted for by the allowlist?
 
     A plain add/modify/delete is exempt only if its path is allowed. A
@@ -214,9 +257,9 @@ def _entry_is_exempt(entry: DirtyEntry, allowed: frozenset[str]) -> bool:
     behind a workflow-artifact-looking destination name.
     """
 
-    if entry.path not in allowed:
+    if not _is_allowed(entry.path, allowed, prompts_dir):
         return False
-    if entry.old_path is not None and entry.old_path not in allowed:
+    if entry.old_path is not None and not _is_allowed(entry.old_path, allowed, prompts_dir):
         return False
     return True
 
@@ -249,6 +292,7 @@ def _partition_dirty(
         raise AcceptanceError(str(exc)) from exc
 
     allowed = _stage_artifact_allowlist(repo_root, stage)
+    prompts_dir = _prompts_dir_relative(repo_root, stage)
 
     blocking: list[str] = []
     ignored: list[str] = []
@@ -258,7 +302,9 @@ def _partition_dirty(
             if entry.old_path is not None
             else entry.path
         )
-        (ignored if _entry_is_exempt(entry, allowed) else blocking).append(description)
+        (ignored if _entry_is_exempt(entry, allowed, prompts_dir) else blocking).append(
+            description
+        )
     return tuple(blocking), tuple(ignored)
 
 
