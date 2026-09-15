@@ -8,6 +8,23 @@ the *existing* :class:`~agent_sparring.stage.StageState` vocabulary
     freeze_candidate()  WORKING/FROZEN -> FROZEN, candidate_sha = exact HEAD
     accept_candidate()  FROZEN         -> ACCEPTED, candidate_sha unchanged
 
+and one more for the single kind of stage that has no candidate of its own
+to freeze:
+
+    accept_reviewed_candidate()
+                        WORKING -> ACCEPTED, candidate_sha = the commit this
+                        review-only stage was entered against
+
+A review-only stage (:attr:`~agent_sparring.stage.StageMode.
+INDEPENDENT_REVIEW`) reviews commits the preceding stages already accepted
+and writes none of its own, so the two-step freeze has nothing to pin at
+READY: there is no new commit, and inventing one to satisfy the machinery
+would mean accepting a candidate that represents no work. The identity it
+is judged against is therefore pinned when the stage is *entered*, before
+the reviewer runs, and this third operation re-verifies exactly that pinned
+set before recording acceptance. The implementation path above is
+untouched, and neither operation is reachable from the other's mode.
+
 There is deliberately no transition table, no generic workflow engine, and
 none of the V1 machinery the plan explicitly rules out: no review states,
 no attempt ids, no immutable intermediate verdicts, no history log. Both
@@ -89,6 +106,7 @@ from agent_sparring.stage import (
     CandidateRepository,
     Stage,
     StageError,
+    StageMode,
     StageState,
     StageStatus,
 )
@@ -264,9 +282,19 @@ def _entry_is_exempt(
     return True
 
 
+def _describe_entry(entry: DirtyEntry) -> str:
+    """One status entry as a refusal names it."""
+
+    return (
+        f"{entry.path} (renamed from {entry.old_path})"
+        if entry.old_path is not None
+        else entry.path
+    )
+
+
 def _partition_dirty(
     repo_root: Path, stage: Stage
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+) -> tuple[tuple[DirtyEntry, ...], tuple[DirtyEntry, ...]]:
     """Split the working tree's status entries into (blocking, ignored).
 
     Only this stage's own artifact files (see ``STAGE_ARTIFACT_FILENAMES``)
@@ -294,17 +322,10 @@ def _partition_dirty(
     allowed = _stage_artifact_allowlist(repo_root, stage)
     prompts_dir = _prompts_dir_relative(repo_root, stage)
 
-    blocking: list[str] = []
-    ignored: list[str] = []
+    blocking: list[DirtyEntry] = []
+    ignored: list[DirtyEntry] = []
     for entry in entries:
-        description = (
-            f"{entry.path} (renamed from {entry.old_path})"
-            if entry.old_path is not None
-            else entry.path
-        )
-        (ignored if _entry_is_exempt(entry, allowed, prompts_dir) else blocking).append(
-            description
-        )
+        (ignored if _entry_is_exempt(entry, allowed, prompts_dir) else blocking).append(entry)
     return tuple(blocking), tuple(ignored)
 
 
@@ -446,6 +467,58 @@ def _verify_siblings(repo_root: Path, repositories: tuple[CandidateRepository, .
             )
 
 
+def unrepresented_dirty_entries(repo_root: Path, stage: Stage) -> tuple[DirtyEntry, ...]:
+    """The working-tree status entries ``stage``'s own commit does not
+    represent.
+
+    The exact check :func:`freeze_candidate` and :func:`accept_candidate`
+    make, exposed so the independent-review lifecycle
+    (:mod:`agent_sparring.review`) and the recovery operation
+    (:mod:`agent_sparring.recovery`) ask the same question of a worktree and
+    get the same answer, rather than each growing its own idea of "clean".
+    Empty means the worktree is exactly its commit, apart from this stage's
+    own workflow artifacts.
+    """
+
+    blocking, _ignored = _partition_dirty(repo_root, stage)
+    return blocking
+
+
+def unrepresented_dirty(repo_root: Path, stage: Stage) -> tuple[str, ...]:
+    """:func:`unrepresented_dirty_entries`, described the way a refusal
+    names each entry."""
+
+    return tuple(
+        _describe_entry(entry) for entry in unrepresented_dirty_entries(repo_root, stage)
+    )
+
+
+def pin_sibling_candidates(
+    repo_root: Path, repositories: tuple[CandidateRepository, ...]
+) -> tuple[CandidateRepository, ...]:
+    """Resolve and pin every declared sibling candidate, or refuse.
+
+    The public name for the freeze's own sibling handling, so an
+    independent-review stage pins the sibling candidates it is reviewing
+    under exactly the checks a freeze applies (see :func:`_freeze_siblings`)
+    instead of a second, looser version of them.
+    """
+
+    return _freeze_siblings(repo_root, repositories)
+
+
+def verify_sibling_candidates(
+    repo_root: Path, repositories: tuple[CandidateRepository, ...]
+) -> None:
+    """Re-check that every pinned sibling candidate is still what was pinned.
+
+    The public name for :func:`_verify_siblings`, for the same reason as
+    :func:`pin_sibling_candidates`.
+    """
+
+    _verify_siblings(repo_root, repositories)
+
+
 def freeze_candidate(
     stage: Stage,
     sparring_dir: Path,
@@ -555,7 +628,7 @@ def _freeze_candidate_locked(
 
     blocking, ignored = _partition_dirty(repo_root, stage)
     if blocking:
-        listed = ", ".join(blocking)
+        listed = ", ".join(_describe_entry(entry) for entry in blocking)
         raise AcceptanceError(
             f"refusing to freeze {candidate_sha} as the candidate for stage "
             f"{stage.stage_id!r}: the working tree holds changes that commit "
@@ -584,7 +657,7 @@ def _freeze_candidate_locked(
         candidate_sha=candidate_sha,
         branch=branch,
         push_detail=push_detail,
-        ignored_dirty_paths=ignored,
+        ignored_dirty_paths=tuple(_describe_entry(entry) for entry in ignored),
         repositories=repositories,
     )
 
@@ -707,7 +780,7 @@ def _accept_candidate_locked(
     # evidence in this stage's own artifact files never blocks acceptance.
     blocking, _ignored = _partition_dirty(repo_root, stage)
     if blocking:
-        listed = ", ".join(blocking)
+        listed = ", ".join(_describe_entry(entry) for entry in blocking)
         raise AcceptanceError(
             f"refusing to accept {frozen_sha} for stage {stage.stage_id!r}: "
             f"the working tree holds changes that commit does not represent "
@@ -729,12 +802,168 @@ def _accept_candidate_locked(
     )
 
 
+def accept_reviewed_candidate(
+    stage: Stage,
+    repo_root: Path,
+    *,
+    expected_branch: str,
+) -> AcceptanceResult:
+    """Complete a review-only stage over the candidate set it reviewed.
+
+    A stage in :attr:`~agent_sparring.stage.StageMode.INDEPENDENT_REVIEW`
+    mode produces no commit. Its content is a judgement about commits the
+    preceding stages already froze and accepted, and there is nothing for it
+    to implement -- so requiring it to present a new candidate commit before
+    it may complete would mean manufacturing one, which is the opposite of
+    what a review is. The smallest honest completion rule instead is: *the
+    candidate set you reviewed must still be exactly what you reviewed.*
+
+    That identity is not decided here. :mod:`agent_sparring.review` pins it
+    into ``state.json`` when the stage is entered, before the reviewer is
+    given control: ``base_sha`` is the primary commit under review, and
+    ``repositories`` holds every sibling candidate, each pinned at the
+    commit it was at. This function re-verifies exactly that pinned set,
+    the same way :func:`accept_candidate` re-verifies a freeze:
+
+    1. the stage's recorded mode really is ``INDEPENDENT_REVIEW`` -- an
+       implementation stage can never reach completion through here, so this
+       is not a second, softer door onto the same gate;
+    2. the stage is not already ACCEPTED;
+    3. ``base_sha`` is a full commit id, i.e. the stage was entered through
+       the review lifecycle and the reviewed identity was actually recorded;
+    4. the worktree is on ``expected_branch``;
+    5. ``HEAD`` is still exactly the reviewed commit -- otherwise
+       :class:`StaleCandidateError`, because a review of one commit is not a
+       review of another;
+    6. the worktree holds no changes that commit does not represent (the
+       same allowlist the freeze uses, so this stage's own artifacts never
+       block it);
+    7. the reviewed commit is still reachable from ``expected_branch``'s
+       remote -- already true when the preceding stage accepted it, and
+       cheap to prove again rather than assume across a force-push;
+    8. every pinned sibling candidate is still on its branch, at its pinned
+       commit, with a clean worktree.
+
+    Only then is ``candidate_sha`` written as that same reviewed commit and
+    ``status`` set to ACCEPTED. ``candidate_sha == base_sha`` is not a
+    degenerate case to be tidied away: it is the accurate statement that
+    this stage added no commit of its own, and it keeps the reviewed
+    identity inspectable afterwards.
+
+    Nothing is committed, pushed, merged or created. There is no new
+    candidate, no dummy commit, and no change to
+    :func:`freeze_candidate`/:func:`accept_candidate`, which an
+    implementation stage still goes through unchanged.
+    """
+
+    try:
+        with worktree_lock(repo_root):
+            accepted = _accept_reviewed_candidate_locked(
+                stage, repo_root, expected_branch=expected_branch
+            )
+    except WorktreeLockError as exc:
+        error = AcceptanceError(
+            f"cannot complete the independent review for stage {stage.stage_id!r}: {exc}"
+        )
+        _emit_refusal(stage, "accept", error)
+        raise error from exc
+    except AcceptanceError as exc:
+        _emit_refusal(stage, "accept", exc)
+        raise
+    stage.activity_log().emit("gate", "candidate.accepted", sha=accepted.candidate_sha)
+    return accepted
+
+
+def _accept_reviewed_candidate_locked(
+    stage: Stage,
+    repo_root: Path,
+    *,
+    expected_branch: str,
+) -> AcceptanceResult:
+    state = _read_state(stage)
+
+    if state.mode is not StageMode.INDEPENDENT_REVIEW:
+        raise AcceptanceError(
+            f"stage {stage.stage_id!r} ran as {state.mode.describe}, not as an "
+            "independent review; a stage that implements something is accepted through "
+            "freeze-candidate and accept-candidate over the commit it produced, and "
+            "completing it without one would accept work no candidate represents"
+        )
+    if state.status is StageStatus.ACCEPTED:
+        raise AcceptanceError(
+            f"stage {stage.stage_id!r} is already ACCEPTED at "
+            f"{state.candidate_sha}; refusing to re-accept it"
+        )
+
+    reviewed_sha = state.base_sha
+    if not is_full_sha(reviewed_sha):
+        raise AcceptanceError(
+            f"stage {stage.stage_id!r} is an independent review but the commit it is "
+            f"reviewing is not recorded as a full commit id ({reviewed_sha!r}); the "
+            "reviewed identity is pinned when the stage is entered, so this stage was "
+            "never entered through the review lifecycle. Nothing was accepted."
+        )
+
+    branch = _require_branch(
+        repo_root, expected_branch, operation="complete an independent review"
+    )
+
+    try:
+        head_sha = resolve_commit(repo_root, "HEAD", label="current HEAD")
+    except GitContextError as exc:
+        raise AcceptanceError(str(exc)) from exc
+
+    if head_sha != reviewed_sha:
+        raise StaleCandidateError(
+            f"stage {stage.stage_id!r} reviewed {reviewed_sha}, but {branch} in "
+            f"{repo_root} is now at {head_sha}; refusing to complete the review as "
+            "stale. A review of one commit is not a review of another: the reviewer "
+            "must see the moved candidate before this stage can complete. Nothing was "
+            "accepted and the reviewed commit was left recorded as it was."
+        )
+
+    blocking, _ignored = _partition_dirty(repo_root, stage)
+    if blocking:
+        listed = ", ".join(_describe_entry(entry) for entry in blocking)
+        raise AcceptanceError(
+            f"refusing to complete the independent review of {reviewed_sha} for stage "
+            f"{stage.stage_id!r}: the working tree holds changes that commit does not "
+            f"represent ({listed}), so it is not the state that was reviewed, even "
+            "though HEAD still matches. Commit or discard them first."
+        )
+
+    pushed, push_detail = verify_pushed(repo_root, reviewed_sha, branch)
+    if not pushed:
+        raise AcceptanceError(
+            f"refusing to complete the independent review of {reviewed_sha} for stage "
+            f"{stage.stage_id!r}: that commit is no longer available on the intended "
+            f"remote branch ({push_detail})"
+        )
+
+    _verify_siblings(repo_root, state.repositories)
+
+    state.status = StageStatus.ACCEPTED
+    # The reviewed commit, not a new one: this stage's candidate *is* the
+    # candidate it reviewed, which is exactly what "review only" means.
+    state.candidate_sha = reviewed_sha
+    stage.write_state(state)
+
+    return AcceptanceResult(
+        candidate_sha=reviewed_sha, branch=branch, repositories=state.repositories
+    )
+
+
 __all__ = [
     "AcceptanceError",
     "AcceptanceResult",
     "FreezeResult",
     "StaleCandidateError",
     "accept_candidate",
+    "accept_reviewed_candidate",
     "freeze_candidate",
+    "pin_sibling_candidates",
     "sibling_root",
+    "unrepresented_dirty",
+    "unrepresented_dirty_entries",
+    "verify_sibling_candidates",
 ]

@@ -19,6 +19,7 @@ A manifest is deliberately small and explicit::
           "label": "Stage 3C",
           "title": "Cloud schema/RPC and sync transport",
           "brief": "... the exact brief.md content ...",
+          "mode": "implementation",
           "repositories": [
             {"name": "sporely-web",
              "path": "../sporely-web-reported-statistics",
@@ -29,11 +30,30 @@ A manifest is deliberately small and explicit::
       ]
     }
 
-It carries stage identity, display label and title, the exact brief, and the
-order. It carries **no** status, position, transition, verdict or session:
-those are the engine's, and a manifest that tried to hold them would be a
-second workflow engine. ``stages`` order is the execution order -- labels are
-never parsed to derive one, so numeric ``1..N`` is not required here.
+It carries stage identity, display label and title, the exact brief, the
+stage's mode, and the order. It carries **no** status, position, transition,
+verdict or session: those are the engine's, and a manifest that tried to
+hold them would be a second workflow engine. ``stages`` order is the
+execution order -- labels are never parsed to derive one, so numeric
+``1..N`` is not required here.
+
+``mode``
+--------
+
+``mode`` is optional and defaults to ``"implementation"``, so every manifest
+written before it existed means exactly what it always meant. The other
+value is ``"independent_review"``: a stage that runs *no* implementation
+agent, only a fresh independent reviewer over the candidate set the
+preceding stages already accepted (see :class:`~agent_sparring.stage.
+StageMode` and :mod:`agent_sparring.review`).
+
+It is deliberately a declaration, not a description. The engine never
+derives a stage's mode from its title, its brief's prose, or its position in
+the plan -- a plan whose last stage is called "Independent final review and
+activation decision" still runs the implementation lifecycle unless the
+manifest says ``"mode": "independent_review"`` for it. Which agent runs is
+too consequential to hang on a word in a heading, and the caller that
+interprets the plan document is the one that knows.
 
 ``source_digest`` is opaque provenance: the engine never recomputes it (it
 does not know how the caller digested the document), but it is part of this
@@ -69,12 +89,17 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from agent_sparring.plan_model import PlannedStage, digest_planned_stages
-from agent_sparring.stage import CandidateRepository, StageError, validate_stage_id
+from agent_sparring.stage import (
+    CandidateRepository,
+    StageError,
+    StageMode,
+    validate_stage_id,
+)
 
 MANIFEST_VERSION = 1
 
 _TOP_LEVEL_KEYS = frozenset({"version", "plan_label", "source_digest", "stages"})
-_STAGE_KEYS = frozenset({"stage_id", "label", "title", "brief", "repositories"})
+_STAGE_KEYS = frozenset({"stage_id", "label", "title", "brief", "mode", "repositories"})
 _REPOSITORY_KEYS = frozenset({"name", "path", "branch", "candidate_sha"})
 
 
@@ -159,7 +184,31 @@ def _stage(entry: Any, position: int) -> PlannedStage:
         stage_id=stage_id,
         brief=brief,
         repositories=_repositories(entry.get("repositories"), where),
+        mode=_mode(entry.get("mode"), f"{where} ({stage_id})"),
     )
+
+
+def _mode(raw: Any, where: str) -> StageMode:
+    """The stage's declared mode, defaulting to the implementation lifecycle.
+
+    Absent or null means :attr:`~agent_sparring.stage.StageMode.
+    IMPLEMENTATION`, which is what every manifest written before modes
+    existed means and is why adding this field changed no existing run. A
+    value this engine does not recognise is refused rather than defaulted:
+    the whole point of an explicit mode is that which agent runs is never
+    guessed, and quietly running the implementation lifecycle for a stage
+    whose manifest asked for something else would be the exact accident
+    this field exists to rule out.
+    """
+
+    if raw is None:
+        return StageMode.IMPLEMENTATION
+    if not isinstance(raw, str):
+        raise ManifestError(f"{where}: 'mode' must be a string or null, got {raw!r}")
+    try:
+        return StageMode.from_str(raw.strip())
+    except StageError as exc:
+        raise ManifestError(f"{where}: {exc}") from exc
 
 
 def _repositories(raw: Any, where: str) -> tuple[CandidateRepository, ...]:
@@ -202,14 +251,26 @@ def manifest_digest(manifest: ExecutionManifest) -> str:
     """SHA-256 over everything this manifest actually executes.
 
     Version, plan label and source digest, then, per stage in order: the
-    stage id, label, title, brief, and each declared repository. Anything
-    that changes what would run changes this digest, and a recorded run
-    refuses to continue against a different one.
+    stage id, label, title, brief, a non-default mode, and each declared
+    repository. Anything that changes what would run changes this digest,
+    and a recorded run refuses to continue against a different one.
+
+    A stage in the default :attr:`~agent_sparring.stage.StageMode.
+    IMPLEMENTATION` mode contributes nothing for its mode, which is not a
+    softening of the guard but the precise statement of it: the digest
+    carries exactly what would change execution, and a manifest written
+    before modes existed executes the implementation lifecycle either way,
+    so it must digest to the same value and its recorded run must keep
+    resuming. Declaring a stage ``independent_review`` *does* change the
+    digest, in both directions -- so a stage cannot be flipped between the
+    two lifecycles under a run that is already under way.
     """
 
     parts: list[str] = [str(manifest.version), manifest.plan_label, manifest.source_digest]
     for stage in manifest.stages:
         parts += [stage.stage_id, stage.label, stage.title, stage.brief]
+        if stage.mode is not StageMode.IMPLEMENTATION:
+            parts.append(stage.mode.value)
         for repository in stage.repositories:
             parts += [
                 repository.name,

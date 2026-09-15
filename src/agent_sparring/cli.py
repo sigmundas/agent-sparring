@@ -50,11 +50,12 @@ from agent_sparring.providers.claude_cli import (
 )
 from agent_sparring.providers import ProviderError
 from agent_sparring.providers.codex_cli import PROVIDER_ID as CODEX_PROVIDER_ID, CodexCliAdapter
+from agent_sparring.recovery import RecoveryError, reset_stage
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.sparring_prompt import build_sparring_prompt
-from agent_sparring.stage import Stage, StageError
+from agent_sparring.stage import Stage, StageError, StageMode
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 from agent_sparring.stage_prompt import build_stage_prompt
 
@@ -654,6 +655,64 @@ def _cmd_resume_plan(args: argparse.Namespace) -> int:
     return _run_plan_command(args, resume=True)
 
 
+def _cmd_reset_stage(args: argparse.Namespace) -> int:
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        source = _plan_source(args, repo_root)
+        expect_mode = StageMode.from_str(args.mode) if args.mode else None
+
+        def report(message: str) -> None:
+            print(message, file=sys.stderr)
+
+        result = reset_stage(
+            source,
+            sparring_dir,
+            repo_root,
+            stage_id=args.stage_id,
+            expected_branch=args.expected_branch,
+            expect_mode=expect_mode,
+            report=report,
+        )
+    except (
+        RecoveryError,
+        PlanError,
+        ManifestError,
+        StageError,
+        ProjectConfigError,
+        GitContextError,
+    ) as exc:
+        print(f"could not reset stage: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"reset stage: {result.stage_id}")
+    print(f"was: {result.from_mode.value} ({result.from_mode.describe})")
+    print(f"now: {result.to_mode.value} ({result.to_mode.describe})")
+    print(f"stage directory: {result.stage_directory}")
+    print(f"archived attempt: {result.archive}")
+    for role, session in result.discarded_sessions:
+        print(f"  no longer authoritative: {role} session {session}")
+    print(
+        f"verified: {result.reviewed_stage} [{result.reviewed_stage_id}] accepted "
+        f"{result.reviewed_sha}, and the repository is at it"
+    )
+    for touched in result.files:
+        print(f"  {touched.disposition}: {touched.path}")
+    if not result.files:
+        print("  the attempt recorded writing no files")
+    if result.previous_digest != result.digest:
+        print(f"plan digest re-recorded: {result.previous_digest} -> {result.digest}")
+    else:
+        print(f"plan digest unchanged: {result.digest}")
+    print()
+    print("The stage is fresh and the run is paused at it. Continue with:")
+    print(
+        f"  sparring resume-plan {_plan_input_args(args)} "
+        f"--repo-root {args.repo_root or '.'} --expected-branch {args.expected_branch}"
+    )
+    return 0
+
+
 def _resolved_stage(args: argparse.Namespace, sparring_dir: Path) -> Stage:
     stage = Stage.resolve(sparring_dir, args.stage_id)
     if not stage.exists():
@@ -1070,6 +1129,47 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     resume_plan_parser.set_defaults(func=_cmd_resume_plan, adopt=False)
+
+    reset_stage_parser = subparsers.add_parser(
+        "reset-stage",
+        help=(
+            "archive a plan run's current, unaccepted stage and restart it under the "
+            "mode the plan input declares: the attempt is preserved as history and "
+            "stripped of its authority, earlier stages and their acceptance are left "
+            "untouched and verified, the repository is checked to be at the preceding "
+            "accepted candidate, and the stage is recreated fresh with no session"
+        ),
+    )
+    reset_stage_parser.add_argument(
+        "stage_id",
+        help="the stage to reset; must be the run's current stage and must not be accepted",
+    )
+    reset_stage_parser.add_argument(
+        "plan_path",
+        nargs="?",
+        default=None,
+        help="path to the same reviewed plan file the run will continue with "
+        "(omit when using --manifest)",
+    )
+    reset_stage_parser.add_argument(
+        "--manifest", default=None, metavar="PATH", help=manifest_help
+    )
+    reset_stage_parser.add_argument(
+        "--mode",
+        default=None,
+        choices=[member.value for member in StageMode],
+        help=(
+            "the mode you expect the plan input to declare for this stage; when given it "
+            "must match, so a stale plan input is caught instead of quietly obeyed"
+        ),
+    )
+    reset_stage_parser.add_argument("--repo-root", default=None, help=repo_root_help)
+    reset_stage_parser.add_argument(
+        "--expected-branch",
+        required=True,
+        help="the branch the plan run was started for; required and verified",
+    )
+    reset_stage_parser.set_defaults(func=_cmd_reset_stage)
 
     freeze = subparsers.add_parser(
         "freeze-candidate",

@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from agent_sparring.stage import CandidateRepository
+from agent_sparring.stage import CandidateRepository, StageMode
 
 
 @dataclass(frozen=True)
@@ -53,6 +53,16 @@ class PlannedStage:
     belong to this stage (see
     :class:`~agent_sparring.stage.CandidateRepository`); empty for the
     ordinary single-repository stage.
+
+    ``mode`` is what the stage is made of (see
+    :class:`~agent_sparring.stage.StageMode`): the default
+    ``IMPLEMENTATION`` lifecycle, or ``INDEPENDENT_REVIEW`` for a stage that
+    runs no implementation agent at all. It is declared by the plan input
+    and never derived here -- not from the title, not from the brief's
+    prose, not from the position in the plan. A plan whose last stage is
+    called "Independent final review" still runs the implementation
+    lifecycle unless its manifest says otherwise, because a stage's title is
+    text an agent reads, not a decision about which agent runs.
     """
 
     position: int
@@ -61,6 +71,13 @@ class PlannedStage:
     stage_id: str
     brief: str
     repositories: tuple[CandidateRepository, ...] = field(default_factory=tuple)
+    mode: StageMode = StageMode.IMPLEMENTATION
+
+    @property
+    def review_only(self) -> bool:
+        """Does this stage run a reviewer instead of an implementation agent?"""
+
+        return self.mode.is_review
 
     @property
     def display(self) -> str:
@@ -115,4 +132,4 @@ def digest_planned_stages(*parts: str) -> str:
     return digest.hexdigest()
 
 
-__all__ = ["PlanSource", "PlannedStage", "digest_planned_stages"]
+__all__ = ["PlanSource", "PlannedStage", "StageMode", "digest_planned_stages"]

@@ -128,7 +128,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
-from agent_sparring.acceptance import AcceptanceError, accept_candidate, freeze_candidate
+from agent_sparring.acceptance import (
+    AcceptanceError,
+    accept_candidate,
+    accept_reviewed_candidate,
+    freeze_candidate,
+)
 from agent_sparring.activity import ActivityEmitter
 from agent_sparring.finalization import FinalizationError, pending_finalization
 from agent_sparring.git_context import GitContextError, is_ignored
@@ -140,6 +145,13 @@ from agent_sparring.loop import (
 from agent_sparring.manifest import ManifestError, ManifestPlanSource, load_manifest_source
 from agent_sparring.plan_model import PlanSource, PlannedStage, digest_planned_stages
 from agent_sparring.providers import SparringAgentAdapter, StageAgentAdapter
+from agent_sparring.review import (
+    ReviewError,
+    ReviewResult,
+    declare_stage_mode,
+    enter_review,
+    run_independent_review,
+)
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import RecordedOutcome, read_recorded_outcome
 from agent_sparring.stage import (
@@ -870,15 +882,30 @@ def resume_plan(
             current_state = stage.read_state()
         except StageError as exc:
             raise PlanError(f"cannot read the state of {current.stage_id!r}: {exc}") from exc
-        sparrer_first = (
-            current_state.status is not StageStatus.ACCEPTED
-            and current_state.implementation_session_id is not None
-        )
-        if sparrer_first:
-            report(
-                f"stage {current.stage_id}: resuming the sparrer against the unchanged "
-                "candidate with this evidence; the stage agent is not started"
+        if current.review_only:
+            # A review-only stage has no implementation session to gate on
+            # and no implementation turn to skip: its whole lifecycle is the
+            # reviewer, so evidence always goes straight to it. What this
+            # flag still does there is keep the recorded NEEDS_YOU from
+            # being adopted as a pause that nothing answers -- the human
+            # just answered it.
+            sparrer_first = current_state.status is not StageStatus.ACCEPTED
+            if sparrer_first:
+                report(
+                    f"stage {current.stage_id}: this is a review-only stage; the same "
+                    "independent reviewer judges this evidence against the unchanged "
+                    "candidate set"
+                )
+        else:
+            sparrer_first = (
+                current_state.status is not StageStatus.ACCEPTED
+                and current_state.implementation_session_id is not None
             )
+            if sparrer_first:
+                report(
+                    f"stage {current.stage_id}: resuming the sparrer against the unchanged "
+                    "candidate with this evidence; the stage agent is not started"
+                )
 
     return _drive(
         source,
@@ -1054,6 +1081,141 @@ def _awaiting_finalization(
         ) from exc
 
 
+def _declare_mode(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    stage: Stage,
+    planned: PlannedStage,
+) -> None:
+    """Record what this stage runs as, before anything about where it is.
+
+    A stage's mode is settled before its status is even consulted, because
+    the mode decides *which agent runs* and the status only says how far
+    along that has got. A stage that already ran under a different mode than
+    the plan declares stops the run here with the supported recovery named
+    (see :func:`agent_sparring.review.declare_stage_mode`), rather than
+    somewhere further in where an implementation session or a stage agent's
+    leftovers would already have been adopted into a review.
+    """
+
+    try:
+        declare_stage_mode(stage, planned)
+    except ReviewError as exc:
+        raise _fail(
+            state,
+            state_path,
+            activity,
+            why="stage mode mismatch",
+            message=f"plan {state.plan} stopped at stage {stage.stage_id!r}: {exc}",
+        ) from exc
+
+
+def _run_review(
+    stages: tuple[PlannedStage, ...],
+    state: PlanRunState,
+    state_path: Path,
+    sparring_dir: Path,
+    repo_root: Path,
+    make_adapters: AdapterFactory,
+    planned: PlannedStage,
+    stage: Stage,
+    activity: ActivityEmitter,
+    *,
+    position: str,
+    evidence_first: bool,
+    report: Reporter,
+) -> ReviewResult:
+    """Enter a review-only stage and run its one independent-review turn.
+
+    Pins and verifies the accepted candidate set first (see
+    :func:`agent_sparring.review.enter_review`), so a reviewer is never
+    given control over a repository that is not at the work it is being
+    asked about. Every refusal pauses the run and stops; nothing is
+    substituted and no stage is advanced.
+
+    The adapter pair is built for this stage exactly as for an
+    implementation stage, and the sparring half of it is the independent
+    reviewer. The stage half is deliberately not used: a review-only stage
+    has no implementation turn, so the one adapter that could write to the
+    repository is never handed a prompt.
+    """
+
+    preceding = tuple(
+        (earlier, Stage.resolve(sparring_dir, earlier.stage_id))
+        for earlier in stages[: state.current_stage_index]
+    )
+    try:
+        subject = enter_review(
+            stage,
+            repo_root,
+            expected_branch=state.expected_branch,
+            preceding=preceding,
+        )
+    except (ReviewError, StageError) as exc:
+        raise _fail(
+            state,
+            state_path,
+            activity,
+            why="review subject unusable",
+            message=(
+                f"plan {state.plan} stopped at stage {stage.stage_id!r} before any "
+                f"provider turn: {exc}"
+            ),
+        ) from exc
+
+    activity.emit(
+        "plan.stage.entered",
+        summary=f"{planned.display} ({position}); independent review only",
+    )
+    report(
+        f"stage {position} {stage.stage_id}: independent review only; no implementation "
+        f"agent runs. Reviewing {subject.candidate_sha} on {subject.branch}, the "
+        f"candidate accepted by {subject.accepted[-1].display}"
+        + (
+            f", plus {len(subject.repositories)} sibling candidate(s)"
+            if subject.repositories
+            else ""
+        )
+    )
+
+    try:
+        _stage_adapter, reviewer_adapter = make_adapters(stage)
+    except Exception as exc:
+        raise _fail(
+            state,
+            state_path,
+            activity,
+            why="adapter construction failed",
+            message=(
+                f"plan {state.plan} stopped at stage {stage.stage_id!r} before any "
+                f"provider turn: could not build the provider adapters: {exc}"
+            ),
+        ) from exc
+
+    try:
+        return run_independent_review(
+            stage,
+            sparring_dir,
+            repo_root,
+            reviewer_adapter,
+            expected_branch=state.expected_branch,
+            subject=subject,
+            evidence_first=evidence_first,
+        )
+    except ReviewError as exc:
+        raise _fail(
+            state,
+            state_path,
+            activity,
+            why="independent review failed",
+            message=(
+                f"plan {state.plan} stopped at stage {stage.stage_id!r} (not accepted, "
+                f"not advanced): {exc}"
+            ),
+        ) from exc
+
+
 def _recorded_pause(stage: Stage) -> RecordedOutcome | None:
     """The verdict this stage is already stopped at, when it is one only a
     person can answer (NEEDS_YOU or ESCALATE); otherwise ``None``.
@@ -1215,6 +1377,8 @@ def _drive(
                 message=f"plan {state.plan} stopped at {stage.stage_id!r}: {exc}",
             ) from exc
 
+        _declare_mode(state, state_path, activity, stage, plan_stage)
+
         position = f"{plan_stage.position}/{total}"
         if stage_state.status is StageStatus.ACCEPTED:
             # Already through the hard gate (by hand, or by a run that stopped
@@ -1262,127 +1426,214 @@ def _drive(
             # stage, so the acceptance gate finds it wherever it is invoked
             # from. Written before any provider turn.
             _declare_repositories(stage, plan_stage)
-            if sparrer_first:
-                start_with = "sparring"
-                sparrer_first = False  # only the stage this resume entered
-            elif _awaiting_finalization(state, state_path, activity, repo_root, stage):
-                # Stopped between the reviewer's READY and the commit that
-                # acceptance can freeze -- where a run that predates the
-                # finalization cycle was left, and where any process killed
-                # between those two points stops.
-                start_with = "finalization"
-            else:
-                start_with = "stage"
-            entering = {
-                "sparring": "; sparring first",
-                "finalization": "; finalizing the reviewed candidate",
-                "stage": "",
-            }[start_with]
-            activity.emit(
-                "plan.stage.entered",
-                summary=f"{plan_stage.display} ({position}){entering}",
-            )
-            report(
-                f"stage {position} {stage.stage_id}: "
-                + {
-                    "sparring": "resuming the sparrer against the unchanged candidate",
-                    "finalization": (
-                        "the sparrer already said READY and the reviewed candidate is not "
-                        "committed; committing and pushing exactly that work, then "
-                        "reviewing the commit"
-                    ),
-                    "stage": "running the implementation <-> sparring loop",
-                }[start_with]
-            )
-            # Adapters are built for THIS stage, so a caller can bind their
-            # provider telemetry to this stage's activity.jsonl. Session
-            # continuity comes from state.json's recorded ids, which
-            # run_stage_agent/run_sparring_agent pass to resume(); it does
-            # not depend on the adapter objects from an earlier stage or an
-            # earlier process.
-            try:
-                stage_adapter, sparring_adapter = make_adapters(stage)
-            except Exception as exc:
-                raise _fail(
+
+            if plan_stage.review_only:
+                # No implementation turn exists for this stage, so none of
+                # the implementation-first machinery below applies to it:
+                # one fresh independent reviewer over the candidate set the
+                # preceding stages already accepted (see
+                # agent_sparring.review), and all four of its routing
+                # actions are terminal.
+                review = _run_review(
+                    stages,
                     state,
                     state_path,
-                    activity,
-                    why="adapter construction failed",
-                    message=(
-                        f"plan {state.plan} stopped at stage {stage.stage_id!r} before any "
-                        f"provider turn: could not build the provider adapters: {exc}"
-                    ),
-                ) from exc
-            try:
-                loop_result = run_unattended_loop(
-                    stage,
                     sparring_dir,
                     repo_root,
-                    stage_adapter,
-                    sparring_adapter,
-                    expected_branch=state.expected_branch,
-                    max_send_back_cycles=max_send_back_cycles,
-                    self_check=self_check,
-                    start_with=start_with,
+                    make_adapters,
+                    plan_stage,
+                    stage,
+                    activity,
+                    position=position,
+                    evidence_first=sparrer_first,
+                    report=report,
                 )
-            except LoopError as exc:
-                raise _fail(
+                sparrer_first = False  # only the stage this resume entered
+                if review.outcome is not RoutingAction.READY:
+                    _pause(state, state_path)
+                    activity.emit("plan.paused", action=review.outcome.value)
+                    report(
+                        f"stage {stage.stage_id}: {review.outcome.value}; plan paused"
+                        + (
+                            ". The independent reviewer found a defect that needs a code "
+                            "change. This stage has no implementation agent behind it, so "
+                            "nothing was changed and nothing was accepted: decide where "
+                            "the fix belongs before continuing."
+                            if review.defect
+                            else ""
+                        )
+                    )
+                    return PlanRunResult(
+                        status=PlanRunStatus.PAUSED,
+                        plan=state.plan,
+                        stage_id=stage.stage_id,
+                        routing=review.routing,
+                        accepted=tuple(accepted),
+                    )
+
+                # READY: the same plan-unchanged check the implementation
+                # path makes, then this stage's own completion rule -- no
+                # freeze, because there is no new commit to freeze, and the
+                # identity being completed over was pinned on entry.
+                _require_plan_unchanged(
+                    source,
                     state,
                     state_path,
                     activity,
-                    why="stage loop failed",
-                    message=(
-                        f"plan {state.plan} stopped at stage {stage.stage_id!r} (not accepted, "
-                        f"not advanced): {exc}"
-                    ),
-                ) from exc
-
-            if loop_result.outcome is not RoutingAction.READY:
-                _pause(state, state_path)
-                activity.emit("plan.paused", action=loop_result.outcome.value)
-                report(f"stage {stage.stage_id}: {loop_result.outcome.value}; plan paused")
-                return PlanRunResult(
-                    status=PlanRunStatus.PAUSED,
-                    plan=state.plan,
-                    stage_id=stage.stage_id,
-                    routing=loop_result.routing,
-                    accepted=tuple(accepted),
+                    before="completing the independent review",
                 )
-
-            # READY: first make sure the reviewed plan the sparrer judged
-            # against is still the plan on disk -- an implementation turn
-            # could have edited and committed a stage section -- then invoke
-            # the existing hard gate on the exact pushed SHA. Any refusal
-            # stops the plan; nothing else is ever substituted.
-            _require_plan_unchanged(
-                source, state, state_path, activity, before="accepting the candidate"
-            )
-            try:
-                frozen = freeze_candidate(
-                    stage, sparring_dir, repo_root, expected_branch=state.expected_branch
-                )
-                result = accept_candidate(stage, repo_root, expected_branch=state.expected_branch)
-            except AcceptanceError as exc:
-                raise _fail(
-                    state,
-                    state_path,
-                    activity,
-                    why="acceptance gate refused",
-                    message=(
-                        f"plan {state.plan} stopped at stage {stage.stage_id!r}: the sparrer "
-                        f"said READY but the acceptance gate refused ({exc}); the plan did not "
-                        "advance"
-                    ),
-                ) from exc
-            report(f"stage {stage.stage_id}: READY; frozen and accepted {result.candidate_sha} "
-                   f"({frozen.push_detail})")
-            for repository in result.repositories:
+                try:
+                    result = accept_reviewed_candidate(
+                        stage, repo_root, expected_branch=state.expected_branch
+                    )
+                except AcceptanceError as exc:
+                    raise _fail(
+                        state,
+                        state_path,
+                        activity,
+                        why="acceptance gate refused",
+                        message=(
+                            f"plan {state.plan} stopped at stage {stage.stage_id!r}: the "
+                            f"independent reviewer said READY but completing the review "
+                            f"was refused ({exc}); the plan did not advance"
+                        ),
+                    ) from exc
                 report(
-                    f"stage {stage.stage_id}: sibling candidate {repository.name} "
-                    f"{repository.branch} pinned and verified at {repository.candidate_sha}"
+                    f"stage {stage.stage_id}: READY; independent review completed over "
+                    f"{result.candidate_sha}, which stays the candidate it reviewed (this "
+                    "stage adds no commit and merges nothing)"
                 )
-            accepted.append((stage.stage_id, result.candidate_sha))
-            activity.emit("plan.stage.accepted", sha=result.candidate_sha)
+                for repository in result.repositories:
+                    report(
+                        f"stage {stage.stage_id}: reviewed sibling candidate "
+                        f"{repository.name} {repository.branch} re-verified at "
+                        f"{repository.candidate_sha}"
+                    )
+                accepted.append((stage.stage_id, result.candidate_sha))
+                activity.emit("plan.stage.accepted", sha=result.candidate_sha)
+
+            else:
+                if sparrer_first:
+                    start_with = "sparring"
+                    sparrer_first = False  # only the stage this resume entered
+                elif _awaiting_finalization(state, state_path, activity, repo_root, stage):
+                    # Stopped between the reviewer's READY and the commit that
+                    # acceptance can freeze -- where a run that predates the
+                    # finalization cycle was left, and where any process killed
+                    # between those two points stops.
+                    start_with = "finalization"
+                else:
+                    start_with = "stage"
+                entering = {
+                    "sparring": "; sparring first",
+                    "finalization": "; finalizing the reviewed candidate",
+                    "stage": "",
+                }[start_with]
+                activity.emit(
+                    "plan.stage.entered",
+                    summary=f"{plan_stage.display} ({position}){entering}",
+                )
+                report(
+                    f"stage {position} {stage.stage_id}: "
+                    + {
+                        "sparring": "resuming the sparrer against the unchanged candidate",
+                        "finalization": (
+                            "the sparrer already said READY and the reviewed candidate is not "
+                            "committed; committing and pushing exactly that work, then "
+                            "reviewing the commit"
+                        ),
+                        "stage": "running the implementation <-> sparring loop",
+                    }[start_with]
+                )
+                # Adapters are built for THIS stage, so a caller can bind their
+                # provider telemetry to this stage's activity.jsonl. Session
+                # continuity comes from state.json's recorded ids, which
+                # run_stage_agent/run_sparring_agent pass to resume(); it does
+                # not depend on the adapter objects from an earlier stage or an
+                # earlier process.
+                try:
+                    stage_adapter, sparring_adapter = make_adapters(stage)
+                except Exception as exc:
+                    raise _fail(
+                        state,
+                        state_path,
+                        activity,
+                        why="adapter construction failed",
+                        message=(
+                            f"plan {state.plan} stopped at stage {stage.stage_id!r} before any "
+                            f"provider turn: could not build the provider adapters: {exc}"
+                        ),
+                    ) from exc
+                try:
+                    loop_result = run_unattended_loop(
+                        stage,
+                        sparring_dir,
+                        repo_root,
+                        stage_adapter,
+                        sparring_adapter,
+                        expected_branch=state.expected_branch,
+                        max_send_back_cycles=max_send_back_cycles,
+                        self_check=self_check,
+                        start_with=start_with,
+                    )
+                except LoopError as exc:
+                    raise _fail(
+                        state,
+                        state_path,
+                        activity,
+                        why="stage loop failed",
+                        message=(
+                            f"plan {state.plan} stopped at stage {stage.stage_id!r} (not accepted, "
+                            f"not advanced): {exc}"
+                        ),
+                    ) from exc
+
+                if loop_result.outcome is not RoutingAction.READY:
+                    _pause(state, state_path)
+                    activity.emit("plan.paused", action=loop_result.outcome.value)
+                    report(f"stage {stage.stage_id}: {loop_result.outcome.value}; plan paused")
+                    return PlanRunResult(
+                        status=PlanRunStatus.PAUSED,
+                        plan=state.plan,
+                        stage_id=stage.stage_id,
+                        routing=loop_result.routing,
+                        accepted=tuple(accepted),
+                    )
+
+                # READY: first make sure the reviewed plan the sparrer judged
+                # against is still the plan on disk -- an implementation turn
+                # could have edited and committed a stage section -- then invoke
+                # the existing hard gate on the exact pushed SHA. Any refusal
+                # stops the plan; nothing else is ever substituted.
+                _require_plan_unchanged(
+                    source, state, state_path, activity, before="accepting the candidate"
+                )
+                try:
+                    frozen = freeze_candidate(
+                        stage, sparring_dir, repo_root, expected_branch=state.expected_branch
+                    )
+                    result = accept_candidate(stage, repo_root, expected_branch=state.expected_branch)
+                except AcceptanceError as exc:
+                    raise _fail(
+                        state,
+                        state_path,
+                        activity,
+                        why="acceptance gate refused",
+                        message=(
+                            f"plan {state.plan} stopped at stage {stage.stage_id!r}: the sparrer "
+                            f"said READY but the acceptance gate refused ({exc}); the plan did not "
+                            "advance"
+                        ),
+                    ) from exc
+                report(f"stage {stage.stage_id}: READY; frozen and accepted {result.candidate_sha} "
+                       f"({frozen.push_detail})")
+                for repository in result.repositories:
+                    report(
+                        f"stage {stage.stage_id}: sibling candidate {repository.name} "
+                        f"{repository.branch} pinned and verified at {repository.candidate_sha}"
+                    )
+                accepted.append((stage.stage_id, result.candidate_sha))
+                activity.emit("plan.stage.accepted", sha=result.candidate_sha)
 
         if state.current_stage_index + 1 >= total:
             state.status = PlanRunStatus.COMPLETE

@@ -76,6 +76,60 @@ class StageStatus(str, Enum):
             ) from exc
 
 
+class StageMode(str, Enum):
+    """What kind of turn a stage is made of -- what actually runs for it.
+
+    Status says *how far along* a stage is; mode says *what it is*. They are
+    independent, and a stage's mode never changes while it runs.
+
+    - :attr:`IMPLEMENTATION` is every stage this engine has ever run: a
+      stage agent writes code, a sparrer reviews it, and READY leads to a
+      freeze of the commit that stage produced.
+    - :attr:`INDEPENDENT_REVIEW` is a stage whose whole content is a review
+      of work that is *already* accepted. No implementation agent runs for
+      it at all: a fresh independent reviewer inspects the accepted
+      candidate SHAs and the repository state and routes. It produces no
+      commit of its own, because there is nothing for it to implement.
+
+    Mode is declared, never inferred. A stage titled "Independent final
+    review" is not a review-only stage because of its title, and a brief
+    that asks for a review is not one either -- the prose is what the agent
+    reads, not what decides which agent runs. Only an explicit ``mode`` in
+    the execution manifest (see :mod:`agent_sparring.manifest`) selects
+    :attr:`INDEPENDENT_REVIEW`; everything else, including every plan and
+    manifest written before this existed, is :attr:`IMPLEMENTATION`.
+    """
+
+    IMPLEMENTATION = "implementation"
+    INDEPENDENT_REVIEW = "independent_review"
+
+    @classmethod
+    def from_str(cls, value: str) -> "StageMode":
+        try:
+            return cls(value)
+        except ValueError as exc:
+            valid = ", ".join(member.value for member in cls)
+            raise StageError(
+                f"unknown stage mode {value!r}; expected one of: {valid}"
+            ) from exc
+
+    @property
+    def is_review(self) -> bool:
+        """Does this mode mean "no implementation agent runs for this stage"?"""
+
+        return self is StageMode.INDEPENDENT_REVIEW
+
+    @property
+    def describe(self) -> str:
+        """How the mode is named in refusals and reports."""
+
+        return (
+            "independent review (review only)"
+            if self.is_review
+            else "implementation (stage agent then sparrer)"
+        )
+
+
 def validate_stage_id(stage_id: str) -> str:
     """Validate a stage id is safe to use as a single path segment.
 
@@ -190,6 +244,13 @@ class StageState:
     # Empty for the ordinary single-repository stage, and absent from
     # state.json in that case, so existing files are unchanged.
     repositories: tuple[CandidateRepository, ...] = ()
+    # What kind of stage this actually ran as (see StageMode). Written once,
+    # before the first provider turn, by whoever enters the stage; it is the
+    # record of what was executed, not of what the plan says today, which is
+    # the whole point of having it. Absent from state.json for the default
+    # IMPLEMENTATION mode, so every existing file stays byte-identical and
+    # reads back as the mode it in fact ran under.
+    mode: StageMode = StageMode.IMPLEMENTATION
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -198,6 +259,10 @@ class StageState:
             payload["repositories"] = [repo.to_dict() for repo in self.repositories]
         else:
             payload.pop("repositories", None)
+        if self.mode is StageMode.IMPLEMENTATION:
+            payload.pop("mode", None)
+        else:
+            payload["mode"] = self.mode.value
         return payload
 
     @classmethod
@@ -211,6 +276,17 @@ class StageState:
             repositories = tuple(CandidateRepository.from_dict(entry) for entry in raw_repositories)
         else:
             raise StageError("state.json field 'repositories' must be a list or null")
+        raw_mode = payload.get("mode")
+        # A state.json written before modes existed ran the implementation
+        # lifecycle, which is exactly what the default says; an unreadable or
+        # unknown mode is refused rather than defaulted, because guessing it
+        # would decide which agent runs.
+        if raw_mode is None:
+            mode = StageMode.IMPLEMENTATION
+        elif isinstance(raw_mode, str):
+            mode = StageMode.from_str(raw_mode)
+        else:
+            raise StageError("state.json field 'mode' must be a string or null")
         return cls(
             status=status,
             implementation_session_id=_optional_str_field(
@@ -220,6 +296,7 @@ class StageState:
             base_sha=_optional_str_field(payload, "base_sha"),
             candidate_sha=_optional_str_field(payload, "candidate_sha"),
             repositories=repositories,
+            mode=mode,
         )
 
 
@@ -258,7 +335,13 @@ class Stage:
 
     # -- skeleton creation ------------------------------------------------
 
-    def create(self, *, exist_ok: bool = False, brief: str | None = None) -> "Stage":
+    def create(
+        self,
+        *,
+        exist_ok: bool = False,
+        brief: str | None = None,
+        mode: StageMode = StageMode.IMPLEMENTATION,
+    ) -> "Stage":
         """Create a new stage skeleton with initial state and templates.
 
         ``brief`` is the initial ``brief.md`` content, written verbatim in
@@ -266,6 +349,13 @@ class Stage:
         ``brief.md`` does not exist yet: an existing brief (``exist_ok``) is
         never overwritten. The caller decides what the brief says; this
         method only owns *where* it goes and *when* it is written.
+
+        ``mode`` is recorded in the fresh ``state.json`` (see
+        :class:`StageMode`), so a stage that will never run an
+        implementation agent says so from the moment it exists rather than
+        from the moment something first runs for it. Like the brief it is
+        only written with the initial state: an existing ``state.json``
+        (``exist_ok``) keeps whatever mode it already ran under.
 
         Raises :class:`StageError` if the stage already exists and
         ``exist_ok`` is False.
@@ -278,7 +368,7 @@ class Stage:
 
         state_path = self.directory / STATE_FILENAME
         if not state_path.is_file():
-            self.write_state(StageState())
+            self.write_state(StageState(mode=mode))
 
         initial_brief = (
             brief if brief is not None else templates.BRIEF_TEMPLATE.format(stage_id=self.stage_id)

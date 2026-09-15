@@ -46,6 +46,13 @@ TURN_FINALIZED_REVIEW = "finalized_review"
 
 ROLE_STAGE = "stage"
 ROLE_SPARRER = "sparrer"
+# The independent reviewer of a review-only stage (see
+# :mod:`agent_sparring.review`). Deliberately its own role rather than
+# ``sparrer``: it reviews an already-accepted candidate set instead of one
+# stage agent's work, there is no implementation turn beside it, and an
+# inspector that showed it as a sparring turn would be describing a pairing
+# that does not exist for that stage.
+ROLE_REVIEWER = "reviewer"
 
 
 @dataclass(frozen=True)
@@ -155,11 +162,29 @@ def sparring_turn_kind(
     return TURN_RESUME if resume else TURN_ORIGINAL
 
 
+def review_turn_kind(*, resume: bool, evidence_first: bool = False) -> str:
+    """The turn kind for an independent reviewer's prompt.
+
+    A review-only stage has no implementation turn and therefore no
+    finalization: its reviewer's first turn is ``original``, a turn carrying
+    a human's answer to its own gate is ``evidence_review``, and anything
+    else that continues the same review is ``resume``. ``evidence_first`` is
+    something only the caller knows, so -- as on the sparring side -- it is
+    passed in rather than guessed, and it cannot apply to a first turn,
+    which by definition has no gate to have answered.
+    """
+
+    if not resume:
+        return TURN_ORIGINAL
+    return TURN_EVIDENCE_REVIEW if evidence_first else TURN_RESUME
+
+
 __all__ = [
     "AssembledPrompt",
     "ORIGIN_ENGINE",
     "ORIGIN_FILE",
     "PromptSection",
+    "ROLE_REVIEWER",
     "ROLE_SPARRER",
     "ROLE_STAGE",
     "SECTION_SEPARATOR",
@@ -168,6 +193,7 @@ __all__ = [
     "TURN_FINALIZED_REVIEW",
     "TURN_ORIGINAL",
     "TURN_RESUME",
+    "review_turn_kind",
     "section",
     "sparring_turn_kind",
     "stage_turn_kind",

@@ -90,6 +90,7 @@ from agent_sparring.providers import ProviderError, SparringAgentAdapter, Sparri
 from agent_sparring.routing import RoutingResult, RoutingResultError
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.prompt_capture import capture_prompt
+from agent_sparring.review_prompt import assemble_review_prompt
 from agent_sparring.sparring_prompt import assemble_sparring_prompt
 from agent_sparring.stage import Stage
 
@@ -209,8 +210,22 @@ def run_sparring_agent(
     expected_branch: str,
     finalization: str | None = None,
     evidence_first: bool = False,
+    review_candidate_set: str | None = None,
 ) -> SparringAgentRunResult:
     """Start or resume the sparring agent for one turn.
+
+    ``review_candidate_set`` switches this turn to the independent-review
+    prompt (:mod:`agent_sparring.review_prompt`) over the accepted candidate
+    set it describes, and labels the captured prompt with the ``reviewer``
+    role instead of ``sparrer``. It is the one thing that differs for a
+    review-only stage. Everything below -- the branch check before the
+    turn, the before/after read-only integrity check, the worktree lock,
+    the session-identity rule, the verdict parse, the ``sparring.md`` write
+    -- is identical and is the reason this lives here rather than in a
+    second copy: an independent reviewer needs *more* read-only enforcement
+    than a sparrer, not less, and there is exactly one implementation of it.
+    It cannot be combined with ``finalization``, which describes a commit
+    turn a review-only stage never has.
 
     ``expected_branch`` is required, mirroring
     :func:`agent_sparring.stage_agent.run_stage_agent`: a local
@@ -273,6 +288,11 @@ def run_sparring_agent(
             "expected_branch is required for a sparring-agent run; a local "
             "repo-aware sparring run must know which branch it is meant to review"
         )
+    if review_candidate_set is not None and finalization is not None:
+        raise SparringAgentRunError(
+            "a turn cannot be both an independent review and a review of a finalization "
+            "commit; a review-only stage has no commit turn"
+        )
 
     try:
         with worktree_lock(repo_root):
@@ -284,6 +304,7 @@ def run_sparring_agent(
                 expected_branch=expected_branch,
                 finalization=finalization,
                 evidence_first=evidence_first,
+                review_candidate_set=review_candidate_set,
             )
     except WorktreeLockError as exc:
         raise SparringAgentRunError(
@@ -300,18 +321,29 @@ def _run_sparring_agent_locked(
     expected_branch: str,
     finalization: str | None = None,
     evidence_first: bool = False,
+    review_candidate_set: str | None = None,
 ) -> SparringAgentRunResult:
     state = stage.read_state()
     resume_id = state.sparring_session_id
 
-    assembled = assemble_sparring_prompt(
-        stage,
-        sparring_dir,
-        resume=resume_id is not None,
-        expected_branch=expected_branch,
-        finalization=finalization,
-        evidence_first=evidence_first,
-    )
+    if review_candidate_set is not None:
+        assembled = assemble_review_prompt(
+            stage,
+            sparring_dir,
+            resume=resume_id is not None,
+            expected_branch=expected_branch,
+            candidate_set=review_candidate_set,
+            evidence_first=evidence_first,
+        )
+    else:
+        assembled = assemble_sparring_prompt(
+            stage,
+            sparring_dir,
+            resume=resume_id is not None,
+            expected_branch=expected_branch,
+            finalization=finalization,
+            evidence_first=evidence_first,
+        )
     prompt = assembled.text
 
     # Between assembly and the adapter call, for the same reason as in

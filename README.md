@@ -279,6 +279,7 @@ sparring resume-plan --manifest .../manifest.json --repo-root . --expected-branc
       "label": "Stage 3C",
       "title": "Cloud schema/RPC and sync transport",
       "brief": "… the exact brief.md content …",
+      "mode": "implementation",
       "repositories": [
         {"name": "sporely-web", "path": "../sporely-web-worktree",
          "branch": "feature/cloud-transport", "candidate_sha": null}
@@ -303,7 +304,8 @@ protection the Markdown path gets. Re-emitting an unchanged one is stable, so
 a tool may regenerate the file on every invocation.
 
 `repositories` is for a stage whose reviewed candidate spans more than one
-repository; see "Cross-repository candidates" below.
+repository; see "Cross-repository candidates" below. `mode` is for a stage
+that is a review and nothing else; see "Review-only stages" below.
 
 #### The Markdown convention
 
@@ -503,3 +505,96 @@ the sibling is not exactly there.
 That is the whole feature. There is no cross-repository merge, no
 transaction and no remote coordination — the requirement is only that
 acceptance pins and verifies the complete reviewed candidate set.
+
+## Review-only stages
+
+A plan's last stage is often not work at all: a fresh independent reviewer
+verifies the candidates the earlier stages accepted, checks every gate, and
+the plan's activation decision is taken on that. Run through the ordinary
+lifecycle, such a stage gets an implementation agent that has nothing to
+implement — it opens a session, reads around, and sooner or later writes
+something to try an idea out, at which point the reviewer of the work is
+also its author.
+
+So a stage can declare what it *is*, in its manifest entry:
+
+```json
+{"stage_id": "stage-5-independent-final-review", "label": "Stage 5",
+ "title": "Independent final review and activation decision",
+ "brief": "…", "mode": "independent_review"}
+```
+
+`mode` is optional and defaults to `implementation`, so every manifest
+written before it existed means what it always meant. Nothing infers it:
+a stage titled "Independent final review" runs the implementation lifecycle
+unless its manifest says otherwise, because which agent runs is not a thing
+to read off a heading. The Markdown convention has no way to declare a mode
+and always means `implementation`.
+
+A review-only stage's lifecycle has no implementation turn in it:
+
+    enter the stage → pin exactly what is under review → one fresh
+    independent reviewer → READY / NEEDS_YOU / defect
+
+All four outcomes are terminal. `SEND_BACK` is a **defect report**, not a
+correction cycle: there is no stage agent behind this stage to send work
+back to, so the plan stops, unaccepted, and you decide where the fix belongs
+— a new stage, a reopened earlier one, or outside the plan. Nothing turns
+the review stage into an implementation stage on its own. `NEEDS_YOU` is the
+ordinary structured gate: `resume-plan --evidence` records your answer and
+the *same* reviewer session judges it.
+
+What the reviewer is told is assembled for the job. There is no `handoff.md`
+to show it (no stage agent ran), so in its place the engine states the exact
+accepted candidate commits, per stage, across every declared repository —
+verified against the repositories immediately before the turn. The reviewer
+is told plainly that it has no write access and that a defect it finds is
+not its to fix. Its captured prompt is recorded under the `reviewer` role,
+so `prompts/0001-reviewer-original.md` is what you read to see whether the
+active actor really is a fresh independent reviewer.
+
+Completion does not manufacture a commit. What the stage is judged against
+is pinned into its `state.json` when it is *entered* — `base_sha` is the
+primary commit, `repositories` the sibling candidates — and READY re-verifies
+exactly that set: right branch, HEAD still at the reviewed commit, worktree
+clean, the commit still on the remote, every sibling still at its pin. Only
+then is the stage ACCEPTED, with `candidate_sha` equal to `base_sha`: the
+accurate statement that this stage added no commit of its own. The
+implementation path's `freeze-candidate`/`accept-candidate` is untouched and
+is not reachable from review mode, nor the other way round. Nothing is
+merged, here or anywhere else.
+
+### Restarting a stage started under the wrong mode
+
+A stage can end up having run through the wrong lifecycle: the run reached it
+before the mode was declared, or against a plan input that did not carry it.
+It then holds an implementation session, possibly something the stage agent
+left in the worktree, and no independent review — and none of that can
+become the authoritative review. The engine refuses to continue such a stage
+rather than adopting that attempt, and names one command:
+
+```sh
+sparring reset-stage stage-5-independent-final-review \
+  --manifest .../manifest.json --mode independent_review \
+  --repo-root . --expected-branch feature/x
+```
+
+It archives the attempt to
+`.sparring/stages/.archive/<stage-id>/<n>-<mode>-<timestamp>/` — the stage
+directory, its captured prompts and its session ids all preserved as
+history, and stripped of their authority, since nothing resumes an archive.
+Files the attempt wrote are read from its own activity log and quarantined
+into the same archive (including a compiled `__pycache__` copy of a test
+file it created, which git never showed you and a later test run would still
+import). Then the stage is recreated in place, under the same id, with the
+plan input's brief and a fresh `state.json` — no session, no candidate — and
+the run's plan digest is re-recorded, since declaring a mode changes what
+the plan executes.
+
+What it refuses, before moving anything: a stage that is not the run's
+current stage, or is accepted; a plan input that declares the mode the stage
+already ran under, or disagrees with `--mode`; a preceding stage that is not
+accepted with a real candidate; a repository that is not on the expected
+branch and at the preceding accepted candidate; an attempt that modified
+tracked, committed content; and any dirty path it cannot account for — your
+uncommitted work is never swept aside to make a recovery possible.
