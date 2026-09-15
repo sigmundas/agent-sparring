@@ -163,6 +163,52 @@ refusal, the SEND_BACK runaway limit, and the end of the plan; ordinary
 pushed SHA, with no human confirmation. The gate itself is unchanged: if it
 refuses, the plan stops and nothing is substituted.
 
+Use `--stop-after-stage <stage-id>` to take a plan one stage at a time: the
+run accepts that stage and then pauses with its position already advanced,
+without running, creating or briefing the next one. The plan is left exactly
+as any other pause leaves it, so the next `resume-plan` continues normally.
+
+### A stage whose candidate is still uncommitted
+
+Some stages are deliberately left uncommitted until a human has verified
+them — a project convention for work that needs a real look before it
+becomes a commit. `READY` then arrives over a working tree, not a commit,
+and the acceptance gate has nothing to freeze. The runner does not treat
+such a `READY` as the end:
+
+```text
+Stage 4: implementation, deliberately left uncommitted
+    -> NEEDS_YOU: five manual checks
+you do the checks
+    -> resume-plan --evidence "…"
+    -> the SPARRER resumes against the unchanged candidate … READY
+    -> ONE bounded turn: commit that exact tree on the expected branch, push,
+       report the SHA — and change nothing else
+    -> the engine compares the committed content against the reviewed tree,
+       path by path
+    -> the sparrer reviews that exact commit … READY -> freeze -> accept
+```
+
+The comparison is the point: a turn that rewrote a file and committed the
+rewrite leaves a working tree just as clean as one that committed the
+reviewed work untouched, so "clean now" proves nothing. If the committed
+content is not the content that was reviewed, the run stops without
+accepting and records which paths diverged in the stage's `notes.md` —
+because a person's manual check described the tree they inspected, and it
+does not carry forward onto different work. Nothing is rolled back; the
+commit and both sessions are left as they are.
+
+Stage artifact files (`state.json`, `brief.md`, `notes.md`, `handoff.md`,
+`sparring.md`, `activity.jsonl`) are outside that comparison, as they are
+outside candidate identity everywhere else: the engine rewrites them on
+every turn. The freeze's own dirty-tree rules are not relaxed for any of
+this.
+
+A run that is *already* stopped between a recorded `READY` and the commit —
+which is where any run killed at that moment stops — is resumed the same
+way: `resume-plan` recognises it and enters at that one bounded turn instead
+of spending an implementation turn on a tree a human has already verified.
+
 Each planned stage gets its own `.sparring/stages/<stage-id>/activity.jsonl`,
 with the same provider stream a direct `run-loop` produces (the adapters are
 rebuilt per stage so the stream follows the stage), plus `plan.*` lines
@@ -324,7 +370,7 @@ very commit under review. What the sparrer says next decides:
 
 | verdict     | what happens                                                    |
 | ----------- | --------------------------------------------------------------- |
-| `READY`     | freeze and accept at the same SHA, then the next stage starts     |
+| `READY`     | freeze and accept at the same SHA, then the next stage starts — unless the reviewed candidate is not a commit yet, which adds one bounded commit/push turn and a review of that commit first (see above) |
 | `SEND_BACK` | there *is* work: the ordinary loop takes over from the stage agent |
 | `NEEDS_YOU` | still paused, with the new gate                                    |
 | `ESCALATE`  | still paused                                                       |

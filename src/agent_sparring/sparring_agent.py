@@ -206,6 +206,7 @@ def run_sparring_agent(
     adapter: SparringAgentAdapter,
     *,
     expected_branch: str,
+    finalization: str | None = None,
 ) -> SparringAgentRunResult:
     """Start or resume the sparring agent for one turn.
 
@@ -226,6 +227,13 @@ def run_sparring_agent(
     freeze/accept/implementation turn on the same worktree. A contended
     lock raises :class:`SparringAgentRunError` immediately, before the
     provider is ever invoked, and touches nothing.
+
+    ``finalization`` is forwarded verbatim to
+    :func:`~agent_sparring.sparring_prompt.build_sparring_prompt`; see it
+    for what that section says and why only the engine can supply it. It is
+    prompt text and nothing else here: it is not recorded in
+    ``state.json``, not written to ``sparring.md``, and changes no check in
+    this function.
 
     Records the provider's own returned session id in state.json and
     refuses to silently replace it if a resume call returns a different id
@@ -260,7 +268,12 @@ def run_sparring_agent(
     try:
         with worktree_lock(repo_root):
             return _run_sparring_agent_locked(
-                stage, sparring_dir, repo_root, adapter, expected_branch=expected_branch
+                stage,
+                sparring_dir,
+                repo_root,
+                adapter,
+                expected_branch=expected_branch,
+                finalization=finalization,
             )
     except WorktreeLockError as exc:
         raise SparringAgentRunError(
@@ -275,12 +288,17 @@ def _run_sparring_agent_locked(
     adapter: SparringAgentAdapter,
     *,
     expected_branch: str,
+    finalization: str | None = None,
 ) -> SparringAgentRunResult:
     state = stage.read_state()
     resume_id = state.sparring_session_id
 
     prompt = build_sparring_prompt(
-        stage, sparring_dir, resume=resume_id is not None, expected_branch=expected_branch
+        stage,
+        sparring_dir,
+        resume=resume_id is not None,
+        expected_branch=expected_branch,
+        finalization=finalization,
     )
 
     try:

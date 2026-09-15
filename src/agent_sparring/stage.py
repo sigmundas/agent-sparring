@@ -43,6 +43,14 @@ ACTIVITY_FILENAME = "activity.jsonl"
 # parses or gates on its content.
 HUMAN_EVIDENCE_HEADING = "## Human evidence"
 
+# The notes.md heading under which the engine records what a finalization
+# turn actually did to the reviewed candidate (see
+# :mod:`agent_sparring.finalization`). Also prose, and also never gated on:
+# it exists so a human reading notes.md later can see that a commit turn
+# altered work a human had already verified, instead of that fact living
+# only in a terminal that has since closed.
+FINALIZATION_HEADING = "## Finalization"
+
 _STAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -347,6 +355,45 @@ class Stage:
 
     def read_sparring(self) -> str:
         return self._read_text(SPARRING_FILENAME)
+
+    def append_note(self, heading: str, entry: str) -> None:
+        """Append ``entry`` at the end of notes.md's ``heading`` section,
+        creating the heading at the end of the file on first use.
+
+        The entry lands inside the named section, not merely at the end of
+        the file. That distinction matters as soon as notes.md holds more
+        than one such section: a reader of ``## Human evidence`` (the
+        handoff and both prompts, via
+        :func:`agent_sparring.handoff.extract_section`) stops at the next
+        heading, so an entry appended past a later heading would be recorded
+        and then never shown again.
+
+        Prose only, like everything else in notes.md: nothing parses these
+        sections as machine state.
+        """
+
+        lines = self.read_notes().rstrip("\n").splitlines()
+        body = entry.strip()
+        start = next(
+            (i for i, line in enumerate(lines) if line.strip() == heading.strip()), None
+        )
+        if start is None:
+            trailing = "\n".join(lines).rstrip("\n")
+            self.write_notes(f"{trailing}\n\n{heading}\n\n{body}\n")
+            return
+
+        # extract_section ends a section at the next line starting with '#';
+        # the insertion point must agree with it, or the entry would be
+        # written outside the section it belongs to.
+        end = next(
+            (i for i in range(start + 1, len(lines)) if lines[i].startswith("#")), len(lines)
+        )
+        section = lines[:end]
+        while section and not section[-1].strip():
+            section.pop()
+        rest = lines[end:]
+        merged = section + ["", body] + (["", *rest] if rest else [])
+        self.write_notes("\n".join(merged).rstrip("\n") + "\n")
 
     def write_brief(self, content: str) -> None:
         self._write_text(BRIEF_FILENAME, content)

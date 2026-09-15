@@ -103,7 +103,7 @@ from agent_sparring.stage import (
 # "sparring_dir" must never make an arbitrary tree (up to and including the
 # whole repository, if a caller passed sparring_dir == repo_root) invisible
 # to this check.
-_STAGE_ARTIFACT_FILENAMES = (
+STAGE_ARTIFACT_FILENAMES = (
     STATE_FILENAME,
     BRIEF_FILENAME,
     NOTES_FILENAME,
@@ -201,7 +201,7 @@ def _stage_artifact_allowlist(repo_root: Path, stage: Stage) -> frozenset[str]:
         # can match it, so the allowlist is correctly empty rather than an
         # error here (the dirty check below will simply block on anything).
         return frozenset()
-    return frozenset((rel_dir / name).as_posix() for name in _STAGE_ARTIFACT_FILENAMES)
+    return frozenset((rel_dir / name).as_posix() for name in STAGE_ARTIFACT_FILENAMES)
 
 
 def _entry_is_exempt(entry: DirtyEntry, allowed: frozenset[str]) -> bool:
@@ -226,7 +226,7 @@ def _partition_dirty(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Split the working tree's status entries into (blocking, ignored).
 
-    Only this stage's own artifact files (see ``_STAGE_ARTIFACT_FILENAMES``)
+    Only this stage's own artifact files (see ``STAGE_ARTIFACT_FILENAMES``)
     are ignored: agent_sparring itself rewrites those on every stage/
     sparring turn, so a project that neither commits nor gitignores them
     would otherwise be unable to freeze anything at all. Everything else —

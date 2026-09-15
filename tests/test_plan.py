@@ -820,6 +820,29 @@ class PlanCliTests(_PlanRepoTestCase):
         self.assertIn(f"accepted {S2} at {_head_sha(self.repo)}", out)
         self.assertIn("recorded human evidence", err)
 
+    def test_a_bounded_run_that_accepted_everything_exits_zero(self):
+        # The exit code is the only signal a caller (the VS Code extension)
+        # trusts for "did this land", so a run that accepted the stage it was
+        # asked to must not report failure. This one paused with no verdict
+        # to print -- the next stage was never entered -- which is not an
+        # error and must not be reported as one.
+        adapters = (_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]))
+        code, out, err = self._main(
+            "run-plan", str(self.plan_path), "--repo-root", str(self.repo),
+            "--expected-branch", "feature/x", "--stop-after-stage", S1, adapters=adapters,
+        )
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("plan paused: docs/plan.md", out)
+        self.assertIn(f"accepted {S1} at {_head_sha(self.repo)}", out)
+        self.assertIn(f"next stage: {S2}", out)
+        self.assertIn("not started", out)
+        self.assertIn(f"sparring resume-plan {self.plan_path}", out)
+        # No verdict was invented for a stage nothing reviewed.
+        self.assertNotIn("action:", out)
+        self.assertNotIn("summary:", out)
+        self.assertIn("stopping after", err)
+
     def test_escalate_output_points_at_the_handoff_and_packet_commands(self):
         adapters = (_StageAdapter(self.repo), _SparringAdapter([ESCALATE]))
         code, out, _ = self._main(

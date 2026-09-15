@@ -80,6 +80,20 @@ asked about. If the sparrer then says SEND_BACK there *is* implementation
 work and the ordinary loop takes over from the stage agent; READY accepts
 and advances; NEEDS_YOU and ESCALATE leave the plan paused.
 
+That READY is where a human-gated stage differs from every other one, and
+the loop -- not this module -- is what closes the difference. A stage whose
+implementation was deliberately left uncommitted until a human verified it
+reaches READY with the reviewed work still in the working tree and HEAD
+still at the stage's base, so there is no commit for the gate to freeze.
+:func:`~agent_sparring.loop.run_unattended_loop` therefore does not call a
+READY terminal until the reviewed candidate is a commit: it routes one
+bounded commit/push turn, verifies path by path that the committed content
+is the content that was reviewed, and returns the verdict of the sparring
+turn over that exact SHA. By the time a READY reaches the freeze below,
+there is a real candidate and it holds the work the human actually
+verified. See that module's "Finalization" section; nothing about the gate
+here is relaxed for it.
+
 Adapters are built per planned stage
 ------------------------------------
 
@@ -116,6 +130,7 @@ from typing import Any, Callable
 
 from agent_sparring.acceptance import AcceptanceError, accept_candidate, freeze_candidate
 from agent_sparring.activity import ActivityEmitter
+from agent_sparring.finalization import FinalizationError, pending_finalization
 from agent_sparring.git_context import GitContextError, is_ignored
 from agent_sparring.loop import (
     DEFAULT_MAX_SEND_BACK_CYCLES,
@@ -566,6 +581,7 @@ def start_plan(
     adopt: bool = False,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
+    stop_after_stage: str | None = None,
     report: Reporter = lambda message: None,
 ) -> PlanRunResult:
     """Validate the whole plan, record position at stage 1, and run.
@@ -650,6 +666,7 @@ def start_plan(
         max_send_back_cycles=max_send_back_cycles,
         self_check=self_check,
         report=report,
+        stop_after_stage=stop_after_stage,
     )
 
 
@@ -765,6 +782,7 @@ def resume_plan(
     evidence: str | None = None,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
+    stop_after_stage: str | None = None,
     report: Reporter = lambda message: None,
 ) -> PlanRunResult:
     """Continue a recorded plan run at its current stage.
@@ -795,6 +813,16 @@ def resume_plan(
     A current stage that is already ACCEPTED (by hand, after an ESCALATE
     sparred elsewhere, or by a run that stopped between accept and advance)
     is advanced past without running anything.
+
+    ``stop_after_stage`` bounds this call to the named stage: once that
+    stage is accepted and the position has advanced, the run pauses instead
+    of entering the next one, and nothing is run, created or briefed for it.
+    That is what lets a person take one stage at a time through a managed
+    run -- finish and accept this stage, look at what was accepted, and
+    decide about the next one separately -- without giving up the managed
+    run's own position, digest and acceptance handling. The plan is left
+    exactly as an ordinary pause leaves it, so the next ``resume-plan``
+    continues normally. A stage id that is not in the plan is refused.
 
     Refuses (:class:`PlanError`) if no run is recorded, the run is complete,
     ``expected_branch`` differs from the recorded one, the source kind
@@ -864,6 +892,7 @@ def resume_plan(
         self_check=self_check,
         report=report,
         sparrer_first=sparrer_first,
+        stop_after_stage=stop_after_stage,
     )
 
 
@@ -871,12 +900,7 @@ def record_human_evidence(stage: Stage, evidence: str) -> None:
     """Append ``evidence`` under ``## Human evidence`` in the stage's notes.md
     (creating the heading on first use). Prose only; nothing parses it."""
 
-    entry = evidence.strip()
-    notes = stage.read_notes().rstrip("\n")
-    has_heading = any(line.strip() == HUMAN_EVIDENCE_HEADING for line in notes.splitlines())
-    if not has_heading:
-        notes += f"\n\n{HUMAN_EVIDENCE_HEADING}"
-    stage.write_notes(f"{notes}\n\n{entry}\n")
+    stage.append_note(HUMAN_EVIDENCE_HEADING, evidence)
 
 
 def _ensure_stage(sparring_dir: Path, planned: PlannedStage) -> Stage:
@@ -959,6 +983,75 @@ def _declare_repositories(stage: Stage, planned: PlannedStage) -> None:
         for repository in declared
     )
     stage.write_state(state)
+
+
+def _stop_index(stages: tuple[PlannedStage, ...], stop_after_stage: str | None) -> int | None:
+    """Where ``stop_after_stage`` sits in the plan, or ``None`` for no bound.
+
+    An id that is not in this plan is refused rather than ignored: a caller
+    that meant to bound a run and mistyped the stage would otherwise get an
+    unbounded one, which is the opposite of what it asked for.
+    """
+
+    if stop_after_stage is None:
+        return None
+    wanted = stop_after_stage.strip()
+    for index, planned in enumerate(stages):
+        if planned.stage_id == wanted:
+            return index
+    known = ", ".join(planned.stage_id for planned in stages)
+    raise PlanError(
+        f"stop-after stage {wanted!r} is not a stage of this plan; it has: {known}"
+    )
+
+
+def _awaiting_finalization(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    repo_root: Path,
+    stage: Stage,
+) -> bool:
+    """Is this stage stopped exactly between READY and the commit?
+
+    True when the sparrer's recorded verdict is READY *and* the reviewed
+    candidate is still in the working tree rather than in a commit. That is
+    a real, reachable resting place: it is where every run stopped before
+    the loop's finalization cycle existed (the reviewer said READY, the
+    acceptance gate refused a candidate that was never committed, and the
+    run stopped with the verified work still uncommitted), and it is where
+    any process killed between the READY and the commit stops today.
+
+    Entering such a stage at the stage agent would spend an unbounded
+    implementation turn on a tree a human has already verified; entering at
+    the sparrer would only re-derive a READY that is already on disk. So the
+    run enters at the commit/push cycle instead, and
+    :mod:`agent_sparring.finalization` holds that turn to the reviewed
+    content exactly as it does when the READY happens inside the loop.
+
+    A verdict that cannot be read yields False -- the same rule the rest of
+    this module follows, that a half-read verdict never decides whether an
+    agent runs. Candidate content that cannot be read is a broken
+    repository, not an ambiguous state, and stops the run.
+    """
+
+    outcome = read_recorded_outcome(stage)
+    if outcome is None or outcome.action is not RoutingAction.READY:
+        return False
+    try:
+        return pending_finalization(repo_root, stage) is not None
+    except FinalizationError as exc:
+        raise _fail(
+            state,
+            state_path,
+            activity,
+            why="candidate content unreadable",
+            message=(
+                f"plan {state.plan} stopped at stage {stage.stage_id!r}: its recorded "
+                f"verdict is READY, but its candidate content could not be read to tell "
+                f"whether the reviewed work is committed: {exc}"
+            ),
+        ) from exc
 
 
 def _recorded_pause(stage: Stage) -> RecordedOutcome | None:
@@ -1055,6 +1148,7 @@ def _drive(
     self_check: bool,
     report: Reporter,
     sparrer_first: bool = False,
+    stop_after_stage: str | None = None,
 ) -> PlanRunResult:
     """Walk the plan's stages from the recorded position until it pauses,
     fails or completes.
@@ -1063,13 +1157,39 @@ def _drive(
     only changes where the *first* stage entered starts (see
     :func:`resume_plan`), and is consumed immediately so every later stage
     runs the ordinary implementation-first loop.
+
+    ``stop_after_stage`` bounds how far this call goes (see
+    :func:`resume_plan`). It is checked before a stage is entered -- and so
+    before :func:`_ensure_stage` would create its directory -- because
+    creating a briefed stage is itself a deliberate step, not something a
+    run that is stopping should leave behind.
     """
 
     total = len(stages)
     accepted: list[tuple[str, str]] = []
+    stop_index = _stop_index(stages, stop_after_stage)
+    # Only for the observational plan.paused event: the run state, not this,
+    # is the authority for where a stopped run is positioned.
+    last_activity: ActivityEmitter | None = None
 
     while True:
         plan_stage = stages[state.current_stage_index]
+        if stop_index is not None and state.current_stage_index > stop_index:
+            stopped_after = stages[stop_index].stage_id
+            _pause(state, state_path)
+            if last_activity is not None:
+                last_activity.emit("plan.paused", summary=f"stopping after {stopped_after}")
+            report(
+                f"plan {state.plan}: stopping after {stopped_after} as asked. The run is "
+                f"positioned at {plan_stage.stage_id} ({plan_stage.position}/{total}) and "
+                "nothing was run, created or briefed for it."
+            )
+            return PlanRunResult(
+                status=PlanRunStatus.PAUSED,
+                plan=state.plan,
+                stage_id=plan_stage.stage_id,
+                accepted=tuple(accepted),
+            )
         try:
             stage = _ensure_stage(sparring_dir, plan_stage)
         except PlanError:
@@ -1083,6 +1203,7 @@ def _drive(
                 pass
             raise
         activity = _plan_emitter(stage)
+        last_activity = activity
         try:
             stage_state = stage.read_state()
         except StageError as exc:
@@ -1141,20 +1262,37 @@ def _drive(
             # stage, so the acceptance gate finds it wherever it is invoked
             # from. Written before any provider turn.
             _declare_repositories(stage, plan_stage)
-            start_with = "sparring" if sparrer_first else "stage"
-            sparrer_first = False  # only the stage this resume entered
+            if sparrer_first:
+                start_with = "sparring"
+                sparrer_first = False  # only the stage this resume entered
+            elif _awaiting_finalization(state, state_path, activity, repo_root, stage):
+                # Stopped between the reviewer's READY and the commit that
+                # acceptance can freeze -- where a run that predates the
+                # finalization cycle was left, and where any process killed
+                # between those two points stops.
+                start_with = "finalization"
+            else:
+                start_with = "stage"
+            entering = {
+                "sparring": "; sparring first",
+                "finalization": "; finalizing the reviewed candidate",
+                "stage": "",
+            }[start_with]
             activity.emit(
                 "plan.stage.entered",
-                summary=f"{plan_stage.display} ({position})"
-                + ("; sparring first" if start_with == "sparring" else ""),
+                summary=f"{plan_stage.display} ({position}){entering}",
             )
             report(
                 f"stage {position} {stage.stage_id}: "
-                + (
-                    "resuming the sparrer against the unchanged candidate"
-                    if start_with == "sparring"
-                    else "running the implementation <-> sparring loop"
-                )
+                + {
+                    "sparring": "resuming the sparrer against the unchanged candidate",
+                    "finalization": (
+                        "the sparrer already said READY and the reviewed candidate is not "
+                        "committed; committing and pushing exactly that work, then "
+                        "reviewing the commit"
+                    ),
+                    "stage": "running the implementation <-> sparring loop",
+                }[start_with]
             )
             # Adapters are built for THIS stage, so a caller can bind their
             # provider telemetry to this stage's activity.jsonl. Session

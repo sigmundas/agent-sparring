@@ -148,6 +148,7 @@ def build_sparring_prompt(
     *,
     resume: bool,
     expected_branch: str | None = None,
+    finalization: str | None = None,
 ) -> str:
     """Assemble the bounded prompt for one sparring-agent turn.
 
@@ -166,6 +167,18 @@ def build_sparring_prompt(
     sparrer against the unchanged candidate: notes.md is the one canonical
     place a human's answer lives, and no caller has to mirror it anywhere
     else to be seen.
+
+    ``finalization``, when given, is one factual statement from the engine
+    about the commit turn that produced the candidate now under review: that
+    the committed content is byte-for-byte the content of the tree this
+    sparrer already reviewed (see :mod:`agent_sparring.finalization`). It is
+    something only the engine can know and the sparrer cannot establish by
+    reading the repository, and without it a sparrer looking at a
+    just-committed candidate cannot tell a plain commit of reviewed work
+    from a commit that quietly rewrote it. It is passed through verbatim by
+    :func:`agent_sparring.sparring_agent.run_sparring_agent`, which never
+    sends it unless the engine's own path-by-path comparison actually
+    passed.
     """
 
     parts = [f"# Sparring: {stage.stage_id}", ""]
@@ -203,6 +216,14 @@ def build_sparring_prompt(
             "current as of this turn and supersedes any copy of it inside the handoff "
             "above. Judge the candidate with it: if it satisfies what you asked for, say "
             "so and route accordingly rather than asking for it again.",
+        ]
+
+    if finalization and finalization.strip():
+        parts += [
+            "",
+            "## Finalization",
+            "",
+            finalization.strip(),
         ]
 
     if resume:

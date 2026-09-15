@@ -22,6 +22,49 @@ from agent_sparring.handoff import human_evidence_section
 from agent_sparring.stage import HUMAN_EVIDENCE_HEADING, Stage, StageError
 
 
+def _finalization_section(expected_branch: str) -> list[str]:
+    """The bounded commit/push turn's instruction.
+
+    Deliberately the narrowest turn this package ever asks for: the work is
+    already implemented, already reviewed, and (for a human-gated stage)
+    already manually verified, and the only thing missing is the commit the
+    acceptance gate can freeze. The engine compares the committed content
+    against the reviewed tree path by path afterwards (see
+    :mod:`agent_sparring.finalization`), so the limits below are not an
+    honour system -- but saying them is what lets an agent comply instead of
+    tripping over them.
+    """
+
+    return [
+        "",
+        "## Finalize this candidate",
+        "",
+        "This stage's implementation is complete and the sparrer has accepted "
+        "it. The reviewed work is still sitting uncommitted in the working "
+        "tree, which is why this turn exists: the acceptance gate only ever "
+        "freezes an exact commit. Turn this exact working tree into that "
+        "commit, and change nothing about it.",
+        "",
+        f"- Commit the stage's work on `{expected_branch}` and push "
+        f"`{expected_branch}`.",
+        "- Report the exact committed SHA.",
+        "- Run only the checks you need in order to commit safely.",
+        "- Do not re-implement, refactor, rename, reformat, reword or "
+        "otherwise improve anything -- not the code, not the tests, not the "
+        "documentation.",
+        "- If a check fails, or you believe a real code change is needed, "
+        "make no change: say what you found and stop. That is a useful "
+        "turn, and the run will handle it.",
+        "",
+        "The engine compares what you commit against the tree that was "
+        "reviewed, path by path. Any content you change invalidates the "
+        "verification this stage already passed -- including any manual "
+        "check a human performed on it -- and the run will stop without "
+        "accepting rather than carry that verification forward onto "
+        "different work.",
+    ]
+
+
 def build_stage_prompt(
     stage: Stage,
     sparring_dir: Path,
@@ -29,6 +72,7 @@ def build_stage_prompt(
     resume: bool,
     expected_branch: str,
     self_check: bool = False,
+    finalize_only: bool = False,
 ) -> str:
     """Assemble the bounded prompt for one stage-agent turn.
 
@@ -42,6 +86,15 @@ def build_stage_prompt(
     lightweight: no new machine-readable workflow state, no checklist
     fields, no pass/fail gate. Independent sparring still runs afterward
     regardless of what this section asks for.
+
+    ``finalize_only`` (default false) turns this into a commit/push turn for
+    an already-reviewed candidate: it replaces the ordinary "act on the
+    human's answer" and self-check instructions -- both of which invite
+    implementation work -- with the bounded finalization instruction, since
+    asking for a change and forbidding one in the same prompt would be
+    incoherent. Like ``self_check`` it is never recorded as machine state;
+    :mod:`agent_sparring.loop` decides when a turn is one of these, and
+    :mod:`agent_sparring.finalization` is what actually holds the turn to it.
     """
 
     parts = [
@@ -85,10 +138,22 @@ def build_stage_prompt(
             "",
             evidence,
             "",
-            "Treat this as the human's answer to the latest NEEDS_YOU question "
-            "or as recorded manual-check results. If it calls for implementation "
-            "changes, make them; if not, report that no code change is needed.",
+            (
+                "This is what the human verified about the very tree you are about "
+                "to commit, and it is the reason this turn must not change that tree."
+            )
+            if finalize_only
+            else (
+                "Treat this as the human's answer to the latest NEEDS_YOU question "
+                "or as recorded manual-check results. If it calls for implementation "
+                "changes, make them; if not, report that no code change is needed."
+            ),
         ]
+
+    if finalize_only:
+        # No self-check and no scope reminder: both ask for implementation
+        # judgement, which is exactly what this turn must not exercise.
+        return "\n".join(parts + _finalization_section(expected_branch)).rstrip() + "\n"
 
     if self_check:
         parts += [

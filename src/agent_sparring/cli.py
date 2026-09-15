@@ -508,12 +508,32 @@ def _report_plan_result(
             print(f"  accepted {stage_id} at {sha}")
         return
 
-    # A PAUSED result carries either the verdict this run produced or, when
-    # the stage was already stopped for a human before the run reached it,
-    # the one that was already on disk. They print the same way.
-    routing = result.routing or result.recorded
-    assert routing is not None
     stage = Stage.resolve(sparring_dir, result.stage_id)
+
+    # A PAUSED result usually carries either the verdict this run produced
+    # or, when the stage was already stopped for a human before the run
+    # reached it, the one that was already on disk. They print the same way.
+    #
+    # One pause carries neither, and it is not a verdict at all: a run
+    # bounded by --stop-after-stage accepted everything it was asked to and
+    # then stopped before entering the next stage, which was never run and
+    # has nothing to report. Printing a verdict's shape for it (or asserting
+    # one exists) would be wrong twice over -- there is no review to show,
+    # and nothing here failed.
+    routing = result.routing or result.recorded
+    if routing is None:
+        print(f"plan paused: {result.plan}")
+        for stage_id, sha in result.accepted:
+            print(f"  accepted {stage_id} at {sha}")
+        print(f"next stage: {result.stage_id} ({stage.directory}); not started")
+        print()
+        print("Continue when you are ready:")
+        print(
+            f"  sparring resume-plan {_plan_input_args(args)} "
+            f"--repo-root {args.repo_root or '.'} --expected-branch {args.expected_branch}"
+        )
+        return
+
     print(f"plan paused: {result.plan}")
     print(f"stage: {result.stage_id} ({stage.directory})")
     print(f"action: {routing.action.value}")
@@ -594,6 +614,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
             expected_branch=args.expected_branch,
             max_send_back_cycles=args.max_send_back_cycles,
             self_check=self_check,
+            stop_after_stage=args.stop_after_stage,
             report=report,
         )
         if resume:
@@ -983,6 +1004,17 @@ def build_parser() -> argparse.ArgumentParser:
         repo_root_help,
         branch_help="the feature branch every stage of this plan must modify; required",
     )
+    run_plan.add_argument(
+        "--stop-after-stage",
+        default=None,
+        metavar="STAGE_ID",
+        help=(
+            "stop once this stage is accepted, instead of continuing into the next one: "
+            "the run pauses with its position already advanced, and nothing is run, "
+            "created or briefed for the next stage. For taking a managed plan one stage "
+            "at a time without giving up its position, digest and acceptance handling"
+        ),
+    )
     run_plan.set_defaults(func=_cmd_run_plan)
 
     resume_plan_parser = subparsers.add_parser(
@@ -1014,6 +1046,17 @@ def build_parser() -> argparse.ArgumentParser:
             "or scope approval; appended to the current stage's notes.md under "
             "'## Human evidence', after which the SPARRER resumes against the unchanged "
             "candidate (the stage agent is not started to deliver an answer)"
+        ),
+    )
+    resume_plan_parser.add_argument(
+        "--stop-after-stage",
+        default=None,
+        metavar="STAGE_ID",
+        help=(
+            "stop once this stage is accepted, instead of continuing into the next one: "
+            "the run pauses with its position already advanced, and nothing is run, "
+            "created or briefed for the next stage. For taking a managed plan one stage "
+            "at a time without giving up its position, digest and acceptance handling"
         ),
     )
     resume_plan_parser.set_defaults(func=_cmd_resume_plan, adopt=False)

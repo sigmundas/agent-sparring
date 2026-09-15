@@ -110,6 +110,7 @@ def run_stage_agent(
     *,
     expected_branch: str,
     self_check: bool = False,
+    finalize_only: bool = False,
 ) -> StageAgentRunResult:
     """Start or resume the stage agent for one turn.
 
@@ -123,6 +124,13 @@ def run_stage_agent(
     verbatim; see that function for what it adds. It never becomes machine
     state here — it is not recorded in ``state.json`` and does not change
     any control flow in this function.
+
+    ``finalize_only`` (default false) is forwarded the same way, and is
+    equally not machine state: it narrows this turn's prompt to committing
+    and pushing an already-reviewed candidate. Nothing in this function
+    enforces that narrowing — :mod:`agent_sparring.loop` asks for such a
+    turn and :mod:`agent_sparring.finalization` checks afterwards that the
+    committed content is the content that was reviewed.
 
     Records the provider's own returned session id in state.json and
     regenerates handoff.md from the provider's result and actual git
@@ -207,6 +215,7 @@ def run_stage_agent(
                 resume=resume_id is not None,
                 expected_branch=expected_branch,
                 self_check=self_check,
+                finalize_only=finalize_only,
             )
 
             # Observational telemetry only: emitted alongside the existing
