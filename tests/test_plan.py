@@ -495,6 +495,57 @@ class PlanRunTests(_PlanRepoTestCase):
         self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
         self.assertNotIn("Human evidence", self._stage(S1).read_notes())
 
+    def test_appended_implementation_record_is_refused_and_named_as_a_mutation(self):
+        # The real failure this guard exists for: an agent, following its
+        # project's ordinary "keep the active plan updated" instruction,
+        # appends its own '## Stage 1' under an '# Implementation record'
+        # heading. The plan then parses as Stage 1, 2, 3, 1 -- unreadable as
+        # the plan the run started against, not merely a digest mismatch.
+        stage_adapter = _StageAdapter(self.repo)
+        sparring_adapter = _SparringAdapter([NEEDS_YOU, READY, READY])
+        self._start(stage_adapter, sparring_adapter)
+        self.plan_path.write_text(
+            PLAN + "\n# Implementation record\n\n## Stage 1 — Foundation (done)\n\nBuilt it.\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(stage_adapter, sparring_adapter, evidence="done")
+
+        message = str(ctx.exception)
+        self.assertIn("can no longer be read as the plan this run started against", message)
+        self.assertIn("must not be edited while it is running", message)
+        self.assertIn("Restore it", message)
+        self.assertEqual(stage_adapter.resume_calls, [])
+        self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
+        self.assertNotIn("Human evidence", self._stage(S1).read_notes())
+
+    def test_mutated_plan_does_not_replace_the_frozen_stage_sequence(self):
+        # Whatever the document now says, the run's recorded definition --
+        # digest, position and current stage id -- is unchanged, and the
+        # stage keeps the brief it was created with. The edited document
+        # never becomes the execution definition, and nothing is reverted
+        # for the user.
+        stage_adapter = _StageAdapter(self.repo)
+        sparring_adapter = _SparringAdapter([NEEDS_YOU, READY, READY])
+        self._start(stage_adapter, sparring_adapter)
+        before = self._plan_state()
+        mutated = PLAN + "\n# Implementation record\n\n## Stage 1 — Foundation (done)\n\nBuilt it.\n"
+        self.plan_path.write_text(mutated, encoding="utf-8")
+
+        with self.assertRaises(PlanError):
+            self._resume(stage_adapter, sparring_adapter)
+
+        after = self._plan_state()
+        self.assertEqual(after.plan_digest, before.plan_digest)
+        self.assertEqual(after.current_stage, before.current_stage)
+        self.assertEqual(after.current_stage_index, before.current_stage_index)
+        # And the stage the run is on still holds the brief it was created
+        # with, not anything the edited document now says.
+        self.assertIn("Lay the groundwork.", self._stage(S1).read_brief())
+        # The user's file is left exactly as they left it.
+        self.assertEqual(self.plan_path.read_text(encoding="utf-8"), mutated)
+
     def test_prose_edits_outside_stages_do_not_block_resume(self):
         stage_adapter = _StageAdapter(self.repo)
         sparring_adapter = _SparringAdapter([NEEDS_YOU, READY, READY])

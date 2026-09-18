@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent_sparring.artifact_ownership import ROLE_STAGE, ownership_section
 from agent_sparring.config import load_project_markdown
 from agent_sparring.handoff import human_evidence_section
 from agent_sparring.stage import HUMAN_EVIDENCE_HEADING, Stage, StageError
@@ -60,6 +61,13 @@ def build_stage_prompt(
     project_context = load_project_markdown(sparring_dir)
     if project_context and project_context.strip():
         parts += ["", "## Project context", "", project_context.strip()]
+
+    # Before any of the turn's own instructions, and on every turn kind:
+    # the project's own agent instructions may well tell an agent to record
+    # its progress in the active plan, and this is the only party that knows
+    # the plan is currently a run's execution definition. See
+    # :mod:`agent_sparring.artifact_ownership`.
+    parts += ["", *ownership_section(ROLE_STAGE)]
 
     if resume:
         try:

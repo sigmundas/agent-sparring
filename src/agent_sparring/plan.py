@@ -375,9 +375,29 @@ def _verify_plan_unchanged(plan_path: Path, state: PlanRunState) -> tuple[PlanSt
     """Re-read the plan from disk and require its stage-section digest to
     equal the one recorded when the run started. The one check used on
     resume, before accepting a READY stage, and before advancing -- so a
-    stage section edited (even committed) mid-run is caught, not executed."""
+    stage section edited (even committed) mid-run is caught, not executed.
 
-    stages = _read_plan(plan_path, state.plan)
+    A plan that can no longer be read at all is the same finding and is
+    reported as such: both failures raise :class:`PlanError`, so a caller
+    has one exception type to handle."""
+
+    try:
+        stages = _read_plan(plan_path, state.plan)
+    except PlanError as exc:
+        # The plan on disk can no longer be read as a plan at all. That is
+        # the same fact as a digest mismatch -- the run's execution content
+        # changed -- but it arrives as a parse error, which on its own reads
+        # like a malformed document rather than like a run whose definition
+        # was edited underneath it. Appending an implementation record whose
+        # own '## Stage 1' heading follows the plan's 'Stage 1..7' is exactly
+        # this case, so say which situation the reader is in before handing
+        # over the parser's detail.
+        raise PlanError(
+            f"{state.plan} can no longer be read as the plan this run started against "
+            f"({exc}); a managed run's plan must not be edited while it is running. "
+            "Restore it as it was, or deliberately start over (see run-plan's refusal "
+            "message for what to remove)."
+        ) from exc
     if plan_digest(stages) != state.plan_digest:
         raise PlanError(
             f"the reviewed stage content of {state.plan} has changed since this run "
