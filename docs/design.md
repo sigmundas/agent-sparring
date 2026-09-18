@@ -286,6 +286,56 @@ concurrency issues, ways invariants can be bypassed) before finishing its
 turn. It is prose only: no workflow state, no checklist fields, no
 pass/fail gate. Independent sparring still runs afterward regardless.
 
+### Model and effort: one resolution, honest per provider
+
+`[agents.<role>]` also carries optional `model` and `effort`. Resolution for
+every role and every field lives in exactly one module,
+`agent_sparring/agent_config.py`, and every orchestration path — `run-stage`,
+`run-sparring`, `run-loop`, `run-plan`, `resume-plan`, the independent-review
+stage and the finalization turn — builds its adapters from it. The
+alternative, each command consulting the config for itself, is how one path
+ends up quietly ignoring it.
+
+    explicit CLI override  >  .sparring/project.toml  >  provider default
+
+"Provider default" is a real state, not a missing answer: the engine passes
+no flag and reports the value as unset with source `provider-default`. It
+never writes a guessed model name into that gap, because a provider's
+internal default moves without telling us, and a UI that displayed the guess
+would be asserting something nobody checked.
+
+Effort is modelled per provider rather than as one engine-wide vocabulary.
+The two installed CLIs agree on `low|medium|high|xhigh|max` and disagree
+beyond it (Codex additionally has `minimal` and `ultra`), and they express
+the setting through unrelated argv: Claude has `--effort`, while Codex has no
+such flag and takes `-c model_reasoning_effort=…`. A generic translation
+layer — "high means whatever each provider's high-ish setting is" — would be
+the engine claiming a capability it has not verified, so an unsupported level
+is a configuration error raised before a provider process exists. Claude's
+CLI makes that refusal load-bearing rather than pedantic: it accepts an
+unknown `--effort`, warns, and runs the turn at its default, so a typo would
+otherwise be paid for in full and never noticed.
+
+Model *names* are not enumerated, because both CLIs accept free-form names
+and gain new ones between engine releases. The engine validates the shape of
+the configuration and the vocabulary it genuinely knows; the provider stays
+the authority on its own models. Configuration is typed for the same reason
+there is no `extra_args`: a list of raw command fragments in TOML is shell
+injection with a schema, and it would let a project reach past the
+invariants an adapter exists to hold (the sparrer's read-only sandbox, most
+of all).
+
+Resolution happens when a turn is launched and is re-read per stage, so
+editing `project.toml` affects the next turn and cannot reconfigure or
+restart one in flight. Provider session resume is untouched by any of this:
+the session id is the provider's own, recorded in stage state, and never
+carried on an adapter object.
+
+`show-config --json` reports the resolved result and the source of each
+value. It exists so that a UI never re-derives provider semantics; the
+engine owns the question "what would actually run". It reports configuration
+only — never environment contents or credentials.
+
 Only values that software actually needs belong here.
 
 Do not invent another custom Markdown/front-matter parser for machine state.

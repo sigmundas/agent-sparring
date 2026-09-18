@@ -59,7 +59,10 @@ authority to give independent acceptance -- a distinct, not-yet-built mode.
 For this adapter, read-only is an invariant, not a configuration option:
 there is no ``sandbox`` constructor field, no runtime-mutable attribute,
 and no ``extra_args`` passthrough that could inject a different sandbox or
-config override. The verified read-only setting is hard-coded directly
+an arbitrary config override. (The one other ``-c`` this adapter can emit
+is ``model_reasoning_effort``, whose value is restricted to
+:data:`EFFORT_LEVELS`; it cannot name another key and cannot express a
+sandbox.) The verified read-only setting is hard-coded directly
 into argument-building (see ``_SANDBOX_CONFIG_ARG`` below) with no
 supported path -- constructor, attribute mutation after construction, or
 otherwise -- to select anything else. A future contributor-sparrer mode
@@ -100,6 +103,28 @@ from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 DEFAULT_EXECUTABLE = "codex"
 DEFAULT_SANDBOX = "read-only"
 PROVIDER_ID = "codex-cli"
+# Human-readable name for this provider. The engine keeps PROVIDER_ID as the
+# canonical identifier everywhere; this is only for showing a person.
+DISPLAY_NAME = "Codex"
+
+# Verified against the installed CLI (codex-cli 0.153.4): "codex exec" has no
+# --effort flag at all. Reasoning effort is the "model_reasoning_effort"
+# config key, set with the same "-c key=value" override mechanism this
+# adapter already uses for the read-only sandbox, and accepted by both
+# "codex exec" and "codex exec resume". The vocabulary below was read out of
+# the installed binary and cross-checked against "codex debug models", whose
+# catalog reports each model's "supported_reasoning_levels" as a subset of
+# it. That per-model subset is deliberately not enforced here: it moves with
+# the catalog, and the provider is the authority on its own models.
+EFFORT_LEVELS: tuple[str, ...] = (
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
 
 # Verified live (see module docstring): "codex exec resume" rejects the
 # top-level --sandbox flag outright, and without any override does not
@@ -319,7 +344,16 @@ class CodexCliAdapter:
 
     repo_root: Path
     executable: str = DEFAULT_EXECUTABLE
+    # Typed provider-turn configuration, already resolved by
+    # agent_sparring.agent_config. ``None`` means "pass no flag": the CLI
+    # then picks its own model/effort, and the engine claims nothing about
+    # which one that is. ``effort`` becomes a "-c model_reasoning_effort"
+    # override, which is a config override like the sandbox one -- but a
+    # closed, validated enum (see EFFORT_LEVELS and __post_init__), not an
+    # arbitrary key=value passthrough: no value of this field can name a
+    # different config key or touch the sandbox.
     model: str | None = None
+    effort: str | None = None
     timeout_seconds: float | None = None
     runner: Runner = field(default=_default_runner)
     # Optional observational emitter; None means no telemetry, nothing else
@@ -333,6 +367,17 @@ class CodexCliAdapter:
     # say so via this flag rather than the caller discovering it by a failed
     # call.
     supports_resume: bool = True
+
+    def __post_init__(self) -> None:
+        # Refuse an unsupported effort at construction, which is always
+        # before a provider process exists, and which also guarantees the
+        # "-c model_reasoning_effort=..." value below is one of a closed set
+        # of bare words rather than anything a caller composed.
+        if self.effort is not None and self.effort not in EFFORT_LEVELS:
+            raise ProviderError(
+                f"effort {self.effort!r} is not supported by {PROVIDER_ID}; "
+                f"supported levels: {', '.join(EFFORT_LEVELS)}"
+            )
 
     def start(self, prompt: str) -> SparringAgentResult:
         return self._invoke(prompt, resume_session_id=None)
@@ -363,6 +408,13 @@ class CodexCliAdapter:
         # change it, and no extra_args passthrough that could append a
         # conflicting override after it.
         args += list(_SANDBOX_CONFIG_ARG)
+        if self.effort:
+            # Codex has no --effort flag; the setting is a config override.
+            # The value is one of EFFORT_LEVELS (enforced in __post_init__),
+            # so this can never become a second sandbox override. It is
+            # appended after the sandbox arg, but a later "-c" for a
+            # different key does not disturb it.
+            args += ["-c", f'model_reasoning_effort="{self.effort}"']
         args += [
             "--json",
             "--output-schema",
@@ -470,6 +522,8 @@ __all__ = [
     "CodexCliAdapter",
     "DEFAULT_EXECUTABLE",
     "DEFAULT_SANDBOX",
+    "DISPLAY_NAME",
+    "EFFORT_LEVELS",
     "PROVIDER_ID",
     "VERDICT_SCHEMA",
 ]

@@ -49,6 +49,19 @@ from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 DEFAULT_EXECUTABLE = "claude"
 DEFAULT_PERMISSION_MODE = "acceptEdits"
 PROVIDER_ID = "claude-cli"
+# Human-readable name for this provider. The engine keeps PROVIDER_ID as the
+# canonical identifier everywhere; this is only for showing a person.
+DISPLAY_NAME = "Claude"
+
+# Verified against the installed CLI (claude 2.1.277): "--effort <level>
+# Effort level for the current session (low, medium, high, xhigh, max)".
+#
+# The CLI does NOT reject an unrecognised level. It prints "Warning: Unknown
+# --effort value 'bogus' - ignoring it and using the default effort" and runs
+# the turn anyway. A typo would therefore buy a full-price turn at an effort
+# nobody chose, so this adapter refuses the value itself rather than passing
+# it through (see ClaudeCliAdapter.__post_init__).
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
 # Tool names whose ``input.file_path`` (or ``notebook_path``) names a file
 # the agent is changing. Only the path is ever recorded -- never
@@ -245,7 +258,12 @@ class ClaudeCliAdapter:
     repo_root: Path
     executable: str = DEFAULT_EXECUTABLE
     permission_mode: str = DEFAULT_PERMISSION_MODE
+    # Typed provider-turn configuration, already resolved by
+    # agent_sparring.agent_config. ``None`` means "pass no flag": the CLI
+    # then picks its own model/effort, and the engine claims nothing about
+    # which one that is.
     model: str | None = None
+    effort: str | None = None
     extra_args: tuple[str, ...] = ()
     timeout_seconds: float | None = None
     runner: Runner = field(default=_default_runner)
@@ -265,6 +283,17 @@ class ClaudeCliAdapter:
     # cannot resume should say so via this flag rather than the caller
     # discovering it by a failed call.
     supports_resume: bool = True
+
+    def __post_init__(self) -> None:
+        # Refuse an unsupported effort at construction, which is always
+        # before a provider process exists. The CLI would merely warn and
+        # silently fall back (see EFFORT_LEVELS), and a turn that ran at an
+        # unintended effort cannot be undone.
+        if self.effort is not None and self.effort not in EFFORT_LEVELS:
+            raise ProviderError(
+                f"effort {self.effort!r} is not supported by {PROVIDER_ID}; "
+                f"supported levels: {', '.join(EFFORT_LEVELS)}"
+            )
 
     def start(self, prompt: str) -> StageAgentResult:
         return self._invoke(prompt, resume_session_id=None)
@@ -294,6 +323,8 @@ class ClaudeCliAdapter:
         ]
         if self.model:
             args += ["--model", self.model]
+        if self.effort:
+            args += ["--effort", self.effort]
         if resume_session_id:
             args += ["--resume", resume_session_id]
         args += list(self.extra_args)
@@ -369,4 +400,11 @@ class ClaudeCliAdapter:
         )
 
 
-__all__ = ["ClaudeCliAdapter", "DEFAULT_EXECUTABLE", "DEFAULT_PERMISSION_MODE", "PROVIDER_ID"]
+__all__ = [
+    "ClaudeCliAdapter",
+    "DEFAULT_EXECUTABLE",
+    "DEFAULT_PERMISSION_MODE",
+    "DISPLAY_NAME",
+    "EFFORT_LEVELS",
+    "PROVIDER_ID",
+]
