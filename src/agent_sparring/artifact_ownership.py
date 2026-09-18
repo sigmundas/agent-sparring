@@ -1,10 +1,13 @@
 """Who owns each managed-run artifact, and the prompt section that says so.
 
 Every file a managed run reads or writes has exactly one authority. This
-module is the single declaration of that, and the single source of the
-sentence the providers are told it in -- so the table in the README and the
-instruction in a stage or sparring prompt cannot drift into describing
-different contracts.
+module is the production declaration of that: :data:`ARTIFACTS` is what the
+tests are written against, and :func:`ownership_section` is the single source
+of the sentence the providers are told it in -- so a stage prompt and a
+sparring prompt cannot drift into describing different contracts. The
+README's ownership table is the corresponding human-readable summary. It is
+hand-written, nothing renders or checks it against this module, so keeping
+the two consistent is a manual step when either changes.
 
 Two facts are worth stating plainly, because both are easy to assume
 wrongly:
@@ -83,7 +86,8 @@ SOURCE_PLAN = ArtifactOwnership(
 )
 
 #: Every artifact a managed run reads or writes, in the order a reader meets
-#: them. The README's ownership table is rendered from this tuple.
+#: them. The README's ownership table summarises this tuple for a reader and
+#: is maintained by hand; it is not generated from it.
 ARTIFACTS: tuple[ArtifactOwnership, ...] = (
     SOURCE_PLAN,
     ArtifactOwnership(
@@ -109,10 +113,16 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
     ),
     ArtifactOwnership(
         path="stages/<stage>/brief.md",
-        owner="engine",
+        owner="engine (a person, for a hand-written stage)",
         provider_writable=False,
-        lifetime="written once at stage creation; then immutable",
-        purpose="the plan section verbatim -- the contract the stage is reviewed against",
+        lifetime=(
+            "managed-plan stage: generated from the plan section, then immutable; "
+            "hand-written stage: authored by a person before execution, then immutable"
+        ),
+        purpose=(
+            "the contract the stage is reviewed against -- the plan section "
+            "verbatim in a managed run"
+        ),
     ),
     ArtifactOwnership(
         path="stages/<stage>/notes.md",

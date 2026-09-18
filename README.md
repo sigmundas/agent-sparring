@@ -223,7 +223,7 @@ itself, which is an ordinary repository file.
 | `PROJECT.md` | human / repository | no | edited between runs by a person | project context embedded in every prompt |
 | `project.toml` | human / repository | no | edited between runs by a person | provider selection and engine configuration |
 | `plans/<run>.json` | engine | no | rewritten on every position/status change | the run's position, expected branch and plan digest |
-| `stages/<stage>/brief.md` | engine | no | written once at stage creation, then immutable | the plan section verbatim — what the stage is reviewed against |
+| `stages/<stage>/brief.md` | engine (a person, for a hand-written stage) | no | generated from the plan section, or hand-written before execution; then immutable | what the stage is reviewed against — the plan section verbatim in a managed run |
 | `stages/<stage>/notes.md` | engine (and a person editing by hand) | no | skeleton at creation, then appended to by section | a human's recorded answer or check results (`## Human evidence`) |
 | `stages/<stage>/handoff.md` | engine | no | regenerated in full by every implementation turn | that turn's claims, git identity and evidence, for the sparrer |
 | `stages/<stage>/sparring.md` | engine | no | rewritten in full by every sparring exchange | the latest verdict, rendered from the structured routing result |
@@ -237,9 +237,11 @@ sparrer because the engine captures that turn's *result* into `handoff.md`,
 and a human's answer reaches both agents because `resume-plan --evidence`
 records it under `## Human evidence`. A provider's designated output is its
 own reply, which the engine records; the files are how the engine keeps it.
-`src/agent_sparring/artifact_ownership.py` is the single declaration of this
-table, and it is also where the sentence the providers are told it in lives,
-so the prompts and this table cannot drift apart.
+`src/agent_sparring/artifact_ownership.py` is the production declaration the
+prompts and tests are built on, and is also where the sentence the providers
+are told it in lives, so the stage and sparring prompts cannot drift apart.
+The table above is the human-readable summary of that declaration; nothing
+generates or checks it, so the two are kept consistent by hand.
 
 **The plan is immutable while a run executes.** The engine digests the plan's
 stage sections at run start and re-reads the document and re-checks that
