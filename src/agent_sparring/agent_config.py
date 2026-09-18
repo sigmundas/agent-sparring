@@ -1,0 +1,386 @@
+"""The one place that resolves which provider, model and effort a role runs with.
+
+Two roles take a provider turn: the stage agent and the sparrer (the
+independent reviewer is the sparring role pointed at a different prompt, so
+it resolves through the sparring role, not a third one). Every orchestration
+path -- ``run-stage``, ``run-sparring``, ``run-loop``, ``run-plan``,
+``resume-plan``, the independent-review stage and the finalization turn --
+builds its adapters from :func:`resolve_agent_configs`, so none of them can
+quietly disagree about what the project configured.
+
+Precedence, per role and per field:
+
+    explicit CLI override  >  .sparring/project.toml  >  provider default
+
+"Provider default" means the engine passes no flag at all and the provider
+CLI does whatever it normally does. The engine never writes a guessed model
+name into that gap, and :func:`resolve_agent_configs` reports the source of
+each value so a UI can say "provider default" honestly instead of inventing
+one.
+
+Provider capabilities below were probed against the installed CLIs, not
+assumed -- see :data:`PROVIDER_CAPABILITIES` for what was verified and how.
+Effort is deliberately modelled as a per-provider enumeration rather than a
+single engine-wide one: the two installed CLIs overlap on
+``low|medium|high|xhigh|max`` but do not agree beyond that, and they express
+the setting through completely different argv. Translating an unsupported
+level into "the nearest thing" would be the engine claiming support a
+provider does not have, so an unsupported level is a configuration error
+raised before any provider process starts.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Mapping
+
+from agent_sparring.config import ProjectConfig, ProjectConfigError
+from agent_sparring.providers import claude_cli, codex_cli
+
+ROLE_STAGE = "stage"
+ROLE_SPARRING = "sparring"
+ROLES: tuple[str, ...] = (ROLE_STAGE, ROLE_SPARRING)
+
+# Where a resolved value came from. Reported verbatim in the effective-config
+# output so a UI never has to guess.
+SOURCE_CLI = "cli"
+SOURCE_PROJECT = "project"
+SOURCE_ENGINE_DEFAULT = "engine-default"
+SOURCE_PROVIDER_DEFAULT = "provider-default"
+
+
+class AgentConfigError(ProjectConfigError):
+    """Raised when a role's provider/model/effort selection cannot be honoured.
+
+    Subclasses :class:`~agent_sparring.config.ProjectConfigError` so the
+    existing command error handling reports it as the configuration problem
+    it is, rather than as a provider failure after a process has started.
+    """
+
+
+@dataclass(frozen=True)
+class ProviderCapability:
+    """What one provider CLI can actually be told to do.
+
+    ``effort_levels`` empty means the provider exposes no effort/reasoning
+    setting at all; configuring one is then an error rather than a no-op.
+    ``effort_argv_note`` is documentation, not behaviour -- the argv itself
+    is built by the adapter module that owns the provider.
+    """
+
+    provider_id: str
+    display_name: str
+    roles: tuple[str, ...]
+    supports_model: bool
+    effort_levels: tuple[str, ...]
+    effort_argv_note: str | None = None
+
+    @property
+    def supports_effort(self) -> bool:
+        return bool(self.effort_levels)
+
+
+# Verified against the installed CLIs on 2026-09-18:
+#
+# claude 2.1.277:
+#   --model <model>   "Provide an alias for the latest model (e.g. 'fable',
+#                     'opus', or 'sonnet') or a model's full name". Free-form:
+#                     the CLI does not enumerate accepted values, so the
+#                     engine must not either.
+#   --effort <level>  "Effort level for the current session (low, medium,
+#                     high, xhigh, max)". A stable, documented enum. An
+#                     unrecognised value is NOT rejected by the CLI: it prints
+#                     "Warning: Unknown --effort value 'bogus' - ignoring it
+#                     and using the default effort" and runs the turn anyway.
+#                     That silent downgrade is exactly why the engine
+#                     validates the level itself, before launching.
+#
+# codex-cli 0.153.4:
+#   -m/--model <MODEL>            Free-form, on both "codex exec" and
+#                                 "codex exec resume".
+#   -c model_reasoning_effort=... Codex has no --effort flag. Reasoning
+#                                 effort is a config override, accepted by
+#                                 both "codex exec" and "codex exec resume"
+#                                 (the same mechanism the read-only sandbox
+#                                 already uses). The level enum was read out
+#                                 of the installed binary and cross-checked
+#                                 against "codex debug models", whose catalog
+#                                 reports per-model "supported_reasoning_levels"
+#                                 drawn from this same set.
+#
+# Per-model narrowing is deliberately NOT enforced here. "codex debug models"
+# shows that the levels a given model accepts are a subset of this enum and
+# that the subset changes with the catalog; pinning today's subset into the
+# engine would reject a level a future model gains. The engine validates the
+# vocabulary, and the provider remains the authority on its own models.
+#
+# The level vocabularies themselves live with the adapters that turn them
+# into argv, so a provider's facts stay in one module.
+CLAUDE_EFFORT_LEVELS: tuple[str, ...] = claude_cli.EFFORT_LEVELS
+CODEX_EFFORT_LEVELS: tuple[str, ...] = codex_cli.EFFORT_LEVELS
+
+PROVIDER_CAPABILITIES: Mapping[str, ProviderCapability] = {
+    claude_cli.PROVIDER_ID: ProviderCapability(
+        provider_id=claude_cli.PROVIDER_ID,
+        display_name=claude_cli.DISPLAY_NAME,
+        roles=(ROLE_STAGE,),
+        supports_model=True,
+        effort_levels=CLAUDE_EFFORT_LEVELS,
+        effort_argv_note="--effort <level>",
+    ),
+    codex_cli.PROVIDER_ID: ProviderCapability(
+        provider_id=codex_cli.PROVIDER_ID,
+        display_name=codex_cli.DISPLAY_NAME,
+        roles=(ROLE_SPARRING,),
+        supports_model=True,
+        effort_levels=CODEX_EFFORT_LEVELS,
+        effort_argv_note='-c model_reasoning_effort="<level>"',
+    ),
+}
+
+# What a role falls back to when neither the command line nor project.toml
+# names a provider. Matches the historical defaults of run-stage/run-sparring.
+DEFAULT_PROVIDERS: Mapping[str, str] = {
+    ROLE_STAGE: "claude-cli",
+    ROLE_SPARRING: "codex-cli",
+}
+
+_ROLE_LABELS: Mapping[str, str] = {
+    ROLE_STAGE: "stage agent",
+    ROLE_SPARRING: "sparring agent",
+}
+
+
+@dataclass(frozen=True)
+class ResolvedAgentConfig:
+    """One role's effective provider turn configuration.
+
+    ``model``/``effort`` being ``None`` means "pass no flag; let the provider
+    do what it normally does" -- never "the engine could not work it out".
+    The ``*_source`` fields say which layer of the precedence chain supplied
+    each value.
+    """
+
+    role: str
+    provider: str
+    provider_display_name: str
+    provider_source: str
+    model: str | None
+    model_source: str
+    effort: str | None
+    effort_source: str
+    effort_supported: bool
+    effort_levels: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        """Machine-readable form for ``sparring show-config --json``.
+
+        Contains configuration only: no environment variables, no secrets,
+        no provider credentials.
+        """
+
+        return {
+            "role": self.role,
+            "provider": self.provider,
+            "provider_display_name": self.provider_display_name,
+            "provider_source": self.provider_source,
+            "model": self.model,
+            "model_source": self.model_source,
+            "effort": self.effort,
+            "effort_source": self.effort_source,
+            "effort_supported": self.effort_supported,
+            "effort_levels": list(self.effort_levels),
+        }
+
+
+@dataclass(frozen=True)
+class RoleOverrides:
+    """The explicit command-line overrides for one role. All optional."""
+
+    provider: str | None = None
+    model: str | None = None
+    effort: str | None = None
+
+
+def capability(provider: str) -> ProviderCapability:
+    """The capability record for ``provider``, or raise :class:`AgentConfigError`."""
+
+    try:
+        return PROVIDER_CAPABILITIES[provider]
+    except KeyError:
+        known = ", ".join(sorted(PROVIDER_CAPABILITIES))
+        raise AgentConfigError(
+            f"unknown provider {provider!r}; known providers: {known}"
+        ) from None
+
+
+def _resolve_provider(role: str, override: str | None, configured: str | None) -> tuple[str, str]:
+    if override:
+        return override, SOURCE_CLI
+    if configured:
+        return configured, SOURCE_PROJECT
+    return DEFAULT_PROVIDERS[role], SOURCE_ENGINE_DEFAULT
+
+
+def _require_role(role: str, cap: ProviderCapability) -> None:
+    if role in cap.roles:
+        return
+    # Phrased as it always has been: the provider is a real provider, it just
+    # is not implemented for this role yet.
+    servers = sorted(
+        other.provider_id
+        for other in PROVIDER_CAPABILITIES.values()
+        if role in other.roles
+    )
+    only = ", ".join(repr(name) for name in servers) or "no provider"
+    raise AgentConfigError(
+        f"unsupported {_ROLE_LABELS[role]} provider {cap.provider_id!r}; only "
+        f"{only} is implemented so far"
+    )
+
+
+def _resolve_effort(
+    role: str,
+    cap: ProviderCapability,
+    override: str | None,
+    configured: str | None,
+) -> tuple[str | None, str]:
+    if override is not None:
+        # Spelled --effort by run-stage/run-sparring and --stage-effort /
+        # --sparring-effort by the loop commands, so name the role rather
+        # than one command's flag.
+        value, source, where = override, SOURCE_CLI, f"the {role} agent effort override"
+    elif configured is not None:
+        value, source, where = configured, SOURCE_PROJECT, f"[agents.{role}] effort"
+    else:
+        return None, SOURCE_PROVIDER_DEFAULT
+
+    if not cap.supports_effort:
+        raise AgentConfigError(
+            f"{where} is not supported by provider {cap.provider_id!r}: that provider "
+            f"exposes no effort/reasoning setting, so the engine will not pretend to "
+            f"apply one. Remove the setting, or choose a provider that supports it"
+        )
+    if value not in cap.effort_levels:
+        supported = ", ".join(cap.effort_levels)
+        raise AgentConfigError(
+            f"{where} value {value!r} is not supported by provider "
+            f"{cap.provider_id!r}; supported levels: {supported}"
+        )
+    return value, source
+
+
+def _resolve_model(
+    cap: ProviderCapability, override: str | None, configured: str | None, *, where: str
+) -> tuple[str | None, str]:
+    if override is not None:
+        value, source = override, SOURCE_CLI
+    elif configured is not None:
+        value, source = configured, SOURCE_PROJECT
+    else:
+        return None, SOURCE_PROVIDER_DEFAULT
+    if not cap.supports_model:
+        raise AgentConfigError(
+            f"{where} is not supported by provider {cap.provider_id!r}: that provider "
+            f"does not accept a model selection"
+        )
+    # Model names are deliberately not enumerated: both installed CLIs accept
+    # free-form model names/aliases and gain new ones without an engine
+    # release. The provider remains the authority on which names exist.
+    return value, source
+
+
+def resolve_role_config(
+    role: str,
+    config: ProjectConfig | None,
+    overrides: RoleOverrides = RoleOverrides(),
+) -> ResolvedAgentConfig:
+    """Resolve one role's effective provider/model/effort.
+
+    ``config`` may be ``None`` when the project has no ``project.toml`` at
+    all; the command line and the engine defaults then supply everything.
+    """
+
+    if role not in ROLES:
+        raise AgentConfigError(f"unknown agent role {role!r}; known roles: {', '.join(ROLES)}")
+
+    configured_provider = configured_model = configured_effort = None
+    if config is not None:
+        if role == ROLE_STAGE:
+            configured_provider = config.stage_agent_provider
+            configured_model = config.stage_agent_model
+            configured_effort = config.stage_agent_effort
+        else:
+            configured_provider = config.sparring_agent_provider
+            configured_model = config.sparring_agent_model
+            configured_effort = config.sparring_agent_effort
+
+    provider, provider_source = _resolve_provider(role, overrides.provider, configured_provider)
+    cap = capability(provider)
+    _require_role(role, cap)
+
+    model, model_source = _resolve_model(
+        cap, overrides.model, configured_model, where=f"[agents.{role}] model"
+    )
+    effort, effort_source = _resolve_effort(role, cap, overrides.effort, configured_effort)
+
+    return ResolvedAgentConfig(
+        role=role,
+        provider=provider,
+        provider_display_name=cap.display_name,
+        provider_source=provider_source,
+        model=model,
+        model_source=model_source,
+        effort=effort,
+        effort_source=effort_source,
+        effort_supported=cap.supports_effort,
+        effort_levels=cap.effort_levels,
+    )
+
+
+@dataclass(frozen=True)
+class EffectiveAgents:
+    """Both roles resolved together, as every orchestration path needs them."""
+
+    stage: ResolvedAgentConfig
+    sparring: ResolvedAgentConfig
+
+    def as_dict(self) -> dict[str, object]:
+        return {ROLE_STAGE: self.stage.as_dict(), ROLE_SPARRING: self.sparring.as_dict()}
+
+
+def resolve_agent_configs(
+    config: ProjectConfig | None,
+    *,
+    stage: RoleOverrides = RoleOverrides(),
+    sparring: RoleOverrides = RoleOverrides(),
+) -> EffectiveAgents:
+    """Resolve both roles. The single entry point every command goes through."""
+
+    return EffectiveAgents(
+        stage=resolve_role_config(ROLE_STAGE, config, stage),
+        sparring=resolve_role_config(ROLE_SPARRING, config, sparring),
+    )
+
+
+__all__ = [
+    "AgentConfigError",
+    "CLAUDE_EFFORT_LEVELS",
+    "CODEX_EFFORT_LEVELS",
+    "DEFAULT_PROVIDERS",
+    "EffectiveAgents",
+    "PROVIDER_CAPABILITIES",
+    "ProviderCapability",
+    "ROLES",
+    "ROLE_SPARRING",
+    "ROLE_STAGE",
+    "ResolvedAgentConfig",
+    "RoleOverrides",
+    "SOURCE_CLI",
+    "SOURCE_ENGINE_DEFAULT",
+    "SOURCE_PROJECT",
+    "SOURCE_PROVIDER_DEFAULT",
+    "capability",
+    "resolve_agent_configs",
+    "resolve_role_config",
+]

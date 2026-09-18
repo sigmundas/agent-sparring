@@ -102,7 +102,7 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
         owner="human / repository",
         provider_writable=False,
         lifetime="edited between runs by a person",
-        purpose="provider selection and engine configuration",
+        purpose="provider, model and effort selection, and engine configuration",
     ),
     ArtifactOwnership(
         path="plans/<run>.json",

@@ -19,8 +19,18 @@ from agent_sparring.acceptance import (
     accept_candidate,
     freeze_candidate,
 )
+from agent_sparring.agent_config import (
+    EffectiveAgents,
+    ROLE_SPARRING,
+    ROLE_STAGE,
+    ResolvedAgentConfig,
+    RoleOverrides,
+    resolve_agent_configs,
+    resolve_role_config,
+)
 from agent_sparring.config import (
     CONFIG_FILENAME,
+    ProjectConfig,
     ProjectConfigError,
     load_project_config,
     load_project_markdown,
@@ -59,6 +69,7 @@ from agent_sparring.sparring_prompt import build_sparring_prompt
 from agent_sparring.stage import Stage, StageError, StageMode
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 from agent_sparring.stage_prompt import build_stage_prompt
+from agent_sparring.templates import render_project_config
 
 # Said the same way by run-plan and resume-plan, because it is the same
 # permission: one run's own branch, to the remote branch the acceptance gate
@@ -86,7 +97,129 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
     print(f"sparring_agent_provider: {config.sparring_agent_provider}")
     print(f"default_sparring_mode: {config.default_sparring_mode}")
     print(f"PROJECT.md present: {markdown is not None}")
+    try:
+        # The same resolution a run would perform, with no CLI overrides:
+        # an effort a provider cannot honour is reported here rather than
+        # discovered when a turn is about to start.
+        effective = resolve_agent_configs(config)
+    except ProjectConfigError as exc:
+        print(f"invalid agent configuration: {exc}", file=sys.stderr)
+        return 1
+    for resolved in (effective.stage, effective.sparring):
+        print(f"{resolved.role} agent: {_describe_agent(resolved)}")
     return _report_workflow_state_ignored(args, sparring_dir)
+
+
+def _describe_agent(resolved: ResolvedAgentConfig) -> str:
+    """One line a person can read, saying where each value came from.
+
+    A value the provider chooses for itself is named as such; the engine
+    never prints a model name it did not actually pass.
+    """
+
+    parts = [f"{resolved.provider} ({resolved.provider_source})"]
+    parts.append(
+        f"model {resolved.model!r} ({resolved.model_source})"
+        if resolved.model
+        else "model: provider default"
+    )
+    if resolved.effort:
+        parts.append(f"effort {resolved.effort!r} ({resolved.effort_source})")
+    elif resolved.effort_supported:
+        parts.append("effort: provider default")
+    else:
+        parts.append("effort: not supported by this provider")
+    return " | ".join(parts)
+
+
+def _cmd_show_config(args: argparse.Namespace) -> int:
+    """Report the configuration a provider turn would actually run with.
+
+    This exists so a UI never has to re-derive "claude-cli plus this
+    project.toml plus no model means X": the resolution lives in the engine
+    (:mod:`agent_sparring.agent_config`) and is reported from there.
+    Configuration only -- no environment variables, no credentials.
+    """
+
+    sparring_dir = Path(args.sparring_dir)
+    # Absolute, because the caller most likely to read this is a UI that
+    # wants to open the file and does not share this process's cwd.
+    config_path = (sparring_dir / CONFIG_FILENAME).resolve()
+    try:
+        config = _optional_project_config(sparring_dir)
+        effective = resolve_agent_configs(
+            config,
+            stage=RoleOverrides(
+                provider=args.stage_provider, model=args.stage_model, effort=args.stage_effort
+            ),
+            sparring=RoleOverrides(
+                provider=args.sparring_provider,
+                model=args.sparring_model,
+                effort=args.sparring_effort,
+            ),
+        )
+    except ProjectConfigError as exc:
+        if args.json:
+            # Still machine-readable: a caller asking for JSON gets JSON
+            # even when the answer is "this configuration is invalid".
+            json.dump(
+                {
+                    "config_path": str(config_path),
+                    "config_exists": config_path.is_file(),
+                    "error": str(exc),
+                },
+                sys.stdout,
+                indent=2,
+            )
+            print()
+        else:
+            print(f"invalid project configuration: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        payload: dict[str, object] = {
+            "config_path": str(config_path),
+            "config_exists": config_path.is_file(),
+            "project": config.project if config is not None else None,
+            "error": None,
+        }
+        payload.update(effective.as_dict())
+        json.dump(payload, sys.stdout, indent=2)
+        print()
+        return 0
+
+    print(f"project.toml: {config_path}{'' if config_path.is_file() else ' (absent)'}")
+    for resolved in (effective.stage, effective.sparring):
+        print(f"{resolved.role} agent: {_describe_agent(resolved)}")
+    return 0
+
+
+def _cmd_init_config(args: argparse.Namespace) -> int:
+    """Create the engine's minimal project.toml, and never overwrite one.
+
+    The template is engine-owned (:func:`agent_sparring.templates.
+    render_project_config`) so nothing else -- including the editor
+    extension -- has to keep a second copy of the schema.
+    """
+
+    sparring_dir = Path(args.sparring_dir)
+    path = sparring_dir / CONFIG_FILENAME
+    if path.is_file():
+        if not args.exist_ok:
+            print(f"{path} already exists", file=sys.stderr)
+            return 1
+        print(str(path))
+        return 0
+    project = args.project or Path(sparring_dir).resolve().parent.name
+    try:
+        sparring_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(render_project_config(project), encoding="utf-8")
+    except OSError as exc:
+        print(f"could not write {path}: {exc}", file=sys.stderr)
+        return 1
+    print(str(path))
+    print(f"wrote minimal project configuration for {project!r}", file=sys.stderr)
+    return 0
 
 
 def _report_workflow_state_ignored(args: argparse.Namespace, sparring_dir: Path) -> int:
@@ -247,17 +380,57 @@ def _cmd_record_sparring(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_stage_provider(explicit_provider: str | None, sparring_dir: Path) -> str:
-    """Precedence: explicit override > configured [agents.stage].provider >
-    ``claude-cli`` (the initial default, per the project plan)."""
+def _optional_project_config(sparring_dir: Path) -> ProjectConfig | None:
+    """The project's parsed ``project.toml``, or ``None`` if it has none.
 
-    if explicit_provider:
-        return explicit_provider
+    A malformed one still raises :class:`ProjectConfigError`: "absent" and
+    "unreadable" are different answers and only the first is benign.
+    """
+
     if (sparring_dir / CONFIG_FILENAME).is_file():
-        config = load_project_config(sparring_dir)
-        if config.stage_agent_provider:
-            return config.stage_agent_provider
-    return "claude-cli"
+        return load_project_config(sparring_dir)
+    return None
+
+
+def _resolve_role(
+    role: str,
+    sparring_dir: Path,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+) -> ResolvedAgentConfig:
+    """One role's effective provider/model/effort for this invocation.
+
+    The single resolution path (see :mod:`agent_sparring.agent_config`):
+    every command that starts a provider turn goes through this or
+    :func:`_resolve_agents`, so no orchestration path can quietly ignore
+    project.toml.
+    """
+
+    return resolve_role_config(
+        role,
+        _optional_project_config(sparring_dir),
+        RoleOverrides(provider=provider, model=model, effort=effort),
+    )
+
+
+def _resolve_agents(args: argparse.Namespace, sparring_dir: Path) -> EffectiveAgents:
+    """Both roles, from the shared loop flags (see :func:`_add_loop_arguments`)."""
+
+    return resolve_agent_configs(
+        _optional_project_config(sparring_dir),
+        stage=RoleOverrides(
+            provider=args.stage_provider,
+            model=args.stage_model,
+            effort=args.stage_effort,
+        ),
+        sparring=RoleOverrides(
+            provider=args.sparring_provider,
+            model=args.sparring_model,
+            effort=args.sparring_effort,
+        ),
+    )
 
 
 def _resolve_self_check(sparring_dir: Path) -> bool:
@@ -298,17 +471,22 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
             print(prompt)
             return 0
 
-        provider = _resolve_stage_provider(args.provider, sparring_dir)
-        if provider != "claude-cli":
-            raise StageError(
-                f"unsupported stage agent provider {provider!r}; only 'claude-cli' is "
-                "implemented so far"
-            )
+        # Resolved here, at launch, from the project.toml on disk right now:
+        # a later edit changes the NEXT turn, never this one (see the
+        # live-run semantics note on _build_loop_adapters).
+        effective = _resolve_role(
+            ROLE_STAGE,
+            sparring_dir,
+            provider=args.provider,
+            model=args.model,
+            effort=args.effort,
+        )
         adapter = ClaudeCliAdapter(
             repo_root=repo_root,
             executable=args.claude_executable,
             permission_mode=args.permission_mode,
-            model=args.model,
+            model=effective.model,
+            effort=effective.effort,
             activity=stage.activity_log().bind("stage", provider=CLAUDE_PROVIDER_ID),
         )
         run_result = run_stage_agent(
@@ -332,19 +510,6 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
     return 1 if run_result.result.is_error else 0
 
 
-def _resolve_sparring_provider(explicit_provider: str | None, sparring_dir: Path) -> str:
-    """Precedence: explicit override > configured [agents.sparring].provider
-    > ``codex-cli`` (the initial default, per the Stage 4 capability probe)."""
-
-    if explicit_provider:
-        return explicit_provider
-    if (sparring_dir / CONFIG_FILENAME).is_file():
-        config = load_project_config(sparring_dir)
-        if config.sparring_agent_provider:
-            return config.sparring_agent_provider
-    return "codex-cli"
-
-
 def _cmd_run_sparring(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
     try:
@@ -364,12 +529,13 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
             print(prompt)
             return 0
 
-        provider = _resolve_sparring_provider(args.provider, sparring_dir)
-        if provider != "codex-cli":
-            raise StageError(
-                f"unsupported sparring agent provider {provider!r}; only 'codex-cli' is "
-                "implemented so far"
-            )
+        effective = _resolve_role(
+            ROLE_SPARRING,
+            sparring_dir,
+            provider=args.provider,
+            model=args.model,
+            effort=args.effort,
+        )
         # No --sandbox override is exposed here: CodexCliAdapter has no
         # sandbox field or extra_args passthrough at all -- read-only is
         # hard-coded (see providers/codex_cli.py), so there is no
@@ -377,7 +543,8 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
         adapter = CodexCliAdapter(
             repo_root=repo_root,
             executable=args.codex_executable,
-            model=args.model,
+            model=effective.model,
+            effort=effective.effort,
             activity=stage.activity_log().bind("sparrer", provider=CODEX_PROVIDER_ID),
         )
         run_result = run_sparring_agent(
@@ -403,23 +570,18 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
 
 
 def _require_loop_providers(args: argparse.Namespace, sparring_dir: Path) -> None:
-    """Refuse (:class:`StageError`) any provider selection the loop commands
-    cannot serve yet. Separate from :func:`_build_loop_adapters` so run-plan
-    can check it once up front, before recording any run state, even though
-    its adapters are built later, per planned stage."""
+    """Refuse any provider/model/effort selection the loop commands cannot
+    serve. Separate from :func:`_build_loop_adapters` so run-plan can check
+    it once up front, before recording any run state, even though its
+    adapters are built later, per planned stage.
 
-    stage_provider = _resolve_stage_provider(args.stage_provider, sparring_dir)
-    if stage_provider != "claude-cli":
-        raise StageError(
-            f"unsupported stage agent provider {stage_provider!r}; only "
-            "'claude-cli' is implemented so far"
-        )
-    sparring_provider = _resolve_sparring_provider(args.sparring_provider, sparring_dir)
-    if sparring_provider != "codex-cli":
-        raise StageError(
-            f"unsupported sparring agent provider {sparring_provider!r}; only "
-            "'codex-cli' is implemented so far"
-        )
+    The check is exactly the resolution the adapters will later perform, so
+    an unsupported effort or an unimplemented provider is an
+    :class:`~agent_sparring.agent_config.AgentConfigError` raised before the
+    run starts rather than partway through it.
+    """
+
+    _resolve_agents(args, sparring_dir)
 
 
 def _build_loop_adapters(
@@ -436,14 +598,23 @@ def _build_loop_adapters(
     :mod:`agent_sparring.activity`); both adapters append their provider
     stream to it. Observational only, never read back. ``None`` produces
     adapters that emit no provider telemetry.
+
+    Live-run semantics: this is called once per planned stage, immediately
+    before that stage's turns, and it re-reads ``project.toml`` every time.
+    Editing the file therefore affects the next stage's turns and leaves
+    any provider process already running untouched -- the engine never
+    reconfigures or restarts a turn in flight. Provider session resume is
+    unaffected: the session id is the provider's, recorded in stage state,
+    and does not live on an adapter object.
     """
 
-    _require_loop_providers(args, sparring_dir)
+    effective = _resolve_agents(args, sparring_dir)
     stage_adapter = ClaudeCliAdapter(
         repo_root=repo_root,
         executable=args.claude_executable,
         permission_mode=args.permission_mode,
-        model=args.stage_model,
+        model=effective.stage.model,
+        effort=effective.stage.effort,
         activity=(
             activity_log.bind("stage", provider=CLAUDE_PROVIDER_ID)
             if activity_log is not None
@@ -456,7 +627,8 @@ def _build_loop_adapters(
     sparring_adapter = CodexCliAdapter(
         repo_root=repo_root,
         executable=args.codex_executable,
-        model=args.sparring_model,
+        model=effective.sparring.model,
+        effort=effective.sparring.effort,
         activity=(
             activity_log.bind("sparrer", provider=CODEX_PROVIDER_ID)
             if activity_log is not None
@@ -829,6 +1001,74 @@ def _cmd_accept_candidate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_single_role_model_arguments(parser: argparse.ArgumentParser) -> None:
+    """The model/effort overrides for a command that drives one role
+    (run-stage, run-sparring), where the role is already implied."""
+
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "model override for the provider (default: project.toml's model for "
+            "this role, else the provider's own default)"
+        ),
+    )
+    parser.add_argument(
+        "--effort",
+        default=None,
+        help=(
+            "reasoning/effort level, validated against the resolved provider "
+            "(default: project.toml's effort for this role, else the provider's "
+            "own default)"
+        ),
+    )
+
+
+def _add_role_model_arguments(parser: argparse.ArgumentParser) -> None:
+    """The per-role model/effort overrides, for every command that configures
+    both roles at once (the loop commands and show-config).
+
+    Precedence for each of them is the same and lives in one place (see
+    :mod:`agent_sparring.agent_config`): this flag, then project.toml's
+    ``[agents.<role>]``, then the provider's own default.
+    """
+
+    parser.add_argument(
+        "--stage-model",
+        default=None,
+        help=(
+            "model override for the stage agent (default: project.toml's "
+            "[agents.stage].model, else the provider's own default)"
+        ),
+    )
+    parser.add_argument(
+        "--sparring-model",
+        default=None,
+        help=(
+            "model override for the sparring agent (default: project.toml's "
+            "[agents.sparring].model, else the provider's own default)"
+        ),
+    )
+    parser.add_argument(
+        "--stage-effort",
+        default=None,
+        help=(
+            "reasoning/effort level for the stage agent, validated against the "
+            "resolved provider (default: project.toml's [agents.stage].effort, "
+            "else the provider's own default)"
+        ),
+    )
+    parser.add_argument(
+        "--sparring-effort",
+        default=None,
+        help=(
+            "reasoning/effort level for the sparring agent, validated against the "
+            "resolved provider (default: project.toml's [agents.sparring].effort, "
+            "else the provider's own default)"
+        ),
+    )
+
+
 def _add_loop_arguments(
     parser: argparse.ArgumentParser, repo_root_help: str, *, branch_help: str
 ) -> None:
@@ -857,10 +1097,7 @@ def _add_loop_arguments(
         default="codex",
         help="codex CLI executable to invoke (default: codex)",
     )
-    parser.add_argument("--stage-model", default=None, help="model override for the stage agent")
-    parser.add_argument(
-        "--sparring-model", default=None, help="model override for the sparring agent"
-    )
+    _add_role_model_arguments(parser)
     parser.add_argument(
         "--permission-mode",
         default=DEFAULT_PERMISSION_MODE,
@@ -904,6 +1141,51 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     check_config.set_defaults(func=_cmd_check_config)
+
+    show_config = subparsers.add_parser(
+        "show-config",
+        help=(
+            "report the provider/model/effort each role would actually run with, "
+            "and where each value came from (configuration only; never secrets "
+            "or environment contents)"
+        ),
+    )
+    show_config.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the effective configuration as a JSON object on stdout",
+    )
+    show_config.add_argument(
+        "--stage-provider",
+        default=None,
+        help="stage agent provider override, as run-plan would pass it",
+    )
+    show_config.add_argument(
+        "--sparring-provider",
+        default=None,
+        help="sparring agent provider override, as run-plan would pass it",
+    )
+    _add_role_model_arguments(show_config)
+    show_config.set_defaults(func=_cmd_show_config)
+
+    init_config = subparsers.add_parser(
+        "init-config",
+        help=(
+            "create a minimal project.toml in --sparring-dir if none exists, and "
+            "print its path (never overwrites an existing file)"
+        ),
+    )
+    init_config.add_argument(
+        "--project",
+        default=None,
+        help="project name to record (default: the directory containing .sparring)",
+    )
+    init_config.add_argument(
+        "--exist-ok",
+        action="store_true",
+        help="succeed and print the path if project.toml already exists",
+    )
+    init_config.set_defaults(func=_cmd_init_config)
 
     new_stage = subparsers.add_parser("new-stage", help="create a new stage skeleton")
     new_stage.add_argument("stage_id")
@@ -1022,7 +1304,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="claude",
         help="claude CLI executable to invoke (default: claude)",
     )
-    run_stage.add_argument("--model", default=None, help="model override for the provider")
+    _add_single_role_model_arguments(run_stage)
     run_stage.add_argument(
         "--permission-mode",
         default=DEFAULT_PERMISSION_MODE,
@@ -1076,7 +1358,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="codex",
         help="codex CLI executable to invoke (default: codex)",
     )
-    run_sparring.add_argument("--model", default=None, help="model override for the provider")
+    _add_single_role_model_arguments(run_sparring)
     # No --sandbox flag: CodexCliAdapter has no sandbox field at all --
     # read-only is hard-coded (see providers/codex_cli.py).
     run_sparring.add_argument(

@@ -40,6 +40,16 @@ class ProjectConfig:
     sparring_agent_provider: str | None = None
     default_sparring_mode: str | None = None
     stage_self_check: bool = False
+    # Optional per-role provider turn settings. ``None`` means the field was
+    # not configured, which is not the same as a default: the engine then
+    # passes no flag and the provider CLI does whatever it normally does.
+    # Whether a given value is meaningful for the resolved provider is not
+    # decided here -- the effective provider may come from a command-line
+    # override -- but by agent_config.resolve_role_config.
+    stage_agent_model: str | None = None
+    stage_agent_effort: str | None = None
+    sparring_agent_model: str | None = None
+    sparring_agent_effort: str | None = None
 
     def command(self, name: str) -> str | None:
         """Return a configured project command by name, if any."""
@@ -89,6 +99,25 @@ def _optional_table(
     return value
 
 
+# The complete schema of an [agents.<role>] table. Kept closed on purpose:
+# a misspelled key here (``efort``, ``reasoning``) would otherwise be
+# silently ignored and the run would quietly use the provider default,
+# which is precisely the "engine claims support it does not have" failure
+# this configuration is meant to avoid.
+_AGENT_ROLE_KEYS: frozenset[str] = frozenset({"provider", "model", "effort"})
+
+
+def _reject_unknown_agent_keys(table: Mapping[str, Any], *, where: str) -> None:
+    unknown = sorted(set(table) - _AGENT_ROLE_KEYS)
+    if not unknown:
+        return
+    known = ", ".join(sorted(_AGENT_ROLE_KEYS))
+    raise ProjectConfigError(
+        f"{where} has unknown field(s) {', '.join(repr(key) for key in unknown)}; "
+        f"supported fields: {known}"
+    )
+
+
 def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> ProjectConfig:
     """Parse project.toml content into a :class:`ProjectConfig`.
 
@@ -122,12 +151,16 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
     sparring_agents = _optional_table(
         agents_table, "sparring", where=f"{source} [agents]"
     )
-    stage_provider = _optional_str(
-        stage_agents, "provider", where=f"{source} [agents.stage]"
-    )
-    sparring_provider = _optional_str(
-        sparring_agents, "provider", where=f"{source} [agents.sparring]"
-    )
+    stage_where = f"{source} [agents.stage]"
+    sparring_where = f"{source} [agents.sparring]"
+    _reject_unknown_agent_keys(stage_agents, where=stage_where)
+    _reject_unknown_agent_keys(sparring_agents, where=sparring_where)
+    stage_provider = _optional_str(stage_agents, "provider", where=stage_where)
+    sparring_provider = _optional_str(sparring_agents, "provider", where=sparring_where)
+    stage_model = _optional_str(stage_agents, "model", where=stage_where)
+    stage_effort = _optional_str(stage_agents, "effort", where=stage_where)
+    sparring_model = _optional_str(sparring_agents, "model", where=sparring_where)
+    sparring_effort = _optional_str(sparring_agents, "effort", where=sparring_where)
 
     sparring_table = _optional_table(table, "sparring", where=source)
     default_mode = _optional_str(
@@ -145,6 +178,10 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
         sparring_agent_provider=sparring_provider,
         default_sparring_mode=default_mode,
         stage_self_check=self_check if self_check is not None else False,
+        stage_agent_model=stage_model,
+        stage_agent_effort=stage_effort,
+        sparring_agent_model=sparring_model,
+        sparring_agent_effort=sparring_effort,
     )
 
 

@@ -49,6 +49,79 @@ provider = "codex-cli"
 self_check = false
 ```
 
+`sparring init-config` writes exactly that file for you (it never overwrites
+an existing one), so the template lives in the engine and nothing else has to
+keep a copy of the schema.
+
+### Choosing a model and an effort level
+
+Each role may also pin the model and the reasoning/effort level its provider
+runs at:
+
+```toml
+[agents.stage]
+provider = "claude-cli"
+model = "opus"
+effort = "high"
+
+[agents.sparring]
+provider = "codex-cli"
+model = "gpt-5.6-terra"
+effort = "xhigh"
+```
+
+Both fields are optional, and **leaving one out is not the same as writing a
+default into it**. An omitted `model` or `effort` means the engine passes no
+flag at all and the provider CLI does whatever it normally does; the engine
+never guesses which model that turns out to be.
+
+`effort` is deliberately not a single engine-wide vocabulary. Each provider
+is validated against what its own CLI accepts:
+
+| Provider | Model flag | Effort | Accepted levels |
+| --- | --- | --- | --- |
+| `claude-cli` | `--model` | `--effort` | `low`, `medium`, `high`, `xhigh`, `max` |
+| `codex-cli` | `--model` | `-c model_reasoning_effort=…` | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
+
+A level the resolved provider does not accept is a configuration error raised
+before any provider process starts, rather than something translated into
+"the nearest equivalent". This matters concretely for `claude-cli`: given an
+unknown `--effort`, the CLI *warns and runs the turn anyway* at its default
+effort, so a typo would otherwise buy a full-price turn at a level nobody
+chose. Model names are not enumerated — both CLIs accept free-form names and
+aliases, and gain new ones without an engine release.
+
+Every command takes overrides, and the precedence is the same everywhere:
+
+```text
+explicit CLI flag  >  .sparring/project.toml  >  the provider's own default
+```
+
+`run-stage` and `run-sparring` take `--model` / `--effort`; `run-loop`,
+`run-plan` and `resume-plan` take `--stage-model` / `--stage-effort` and
+`--sparring-model` / `--sparring-effort`. The independent reviewer is the
+sparring role, so it uses `[agents.sparring]`.
+
+Configuration is resolved when a provider turn is launched, and re-read for
+each stage of a plan run. Editing `project.toml` therefore affects the *next*
+turn; it never reconfigures or restarts a provider process already running,
+and it does not disturb session resume — the session id belongs to the
+provider and is recorded in stage state, not on an adapter object.
+
+To see what a turn would actually run with, and where each value came from:
+
+```sh
+sparring show-config            # human-readable
+sparring show-config --json     # the same answer, machine-readable
+```
+
+The JSON form reports `provider`, `model`, `effort` and a `*_source` for each
+(`cli`, `project`, `engine-default` or `provider-default`) per role, plus the
+path of the `project.toml` it read. It reports configuration only — never
+environment variables or credentials. This is how the VS Code extension shows
+the effective configuration, so that "this provider plus this file plus an
+omitted model means X" is answered in one place.
+
 `PROJECT.md` is prose the workflow never interprets: stack, directory map,
 test and build commands, conventions, product invariants, device/manual
 checks, and — worth the effort — the **current baseline test results**. Verify
@@ -679,7 +752,7 @@ itself, which is an ordinary repository file.
 | --- | --- | --- | --- | --- |
 | the plan document (`docs/plans/.../<plan>.md`) | human / repository | no | immutable for the lifetime of a managed run | the run's execution definition |
 | `PROJECT.md` | human / repository | no | edited between runs by a person | project context embedded in every prompt |
-| `project.toml` | human / repository | no | edited between runs by a person | provider selection and engine configuration |
+| `project.toml` | human / repository | no | edited between runs by a person | provider, model and effort selection, and engine configuration |
 | `plans/<run>.json` | engine | no | rewritten on every position/status change | the run's position, expected branch, plan digest, recorded push authorization and typed pause |
 | `stages/<stage>/brief.md` | engine (a person, for a hand-written stage) | no | generated from the plan section, or hand-written before execution; then immutable | what the stage is reviewed against — the plan section verbatim in a managed run |
 | `stages/<stage>/notes.md` | engine (and a person editing by hand) | no | skeleton at creation, then appended to by section | a human's recorded answer or check results (`## Human evidence`) |
