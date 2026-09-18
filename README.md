@@ -210,3 +210,47 @@ After `ESCALATE`, spar the stage elsewhere with the printed handoff/packet
 commands, then either accept it by hand (`freeze-candidate`,
 `accept-candidate`) and `resume-plan` — an already-accepted current stage is
 advanced past — or `resume-plan --evidence` with the external verdict.
+
+## Who owns which artifact
+
+Every file a run reads or writes has exactly one authority. Paths are
+relative to the project's `.sparring/` directory, except the plan document
+itself, which is an ordinary repository file.
+
+| Artifact | Owner | Provider-writable? | Lifetime | Purpose |
+| --- | --- | --- | --- | --- |
+| the plan document (`docs/plans/.../<plan>.md`) | human / repository | no | immutable for the lifetime of a managed run | the run's execution definition |
+| `PROJECT.md` | human / repository | no | edited between runs by a person | project context embedded in every prompt |
+| `project.toml` | human / repository | no | edited between runs by a person | provider selection and engine configuration |
+| `plans/<run>.json` | engine | no | rewritten on every position/status change | the run's position, expected branch and plan digest |
+| `stages/<stage>/brief.md` | engine | no | written once at stage creation, then immutable | the plan section verbatim — what the stage is reviewed against |
+| `stages/<stage>/notes.md` | engine (and a person editing by hand) | no | skeleton at creation, then appended to by section | a human's recorded answer or check results (`## Human evidence`) |
+| `stages/<stage>/handoff.md` | engine | no | regenerated in full by every implementation turn | that turn's claims, git identity and evidence, for the sparrer |
+| `stages/<stage>/sparring.md` | engine | no | rewritten in full by every sparring exchange | the latest verdict, rendered from the structured routing result |
+| `stages/<stage>/state.json` | engine | no | rewritten on every lifecycle change | status, candidate identity, provider session ids |
+| `stages/<stage>/activity.jsonl` | engine | no | append-only, never read by orchestration | observational telemetry only |
+
+**No artifact is provider-writable, including `notes.md`.** Despite its
+`## Implementation notes` template heading, nothing asks a provider to open
+it: an implementation turn's claims, evidence and deferred checks reach the
+sparrer because the engine captures that turn's *result* into `handoff.md`,
+and a human's answer reaches both agents because `resume-plan --evidence`
+records it under `## Human evidence`. A provider's designated output is its
+own reply, which the engine records; the files are how the engine keeps it.
+`src/agent_sparring/artifact_ownership.py` is the single declaration of this
+table, and it is also where the sentence the providers are told it in lives,
+so the prompts and this table cannot drift apart.
+
+**The plan is immutable while a run executes.** The engine digests the plan's
+stage sections at run start and re-reads the document and re-checks that
+digest on resume, before accepting a candidate, and before advancing. An
+edited plan therefore stops the run rather than becoming its new definition,
+and so does a plan that can no longer be parsed as the one it started as —
+appending an `# Implementation record` whose own `## Stage 1` heading follows
+the plan's `Stage 1..3` is exactly that case. Nothing is ever reverted for
+you: restore the document, or deliberately start the run over.
+
+A consuming project's agent instructions may well tell agents to keep the
+active plan updated with their progress, which is right everywhere except
+inside a managed run — so the restriction travels with the managed prompt
+rather than depending on the project's own wording.

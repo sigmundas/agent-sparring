@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent_sparring.artifact_ownership import ROLE_SPARRER, ownership_section
 from agent_sparring.config import load_project_markdown
 from agent_sparring.stage import Stage, StageError
 
@@ -133,6 +134,12 @@ def build_sparring_prompt(
     project_context = load_project_markdown(sparring_dir)
     if project_context and project_context.strip():
         parts += ["", "## Project context", "", project_context.strip()]
+
+    # The same read-only artifact contract the implementation agent gets.
+    # A sparrer's read-only sandbox is enforced where the provider supports
+    # one, but the instruction is not redundant: it says which files are
+    # engine-owned, which is something no sandbox communicates.
+    parts += ["", *ownership_section(ROLE_SPARRER)]
 
     try:
         handoff_text = stage.read_handoff().strip()
