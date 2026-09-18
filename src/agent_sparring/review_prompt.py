@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent_sparring.artifact_ownership import ROLE_SPARRER, ownership_section
 from agent_sparring.config import CONTEXT_FILENAME, load_project_markdown
 from agent_sparring.handoff import human_evidence_section
 from agent_sparring.prompt_sections import (
@@ -249,6 +250,17 @@ def assemble_review_prompt(
                 source=CONTEXT_FILENAME,
             )
         )
+
+    # The same artifact contract both other agents get. An independent
+    # reviewer is the agent this matters most to: it is asked to read the
+    # plan and the accepted stages, and a project's own instructions may well
+    # tell it to record its findings in that plan. The sparrer's wording is
+    # the right one for it -- it says a structured verdict belongs in the
+    # result this prompt asks for and nowhere else, which is exactly this
+    # turn's output -- so no second version of the contract is invented here.
+    # (artifact_ownership.py has no reviewer role of its own; adding one is
+    # that module's call, not this one's.)
+    parts.append(section("Agent Sparring artifacts", ownership_section(ROLE_SPARRER)))
 
     parts.append(
         section(

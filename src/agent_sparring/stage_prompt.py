@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent_sparring.artifact_ownership import ownership_section
 from agent_sparring.config import CONTEXT_FILENAME, load_project_markdown
 from agent_sparring.handoff import human_evidence_section
 from agent_sparring.prompt_sections import (
@@ -152,6 +153,17 @@ def assemble_stage_prompt(
                 source=CONTEXT_FILENAME,
             )
         )
+
+    # Before any of the turn's own instructions, and on every turn kind:
+    # the project's own agent instructions may well tell an agent to record
+    # its progress in the active plan, and this is the only party that knows
+    # the plan is currently a run's execution definition. See
+    # :mod:`agent_sparring.artifact_ownership`.
+    #
+    # Assembled as its own engine-authored section (no ``source``), like
+    # every other block here, so the prompt inspector shows it by name and
+    # attributes it to this engine rather than to a file on disk.
+    parts.append(section("Agent Sparring artifacts", ownership_section(ROLE_STAGE)))
 
     if resume:
         try:

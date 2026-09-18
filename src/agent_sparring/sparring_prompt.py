@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent_sparring.artifact_ownership import ownership_section
 from agent_sparring.config import CONTEXT_FILENAME, load_project_markdown
 from agent_sparring.handoff import human_evidence_section
 from agent_sparring.prompt_sections import (
@@ -242,6 +243,12 @@ def assemble_sparring_prompt(
                 source=CONTEXT_FILENAME,
             )
         )
+
+    # The same read-only artifact contract the implementation agent gets.
+    # A sparrer's read-only sandbox is enforced where the provider supports
+    # one, but the instruction is not redundant: it says which files are
+    # engine-owned, which is something no sandbox communicates.
+    parts.append(section("Agent Sparring artifacts", ownership_section(ROLE_SPARRER)))
 
     try:
         handoff_text = stage.read_handoff().strip()

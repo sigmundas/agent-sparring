@@ -580,9 +580,30 @@ def _verify_source_unchanged(source: PlanSource, state: PlanRunState) -> tuple[P
     """Re-read the plan input from disk and require its digest to equal the
     one recorded when the run started. The one check used on resume, before
     accepting a READY stage, and before advancing -- so execution content
-    edited (even committed) mid-run is caught, not executed."""
+    edited (even committed) mid-run is caught, not executed.
 
-    fresh = source.reload()
+    A plan input that can no longer be *read* at all is the same finding and
+    is reported as such: both failures raise :class:`PlanError`, so a caller
+    has one exception type to handle.
+    """
+
+    try:
+        fresh = source.reload()
+    except (PlanError, ManifestError) as exc:
+        # The input on disk can no longer be read as the thing this run
+        # started against. That is the same fact as a digest mismatch -- the
+        # run's execution content changed -- but it arrives as a parse error,
+        # which on its own reads like a malformed document rather than like a
+        # run whose definition was edited underneath it. Appending an
+        # implementation record whose own '## Stage 1' heading follows the
+        # plan's 'Stage 1..7' is exactly this case, so say which situation the
+        # reader is in before handing over the parser's detail.
+        raise PlanError(
+            f"{state.plan} can no longer be read as the plan this run started against "
+            f"({exc}); a managed run's plan must not be edited while it is running. "
+            "Restore it as it was, or deliberately start over (see run-plan's refusal "
+            "message for what to remove)."
+        ) from exc
     if fresh.digest() != state.plan_digest:
         raise PlanError(
             f"the executable content of {state.plan} has changed since this run started; "
@@ -924,7 +945,10 @@ def resume_plan(
     longer matches the digest recorded at start.
     """
 
-    source = _coerce_source(plan, repo_root)
+    try:
+        source = _coerce_source(plan, repo_root)
+    except (PlanError, ManifestError) as exc:
+        raise _unreadable_resume_input(plan, repo_root, sparring_dir, exc) from exc
     label = source.label
     state_path = plan_state_path(sparring_dir, label)
     if not state_path.is_file():
@@ -1170,6 +1194,42 @@ def _resuming_authorized_push(
     except GitContextError:
         return None
     return awaiting if head == awaiting.candidate_sha else None
+
+
+def _unreadable_resume_input(
+    plan: "Path | str | PlanSource",
+    repo_root: Path,
+    sparring_dir: Path,
+    exc: Exception,
+) -> PlanError:
+    """The refusal for a resume whose plan input can no longer be read.
+
+    A resume reads its input *before* it reads the run state, so a plan that
+    no longer parses fails here rather than at the digest check -- and a bare
+    parser error reads like a malformed document instead of like a run whose
+    definition was edited underneath it. Appending an implementation record
+    whose own ``## Stage 1`` heading follows the plan's ``Stage 1..N`` is
+    exactly that case.
+
+    Said only when a run for that plan is actually recorded, which is what
+    makes the claim true: without one there is no run it "started against",
+    and the parser's own error is the whole of the finding. The label is
+    derived from the path rather than from the file's content, so it survives
+    the content being unreadable; a manifest, whose label lives *inside* the
+    file, cannot be identified that way and keeps the plain error.
+    """
+
+    if not isinstance(plan, (str, Path)):
+        return exc if isinstance(exc, PlanError) else PlanError(str(exc))
+    label = plan_label(Path(plan), Path(repo_root))
+    if not plan_state_path(sparring_dir, label).is_file():
+        return exc if isinstance(exc, PlanError) else PlanError(str(exc))
+    return PlanError(
+        f"{label} can no longer be read as the plan this run started against ({exc}); "
+        "a managed run's plan must not be edited while it is running. Restore it as it "
+        "was, or deliberately start over (see run-plan's refusal message for what to "
+        "remove)."
+    )
 
 
 def record_human_evidence(stage: Stage, evidence: str) -> None:
