@@ -94,6 +94,21 @@ there is a real candidate and it holds the work the human actually
 verified. See that module's "Finalization" section; nothing about the gate
 here is relaxed for it.
 
+Pushing a verified candidate
+----------------------------
+
+The acceptance gate only freezes a commit that is already reachable from its
+intended remote branch, and that has always been the rule. What used to
+happen when it was not -- the reviewer said READY over a committed but
+unpushed candidate, the gate refused, and nothing in the workflow could get
+past it -- is now a typed stop: :mod:`agent_sparring.push_gate` reports that
+this exact candidate needs a person's permission to be pushed, the run pauses
+with that recorded in its state, and a resume carrying the permission pushes
+exactly that commit, re-proves reachability, and then runs the same
+unchanged gate. Permission can cover one candidate or every later verified
+candidate of this run; without it nothing is ever pushed. See that module for
+the two scopes, what the push is allowed to be, and what it is not.
+
 Adapters are built per planned stage
 ------------------------------------
 
@@ -136,7 +151,7 @@ from agent_sparring.acceptance import (
 )
 from agent_sparring.activity import ActivityEmitter
 from agent_sparring.finalization import FinalizationError, pending_finalization
-from agent_sparring.git_context import GitContextError, is_ignored
+from agent_sparring.git_context import GitContextError, is_ignored, resolve_commit
 from agent_sparring.loop import (
     DEFAULT_MAX_SEND_BACK_CYCLES,
     LoopError,
@@ -144,6 +159,14 @@ from agent_sparring.loop import (
 )
 from agent_sparring.manifest import ManifestError, ManifestPlanSource, load_manifest_source
 from agent_sparring.plan_model import PlanSource, PlannedStage, digest_planned_stages
+from agent_sparring.push_gate import (
+    PushAuthorization,
+    PushError,
+    PushRequired,
+    authorization_for_candidate,
+    authorization_for_run,
+    ensure_candidate_pushed,
+)
 from agent_sparring.providers import SparringAgentAdapter, StageAgentAdapter
 from agent_sparring.review import (
     ReviewError,
@@ -366,15 +389,33 @@ class PlanRunState:
     #: ``"markdown"`` then; a resume with a different kind is refused, since
     #: the two describe different execution content for the same plan.
     source: str = "markdown"
+    #: What a person has allowed this run to push, and for exactly what (see
+    #: :mod:`agent_sparring.push_gate`). ``None`` -- including for every run
+    #: recorded before push authorization existed -- means no authorization:
+    #: a verified candidate that is not on its intended remote branch stops
+    #: the run and asks.
+    push_authorization: PushAuthorization | None = None
+    #: Why this run is stopped, when the reason is a typed one the runner
+    #: itself recorded rather than a reviewer's verdict. Today that is only
+    #: :class:`~agent_sparring.push_gate.PushRequired`. Cleared whenever the
+    #: run enters a stage for execution, so it can never describe an older
+    #: pause than the one the run is actually in.
+    awaiting: PushRequired | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["status"] = self.status.value
+        payload["push_authorization"] = (
+            self.push_authorization.to_dict() if self.push_authorization is not None else None
+        )
+        payload["awaiting"] = self.awaiting.to_dict() if self.awaiting is not None else None
         return payload
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PlanRunState":
         try:
+            authorization = payload.get("push_authorization")
+            awaiting = payload.get("awaiting")
             return cls(
                 plan=str(payload["plan"]),
                 plan_digest=str(payload["plan_digest"]),
@@ -383,7 +424,13 @@ class PlanRunState:
                 current_stage=str(payload["current_stage"]),
                 status=PlanRunStatus(str(payload["status"])),
                 source=str(payload.get("source", "markdown")),
+                push_authorization=(
+                    PushAuthorization.from_dict(authorization) if authorization else None
+                ),
+                awaiting=PushRequired.from_dict(awaiting) if awaiting else None,
             )
+        except PushError as exc:
+            raise PlanError(f"malformed plan-run state: {exc}") from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
 
@@ -521,6 +568,12 @@ class PlanRunResult:
     #: *already on disk* rather than one it produced -- see
     #: :func:`_recorded_pause`. The two are never both set.
     recorded: RecordedOutcome | None = None
+    #: Set instead of either when the run stopped on a typed reason of its
+    #: own rather than on a reviewer's verdict: a verified candidate that
+    #: needs push authorization (see :mod:`agent_sparring.push_gate`). The
+    #: reviewer said READY; what is missing is a person's permission, not a
+    #: review outcome, so this is not dressed up as one.
+    awaiting: PushRequired | None = None
 
 
 def _verify_source_unchanged(source: PlanSource, state: PlanRunState) -> tuple[PlannedStage, ...]:
@@ -591,6 +644,7 @@ def start_plan(
     *,
     expected_branch: str,
     adopt: bool = False,
+    allow_push_for_run: bool = False,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
     stop_after_stage: str | None = None,
@@ -604,6 +658,12 @@ def start_plan(
     ``make_adapters`` (an :data:`AdapterFactory`) is called once per stage
     entered for execution, with that stage, and returns the stage and
     sparring adapters to drive it with.
+
+    ``allow_push_for_run`` records, as part of creating the run, that this
+    run may push the verified candidates it produces to their intended remote
+    branch (see :mod:`agent_sparring.push_gate`). Without it the run has no
+    push authorization at all and stops the first time a verified candidate
+    is not already on the remote.
 
     ``adopt`` opts in to running a plan whose stages *already exist* on disk
     -- the migration case, where a sequence was driven stage by stage before
@@ -662,6 +722,14 @@ def start_plan(
         status=PlanRunStatus.RUNNING,
         source=source.kind,
     )
+    if allow_push_for_run:
+        try:
+            state.push_authorization = authorization_for_run(
+                Path(repo_root), branch=expected_branch
+            )
+        except PushError as exc:
+            raise PlanError(str(exc)) from exc
+        report(f"push authorization recorded for this run: {state.push_authorization.describe}")
     state.save(state_path)
     report(
         f"{describe_source(source)}: {len(stages)} stage(s) from {source.kind}; "
@@ -792,6 +860,8 @@ def resume_plan(
     *,
     expected_branch: str,
     evidence: str | None = None,
+    allow_push_candidate: str | None = None,
+    allow_push_for_run: bool = False,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
     stop_after_stage: str | None = None,
@@ -821,6 +891,18 @@ def resume_plan(
     SEND_BACK there is real work and the ordinary loop takes over from the
     stage agent. A stage with no implementation session yet has no candidate
     to spar, so it starts normally.
+
+    ``allow_push_candidate`` is a person allowing this run to push *exactly*
+    that commit, and it is refused unless the run is in fact stopped waiting
+    for permission to push exactly that commit (see
+    :mod:`agent_sparring.push_gate`). That refusal is the point: a stale
+    surface offering the permission it was rendered from cannot authorize a
+    candidate the run has since replaced. ``allow_push_for_run`` records the
+    wider permission -- the verified candidates this run produces from now on
+    -- and the two combine, so a person can allow the candidate in front of
+    them and stop being asked in the same action. Either one is recorded in
+    the run's own state before anything runs, so it survives a reload and a
+    later resume; neither is ever inferred from evidence text.
 
     A current stage that is already ACCEPTED (by hand, after an ESCALATE
     sparred elsewhere, or by a run that stopped between accept and advance)
@@ -869,6 +951,14 @@ def resume_plan(
             f"{len(stages)} stage(s)"
         )
     _require_state_ignored(repo_root, state_path)
+    _grant_push_authorization(
+        state,
+        state_path,
+        Path(repo_root),
+        allow_push_candidate=allow_push_candidate,
+        allow_push_for_run=allow_push_for_run,
+        report=report,
+    )
 
     sparrer_first = False
     if evidence is not None and evidence.strip():
@@ -921,6 +1011,165 @@ def resume_plan(
         sparrer_first=sparrer_first,
         stop_after_stage=stop_after_stage,
     )
+
+
+def _grant_push_authorization(
+    state: PlanRunState,
+    state_path: Path,
+    repo_root: Path,
+    *,
+    allow_push_candidate: str | None,
+    allow_push_for_run: bool,
+    report: Reporter,
+) -> None:
+    """Record what a person just allowed this run to push, or refuse.
+
+    A one-candidate permission is checked against the run's own recorded
+    reason for being stopped, and against nothing else. Three refusals, all
+    before anything runs:
+
+    - the run is not waiting for push permission at all (so there is no
+      candidate this could be about);
+    - it is waiting for a *different* commit -- the surface the person acted
+      on was showing a candidate this run has replaced;
+    - the sha is not a full commit id, so what was authorized is ambiguous.
+
+    A run-scoped permission needs no pending request: it is a person saying
+    "don't ask me again for this run", which is a decision about the run
+    rather than about one commit. Both are written to the run state
+    immediately, so the permission is durable even if this call then fails
+    for an unrelated reason.
+    """
+
+    if not allow_push_candidate and not allow_push_for_run:
+        return
+
+    awaiting = state.awaiting
+    if allow_push_candidate:
+        wanted = allow_push_candidate.strip().lower()
+        if awaiting is None:
+            raise PlanError(
+                f"plan run for {state.plan} is not waiting for permission to push a "
+                "candidate, so there is nothing to authorize for one"
+            )
+        if awaiting.candidate_sha.lower() != wanted:
+            raise PlanError(
+                f"plan run for {state.plan} is waiting for permission to push "
+                f"{awaiting.candidate_sha} of stage {awaiting.stage_id!r}, not "
+                f"{allow_push_candidate}; refusing to authorize a commit this run is not "
+                "waiting on"
+            )
+
+    granted: PushAuthorization
+    try:
+        if not allow_push_for_run and awaiting is not None:
+            granted = authorization_for_candidate(
+                repo_root,
+                stage_id=awaiting.stage_id,
+                candidate_sha=awaiting.candidate_sha,
+                branch=state.expected_branch,
+            )
+        else:
+            granted = authorization_for_run(repo_root, branch=state.expected_branch)
+    except PushError as exc:
+        raise PlanError(str(exc)) from exc
+
+    state.push_authorization = granted
+    state.save(state_path)
+    report(f"push authorization recorded: {granted.describe}")
+
+
+def _ensure_candidate_pushed(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    repo_root: Path,
+    stage: Stage,
+    *,
+    report: Reporter,
+) -> PushRequired | None:
+    """Put the verified candidate where the acceptance gate requires it, or
+    say that a person has to allow that first.
+
+    Returns the typed request when the run must stop for permission -- the
+    run is already paused and the request recorded by the time it returns.
+    Returns ``None`` when nothing was needed or the push succeeded and
+    reachability was re-proven; a failure of either raises
+    :class:`PlanRunError` with the run paused and the stage unaccepted.
+    """
+
+    try:
+        outcome = ensure_candidate_pushed(
+            repo_root,
+            stage_id=stage.stage_id,
+            expected_branch=state.expected_branch,
+            authorization=state.push_authorization,
+        )
+    except PushError as exc:
+        raise _fail(
+            state,
+            state_path,
+            activity,
+            why="push failed",
+            message=(
+                f"plan {state.plan} stopped at stage {stage.stage_id!r}: the reviewer said "
+                f"READY but the candidate could not be put on its intended remote branch "
+                f"({exc}); nothing was accepted"
+            ),
+        ) from exc
+
+    if outcome.required is not None:
+        state.awaiting = outcome.required
+        _pause(state, state_path)
+        activity.emit("plan.paused", summary="push authorization required")
+        report(
+            f"stage {stage.stage_id}: {outcome.required.describe}. The plan is paused until "
+            "you allow that push; nothing was pushed and nothing was accepted."
+        )
+        return outcome.required
+
+    state.awaiting = None
+    if outcome.pushed:
+        activity.emit("plan.candidate.pushed", sha=outcome.target.candidate_sha)
+        report(
+            f"stage {stage.stage_id}: pushed the verified candidate "
+            f"{outcome.target.candidate_sha} to {outcome.target.remote}/"
+            f"{outcome.target.remote_branch} as authorized ({outcome.detail})"
+        )
+    return None
+
+
+def _resuming_authorized_push(
+    repo_root: Path, stage: Stage, awaiting: PushRequired | None
+) -> PushRequired | None:
+    """Is this stage the one the run stopped on for push permission, still at
+    the same commit?
+
+    When it is, there is nothing left for either agent to do: the reviewer's
+    READY is on disk, the candidate is that exact commit, and the only step
+    between it and the acceptance gate is the push the person has now allowed.
+    Entering at the stage agent would spend an unbounded implementation turn
+    on work that is already verified and would move the very commit that was
+    authorized; entering at the sparrer would re-derive a verdict already
+    recorded.
+
+    Anything that does not line up exactly -- another stage, a verdict that
+    is not READY or cannot be read, a ``HEAD`` that has moved since the run
+    stopped -- yields ``None``, and the stage is entered the ordinary way.
+    """
+
+    if awaiting is None:
+        return None
+    if awaiting.stage_id != stage.stage_id:
+        return None
+    outcome = read_recorded_outcome(stage)
+    if outcome is None or outcome.action is not RoutingAction.READY:
+        return None
+    try:
+        head = resolve_commit(repo_root, "HEAD", label="HEAD")
+    except GitContextError:
+        return None
+    return awaiting if head == awaiting.candidate_sha else None
 
 
 def record_human_evidence(stage: Stage, evidence: str) -> None:
@@ -1330,6 +1579,10 @@ def _drive(
     total = len(stages)
     accepted: list[tuple[str, str]] = []
     stop_index = _stop_index(stages, stop_after_stage)
+    # The typed reason this run was stopped, if it was. Consumed by the first
+    # stage entered, exactly like ``sparrer_first``: it is a fact about where
+    # the run stopped, not about every stage that follows.
+    pending_push = state.awaiting
     # Only for the observational plan.paused event: the run state, not this,
     # is the authority for where a stopped run is positioned.
     last_activity: ActivityEmitter | None = None
@@ -1421,6 +1674,10 @@ def _drive(
                     accepted=tuple(accepted),
                 )
             state.status = PlanRunStatus.RUNNING
+            # A recorded typed stop describes the pause this run is leaving,
+            # never the one it might reach next; it is cleared on entry so it
+            # can only ever be re-recorded by the step that means it.
+            state.awaiting = None
             state.save(state_path)
             # The declared cross-repository candidate set belongs to the
             # stage, so the acceptance gate finds it wherever it is invoked
@@ -1513,101 +1770,139 @@ def _drive(
                 activity.emit("plan.stage.accepted", sha=result.candidate_sha)
 
             else:
-                if sparrer_first:
-                    start_with = "sparring"
-                    sparrer_first = False  # only the stage this resume entered
-                elif _awaiting_finalization(state, state_path, activity, repo_root, stage):
-                    # Stopped between the reviewer's READY and the commit that
-                    # acceptance can freeze -- where a run that predates the
-                    # finalization cycle was left, and where any process killed
-                    # between those two points stops.
-                    start_with = "finalization"
-                else:
-                    start_with = "stage"
-                entering = {
-                    "sparring": "; sparring first",
-                    "finalization": "; finalizing the reviewed candidate",
-                    "stage": "",
-                }[start_with]
-                activity.emit(
-                    "plan.stage.entered",
-                    summary=f"{plan_stage.display} ({position}){entering}",
-                )
-                report(
-                    f"stage {position} {stage.stage_id}: "
-                    + {
-                        "sparring": "resuming the sparrer against the unchanged candidate",
-                        "finalization": (
-                            "the sparrer already said READY and the reviewed candidate is not "
-                            "committed; committing and pushing exactly that work, then "
-                            "reviewing the commit"
-                        ),
-                        "stage": "running the implementation <-> sparring loop",
-                    }[start_with]
-                )
-                # Adapters are built for THIS stage, so a caller can bind their
-                # provider telemetry to this stage's activity.jsonl. Session
-                # continuity comes from state.json's recorded ids, which
-                # run_stage_agent/run_sparring_agent pass to resume(); it does
-                # not depend on the adapter objects from an earlier stage or an
-                # earlier process.
-                try:
-                    stage_adapter, sparring_adapter = make_adapters(stage)
-                except Exception as exc:
-                    raise _fail(
-                        state,
-                        state_path,
-                        activity,
-                        why="adapter construction failed",
-                        message=(
-                            f"plan {state.plan} stopped at stage {stage.stage_id!r} before any "
-                            f"provider turn: could not build the provider adapters: {exc}"
-                        ),
-                    ) from exc
-                try:
-                    loop_result = run_unattended_loop(
-                        stage,
-                        sparring_dir,
-                        repo_root,
-                        stage_adapter,
-                        sparring_adapter,
-                        expected_branch=state.expected_branch,
-                        max_send_back_cycles=max_send_back_cycles,
-                        self_check=self_check,
-                        start_with=start_with,
+                # A run stopped for push permission, resumed with it, and
+                # still at the exact commit it stopped over, has nothing left
+                # for either agent: the READY is recorded, the candidate is
+                # that commit, and the only missing step is the push itself.
+                authorized_push = _resuming_authorized_push(repo_root, stage, pending_push)
+                pending_push = None  # only the stage this resume entered
+                if authorized_push is not None:
+                    # Both flags belong to the one stage this resume entered;
+                    # neither may leak into the next stage, whose
+                    # implementation turn must still run.
+                    sparrer_first = False
+                    activity.emit(
+                        "plan.stage.entered",
+                        summary=f"{plan_stage.display} ({position}); pushing the "
+                        "authorized candidate",
                     )
-                except LoopError as exc:
-                    raise _fail(
-                        state,
-                        state_path,
-                        activity,
-                        why="stage loop failed",
-                        message=(
-                            f"plan {state.plan} stopped at stage {stage.stage_id!r} (not accepted, "
-                            f"not advanced): {exc}"
-                        ),
-                    ) from exc
+                    report(
+                        f"stage {position} {stage.stage_id}: the reviewer already said READY "
+                        f"over {authorized_push.candidate_sha}; pushing exactly that commit "
+                        "as authorized and then running the acceptance gate. No agent runs."
+                    )
+                else:
+                    if sparrer_first:
+                        start_with = "sparring"
+                        sparrer_first = False  # only the stage this resume entered
+                    elif _awaiting_finalization(state, state_path, activity, repo_root, stage):
+                        # Stopped between the reviewer's READY and the commit that
+                        # acceptance can freeze -- where a run that predates the
+                        # finalization cycle was left, and where any process killed
+                        # between those two points stops.
+                        start_with = "finalization"
+                    else:
+                        start_with = "stage"
+                    entering = {
+                        "sparring": "; sparring first",
+                        "finalization": "; finalizing the reviewed candidate",
+                        "stage": "",
+                    }[start_with]
+                    activity.emit(
+                        "plan.stage.entered",
+                        summary=f"{plan_stage.display} ({position}){entering}",
+                    )
+                    report(
+                        f"stage {position} {stage.stage_id}: "
+                        + {
+                            "sparring": "resuming the sparrer against the unchanged candidate",
+                            "finalization": (
+                                "the sparrer already said READY and the reviewed candidate is "
+                                "not committed; committing and pushing exactly that work, then "
+                                "reviewing the commit"
+                            ),
+                            "stage": "running the implementation <-> sparring loop",
+                        }[start_with]
+                    )
+                    # Adapters are built for THIS stage, so a caller can bind their
+                    # provider telemetry to this stage's activity.jsonl. Session
+                    # continuity comes from state.json's recorded ids, which
+                    # run_stage_agent/run_sparring_agent pass to resume(); it does
+                    # not depend on the adapter objects from an earlier stage or an
+                    # earlier process.
+                    try:
+                        stage_adapter, sparring_adapter = make_adapters(stage)
+                    except Exception as exc:
+                        raise _fail(
+                            state,
+                            state_path,
+                            activity,
+                            why="adapter construction failed",
+                            message=(
+                                f"plan {state.plan} stopped at stage {stage.stage_id!r} before "
+                                f"any provider turn: could not build the provider adapters: "
+                                f"{exc}"
+                            ),
+                        ) from exc
+                    try:
+                        loop_result = run_unattended_loop(
+                            stage,
+                            sparring_dir,
+                            repo_root,
+                            stage_adapter,
+                            sparring_adapter,
+                            expected_branch=state.expected_branch,
+                            max_send_back_cycles=max_send_back_cycles,
+                            self_check=self_check,
+                            start_with=start_with,
+                        )
+                    except LoopError as exc:
+                        raise _fail(
+                            state,
+                            state_path,
+                            activity,
+                            why="stage loop failed",
+                            message=(
+                                f"plan {state.plan} stopped at stage {stage.stage_id!r} (not "
+                                f"accepted, not advanced): {exc}"
+                            ),
+                        ) from exc
 
-                if loop_result.outcome is not RoutingAction.READY:
-                    _pause(state, state_path)
-                    activity.emit("plan.paused", action=loop_result.outcome.value)
-                    report(f"stage {stage.stage_id}: {loop_result.outcome.value}; plan paused")
+                    if loop_result.outcome is not RoutingAction.READY:
+                        _pause(state, state_path)
+                        activity.emit("plan.paused", action=loop_result.outcome.value)
+                        report(
+                            f"stage {stage.stage_id}: {loop_result.outcome.value}; plan paused"
+                        )
+                        return PlanRunResult(
+                            status=PlanRunStatus.PAUSED,
+                            plan=state.plan,
+                            stage_id=stage.stage_id,
+                            routing=loop_result.routing,
+                            accepted=tuple(accepted),
+                        )
+
+                # READY: first make sure the reviewed plan the sparrer judged
+                # against is still the plan on disk -- an implementation turn
+                # could have edited and committed a stage section -- then put
+                # that exact commit where the gate requires it (only ever with
+                # a person's permission), and then invoke the existing hard
+                # gate. Any refusal stops the plan; nothing else is ever
+                # substituted.
+                _require_plan_unchanged(
+                    source, state, state_path, activity, before="accepting the candidate"
+                )
+                required = _ensure_candidate_pushed(
+                    state, state_path, activity, repo_root, stage, report=report
+                )
+                if required is not None:
                     return PlanRunResult(
                         status=PlanRunStatus.PAUSED,
                         plan=state.plan,
                         stage_id=stage.stage_id,
-                        routing=loop_result.routing,
+                        awaiting=required,
                         accepted=tuple(accepted),
                     )
-
-                # READY: first make sure the reviewed plan the sparrer judged
-                # against is still the plan on disk -- an implementation turn
-                # could have edited and committed a stage section -- then invoke
-                # the existing hard gate on the exact pushed SHA. Any refusal
-                # stops the plan; nothing else is ever substituted.
-                _require_plan_unchanged(
-                    source, state, state_path, activity, before="accepting the candidate"
-                )
                 try:
                     frozen = freeze_candidate(
                         stage, sparring_dir, repo_root, expected_branch=state.expected_branch

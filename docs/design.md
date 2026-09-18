@@ -527,6 +527,22 @@ digest of the stage sections, branch, current stage, status) under
 and the same stage resumes. Stage boundaries are a fixed heading convention,
 never inferred.
 
+One thing stands between a `READY` candidate and that gate, and it is a
+permission rather than a check: the gate requires the commit to be reachable
+from its intended remote ref, and a reviewed candidate is often not pushed,
+because the project's instructions forbid an agent from pushing unasked.
+`agent_sparring.push_gate` makes that a capability instead of an impasse. No
+authorization is the default; a verified candidate that is not on the remote
+pauses the run with a *typed* reason in the run state (`awaiting.kind =
+push_authorization_required`, with the exact commit, branch, remote and
+remote branch), which is what lets a consumer present a permission question
+instead of mining a reviewer's prose for one. A person's answer is recorded
+as data in the same state — bound to one candidate, or to the run — and
+survives a reload. An authorized push is one non-force, fully-qualified
+refspec of the run's own branch, built in one function; reachability is then
+re-proven and the gate itself runs unchanged. Nothing about acceptance is
+relaxed by any of it, and no sibling repository is ever pushed.
+
 The runner takes an adapter factory (`make_adapters(stage)`) rather than
 finished adapters and calls it once per stage it enters, so each planned
 stage's provider telemetry is bound to that stage's own `activity.jsonl`;

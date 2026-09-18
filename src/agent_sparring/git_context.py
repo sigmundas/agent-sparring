@@ -246,7 +246,17 @@ def dirty_paths(repo_root: Path) -> tuple[str, ...]:
     return tuple(paths)
 
 
-def _tracking_remote(repo_root: Path, branch: str) -> tuple[str, str]:
+def tracking_remote(repo_root: Path, branch: str) -> tuple[str, str]:
+    """The ``(remote, remote branch)`` ``branch`` is configured to track.
+
+    ``origin`` and ``branch``'s own name are the fallbacks, which is what
+    makes an unconfigured branch still have one *intended* remote ref rather
+    than none. Public because the remote ref this resolves is the identity an
+    authorized push is bound to (:mod:`agent_sparring.push_gate`), and the
+    push must target exactly the ref :func:`verify_pushed` then checks --
+    resolving it twice, in two places, is how they could disagree.
+    """
+
     remote = _run(repo_root, "config", "--get", f"branch.{branch}.remote").stdout.strip()
     merge_ref = _run(repo_root, "config", "--get", f"branch.{branch}.merge").stdout.strip()
     if not remote:
@@ -266,7 +276,7 @@ def verify_pushed(repo_root: Path, candidate_sha: str, branch: str) -> tuple[boo
     ``merge-base --is-ancestor``, rather than trusting any recorded flag.
     """
 
-    remote, remote_branch = _tracking_remote(repo_root, branch)
+    remote, remote_branch = tracking_remote(repo_root, branch)
     ref = f"refs/heads/{remote_branch}"
     result = _run(repo_root, "ls-remote", "--exit-code", remote, ref)
     if result.returncode != 0:

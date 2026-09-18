@@ -43,6 +43,7 @@ from agent_sparring.plan import (
     resume_plan,
     start_plan,
 )
+from agent_sparring.push_gate import PUSH_AUTHORIZATION_REQUIRED
 from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
     PROVIDER_ID as CLAUDE_PROVIDER_ID,
@@ -58,6 +59,16 @@ from agent_sparring.sparring_prompt import build_sparring_prompt
 from agent_sparring.stage import Stage, StageError, StageMode
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 from agent_sparring.stage_prompt import build_stage_prompt
+
+# Said the same way by run-plan and resume-plan, because it is the same
+# permission: one run's own branch, to the remote branch the acceptance gate
+# already checks, by ordinary non-force push, and nothing else.
+_ALLOW_RUN_HELP = (
+    "allow this run to push the verified candidates it produces to their intended remote "
+    "branch, so it does not stop to ask for each one. Bound to this run, this worktree, "
+    "this branch and that one remote branch; ordinary non-force push only, and no "
+    "acceptance check is relaxed by it. Default: no push authorization at all"
+)
 
 
 def _cmd_check_config(args: argparse.Namespace) -> int:
@@ -511,6 +522,10 @@ def _report_plan_result(
 
     stage = Stage.resolve(sparring_dir, result.stage_id)
 
+    if result.awaiting is not None:
+        _report_push_authorization_required(result, args, stage)
+        return
+
     # A PAUSED result usually carries either the verdict this run produced
     # or, when the stage was already stopped for a human before the run
     # reached it, the one that was already on disk. They print the same way.
@@ -578,6 +593,54 @@ def _report_plan_result(
     print(f"  {resume} --evidence '<what you found or decided>'")
 
 
+def _report_push_authorization_required(
+    result: PlanRunResult, args: argparse.Namespace, stage: Stage
+) -> None:
+    """A run stopped because a verified candidate needs a person's permission
+    to be pushed.
+
+    Reported as the permission question it is, not as a review outcome and
+    not as a failure: the reviewer already said READY, nothing is wrong with
+    the candidate, and the two commands below are the whole decision.
+    """
+
+    awaiting = result.awaiting
+    assert awaiting is not None  # the caller checked
+    resume = (
+        f"sparring resume-plan {_plan_input_args(args)} --repo-root {args.repo_root or '.'} "
+        f"--expected-branch {args.expected_branch}"
+    )
+    print(f"plan paused: {result.plan}")
+    print(f"stage: {result.stage_id} ({stage.directory})")
+    print(f"needs: {PUSH_AUTHORIZATION_REQUIRED}")
+    for stage_id, sha in result.accepted:
+        print(f"  accepted {stage_id} at {sha}")
+    print(f"candidate: {awaiting.candidate_sha}")
+    print(f"branch: {awaiting.branch}")
+    print(f"push to: {awaiting.remote}/{awaiting.remote_branch}")
+    if awaiting.detail:
+        print(f"why: {awaiting.detail}")
+    print()
+    print(
+        "The review is finished and this exact commit is what would be accepted. It is not "
+        "on the remote branch the acceptance gate checks, and nothing has allowed a push."
+    )
+    print()
+    print("Allow this one commit to be pushed, and continue:")
+    print(f"  {resume} --allow-push-candidate {awaiting.candidate_sha}")
+    print()
+    print("Or allow it and stop being asked again for this run:")
+    print(f"  {resume} --allow-push-candidate {awaiting.candidate_sha} --allow-push-for-run")
+    print()
+    print(
+        "Either way the push is an ordinary non-force push of "
+        f"{awaiting.branch} to {awaiting.remote}/{awaiting.remote_branch}, the engine "
+        "re-checks that the commit is really there, and the acceptance gate then runs "
+        "unchanged. Push it yourself instead if you prefer; resuming without either "
+        "option then accepts it as usual."
+    )
+
+
 def _plan_source(args: argparse.Namespace, repo_root: Path):
     """The plan input for run-plan / resume-plan: exactly one of the
     positional Markdown plan or ``--manifest``."""
@@ -625,11 +688,19 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
                 repo_root,
                 make_adapters,
                 evidence=args.evidence,
+                allow_push_candidate=args.allow_push_candidate,
+                allow_push_for_run=args.allow_push_for_run,
                 **common,
             )
         else:
             result = start_plan(
-                source, sparring_dir, repo_root, make_adapters, adopt=args.adopt, **common
+                source,
+                sparring_dir,
+                repo_root,
+                make_adapters,
+                adopt=args.adopt,
+                allow_push_for_run=args.allow_push_for_run,
+                **common,
             )
     except (
         PlanError,
@@ -1073,6 +1144,7 @@ def build_parser() -> argparse.ArgumentParser:
         repo_root_help,
         branch_help="the feature branch every stage of this plan must modify; required",
     )
+    run_plan.add_argument("--allow-push-for-run", action="store_true", help=_ALLOW_RUN_HELP)
     run_plan.add_argument(
         "--stop-after-stage",
         default=None,
@@ -1084,7 +1156,7 @@ def build_parser() -> argparse.ArgumentParser:
             "at a time without giving up its position, digest and acceptance handling"
         ),
     )
-    run_plan.set_defaults(func=_cmd_run_plan)
+    run_plan.set_defaults(func=_cmd_run_plan, allow_push_candidate=None)
 
     resume_plan_parser = subparsers.add_parser(
         "resume-plan",
@@ -1116,6 +1188,22 @@ def build_parser() -> argparse.ArgumentParser:
             "'## Human evidence', after which the SPARRER resumes against the unchanged "
             "candidate (the stage agent is not started to deliver an answer)"
         ),
+    )
+    resume_plan_parser.add_argument(
+        "--allow-push-candidate",
+        default=None,
+        metavar="SHA",
+        help=(
+            "allow this run to push exactly this commit to its intended remote branch, so "
+            "the acceptance gate can freeze it. Refused unless the run is in fact stopped "
+            "waiting for permission to push that exact commit, which is what stops a stale "
+            "surface authorizing a candidate the run has since replaced. Ordinary non-force "
+            "push of the run's own branch only; it authorizes nothing else and it does not "
+            "relax any acceptance check"
+        ),
+    )
+    resume_plan_parser.add_argument(
+        "--allow-push-for-run", action="store_true", help=_ALLOW_RUN_HELP
     )
     resume_plan_parser.add_argument(
         "--stop-after-stage",

@@ -9,7 +9,7 @@ from unittest import mock
 
 import conftest_path  # noqa: F401
 
-from agent_sparring.acceptance import StaleCandidateError
+from agent_sparring.acceptance import AcceptanceError, StaleCandidateError
 from agent_sparring.cli import main
 from agent_sparring.plan import (
     PlanError,
@@ -492,11 +492,18 @@ class PlanRunTests(_PlanRepoTestCase):
         self.assertIs(self._stage(S2).read_state().status, StageStatus.ACCEPTED)
 
     def test_freeze_refusal_stops_the_plan_without_advancing(self):
-        stage_adapter = _StageAdapter(self.repo, commit=True, push=False)  # unpushed candidate
+        # A refusal from the freeze itself. The candidate reaching the gate
+        # unpushed is no longer one of those: it is a typed pause asking for
+        # push authorization (test_push_authorization.py), not a gate refusal.
+        stage_adapter = _StageAdapter(self.repo, commit=True)
         sparring_adapter = _SparringAdapter([READY, READY])
 
-        with self.assertRaises(PlanRunError) as ctx:
-            self._start(stage_adapter, sparring_adapter)
+        with mock.patch(
+            "agent_sparring.plan.freeze_candidate",
+            side_effect=AcceptanceError("the working tree holds changes that commit does not represent"),
+        ):
+            with self.assertRaises(PlanRunError) as ctx:
+                self._start(stage_adapter, sparring_adapter)
 
         self.assertIn("acceptance gate refused", str(ctx.exception))
         s1 = self._stage(S1).read_state()

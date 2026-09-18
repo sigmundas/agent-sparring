@@ -26,10 +26,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import conftest_path  # noqa: F401
 
-from agent_sparring.acceptance import accept_candidate, freeze_candidate
+from agent_sparring.acceptance import AcceptanceError, accept_candidate, freeze_candidate
 from agent_sparring.cli import main
 from agent_sparring.plan import (
     PlanRunError,
@@ -506,10 +507,13 @@ class PlanEventChronologyTests(_PlanActivityCase):
         self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
 
     def test_acceptance_refusal_is_failed_with_a_fixed_phrase(self):
-        # A committed but unpushed candidate: the sparrer says READY, the
-        # gate refuses.
-        with self.assertRaises(PlanRunError) as ctx:
-            self._start(_StageAdapter(self.repo, commit=True, push=False), _SparringAdapter([READY]))
+        # The sparrer says READY and the gate refuses the candidate.
+        with mock.patch(
+            "agent_sparring.plan.freeze_candidate",
+            side_effect=AcceptanceError("the working tree holds changes that commit does not represent"),
+        ):
+            with self.assertRaises(PlanRunError) as ctx:
+                self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]))
 
         self.assertIn("acceptance gate refused", str(ctx.exception))
         self.assertEqual(
@@ -518,6 +522,27 @@ class PlanEventChronologyTests(_PlanActivityCase):
         )
         # The refusal's own detail (remote names, paths) stays out of the log.
         self.assertNotIn(str(self.remote), self._s1().activity_path().read_text(encoding="utf-8"))
+        self.assertIs(self._s1().read_state().status, StageStatus.WORKING)
+
+    def test_a_candidate_awaiting_push_permission_is_paused_with_a_fixed_phrase(self):
+        # A committed but unpushed candidate: the sparrer says READY and the
+        # run stops to ask, which is a pause and not a failure.
+        result = self._start(
+            _StageAdapter(self.repo, commit=True, push=False), _SparringAdapter([READY])
+        )
+
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(
+            [(e["event"], e.get("summary")) for e in _plan_events(self._s1())],
+            [
+                ("plan.stage.entered", "Stage 1 — Foundation (1/2)"),
+                ("plan.paused", "push authorization required"),
+            ],
+        )
+        # Neither the commit nor the remote's location is copied into the log.
+        log = self._s1().activity_path().read_text(encoding="utf-8")
+        self.assertNotIn(str(self.remote), log)
+        self.assertNotIn(result.awaiting.candidate_sha, log)
         self.assertIs(self._s1().read_state().status, StageStatus.WORKING)
 
     def test_changed_plan_before_acceptance_is_failed(self):

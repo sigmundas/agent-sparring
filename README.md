@@ -255,6 +255,76 @@ a stage, and when evidence was recorded. That is telemetry for watching the
 run; the plan's position lives in `.sparring/plans/` and is never read from
 `activity.jsonl`.
 
+### Pushing a verified candidate
+
+Acceptance only ever freezes a commit that is already reachable from the
+branch's intended remote ref. That rule is not new and is not relaxed. What
+*is* new is what happens when a reviewed candidate has not been pushed —
+usually because the project's own agent instructions forbid an agent from
+pushing without being told:
+
+```text
+    -> the sparrer reviews the commit … READY
+    -> the commit is not on origin/<branch>, and nothing has authorized a push
+    -> the run PAUSES and asks, naming the exact commit
+```
+
+It pauses; it does not fail, and it does not push. The pause is recorded in
+the run's own state as a typed reason, so a tool reading it knows this is a
+permission question rather than a manual test:
+
+```json
+"awaiting": {
+  "kind": "push_authorization_required",
+  "stage_id": "…-stage-4-…",
+  "candidate_sha": "f2e455c…",
+  "branch": "feature/add-reference-dialog",
+  "remote": "origin",
+  "remote_branch": "feature/add-reference-dialog"
+}
+```
+
+Two ways to answer it, and a third that needs nothing from the engine:
+
+```sh
+# allow exactly this commit, then continue
+sparring resume-plan … --allow-push-candidate f2e455c…
+
+# allow it and stop being asked again for this run
+sparring resume-plan … --allow-push-candidate f2e455c… --allow-push-for-run
+
+# or push it yourself and resume normally
+git push origin feature/add-reference-dialog
+sparring resume-plan …
+```
+
+`--allow-push-for-run` can also be given to `run-plan`, which records the
+permission as part of creating the run.
+
+An authorized push is exactly one thing:
+
+```sh
+git -c push.followTags=false push <remote> refs/heads/<branch>:refs/heads/<remote branch>
+```
+
+Ordinary, non-force, one fully qualified refspec, so no `push.default` or
+`remote.*.push` configuration can widen it. No `--force`, no
+`--force-with-lease`, no tags, no ref deletion, no branch switching, no
+other branch, and no sibling repository — a declared sibling is a different
+repository, and authorizing this run's candidate says nothing about it. The
+engine then re-proves that the commit really is reachable from that remote
+ref, and only then runs the unchanged acceptance gate. A push that fails,
+or one that reports success without landing, stops the run with nothing
+accepted.
+
+Permission is bound to what it was granted for: this run, this worktree,
+this branch, that one remote branch, and — for `--allow-push-candidate` —
+that one stage and that one commit. `--allow-push-candidate` is refused
+unless the run is in fact waiting for permission to push exactly that
+commit, so a surface that has been open a while cannot authorize a candidate
+the run has since replaced. The default is no authorization at all, which is
+also what a run recorded before any of this existed loads as.
+
 ### Marking stages in a plan — or handing over an execution manifest
 
 There are two ways to tell `run-plan` what the stages are. The Markdown

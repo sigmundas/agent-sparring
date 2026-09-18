@@ -561,6 +561,13 @@ def reset_stage(
     digest = source.digest()
     run_state.plan_digest = digest
     run_state.status = PlanRunStatus.PAUSED
+    # The stage that was stopped is gone, so any typed reason the run was
+    # stopped *at* it is gone with it -- a request to push a candidate whose
+    # stage has just been archived describes nothing. A recorded push
+    # authorization is left alone: a one-candidate one no longer covers
+    # anything (it names the archived commit), and a run-scoped one is a
+    # decision about the run, which this operation does not revisit.
+    run_state.awaiting = None
     run_state.save(state_path)
 
     result = ResetResult(
