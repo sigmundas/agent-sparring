@@ -83,8 +83,13 @@ def _pump(fd: int, kind: str, sink: "queue.Queue[tuple[str, bytes | None]]") -> 
         sink.put((kind, None))
 
 
-def _stop(proc: "subprocess.Popen[bytes]", fired: threading.Event) -> None:
-    fired.set()
+def _terminate(proc: "subprocess.Popen[bytes]") -> None:
+    """Ask the provider to stop, then insist, then reap it.
+
+    Graceful first (``terminate``), forceful only if that is ignored, and
+    the child is always waited for afterwards so no zombie is left behind.
+    """
+
     try:
         proc.terminate()
     except Exception:
@@ -96,6 +101,15 @@ def _stop(proc: "subprocess.Popen[bytes]", fired: threading.Event) -> None:
             proc.kill()
         except Exception:
             pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _stop(proc: "subprocess.Popen[bytes]", fired: threading.Event) -> None:
+    fired.set()
+    _terminate(proc)
 
 
 class _LineSplitter:
@@ -189,6 +203,11 @@ def run_streaming(
         else:
             stderr_parts.append(stderr_decoder.decode(data))
 
+    # Set when the wait below is abandoned rather than completed: a Ctrl-C
+    # (KeyboardInterrupt) above all. The distinction decides what the
+    # cleanup may do, and it must be a BaseException, because
+    # KeyboardInterrupt is not an Exception.
+    abandoned = False
     try:
         # Phase 1: the provider is alive. Deliver output as it arrives and
         # watch for exit; if both pipes hit EOF first (the provider closed
@@ -214,11 +233,29 @@ def run_streaming(
                     consume(chunks.get(timeout=min(remaining, _POLL_SECONDS)))
                 except queue.Empty:
                     continue
+    except BaseException:
+        # Interrupted (Ctrl-C) or otherwise unwinding. The provider is this
+        # process's child and nothing else will ever reap it, so it must be
+        # stopped here -- see the cleanup below, which used to wait for it.
+        abandoned = True
+        raise
     finally:
         if timer is not None:
             timer.cancel()
         if proc.poll() is None:
-            proc.wait()
+            if abandoned:
+                # The unconditional `proc.wait()` this replaces is correct
+                # only when the provider is on its way out. On the
+                # interrupted path it is not: a Ctrl-C delivered to this
+                # process alone (rather than to the terminal's whole
+                # foreground group) leaves the provider running, and
+                # waiting for it blocked the engine for ever -- the run
+                # neither stopped nor continued, and it went on holding the
+                # worktree lock. An interruption must end the turn, so the
+                # provider is stopped and reaped instead.
+                _terminate(proc)
+            else:
+                proc.wait()
         # Close only the pipes whose pumps have finished; a pump still
         # blocked on a descendant-held pipe keeps its descriptor and dies
         # with the interpreter.
