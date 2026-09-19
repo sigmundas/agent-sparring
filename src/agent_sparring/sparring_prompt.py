@@ -16,6 +16,7 @@ from pathlib import Path
 
 from agent_sparring.artifact_ownership import ownership_section
 from agent_sparring.config import CONTEXT_FILENAME, load_project_markdown
+from agent_sparring.deferred_gate import DeferredObligation
 from agent_sparring.handoff import human_evidence_section
 from agent_sparring.prompt_sections import (
     ROLE_SPARRER,
@@ -40,6 +41,54 @@ def _stage_file(stage: Stage, filename: str) -> str:
 
     return f"stages/{stage.stage_id}/{filename}"
 
+
+def pending_deferred_section(
+    pending: tuple[DeferredObligation, ...],
+) -> PromptSection | None:
+    """The managed run's ledger of human verification still owed.
+
+    Engine-authored, like the candidate-set statement an independent review
+    gets: it is assembled from the plan-run state and is true as of this
+    turn only, so it is passed in rather than read from a file. Absent for a
+    standalone stage, which owes nothing to a plan run.
+
+    It exists so a reviewer can do the one thing only a *later* reviewer can:
+    notice that work it is looking at now depends on a check an earlier
+    reviewer judged safe to defer, and say so.
+    """
+
+    if not pending:
+        return None
+    lines = [
+        "## Human verification already owed",
+        "",
+        "Earlier reviews of this plan deferred these checks: a person still has to do "
+        "them, the engine will not let the plan complete until they are answered, and "
+        "no stage is currently stopped for them.",
+        "",
+    ]
+    for obligation in pending:
+        lines.append(
+            f"- `{obligation.instance_id}` — {obligation.gate.category} — "
+            f"{obligation.gate.title} (raised by {obligation.stage_id}"
+            + (", already promoted to immediate" if obligation.promoted else "")
+            + ")"
+        )
+        lines.append(f"  - Deferred because: {obligation.rationale}")
+        for check in obligation.gate.checks:
+            lines.append(f"  - `{check.id}`: {check.instruction}")
+    lines += [
+        "",
+        "If the work you are reviewing now *depends* on one of these answers — a later "
+        "stage builds on the behaviour it verifies, or continuing would be misleading "
+        "without it — name its gate instance in `promote_deferred` and say why in "
+        "`findings`. The run then stops for it instead of carrying it to the end. If "
+        "none of them has become blocking, leave `promote_deferred` empty; they are "
+        "already recorded and nothing here needs to restate them.",
+    ]
+    return section("Human verification already owed", lines)
+
+
 _VERDICT_INSTRUCTIONS = """\
 ## Your task
 
@@ -62,10 +111,18 @@ nothing else (no markdown fences, no extra prose around it):
                    rationale beyond the one-line summary>",
      "deferred": "<what is deferred, why, and when it becomes required, or
                    null if nothing is deferred>",
-     "human_gate": <the structured blocking human checks -- REQUIRED when
-                   action is NEEDS_YOU, and null for every other action.
-                   See "The human gate" below for its shape and, more
-                   importantly, for what may and may not go in it>}
+     "human_gate": <the structured human checks that must be done BEFORE
+                   this stage can be READY -- REQUIRED when action is
+                   NEEDS_YOU, and null for every other action. See "The
+                   human gate" below for its shape and, more importantly,
+                   for what may and may not go in it>,
+     "deferred_human_gate": <structured human verification that is genuinely
+                   owed but that you judge does not have to happen now.
+                   Allowed ONLY with action READY, and null otherwise. See
+                   "Deciding when a human check has to happen" below>,
+     "promote_deferred": <array of gate instance ids from the "Human
+                   verification already owed" section, if any, that you have
+                   decided can wait no longer; [] otherwise>}
 
 ``summary`` is a short routing headline, not the whole story: put the real
 detail -- what you inspected, what you found, why it matters -- in
@@ -130,9 +187,84 @@ Say those things in ``findings`` and ``deferred``. They are real and worth
 recording; they are not this stage's gate, and listing them as checks asks a
 human to "pass" work that acceptance does not depend on.
 
+Verification a person genuinely owes, but which does not have to stop the
+run, is a third thing again: see "Deciding when a human check has to happen"
+below, and put it in ``deferred_human_gate``, not here.
+
 If, after applying that rule, nothing is left, then this is not NEEDS_YOU:
 choose the action the review itself warrants and record the rest as
 ``deferred``.
+
+## Deciding when a human check has to happen
+
+Some verification a person owes does not have to interrupt the run to be
+worth doing. That timing decision is yours: the engine does not classify
+checks, and there is no list of categories that are automatically one or the
+other. A UI check can be immediate or deferred depending on what the rest of
+the plan does with it.
+
+Ask yourself, in this order:
+
+1. Does the human's answer change what the *subsequent implementation*
+   should be?
+2. Would later work be expensive to redo, or actively misleading, if this
+   check turned out to fail?
+3. Is the check validating semantics and requirements, or mostly confirming
+   a finished surface?
+4. If it fails later, is the correction local and bounded?
+5. Is there a concrete reason a person has to interrupt this run *now*?
+
+Usually immediate (NEEDS_YOU + ``human_gate``):
+
+- a product or preference choice that changes what is required;
+- an ambiguity the next stage builds directly on;
+- security, privacy or destructive approval;
+- an external condition without which the implementation direction is
+  unknown;
+- a manual result that determines whether the subsequent work is correct.
+
+Often deferrable (READY + ``deferred_human_gate``):
+
+- visual polish and readability verification;
+- final resizing or theme inspection;
+- screenshots;
+- device confirmation that later work does not depend on;
+- verification whose failure would cause only a local, bounded fix;
+- checks that are *more* useful against a more complete UI later.
+
+These are heuristics for your judgement, not rules. Nothing in the engine
+re-evaluates them.
+
+Four things are never deferrable, whatever else is true, because continuing
+would cross a real boundary rather than merely leave a question open: an
+irreversible or destructive action awaiting approval; production deployment
+or release authorization; a credential or security boundary; and anything
+the plan itself states must be approved by a human before proceeding. Those
+are NEEDS_YOU.
+
+``deferred_human_gate`` has the same shape as ``human_gate``, plus two
+fields:
+
+    {"category": …, "title": …, "checks": [ … same as human_gate … ],
+     "rationale": "<short: why continuing before this verification is low
+                risk. One or two sentences, concrete about what later work
+                does and does not depend on. Not an essay>",
+     "checkpoint": "before_plan_completion"}
+
+``rationale`` is required. A deferral without one is rejected: it is the
+only record of *why* the run was allowed to continue, and the human, the
+next reviewer and anyone debugging an unattended run all read it.
+
+``checkpoint`` is ``"before_plan_completion"`` — the only value this version
+accepts. The engine keeps the obligation in durable plan state and refuses
+to report the plan complete until a person has answered it. Deferring is
+therefore not waiving: the stage is accepted *and* the verification is still
+owed, and both facts are recorded.
+
+You may use ``deferred_human_gate`` only with READY. If an implementation
+issue remains, that is SEND_BACK; if a person must answer before this stage
+can be READY at all, that is NEEDS_YOU with ``human_gate``. Do not put the
+same check in both.
 
 You may inspect the repository (e.g. git log/diff/status, reading files)
 but must not modify it.
@@ -160,8 +292,10 @@ Reserve NEEDS_YOU for something a human must actually decide or do: a
 product/preference choice between valid behaviors, a visual or UI judgement,
 a device/manual check, an external condition to wait on, or a scope
 expansion to approve. "Someone should re-run the suite where it can write
-files" is a deferred check, not a human decision, and must never appear in
-``human_gate``."""
+files" is prose for ``deferred``, not a human decision, and must never
+appear in ``human_gate`` -- nor in ``deferred_human_gate``, which is for
+verification only a person can perform, not for work you happened to be
+unable to run."""
 
 
 def assemble_sparring_prompt(
@@ -172,6 +306,7 @@ def assemble_sparring_prompt(
     expected_branch: str | None = None,
     finalization: str | None = None,
     evidence_first: bool = False,
+    pending_deferred: tuple[DeferredObligation, ...] = (),
 ) -> AssembledPrompt:
     """Assemble the bounded prompt for one sparring-agent turn.
 
@@ -288,6 +423,10 @@ def assemble_sparring_prompt(
             )
         )
 
+    owed = pending_deferred_section(pending_deferred)
+    if owed is not None:
+        parts.append(owed)
+
     if finalization and finalization.strip():
         parts.append(
             section("Finalization", ["## Finalization", "", finalization.strip()])
@@ -349,4 +488,4 @@ def build_sparring_prompt(
     ).text
 
 
-__all__ = ["assemble_sparring_prompt", "build_sparring_prompt"]
+__all__ = ["assemble_sparring_prompt", "build_sparring_prompt", "pending_deferred_section"]

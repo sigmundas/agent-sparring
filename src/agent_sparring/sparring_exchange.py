@@ -19,6 +19,11 @@ import json
 from dataclasses import dataclass, replace
 from typing import Callable
 
+from agent_sparring.deferred_gate import (
+    DEFERRED_GATE_MARKER,
+    DeferredGateError,
+    DeferredHumanGate,
+)
 from agent_sparring.human_gate import (
     HUMAN_GATE_MARKER,
     HumanGate,
@@ -71,6 +76,9 @@ def render_sparring(stage: Stage, result: RoutingResult, *, findings: str = "") 
             if action is RoutingAction.NEEDS_YOU and result.human_gate is not None:
                 lines.append("")
                 lines.extend(_human_gate_lines(result.human_gate))
+            if action is RoutingAction.READY and result.deferred_human_gate is not None:
+                lines.append("")
+                lines.extend(_deferred_gate_lines(result.deferred_human_gate))
         else:
             lines.append("(not applicable)")
         lines.append("")
@@ -79,6 +87,14 @@ def render_sparring(stage: Stage, result: RoutingResult, *, findings: str = "") 
     lines.append("")
     deferred = result.details.get("deferred") if result.details else None
     lines.append(str(deferred).strip() if deferred else "(none recorded)")
+
+    if result.promote_deferred:
+        # A ledger annotation, not a routing decision, so it is recorded
+        # after the sections rather than inside one. The plan-run state is
+        # the authority for what actually happened to those obligations.
+        lines += ["", "## Promoted deferred verification", ""]
+        for instance_id in result.promote_deferred:
+            lines.append(f"- gate instance `{instance_id}` can wait no longer")
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -115,6 +131,64 @@ def _human_gate_lines(gate: HumanGate) -> list[str]:
     return lines
 
 
+def _deferred_gate_lines(deferred: DeferredHumanGate) -> list[str]:
+    """The deferred gate, in the same two layers as an immediate one: prose
+    for a person, then canonical JSON behind
+    :data:`~agent_sparring.deferred_gate.DEFERRED_GATE_MARKER`.
+
+    The prose says plainly that this stage is *not* waiting, and carries the
+    reviewer's rationale, because a reader of ``sparring.md`` who cannot see
+    why continuing was judged safe has no way to disagree with it.
+    """
+
+    lines = [
+        f"**Human verification deferred, not waived** — {deferred.category} — "
+        f"{deferred.title}",
+        "",
+        f"Owed by: {deferred.checkpoint}. Nothing about this stage's implementation is "
+        "blocked on it, and the plan may not complete until it is answered.",
+        "",
+        f"Reviewer's rationale for deferring: {deferred.rationale}",
+        "",
+    ]
+    if deferred.instance_id is not None:
+        lines += [
+            f"Gate instance: `{deferred.instance_id}` — answer this asking, not an earlier one.",
+            "",
+        ]
+    for position, check in enumerate(deferred.checks, start=1):
+        lines.append(f"{position}. {check.instruction}")
+        lines.append(f"   - Pass when: {check.pass_criteria}")
+        if check.source:
+            lines.append(f"   - Defined in: {check.source}")
+        lines.append(f"   - Check id: `{check.id}`")
+    lines += [
+        "",
+        DEFERRED_GATE_MARKER,
+        "",
+        "```json",
+        json.dumps(deferred.to_dict(), indent=2, ensure_ascii=False),
+        "```",
+    ]
+    return lines
+
+
+@dataclass(frozen=True)
+class SparringRecord:
+    """What was written, and the verdict as written.
+
+    ``result`` is not the object the caller passed in: it is that object with
+    the engine's freshly minted gate instance(s) substituted. Callers that
+    have to act on a gate's identity -- the plan runner recording a deferred
+    obligation in its ledger -- need the recorded form, and re-reading the
+    file to get it would make the identity depend on a parse that is allowed
+    to fail.
+    """
+
+    content: str
+    result: RoutingResult
+
+
 def record_sparring(
     stage: Stage,
     result: RoutingResult,
@@ -135,13 +209,47 @@ def record_sparring(
 
     Nothing about routing, lifecycle or acceptance reads the id; it only
     tells a consumer which asking a recorded answer belongs to.
+
+    The text that was written. :func:`record_sparring_result` is the same
+    call for a caller that also needs the verdict *as recorded*, with the
+    minted identities in it.
+    """
+
+    return record_sparring_result(
+        stage, result, findings=findings, instance_id_factory=instance_id_factory
+    ).content
+
+
+def record_sparring_result(
+    stage: Stage,
+    result: RoutingResult,
+    *,
+    findings: str = "",
+    instance_id_factory: Callable[[], str] = new_gate_instance_id,
+) -> SparringRecord:
+    """:func:`record_sparring`, returning the recorded verdict as well.
+
+    A deferred gate is minted here for exactly the same reason an immediate
+    one is, and by exactly the same rule: writing the verdict *is* the act of
+    asking, so every write is a new asking. A reviewer that restates a
+    deferral it already made therefore creates a second obligation rather
+    than silently re-identifying the first -- which is correct, because the
+    engine cannot tell "I am repeating myself" from "I am asking a materially
+    different question under the same words". What keeps that from
+    accumulating duplicates is the plan runner, which carries one obligation
+    per gate instance and never records the same instance twice.
     """
 
     if result.human_gate is not None:
         result = replace(result, human_gate=result.human_gate.asked_again(instance_id_factory()))
+    if result.deferred_human_gate is not None:
+        result = replace(
+            result,
+            deferred_human_gate=result.deferred_human_gate.asked_again(instance_id_factory()),
+        )
     content = render_sparring(stage, result, findings=findings)
     stage.write_sparring(content)
-    return content
+    return SparringRecord(content=content, result=result)
 
 
 @dataclass(frozen=True)
@@ -161,6 +269,10 @@ class RecordedOutcome:
     summary: str
     needs_you_reason: str | None = None
     human_gate: HumanGate | None = None
+    #: The deferred obligation this verdict raised, if it raised one. Read
+    #: back for display and for a runner reconciling its ledger against what
+    #: is actually on disk; it never makes the stage await a human.
+    deferred_human_gate: DeferredHumanGate | None = None
 
     @property
     def awaits_a_human(self) -> bool:
@@ -211,6 +323,7 @@ def read_recorded_outcome(stage: Stage) -> RecordedOutcome | None:
         summary=summary,
         needs_you_reason=reason,
         human_gate=_recorded_gate(text),
+        deferred_human_gate=_recorded_deferred_gate(text),
     )
 
 
@@ -234,18 +347,40 @@ def _recorded_gate(text: str) -> HumanGate | None:
     """The canonical JSON block behind :data:`HUMAN_GATE_MARKER`, if the file
     has one and it still parses."""
 
-    marker = text.find(HUMAN_GATE_MARKER)
-    if marker < 0:
+    body = _marked_json(text, HUMAN_GATE_MARKER)
+    if body is None:
         return None
-    after = text[marker + len(HUMAN_GATE_MARKER) :]
+    try:
+        return HumanGate.from_dict(json.loads(body))
+    except (json.JSONDecodeError, HumanGateError, TypeError, AttributeError):
+        return None
+
+
+def _recorded_deferred_gate(text: str) -> DeferredHumanGate | None:
+    """The canonical JSON block behind
+    :data:`~agent_sparring.deferred_gate.DEFERRED_GATE_MARKER`, if the file
+    has one and it still parses. A file written before deferrals existed has
+    neither, and reads as ``None`` -- which is exactly right for it."""
+
+    body = _marked_json(text, DEFERRED_GATE_MARKER)
+    if body is None:
+        return None
+    try:
+        return DeferredHumanGate.from_dict(json.loads(body))
+    except (json.JSONDecodeError, DeferredGateError, TypeError, AttributeError):
+        return None
+
+
+def _marked_json(text: str, marker: str) -> str | None:
+    """The body of the first ```` ```json ```` fence after ``marker``."""
+
+    at = text.find(marker)
+    if at < 0:
+        return None
+    after = text[at + len(marker) :]
     opening = after.find("```json")
     if opening < 0:
         return None
     body = after[opening + len("```json") :]
     closing = body.find("```")
-    if closing < 0:
-        return None
-    try:
-        return HumanGate.from_dict(json.loads(body[:closing]))
-    except (json.JSONDecodeError, HumanGateError, TypeError, AttributeError):
-        return None
+    return None if closing < 0 else body[:closing]

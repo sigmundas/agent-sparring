@@ -80,6 +80,7 @@ from typing import Any
 
 from agent_sparring.activity import ActivityEmitter
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
+from agent_sparring.deferred_gate import DeferredObligation
 from agent_sparring.git_context import (
     GitContextError,
     current_branch,
@@ -88,7 +89,7 @@ from agent_sparring.git_context import (
 )
 from agent_sparring.providers import ProviderError, SparringAgentAdapter, SparringAgentResult
 from agent_sparring.routing import RoutingResult, RoutingResultError
-from agent_sparring.sparring_exchange import record_sparring
+from agent_sparring.sparring_exchange import record_sparring_result
 from agent_sparring.prompt_capture import capture_prompt
 from agent_sparring.review_prompt import assemble_review_prompt
 from agent_sparring.sparring_prompt import assemble_sparring_prompt
@@ -160,6 +161,13 @@ def _build_routing_result(payload: dict[str, Any]) -> RoutingResult:
         "summary": payload.get("summary"),
         "needs_you_reason": payload.get("needs_you_reason"),
         "human_gate": payload.get("human_gate"),
+        # The deferred counterpart (see agent_sparring.deferred_gate), and
+        # the ledger annotation that promotes an already-deferred obligation
+        # back to immediate. Both are structural for the same reason the
+        # immediate gate is: what a person must eventually do is not
+        # something a consumer should have to mine out of prose.
+        "deferred_human_gate": payload.get("deferred_human_gate"),
+        "promote_deferred": payload.get("promote_deferred") or (),
     }
     deferred = payload.get("deferred")
     if deferred:
@@ -211,8 +219,15 @@ def run_sparring_agent(
     finalization: str | None = None,
     evidence_first: bool = False,
     review_candidate_set: str | None = None,
+    pending_deferred: tuple[DeferredObligation, ...] = (),
 ) -> SparringAgentRunResult:
     """Start or resume the sparring agent for one turn.
+
+    ``pending_deferred`` is the managed run's own ledger of human
+    verification still owed (see :mod:`agent_sparring.deferred_gate`), passed
+    verbatim to the prompt. It is read-only context: the reviewer may cite
+    it, may promote an entry of it, and may not add to or resolve it here.
+    Empty for a standalone stage, which has no plan run to owe anything to.
 
     ``review_candidate_set`` switches this turn to the independent-review
     prompt (:mod:`agent_sparring.review_prompt`) over the accepted candidate
@@ -305,6 +320,7 @@ def run_sparring_agent(
                 finalization=finalization,
                 evidence_first=evidence_first,
                 review_candidate_set=review_candidate_set,
+                pending_deferred=pending_deferred,
             )
     except WorktreeLockError as exc:
         raise SparringAgentRunError(
@@ -322,6 +338,7 @@ def _run_sparring_agent_locked(
     finalization: str | None = None,
     evidence_first: bool = False,
     review_candidate_set: str | None = None,
+    pending_deferred: tuple[DeferredObligation, ...] = (),
 ) -> SparringAgentRunResult:
     state = stage.read_state()
     resume_id = state.sparring_session_id
@@ -334,6 +351,7 @@ def _run_sparring_agent_locked(
             expected_branch=expected_branch,
             candidate_set=review_candidate_set,
             evidence_first=evidence_first,
+            pending_deferred=pending_deferred,
         )
     else:
         assembled = assemble_sparring_prompt(
@@ -343,6 +361,7 @@ def _run_sparring_agent_locked(
             expected_branch=expected_branch,
             finalization=finalization,
             evidence_first=evidence_first,
+            pending_deferred=pending_deferred,
         )
     prompt = assembled.text
 
@@ -450,7 +469,13 @@ def _run_sparring_agent_locked(
     current_state.sparring_session_id = result.session_id
     stage.write_state(current_state)
 
-    sparring_content = record_sparring(stage, routing, findings=findings_text)
+    recorded = record_sparring_result(stage, routing, findings=findings_text)
+    sparring_content = recorded.content
+    # The verdict *as recorded*, so this turn's caller and this turn's
+    # sparring.md name the same gate instances. Returning the pre-mint object
+    # would leave the plan runner's ledger keyed on identities the file does
+    # not carry.
+    routing = recorded.result
 
     # The verdict is already authoritative in sparring.md / the returned
     # RoutingResult; this line merely mirrors it for observers.

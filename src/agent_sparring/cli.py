@@ -55,6 +55,12 @@ from agent_sparring.plan import (
     resume_plan,
     start_plan,
 )
+from agent_sparring.deferred_gate import (
+    CheckOutcome,
+    DeferredAnswer,
+    DeferredGateError,
+    DeferredVerificationRequired,
+)
 from agent_sparring.push_gate import PUSH_AUTHORIZATION_REQUIRED
 from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
@@ -772,6 +778,10 @@ def _report_plan_result(
 
     stage = Stage.resolve(sparring_dir, result.stage_id)
 
+    if isinstance(result.awaiting, DeferredVerificationRequired):
+        _report_deferred_verification_required(result, args, stage)
+        return
+
     if result.awaiting is not None:
         _report_push_authorization_required(result, args, stage)
         return
@@ -841,6 +851,63 @@ def _report_plan_result(
     else:
         print("When the check/answer above is done, resume the same stage with it:")
     print(f"  {resume} --evidence '<what you found or decided>'")
+
+
+def _report_deferred_verification_required(
+    result: PlanRunResult, args: argparse.Namespace, stage: Stage
+) -> None:
+    """A run stopped for manual verification an earlier reviewer deferred.
+
+    Reported as the outstanding obligation it is, not as a review outcome
+    and not as a failure: every stage the plan could run is accepted, the
+    reviewers judged each of these safe to carry, and what is left is the
+    verification a person owes. One checkpoint, all of it, with the stage
+    that raised each check and the reviewer's own reason for deferring it,
+    so a person can see why they were not interrupted earlier.
+    """
+
+    awaiting = result.awaiting
+    assert isinstance(awaiting, DeferredVerificationRequired)  # the caller checked
+    resume = (
+        f"sparring resume-plan {_plan_input_args(args)} --repo-root {args.repo_root or '.'} "
+        f"--expected-branch {args.expected_branch}"
+    )
+    print(f"plan paused: {result.plan}")
+    print(f"needs: {awaiting.kind}")
+    print(f"why now: {awaiting.reason}")
+    for stage_id, sha in result.accepted:
+        print(f"  accepted {stage_id} at {sha}")
+    print()
+    print(awaiting.describe + ". Every stage is accepted; none of this is a review failure.")
+    answers: list[str] = []
+    for obligation in result.deferred:
+        print()
+        print(f"{obligation.gate.category} — {obligation.gate.title}")
+        print(f"  raised by: {obligation.stage_id}")
+        print(f"  gate instance: {obligation.instance_id}")
+        print(f"  deferred because: {obligation.rationale}")
+        for check in obligation.gate.checks:
+            recorded = obligation.result_for(check.id)
+            mark = f"[{recorded.outcome.word}]" if recorded else "[ ]"
+            print(f"  {mark} {check.id}: {check.instruction}")
+            print(f"      pass when: {check.pass_criteria}")
+            if check.source:
+                print(f"      defined in: {check.source}")
+            if recorded is not None and recorded.note:
+                print(f"      you recorded: {recorded.note}")
+            if recorded is None or recorded.outcome is not CheckOutcome.PASS:
+                answers.append(f"--deferred-result '{obligation.instance_id}:{check.id}=pass'")
+    print()
+    print("Record your results and let the plan finish:")
+    print(f"  {resume} \\\n    " + " \\\n    ".join(answers or ["--deferred-result '<check id>=pass'"]))
+    print()
+    print(
+        "Outcomes are pass, fail or blocked. A note goes after a second '=' . A blocked "
+        "check records that it could not be performed, which resolves nothing and leaves "
+        "the plan stopped. A failed check keeps the plan stopped too and is written into "
+        "the originating stage's notes.md, where that stage's agents read it."
+    )
+    print(f"stage directory of the current stage: {stage.directory}")
 
 
 def _report_push_authorization_required(
@@ -938,6 +1005,9 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
                 repo_root,
                 make_adapters,
                 evidence=args.evidence,
+                deferred_results=tuple(
+                    DeferredAnswer.parse(value) for value in (args.deferred_result or [])
+                ),
                 allow_push_candidate=args.allow_push_candidate,
                 allow_push_for_run=args.allow_push_for_run,
                 **common,
@@ -960,6 +1030,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
         ProjectConfigError,
         GitContextError,
         ProviderError,
+        DeferredGateError,
     ) as exc:
         print(f"could not {'resume' if resume else 'run'} plan: {exc}", file=sys.stderr)
         return 1
@@ -1611,6 +1682,21 @@ def build_parser() -> argparse.ArgumentParser:
             "or scope approval; appended to the current stage's notes.md under "
             "'## Human evidence', after which the SPARRER resumes against the unchanged "
             "candidate (the stage agent is not started to deliver an answer)"
+        ),
+    )
+    resume_plan_parser.add_argument(
+        "--deferred-result",
+        action="append",
+        default=[],
+        metavar="CHECK=OUTCOME[=NOTE]",
+        help=(
+            "answer one deferred manual check at the run's verification checkpoint, e.g. "
+            "--deferred-result 'resize-readability=pass=looked fine at 900px'. OUTCOME is "
+            "pass, fail or blocked; blocked records that the check could not be performed "
+            "and resolves nothing. CHECK is the reviewer's check id, or "
+            "'<gate instance>:<check id>' when the same id belongs to more than one "
+            "asking. Refused unless the run is in fact stopped on deferred verification "
+            "that includes that check. Repeatable"
         ),
     )
     resume_plan_parser.add_argument(

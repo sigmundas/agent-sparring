@@ -33,6 +33,7 @@ from pathlib import Path
 
 from agent_sparring.artifact_ownership import ROLE_SPARRER, ownership_section
 from agent_sparring.config import CONTEXT_FILENAME, load_project_markdown
+from agent_sparring.deferred_gate import DeferredObligation
 from agent_sparring.handoff import human_evidence_section
 from agent_sparring.prompt_sections import (
     ROLE_REVIEWER,
@@ -41,6 +42,7 @@ from agent_sparring.prompt_sections import (
     review_turn_kind,
     section,
 )
+from agent_sparring.sparring_prompt import pending_deferred_section
 from agent_sparring.stage import (
     BRIEF_FILENAME,
     HUMAN_EVIDENCE_HEADING,
@@ -196,6 +198,7 @@ def assemble_review_prompt(
     expected_branch: str,
     candidate_set: str,
     evidence_first: bool = False,
+    pending_deferred: tuple[DeferredObligation, ...] = (),
 ) -> AssembledPrompt:
     """Assemble the bounded prompt for one independent-review turn.
 
@@ -311,6 +314,10 @@ def assemble_review_prompt(
                 source=_stage_file(stage, SPARRING_FILENAME),
             )
         )
+
+    owed = pending_deferred_section(pending_deferred)
+    if owed is not None:
+        parts.append(owed)
 
     parts.append(section("Your task", [_REVIEW_INSTRUCTIONS]))
 
