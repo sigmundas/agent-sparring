@@ -52,6 +52,7 @@ class RecordedOutcomeTests(unittest.TestCase):
                 human_gate=GATE,
             ),
             findings="Long human-readable review prose.",
+            instance_id_factory=lambda: "gate-1",
         )
 
         recorded = read_recorded_outcome(self.stage)
@@ -60,7 +61,11 @@ class RecordedOutcomeTests(unittest.TestCase):
         self.assertIs(recorded.action, RoutingAction.NEEDS_YOU)
         self.assertEqual(recorded.summary, "Only the desktop compatibility gate remains.")
         self.assertEqual(recorded.needs_you_reason, "DEVICE/MANUAL CHECK -- desktop")
-        self.assertEqual(recorded.human_gate, GATE)
+        # The gate as *asked*: recording is the act of asking, so the file
+        # carries the gate plus the identity of this asking. Everything the
+        # reviewer wrote is unchanged.
+        self.assertEqual(recorded.human_gate, GATE.asked_again("gate-1"))
+        self.assertEqual(recorded.human_gate.checks, GATE.checks)
         self.assertTrue(recorded.awaits_a_human)
 
     def test_reads_a_verdict_recorded_before_structured_gates_existed(self):
