@@ -171,6 +171,10 @@ class ResolvedAgentConfig:
     effort_source: str
     effort_supported: bool
     effort_levels: tuple[str, ...]
+    # Every provider implemented for this role, so a UI can offer the real
+    # choice -- or, seeing one entry, show the provider as the fixed fact it
+    # currently is -- without keeping its own list of who exists.
+    provider_choices: tuple[ProviderCapability, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         """Machine-readable form for ``sparring show-config --json``.
@@ -190,6 +194,16 @@ class ResolvedAgentConfig:
             "effort_source": self.effort_source,
             "effort_supported": self.effort_supported,
             "effort_levels": list(self.effort_levels),
+            "provider_choices": [
+                {
+                    "provider": cap.provider_id,
+                    "display_name": cap.display_name,
+                    "supports_model": cap.supports_model,
+                    "effort_supported": cap.supports_effort,
+                    "effort_levels": list(cap.effort_levels),
+                }
+                for cap in self.provider_choices
+            ],
         }
 
 
@@ -335,6 +349,22 @@ def resolve_role_config(
         effort_source=effort_source,
         effort_supported=cap.supports_effort,
         effort_levels=cap.effort_levels,
+        provider_choices=providers_for_role(role),
+    )
+
+
+def providers_for_role(role: str) -> tuple[ProviderCapability, ...]:
+    """Every provider implemented for ``role``, in a stable order.
+
+    The engine answers "which providers could this role use" so that no UI
+    has to keep its own copy of the answer and then go stale when a provider
+    is added or one gains a role.
+    """
+
+    return tuple(
+        cap
+        for cap in sorted(PROVIDER_CAPABILITIES.values(), key=lambda item: item.provider_id)
+        if role in cap.roles
     )
 
 
@@ -381,6 +411,7 @@ __all__ = [
     "SOURCE_PROJECT",
     "SOURCE_PROVIDER_DEFAULT",
     "capability",
+    "providers_for_role",
     "resolve_agent_configs",
     "resolve_role_config",
 ]

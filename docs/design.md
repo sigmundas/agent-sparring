@@ -334,7 +334,58 @@ carried on an adapter object.
 `show-config --json` reports the resolved result and the source of each
 value. It exists so that a UI never re-derives provider semantics; the
 engine owns the question "what would actually run". It reports configuration
-only — never environment contents or credentials.
+only — never environment contents or credentials. Alongside each role it
+reports `provider_choices`, the providers implemented for that role: the
+engine also owns the question "what could this run with", so a UI offering a
+choice is offering the engine's list rather than its own.
+
+### Writing that file, exactly once
+
+`project.toml` is human-owned: the ownership table says so, and managed-run
+agents are instructed not to edit it. A UI that wants inline controls
+nevertheless has to change it somehow, and there were two ways to do that.
+The extension could learn to write TOML, or the engine could expose a typed
+mutation and the extension could ask. The first gives the cockpit a second
+opinion about the schema — one that drifts the moment a field is added, and
+one that can write a file the engine then refuses to load. So
+`agent_sparring/config_edit.py` is the single writer, reached through
+`sparring set-config`, and the extension shells out to it.
+
+Typed, not generic, for the same reason there is no `extra_args`: a "set any
+key to any value" command is the TOML equivalent of shell injection, and it
+would let a UI reach past the invariants an adapter exists to hold. The role
+is one of the two that take a turn and the fields are the same closed set
+`config.py` parses, so a caller cannot express anything the resolver would
+not already have validated.
+
+The order of operations is the load-bearing part. The edit is applied to an
+in-memory document, the result is re-parsed, and the role is resolved through
+`resolve_role_config` — the very function a run calls — and only then is
+anything written. A refusal therefore leaves the file byte-for-byte as it
+was, including the case that matters most: an existing file that does not
+parse is refused rather than replaced with a clean template, because
+discarding someone's half-finished edit is not a repair. The write itself
+goes through a temporary file in the destination's own directory and an
+`os.replace`, so there is no window in which a run could read half a
+configuration.
+
+tomlkit is the engine's one runtime dependency, and it is here for a reason
+the standard library cannot serve: `tomllib` reads TOML and cannot write it,
+and regenerating the file from parsed values would throw away the comments
+and ordering its author chose. Round-tripping means a mutation changes the
+line it was asked about and leaves the rest alone. An edit whose result
+equals the bytes already on disk writes nothing at all — which is both the
+"do not rewrite gratuitously" rule and, incidentally, what makes a
+double-clicked control harmless.
+
+Nothing is silently discarded. A provider change that would orphan an effort
+already in the file is refused with both values named; the caller can then
+set them together in one invocation. Quietly resetting the setting would be
+the engine deciding something the person is better placed to decide.
+
+Mutation changes the next turn and nothing else. It does not signal a running
+process, does not touch `plans/<run>.json`, and does not alter a captured
+prompt: those remain owned by whoever the ownership table says owns them.
 
 Only values that software actually needs belong here.
 

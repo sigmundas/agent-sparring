@@ -120,7 +120,55 @@ The JSON form reports `provider`, `model`, `effort` and a `*_source` for each
 path of the `project.toml` it read. It reports configuration only — never
 environment variables or credentials. This is how the VS Code extension shows
 the effective configuration, so that "this provider plus this file plus an
-omitted model means X" is answered in one place.
+omitted model means X" is answered in one place. Each role also reports
+`provider_choices`: every provider implemented for that role, with its own
+effort vocabulary, so a UI can offer the real choice without keeping a list
+of providers that goes stale.
+
+### Changing it without editing the file
+
+`project.toml` is yours to edit, and usually that is the right way. For the
+times something else needs to change it — the VS Code cockpit's inline
+selectors, a script — there is one typed command:
+
+```sh
+sparring set-config stage --model opus --effort high
+sparring set-config sparring --model gpt-5.6-terra --effort xhigh
+
+sparring set-config stage --model-default     # drop the override; use the provider's
+sparring set-config stage --effort-default    # own default again
+```
+
+The role is `stage` or `sparring` and the fields are `--provider`, `--model`
+and `--effort`. There is deliberately **no** way to set an arbitrary key to an
+arbitrary value: nothing here can reach `[repo].root`, add a key the parser
+would later reject, or smuggle a fragment into a provider's argv.
+
+What it guarantees:
+
+- the edit is validated the way a run resolves it — an effort the provider
+  does not accept, a provider not implemented for the role — *before* anything
+  is written, so a rejected change leaves the file exactly as it was;
+- a file that is already malformed is refused, not replaced: a broken file is
+  someone's work in progress, and overwriting it is not a repair;
+- comments, key order and every unrelated setting survive; only the line asked
+  about changes;
+- the write is atomic, so a reader sees the whole old file or the whole new
+  one and a failure part-way leaves the original intact;
+- a request the file already satisfies writes nothing at all, which makes a
+  repeated or double-clicked change harmless;
+- a project with no `project.toml` gets the same template `init-config`
+  writes, and then the change.
+
+Nothing is ever silently discarded. If changing a role's provider would leave
+an effort already in the file unusable, the command says so and stops rather
+than resetting it for you — set the provider and the effort together in one
+invocation if that is what you meant.
+
+`set-config --json` reports the resulting effective configuration in exactly
+the shape `show-config --json` uses. A change applies to the **next** provider
+turn: it never reconfigures or restarts a turn already running, and it does
+not touch recorded run state or any prompt already captured.
 
 `PROJECT.md` is prose the workflow never interprets: stack, directory map,
 test and build commands, conventions, product invariants, device/manual
@@ -752,7 +800,7 @@ itself, which is an ordinary repository file.
 | --- | --- | --- | --- | --- |
 | the plan document (`docs/plans/.../<plan>.md`) | human / repository | no | immutable for the lifetime of a managed run | the run's execution definition |
 | `PROJECT.md` | human / repository | no | edited between runs by a person | project context embedded in every prompt |
-| `project.toml` | human / repository | no | edited between runs by a person | provider, model and effort selection, and engine configuration |
+| `project.toml` | human / repository | no | edited between runs by a person, by hand or through `sparring set-config` on their behalf | provider, model and effort selection, and engine configuration |
 | `plans/<run>.json` | engine | no | rewritten on every position/status change | the run's position, expected branch, plan digest, recorded push authorization and typed pause |
 | `stages/<stage>/brief.md` | engine (a person, for a hand-written stage) | no | generated from the plan section, or hand-written before execution; then immutable | what the stage is reviewed against — the plan section verbatim in a managed run |
 | `stages/<stage>/notes.md` | engine (and a person editing by hand) | no | skeleton at creation, then appended to by section | a human's recorded answer or check results (`## Human evidence`) |
