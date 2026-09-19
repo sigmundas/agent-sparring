@@ -356,6 +356,49 @@ class MissingAndMalformedTests(_ConfigDirTestCase):
         self.assertEqual(self.text(), HAND_WRITTEN)
 
 
+class UnusualButValidTomlTests(_ConfigDirTestCase):
+    """Shapes a person (or another tool) can legally have written.
+
+    tomlkit hands back a different object for each of these -- a proxy for
+    an out-of-order table, an inline table for a one-liner -- and the edit
+    has to work on all of them rather than on the one shape the template
+    happens to produce.
+    """
+
+    def test_an_out_of_order_agents_table_is_edited_in_place(self):
+        self.write(
+            'project = "demo"\n\n'
+            '[agents.stage]\nprovider = "claude-cli"\n\n'
+            '[commands]\ntest = "pytest -q"\n\n'
+            # Back to [agents] after another table: legal TOML, and the
+            # shape tomlkit represents with a proxy rather than a Table.
+            '[agents.sparring]\nprovider = "codex-cli"\n'
+        )
+        apply_role_edit(self.sparring_dir, ROLE_SPARRING, RoleEdit(effort="ultra"))
+        config = self.config()
+        self.assertEqual(config.sparring_agent_effort, "ultra")
+        self.assertEqual(config.stage_agent_provider, "claude-cli")
+        self.assertEqual(config.commands["test"], "pytest -q")
+
+    def test_an_inline_agents_table_is_edited_in_place(self):
+        self.write(
+            'project = "demo"\n'
+            'agents = { stage = { provider = "claude-cli" }, '
+            'sparring = { provider = "codex-cli" } }\n'
+        )
+        apply_role_edit(self.sparring_dir, ROLE_STAGE, RoleEdit(model="opus"))
+        config = self.config()
+        self.assertEqual(config.stage_agent_model, "opus")
+        self.assertEqual(config.sparring_agent_provider, "codex-cli")
+
+    def test_an_agents_value_that_is_not_a_table_is_refused(self):
+        self.write('project = "demo"\nagents = "nonsense"\n')
+        before = self.text()
+        with self.assertRaises(ProjectConfigError):
+            apply_role_edit(self.sparring_dir, ROLE_STAGE, RoleEdit(model="opus"))
+        self.assertEqual(self.text(), before)
+
+
 class ProviderMutationTests(_ConfigDirTestCase):
     """(18): a provider change never silently discards an existing value."""
 
