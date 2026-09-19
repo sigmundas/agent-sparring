@@ -100,8 +100,15 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
     ArtifactOwnership(
         path="project.toml",
         owner="human / repository",
+        # Still false, and the distinction is the point: an agent taking part
+        # in a run cannot write this file. "sparring set-config" can, but it
+        # is a person's own command -- run from a terminal or from the
+        # cockpit's controls -- never something a managed run invokes.
         provider_writable=False,
-        lifetime="edited between runs by a person",
+        lifetime=(
+            "edited between runs by a person, by hand or through "
+            "'sparring set-config' on their behalf"
+        ),
         purpose="provider, model and effort selection, and engine configuration",
     ),
     ArtifactOwnership(

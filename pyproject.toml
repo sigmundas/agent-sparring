@@ -3,6 +3,12 @@ name = "agent-sparring"
 version = "0.1.0"
 description = "Generic stage/sparring primitives for agent-sparring"
 requires-python = ">=3.11"
+# Reading project.toml needs nothing beyond the standard library's tomllib.
+# Writing it does: `sparring set-config` edits a file a person owns and has
+# commented, and tomllib has no writer at all. tomlkit round-trips comments,
+# key order and formatting, so a mutation changes the one line it was asked
+# to change and leaves the rest of the file exactly as its author left it.
+dependencies = ["tomlkit>=0.13"]
 
 [project.scripts]
 sparring = "agent_sparring.cli:main"

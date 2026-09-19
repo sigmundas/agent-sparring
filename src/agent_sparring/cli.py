@@ -21,6 +21,7 @@ from agent_sparring.acceptance import (
 )
 from agent_sparring.agent_config import (
     EffectiveAgents,
+    ROLES,
     ROLE_SPARRING,
     ROLE_STAGE,
     ResolvedAgentConfig,
@@ -28,6 +29,7 @@ from agent_sparring.agent_config import (
     resolve_agent_configs,
     resolve_role_config,
 )
+from agent_sparring.config_edit import RoleEdit, apply_role_edit
 from agent_sparring.config import (
     CONFIG_FILENAME,
     ProjectConfig,
@@ -132,6 +134,26 @@ def _describe_agent(resolved: ResolvedAgentConfig) -> str:
     return " | ".join(parts)
 
 
+def _effective_payload(
+    config_path: Path, config: ProjectConfig | None, effective: EffectiveAgents
+) -> dict[str, object]:
+    """The machine-readable effective configuration, in one shape.
+
+    ``show-config --json`` and ``set-config --json`` report exactly this, so
+    a UI that refreshes after a change parses the same object it already
+    knows how to read. Configuration only -- no environment, no credentials.
+    """
+
+    payload: dict[str, object] = {
+        "config_path": str(config_path),
+        "config_exists": config_path.is_file(),
+        "project": config.project if config is not None else None,
+        "error": None,
+    }
+    payload.update(effective.as_dict())
+    return payload
+
+
 def _cmd_show_config(args: argparse.Namespace) -> int:
     """Report the configuration a provider turn would actually run with.
 
@@ -177,14 +199,7 @@ def _cmd_show_config(args: argparse.Namespace) -> int:
         return 1
 
     if args.json:
-        payload: dict[str, object] = {
-            "config_path": str(config_path),
-            "config_exists": config_path.is_file(),
-            "project": config.project if config is not None else None,
-            "error": None,
-        }
-        payload.update(effective.as_dict())
-        json.dump(payload, sys.stdout, indent=2)
+        json.dump(_effective_payload(config_path, config, effective), sys.stdout, indent=2)
         print()
         return 0
 
@@ -219,6 +234,69 @@ def _cmd_init_config(args: argparse.Namespace) -> int:
         return 1
     print(str(path))
     print(f"wrote minimal project configuration for {project!r}", file=sys.stderr)
+    return 0
+
+
+def _cmd_set_config(args: argparse.Namespace) -> int:
+    """Change one role's provider/model/effort in the project's project.toml.
+
+    The typed counterpart to :func:`_cmd_show_config`: the engine owns
+    parsing, validation, mutation and effective resolution, so a UI can
+    offer controls without learning to write TOML and without acquiring a
+    second opinion about what a value means. The role is a fixed choice and
+    the fields are a closed set -- there is no way to spell an arbitrary key,
+    an arbitrary value or a command fragment through this command.
+
+    The write itself is :mod:`agent_sparring.config_edit`'s: validated
+    before anything reaches the disk, atomic when it does, and a no-op when
+    the file already says what was asked for.
+    """
+
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        edit = RoleEdit(
+            provider=args.provider,
+            model=args.model,
+            clear_model=args.model_default,
+            effort=args.effort,
+            clear_effort=args.effort_default,
+        )
+        outcome = apply_role_edit(sparring_dir, args.role, edit)
+        # Deliberately re-read from disk rather than reporting the in-memory
+        # result: what a caller needs is the effective configuration of the
+        # file that now exists, resolved the same way a run will resolve it.
+        config = _optional_project_config(sparring_dir)
+        effective = resolve_agent_configs(config)
+    except ProjectConfigError as exc:
+        if args.json:
+            json.dump(
+                {
+                    "config_path": str((sparring_dir / CONFIG_FILENAME).resolve()),
+                    "config_exists": (sparring_dir / CONFIG_FILENAME).is_file(),
+                    "changed": False,
+                    "error": str(exc),
+                },
+                sys.stdout,
+                indent=2,
+            )
+            print()
+        else:
+            print(f"could not change the {args.role} agent configuration: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        payload = _effective_payload(outcome.path.resolve(), config, effective)
+        payload["changed"] = outcome.changed
+        payload["created"] = outcome.created
+        json.dump(payload, sys.stdout, indent=2)
+        print()
+        return 0
+
+    if outcome.created:
+        print(f"created {outcome.path}", file=sys.stderr)
+    elif not outcome.changed:
+        print(f"{outcome.path} already said this; nothing written", file=sys.stderr)
+    print(f"{outcome.resolved.role} agent: {_describe_agent(outcome.resolved)}")
     return 0
 
 
@@ -1186,6 +1264,70 @@ def build_parser() -> argparse.ArgumentParser:
         help="succeed and print the path if project.toml already exists",
     )
     init_config.set_defaults(func=_cmd_init_config)
+
+    set_config = subparsers.add_parser(
+        "set-config",
+        help=(
+            "change one role's provider/model/effort in project.toml, validated "
+            "the way a run would resolve it (the only engine command that writes "
+            "that file)"
+        ),
+        description=(
+            "Set or clear the provider, model and effort of one agent role in "
+            "the project's .sparring/project.toml. Only these fields of only "
+            "these roles can be written: there is no arbitrary key/value "
+            "setting. The edit is validated before anything is written, the "
+            "write is atomic, comments and unrelated settings are preserved, "
+            "and a request that matches the file already writes nothing. "
+            "Clearing an override means the provider's own default applies "
+            "again -- the engine then passes no flag and does not guess what "
+            "that default is. A change applies to the next provider turn; it "
+            "never reconfigures a turn already running."
+        ),
+    )
+    set_config.add_argument(
+        "role",
+        choices=list(ROLES),
+        help="which agent role to configure",
+    )
+    set_config.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "provider for this role, validated against the providers implemented "
+            "for it. A model or effort already configured that the new provider "
+            "cannot honour is reported, never silently dropped"
+        ),
+    )
+    model_choice = set_config.add_mutually_exclusive_group()
+    model_choice.add_argument(
+        "--model", default=None, help="set this role's model (free-form; the provider knows its own names)"
+    )
+    model_choice.add_argument(
+        "--model-default",
+        action="store_true",
+        help="remove the model override, so the provider's own default applies",
+    )
+    effort_choice = set_config.add_mutually_exclusive_group()
+    effort_choice.add_argument(
+        "--effort",
+        default=None,
+        help="set this role's reasoning/effort level (must be one the resolved provider accepts)",
+    )
+    effort_choice.add_argument(
+        "--effort-default",
+        action="store_true",
+        help="remove the effort override, so the provider's own default applies",
+    )
+    set_config.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "emit the resulting effective configuration as JSON, in the same "
+            "shape as show-config --json"
+        ),
+    )
+    set_config.set_defaults(func=_cmd_set_config)
 
     new_stage = subparsers.add_parser("new-stage", help="create a new stage skeleton")
     new_stage.add_argument("stage_id")
