@@ -304,7 +304,15 @@ class DeferredObligation:
 
     def with_result(self, result: CheckResult) -> "DeferredObligation":
         """This obligation with ``result`` recorded, replacing any earlier
-        answer to the same check of the same asking."""
+        answer to the same check of the same asking.
+
+        Replacing, not appending: the ledger holds what is true now, and a
+        person who fixes a failure and re-answers the check has made the
+        earlier Fail untrue of the current behaviour. The history is not
+        lost -- every answer, including the superseded one, is written to the
+        originating stage's ``notes.md`` when it is recorded, and that file
+        is never rewritten.
+        """
 
         if all(check.id != result.check_id for check in self.gate.checks):
             raise DeferredGateError(
@@ -386,8 +394,11 @@ class DeferredAnswer:
     note: str | None = None
 
     #: Separates the gate instance from the check id in a qualified ref. A
-    #: colon, which the engine allows in neither half, so the two can never
-    #: be confused for one another.
+    #: gate instance never contains one (``human_gate._INSTANCE_ID_RE``), so
+    #: the left half is unambiguous; a reviewer's check id is free text and
+    #: may contain one, which is why the plan runner tries the bare reading
+    #: as well as the split one rather than trusting this to partition
+    #: cleanly.
     QUALIFIER = ":"
 
     @property

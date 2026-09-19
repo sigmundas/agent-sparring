@@ -895,8 +895,16 @@ def _report_deferred_verification_required(
                 print(f"      defined in: {check.source}")
             if recorded is not None and recorded.note:
                 print(f"      you recorded: {recorded.note}")
-            if recorded is None or recorded.outcome is not CheckOutcome.PASS:
+            if recorded is None:
                 answers.append(f"--deferred-result '{obligation.instance_id}:{check.id}=pass'")
+            elif recorded.outcome is not CheckOutcome.PASS:
+                # Never a ready-to-paste `=pass` for a check somebody has
+                # just reported as failed or untestable: the shortest path
+                # out of this pause must not be the one that flips their own
+                # result without them noticing.
+                answers.append(
+                    f"--deferred-result '{obligation.instance_id}:{check.id}=<pass|fail|blocked>'"
+                )
     print()
     print("Record your results and let the plan finish:")
     print(f"  {resume} \\\n    " + " \\\n    ".join(answers or ["--deferred-result '<check id>=pass'"]))

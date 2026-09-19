@@ -18,6 +18,7 @@ import conftest_path  # noqa: F401
 
 from agent_sparring.deferred_gate import (
     CHECKPOINT_PLAN_COMPLETION,
+    DEFERRED_GATE_MARKER as DEFERRED_MARKER,
     CheckOutcome,
     CheckResult,
     DeferredAnswer,
@@ -657,3 +658,178 @@ class BackwardCompatibilityTests(_DeferredRunCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FinalizingStageAdapter:
+    """An implementation side that leaves its work uncommitted on the first
+    turn and commits exactly it on the second.
+
+    That is the shape of a stage deliberately left uncommitted until a human
+    has looked at it, and the shape that makes the loop route a second
+    sparring turn -- which overwrites ``sparring.md``, and with it any
+    deferral the first READY recorded there.
+    """
+
+    provider_id = "fake-stage"
+
+    def __init__(self, repo):
+        self.repo = repo
+        self.start_calls: list[str] = []
+        self.resume_calls: list[tuple[str, str]] = []
+        self._calls = 0
+        self._starts = 0
+
+    def _turn(self, session_id: str):
+        from agent_sparring.providers import StageAgentResult
+
+        self._calls += 1
+        if self._calls == 1:
+            (self.repo / "implementation.txt").write_text("work\n", encoding="utf-8")
+        else:
+            _git(self.repo, "add", "-A", "implementation.txt")
+            _git(self.repo, "commit", "-q", "-m", "finalize the reviewed tree")
+            _git(self.repo, "push", "-q", "origin", "feature/x")
+        return StageAgentResult(session_id=session_id, text="claims", is_error=False)
+
+    def start(self, prompt: str):
+        self.start_calls.append(prompt)
+        self._starts += 1
+        return self._turn(f"impl-{self._starts}")
+
+    def resume(self, session_id: str, prompt: str):
+        self.resume_calls.append((session_id, prompt))
+        return self._turn(session_id)
+
+
+def _git(repo, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
+
+
+class ObligationCannotBeLostTests(_DeferredRunCase):
+    """The one property the whole feature rests on: an obligation that never
+    reaches the ledger is an obligation that cannot stop the plan completing.
+
+    Each of these is a path where the verdict that raised the deferral is not
+    the verdict the plan runner is handed at acceptance time.
+    """
+
+    def test_a_deferral_survives_the_finalization_cycle_that_overwrites_sparring_md(self):
+        # READY over an uncommitted candidate routes one commit-and-review
+        # cycle. The second sparring turn rewrites sparring.md, so the first
+        # READY's deferred block is on disk nowhere afterwards.
+        plain_ready = verdict("READY", "the committed candidate is the reviewed work")
+        sparring = _SparringAdapter([READY_WITH_DEFERRAL, plain_ready, READY])
+        result = self._start(_FinalizingStageAdapter(self.repo), sparring, stop_after_stage=S1)
+
+        self.assertNotIn(DEFERRED_MARKER, self._stage(S1).read_sparring())
+        owed = self._plan_state().deferred_human_checks
+        self.assertEqual(len(owed), 1, "the deferral was raised by a verdict since overwritten")
+        self.assertEqual(owed[0].stage_id, S1)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+
+    def test_a_deferral_survives_a_resume_that_only_pushes_an_authorized_candidate(self):
+        # The run stops for push permission *before* the ledger is written,
+        # and the resume that answers it runs no agent at all -- so there is
+        # no fresh verdict to fold in, only the recorded one.
+        stage_adapter = _StageAdapter(self.repo, commit=True, push=False)
+        first = self._start(stage_adapter, _SparringAdapter([READY_WITH_DEFERRAL]))
+        self.assertIsNotNone(first.awaiting)
+        self.assertEqual(self._plan_state().deferred_human_checks, ())
+
+        sha = self._stage(S1).read_state().candidate_sha or first.awaiting.candidate_sha
+        result = self._resume(
+            stage_adapter, _SparringAdapter([READY]), allow_push_candidate=sha
+        )
+        # The stage accepted, and the obligation its recorded verdict raised
+        # is in the ledger even though no agent ran in this process.
+        owed = self._plan_state().deferred_human_checks
+        self.assertEqual([entry.stage_id for entry in owed], [S1])
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+
+    def test_a_deferral_is_recovered_for_a_stage_that_was_accepted_without_it(self):
+        # A stage accepted by hand, or by a run killed between the acceptance
+        # gate and the ledger write. The run passes over it as
+        # "already accepted, advancing" and must still pick the obligation up.
+        self._start(
+            self.stage_adapter, _SparringAdapter([READY_WITH_DEFERRAL, READY])
+        )
+        state = self._plan_state()
+        instance = state.deferred_human_checks[0].instance_id
+        state.deferred_human_checks = ()
+        state.awaiting = None
+        state.status = PlanRunStatus.PAUSED
+        state.current_stage_index = 0
+        state.current_stage = S1
+        state.save(self.state_path)
+
+        result = self._resume(self.stage_adapter, _SparringAdapter([]))
+
+        owed = self._plan_state().deferred_human_checks
+        self.assertEqual([entry.instance_id for entry in owed], [instance])
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+
+
+class AnsweringEdgeCaseTests(_DeferredRunCase):
+    def test_a_check_id_containing_a_colon_is_still_answerable(self):
+        # A reviewer's check id is free text, and the qualified reference is
+        # `<instance>:<check id>`. Splitting naively would make such a check
+        # unanswerable, and an unanswerable check is a plan that can never
+        # complete.
+        colon = verdict(
+            "READY",
+            "fine",
+            deferred=deferred_gate(
+                checks=[
+                    {
+                        "id": "ui:resize",
+                        "instruction": "Resize and look.",
+                        "pass_criteria": "Readable.",
+                        "source": None,
+                    }
+                ]
+            ),
+        )
+        self._start(self.stage_adapter, _SparringAdapter([colon, READY]))
+        result = self._resume(
+            self.stage_adapter,
+            _SparringAdapter([]),
+            deferred_results=(DeferredAnswer.parse("ui:resize=pass"),),
+        )
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+
+    def test_a_refused_answer_records_none_of_them(self):
+        self._start(self.stage_adapter, _SparringAdapter([READY_WITH_DEFERRAL, READY]))
+        with self.assertRaises(PlanError):
+            self._resume(
+                self.stage_adapter,
+                _SparringAdapter([]),
+                deferred_results=(
+                    DeferredAnswer.parse("resize-readability=pass"),
+                    DeferredAnswer.parse("not-a-check=pass"),
+                ),
+            )
+        self.assertEqual(self._plan_state().deferred_human_checks[0].results, ())
+        self.assertNotIn("Pass —", self._stage(S1).read_notes())
+
+    def test_two_answers_to_one_obligation_are_both_kept(self):
+        two = verdict(
+            "READY",
+            "fine",
+            deferred=deferred_gate(
+                checks=[
+                    {"id": "a", "instruction": "Do a.", "pass_criteria": "ok", "source": None},
+                    {"id": "b", "instruction": "Do b.", "pass_criteria": "ok", "source": None},
+                ]
+            ),
+        )
+        self._start(self.stage_adapter, _SparringAdapter([two, READY]))
+        result = self._resume(
+            self.stage_adapter,
+            _SparringAdapter([]),
+            deferred_results=(DeferredAnswer.parse("a=pass"), DeferredAnswer.parse("b=pass")),
+        )
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
