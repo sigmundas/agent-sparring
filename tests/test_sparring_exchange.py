@@ -5,9 +5,19 @@ from pathlib import Path
 
 import conftest_path  # noqa: F401
 
-from agent_sparring.human_gate import HUMAN_GATE_MARKER, HumanCheck, HumanGate
+from agent_sparring.human_gate import (
+    HUMAN_GATE_MARKER,
+    HumanCheck,
+    HumanGate,
+    HumanGateError,
+    new_gate_instance_id,
+)
 from agent_sparring.routing import RoutingAction, RoutingResult
-from agent_sparring.sparring_exchange import record_sparring, render_sparring
+from agent_sparring.sparring_exchange import (
+    read_recorded_outcome,
+    record_sparring,
+    render_sparring,
+)
 from agent_sparring.stage import Stage
 
 
@@ -104,6 +114,135 @@ class SparringExchangeTests(unittest.TestCase):
         result = RoutingResult(action=RoutingAction.READY, summary="ready")
         content = record_sparring(self.stage, result)
         self.assertEqual(self.stage.read_sparring(), content)
+
+
+class GateInstanceIdentityTests(unittest.TestCase):
+    """Recording a verdict is an *asking*, and every asking is identifiable.
+
+    The bug these pin: a reviewer re-issues a check under the same id because
+    the recorded answer was insufficient, and a consumer keying evidence on
+    the check id treats the old answer as satisfying the new asking — leaving
+    a check that can never be answered.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.stage = Stage.resolve(Path(self._tmp.name) / ".sparring", "stage-1").create()
+
+    def _gate(self, instance_id=None):
+        return HumanGate(
+            category="PRODUCT_PREFERENCE",
+            title="Choose the batch-attachment acceptance scope",
+            checks=(
+                HumanCheck(
+                    id="batch-attachment-scope",
+                    instruction="Record one choice in text.",
+                    pass_criteria="An explicit choice is recorded.",
+                ),
+            ),
+            instance_id=instance_id,
+        )
+
+    def _needs_you(self, gate):
+        return RoutingResult(
+            action=RoutingAction.NEEDS_YOU, summary="Choose the scope", human_gate=gate
+        )
+
+    def _recorded_gate(self, content):
+        block = content.split(HUMAN_GATE_MARKER, 1)[1].split("```json", 1)[1].split("```", 1)[0]
+        return json.loads(block)
+
+    def test_recording_mints_an_instance_id(self):
+        content = record_sparring(self.stage, self._needs_you(self._gate()))
+        payload = self._recorded_gate(content)
+        self.assertTrue(payload["instance_id"], "a recorded gate says which asking it is")
+        self.assertEqual(payload["checks"][0]["id"], "batch-attachment-scope")
+
+    def test_the_same_gate_asked_twice_gets_two_identities(self):
+        first = self._recorded_gate(record_sparring(self.stage, self._needs_you(self._gate())))
+        second = self._recorded_gate(record_sparring(self.stage, self._needs_you(self._gate())))
+        self.assertNotEqual(
+            first["instance_id"],
+            second["instance_id"],
+            "re-issuing a check word for word is a new asking, not the old one",
+        )
+        self.assertEqual(first["checks"][0]["id"], second["checks"][0]["id"])
+
+    def test_an_agent_cannot_pin_the_instance_id(self):
+        # A reviewer restating itself has every incentive to repeat the id it
+        # saw in its own prompt; the engine's is the only one that counts.
+        content = record_sparring(self.stage, self._needs_you(self._gate("supplied-by-agent")))
+        self.assertNotEqual(self._recorded_gate(content)["instance_id"], "supplied-by-agent")
+
+    def test_the_recorded_id_is_stable_when_read_back(self):
+        content = record_sparring(
+            self.stage, self._needs_you(self._gate()), instance_id_factory=lambda: "gate-1"
+        )
+        self.assertEqual(self._recorded_gate(content)["instance_id"], "gate-1")
+        outcome = read_recorded_outcome(self.stage)
+        self.assertEqual(outcome.human_gate.instance_id, "gate-1")
+        # Re-reading is not re-asking: nothing about opening the file changes
+        # which asking a person is answering.
+        self.assertEqual(read_recorded_outcome(self.stage).human_gate.instance_id, "gate-1")
+
+    def test_the_prose_names_the_instance_too(self):
+        content = record_sparring(
+            self.stage, self._needs_you(self._gate()), instance_id_factory=lambda: "gate-1"
+        )
+        self.assertIn("Gate instance: `gate-1`", content)
+
+    def test_a_gate_recorded_before_instances_existed_still_reads(self):
+        # Exactly the shape on disk in every run that predates this change.
+        legacy = json.dumps(
+            {
+                "category": "PRODUCT_PREFERENCE",
+                "title": "t",
+                "checks": [
+                    {"id": "c", "instruction": "do it", "pass_criteria": "done", "source": None}
+                ],
+            },
+            indent=2,
+        )
+        self.stage.write_sparring(
+            "# Sparring: stage-1\n\n## Routing outcome\n\n"
+            "- Action: `NEEDS_YOU`\n- Summary: s\n\n## NEEDS YOU\n\ns\n\n"
+            f"{HUMAN_GATE_MARKER}\n\n```json\n{legacy}\n```\n"
+        )
+        outcome = read_recorded_outcome(self.stage)
+        self.assertEqual(outcome.action, RoutingAction.NEEDS_YOU)
+        self.assertIsNone(outcome.human_gate.instance_id, "absent, not invented")
+        self.assertEqual(outcome.human_gate.checks[0].id, "c")
+
+    def test_a_gate_without_an_instance_renders_as_it_always_did(self):
+        content = render_sparring(self.stage, self._needs_you(self._gate()))
+        self.assertNotIn("instance_id", content)
+        self.assertNotIn("Gate instance:", content)
+
+    def test_a_malformed_instance_id_is_refused(self):
+        for bad in ("has space", "back`tick", "", "x" * 129):
+            with self.assertRaises(HumanGateError):
+                HumanGate.from_dict(
+                    {
+                        "category": "OTHER",
+                        "title": "t",
+                        "checks": [{"id": "c", "instruction": "i", "pass_criteria": "p"}],
+                        "instance_id": bad,
+                    }
+                )
+
+    def test_minted_ids_are_usable_and_distinct(self):
+        minted = {new_gate_instance_id() for _ in range(100)}
+        self.assertEqual(len(minted), 100)
+        for identifier in minted:
+            HumanGate.from_dict(
+                {
+                    "category": "OTHER",
+                    "title": "t",
+                    "checks": [{"id": "c", "instruction": "i", "pass_criteria": "p"}],
+                    "instance_id": identifier,
+                }
+            )
 
 
 if __name__ == "__main__":

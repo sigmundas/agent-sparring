@@ -1,18 +1,30 @@
 """Rendering of human-readable sparring.md content from a routing outcome.
 
 This is a straightforward renderer, not a workflow engine: no review-attempt
-counters, immutable verdict ids, or amendment protocol. It only turns one
+counters, verdict ids, or amendment protocol. It only turns one
 :class:`~agent_sparring.routing.RoutingResult` plus free-text discussion into
 the SEND_BACK/NEEDS_YOU/ESCALATE/READY sections already sketched in
 ``templates.SPARRING_TEMPLATE``.
+
+The one identity minted here is a human gate's ``instance_id``, and it is
+deliberately not any of the above: it identifies *this asking* of the gate so
+a consumer can tell a human's answer to it from an answer to an earlier one.
+It orders nothing and authorizes nothing. See
+:mod:`agent_sparring.human_gate`.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Callable
 
-from agent_sparring.human_gate import HUMAN_GATE_MARKER, HumanGate, HumanGateError
+from agent_sparring.human_gate import (
+    HUMAN_GATE_MARKER,
+    HumanGate,
+    HumanGateError,
+    new_gate_instance_id,
+)
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
 from agent_sparring.stage import Stage, StageError
 
@@ -87,6 +99,12 @@ def _human_gate_lines(gate: HumanGate) -> list[str]:
         f"**Required before this stage can be READY** — {gate.category} — {gate.title}",
         "",
     ]
+    if gate.instance_id is not None:
+        # Shown so a person reading sparring.md, or diffing two of them, can
+        # see for themselves that a repeated check is a *new* asking and not
+        # the old one lingering. Nothing parses this line; the JSON is the
+        # contract.
+        lines += [f"Gate instance: `{gate.instance_id}` — answer this asking, not an earlier one.", ""]
     for position, check in enumerate(gate.checks, start=1):
         lines.append(f"{position}. {check.instruction}")
         lines.append(f"   - Pass when: {check.pass_criteria}")
@@ -97,9 +115,30 @@ def _human_gate_lines(gate: HumanGate) -> list[str]:
     return lines
 
 
-def record_sparring(stage: Stage, result: RoutingResult, *, findings: str = "") -> str:
-    """Render and write ``sparring.md`` for one routing outcome."""
+def record_sparring(
+    stage: Stage,
+    result: RoutingResult,
+    *,
+    findings: str = "",
+    instance_id_factory: Callable[[], str] = new_gate_instance_id,
+) -> str:
+    """Render and write ``sparring.md`` for one routing outcome.
 
+    This is the only place a human gate acquires its ``instance_id``, and it
+    always acquires a fresh one — whatever the reviewing agent put in that
+    field is discarded. Writing a verdict *is* the act of asking, so every
+    write is a new asking, even when the reviewer restates a gate it has
+    already issued word for word. That is the case the identity exists for:
+    a check re-asked because its recorded answer was insufficient must be
+    answerable again, and it cannot be if the answer is attributed to the
+    check id alone. See :mod:`agent_sparring.human_gate`.
+
+    Nothing about routing, lifecycle or acceptance reads the id; it only
+    tells a consumer which asking a recorded answer belongs to.
+    """
+
+    if result.human_gate is not None:
+        result = replace(result, human_gate=result.human_gate.asked_again(instance_id_factory()))
     content = render_sparring(stage, result, findings=findings)
     stage.write_sparring(content)
     return content

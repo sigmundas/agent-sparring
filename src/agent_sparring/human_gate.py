@@ -9,11 +9,33 @@ stage.
 
 So the gate is machine-readable, and small:
 
-    category   which kind of human attention is wanted (a closed set)
-    title      one line saying why execution stopped
-    checks     one or more concrete, runnable items, each with a stable id,
-               an instruction, explicit pass criteria and an optional
-               pointer to where the full test is defined
+    category     which kind of human attention is wanted (a closed set)
+    title        one line saying why execution stopped
+    checks       one or more concrete, runnable items, each with a stable id,
+                 an instruction, explicit pass criteria and an optional
+                 pointer to where the full test is defined
+    instance_id  which *asking* this is -- see below
+
+A check's ``id`` says **what question this is**; the gate's ``instance_id``
+says **which turn asked it**. The two are different facts and conflating them
+loses a real one.
+
+A reviewer may re-issue a check it has already asked, under the same id, on
+purpose: the recorded answer was insufficient, and asking a materially
+different question under a new id would throw away the fact that it is the
+same subject. A consumer that keys recorded evidence on the check id alone
+then treats the earlier answer as satisfying the later asking, and the
+re-issued check can never be answered at all. So evidence belongs to a
+*gate instance*, not to a check id for all time.
+
+``instance_id`` is minted **by the engine**, in
+:func:`~agent_sparring.sparring_exchange.record_sparring`, at the moment a
+verdict is written — never by the reviewing agent, which cannot be relied on
+to vary it, and which has an obvious incentive not to when it is restating
+itself. Whatever an agent puts in this field is discarded and replaced. It is
+opaque: nothing orders it, parses it for meaning, or derives anything from
+it. Two gates are the same asking exactly when their ``instance_id`` strings
+are equal.
 
 The rule that makes the list meaningful is a *scope* rule, enforced by the
 prompt rather than by code (see :mod:`agent_sparring.sparring_prompt`): a
@@ -32,7 +54,9 @@ routing envelope that carries it is
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import re
+import uuid
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 # The marker that precedes the canonical JSON block in sparring.md. An HTML
@@ -53,6 +77,29 @@ HUMAN_GATE_CATEGORIES = (
 )
 
 _MAX_ID_LENGTH = 128
+
+# A gate instance id is written into JSON, into Markdown prose, and into the
+# evidence lines a UI records in notes.md, and it is compared for equality by
+# every consumer. Keeping it to an unambiguous, quote-free, whitespace-free
+# alphabet means no consumer ever has to escape or normalise it to compare
+# two of them.
+_INSTANCE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_MAX_INSTANCE_ID_LENGTH = 128
+
+
+def new_gate_instance_id() -> str:
+    """Mint an identity for one asking of a gate.
+
+    Random rather than a counter. A per-stage ordinal would be derivable only
+    from the file about to be overwritten, so it would restart at 1 whenever a
+    stage's ``sparring.md`` was reset or recreated -- and a *restarted*
+    counter is worse than no identity at all, because evidence recorded
+    against the first gate would silently match the first gate of the new
+    sequence. Uniqueness is the whole requirement here; ordering is not, since
+    nothing sorts gates and the recorded order already lives in ``notes.md``.
+    """
+
+    return uuid.uuid4().hex
 
 
 class HumanGateError(ValueError):
@@ -111,13 +158,32 @@ class HumanGate:
     category: str
     title: str
     checks: tuple[HumanCheck, ...]
+    #: Which asking this is; ``None`` for a gate recorded before gate
+    #: instances existed, and for a gate that has not been recorded yet.
+    instance_id: str | None = None
+
+    def asked_again(self, instance_id: str) -> "HumanGate":
+        """This same gate, as a *new* asking.
+
+        The one way an ``instance_id`` is set. Used by
+        :func:`~agent_sparring.sparring_exchange.record_sparring`, which
+        discards whatever the reviewing agent supplied.
+        """
+
+        return replace(self, instance_id=_valid_instance_id(instance_id))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "category": self.category,
             "title": self.title,
             "checks": [check.to_dict() for check in self.checks],
         }
+        # Omitted rather than null when absent, so a gate recorded before
+        # instances existed re-renders byte-identically and a reader can tell
+        # "this engine did not mint one" from "this engine minted nothing".
+        if self.instance_id is not None:
+            payload["instance_id"] = self.instance_id
+        return payload
 
     def to_json(self) -> str:
         """The canonical JSON block embedded in ``sparring.md``."""
@@ -150,7 +216,24 @@ class HumanGate:
                     f"human-gate check ids must be unique within a gate; {check.id!r} repeats"
                 )
             seen.add(check.id)
-        return cls(category=category, title=title, checks=checks)
+        raw_instance = payload.get("instance_id")
+        instance_id = None if raw_instance is None else _valid_instance_id(raw_instance)
+        return cls(category=category, title=title, checks=checks, instance_id=instance_id)
+
+
+def _valid_instance_id(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise HumanGateError("human_gate 'instance_id' must be a non-empty string or absent")
+    identifier = value.strip()
+    if len(identifier) > _MAX_INSTANCE_ID_LENGTH:
+        raise HumanGateError(
+            f"human_gate instance_id is longer than {_MAX_INSTANCE_ID_LENGTH} characters"
+        )
+    if not _INSTANCE_ID_RE.match(identifier):
+        raise HumanGateError(
+            f"human_gate instance_id {identifier!r} must be alphanumerics, '.', '_' or '-'"
+        )
+    return identifier
 
 
 def _required_text(payload: Mapping[str, Any], key: str, what: str) -> str:
@@ -176,5 +259,6 @@ __all__ = [
     "HumanCheck",
     "HumanGate",
     "HumanGateError",
+    "new_gate_instance_id",
     "parse_human_gate",
 ]
