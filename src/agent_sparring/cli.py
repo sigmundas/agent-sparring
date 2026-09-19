@@ -1721,10 +1721,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# What the shell sees when a command is interrupted: the conventional
+# 128 + SIGINT. Returned explicitly rather than left to the interpreter's
+# own handling of an escaping KeyboardInterrupt, so the code a caller reads
+# is the same one on every platform and does not depend on whether Python
+# re-raises the signal.
+INTERRUPTED_EXIT_CODE = 130
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        # An interruption is an ordinary, supported way to end a command, so
+        # it reports as one rather than as a stack trace.
+        #
+        # Nothing is written, reset or rolled back here, deliberately.
+        # Everything the run had got to is already recorded -- a plan run's
+        # position, a stage's status, session ids, the accepted candidate --
+        # and each of those was written when it became true. Unwinding is
+        # therefore the whole of the cleanup: the worktree lock is an
+        # ``flock`` the kernel releases with the process, and the provider
+        # the turn was waiting on is stopped on the way out
+        # (providers/subprocess_runner.py). The interrupted turn itself
+        # simply did not happen, and the next `resume-plan` / `run-loop`
+        # starts it again from what is recorded.
+        print(
+            "interrupted; nothing was left half-written and the recorded state "
+            "is unchanged. Resume the run to continue from it.",
+            file=sys.stderr,
+        )
+        return INTERRUPTED_EXIT_CODE
 
 
 if __name__ == "__main__":

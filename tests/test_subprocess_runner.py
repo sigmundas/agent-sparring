@@ -189,6 +189,42 @@ class RunStreamingTests(unittest.TestCase):
         self.assertEqual(lines, ["a", "b"])
         self.assertEqual(result.stdout, "a\r\nb\r\n")
 
+    def test_an_interrupted_wait_stops_the_provider_instead_of_waiting_for_it(self):
+        """A Ctrl-C delivered to this process alone must still end the turn.
+
+        A terminal's Ctrl-C reaches the provider too, because it goes to the
+        whole foreground process group; a signal sent to the engine's pid
+        does not. The cleanup used to wait for the provider unconditionally,
+        so on that path the engine hung for ever holding the worktree lock
+        instead of stopping. The provider must be stopped, reaped, and the
+        interruption must still propagate to the caller.
+        """
+
+        pid_file = self.cwd / "provider.pid"
+        code = (
+            "import os, sys, time\n"
+            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            "print('working', flush=True)\n"
+            "time.sleep(120)\n"
+        )
+        self.addCleanup(self._kill_pid_file, pid_file)
+
+        def interrupt(line: str) -> None:
+            # Raised from inside the runner's own wait, which is exactly
+            # where a KeyboardInterrupt lands during a provider turn.
+            raise KeyboardInterrupt
+
+        started = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            run_streaming(_python(code), self.cwd, None, interrupt)
+        self.assertLess(time.monotonic() - started, 20, "the runner waited for the provider")
+
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 10
+        while self._alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(self._alive(pid), "the provider was left running after the interruption")
+
 
 if __name__ == "__main__":
     unittest.main()

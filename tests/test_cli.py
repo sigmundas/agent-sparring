@@ -9,7 +9,9 @@ from pathlib import Path
 
 import conftest_path  # noqa: F401
 
-from agent_sparring.cli import main
+from unittest import mock
+
+from agent_sparring.cli import build_parser, main
 
 
 def _run_git(repo: Path, *args: str) -> None:
@@ -774,3 +776,44 @@ open(out, "w").write(json.dumps(verdict))
         for leak in ("OLD-LEAK", "NEW-LEAK", "CMD-LEAK", "OUTPUT-LEAK", "REASONING-LEAK",
                      "FINDINGS-LEAK", "3 passed", "Do the thing", "Stage brief"):
             self.assertNotIn(leak, text)
+
+
+class CliInterruptionTests(unittest.TestCase):
+    """What a Ctrl-C during a command reports.
+
+    Interrupting a run is a supported way to stop it, not a crash, and the
+    UI that offers Stop reads the exit code to tell an interruption from a
+    failure. Both halves are asserted here: the conventional 130, and a
+    plain sentence in place of a Python traceback.
+    """
+
+    def test_keyboard_interrupt_reports_130_and_a_plain_sentence(self):
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["sparring"]), contextlib.redirect_stderr(err):
+            with mock.patch(
+                "agent_sparring.cli.build_parser", side_effect=self._parser_raising_interrupt
+            ):
+                code = main(["check-config"])
+        self.assertEqual(code, 130)
+        message = err.getvalue()
+        self.assertIn("interrupted", message)
+        self.assertIn("Resume the run to continue", message)
+        self.assertNotIn("Traceback", message)
+
+    @staticmethod
+    def _parser_raising_interrupt():
+        """The real parser, with the selected command replaced by one that is
+        interrupted — which is where a Ctrl-C actually lands."""
+
+        parser = build_parser()
+        original = parser.parse_args
+
+        def parse(argv=None, namespace=None):
+            args = original(argv, namespace)
+            def interrupted(_args):
+                raise KeyboardInterrupt
+            args.func = interrupted
+            return args
+
+        parser.parse_args = parse  # type: ignore[method-assign]
+        return parser
