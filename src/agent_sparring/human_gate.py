@@ -216,9 +216,26 @@ class HumanGate:
                     f"human-gate check ids must be unique within a gate; {check.id!r} repeats"
                 )
             seen.add(check.id)
-        raw_instance = payload.get("instance_id")
-        instance_id = None if raw_instance is None else _valid_instance_id(raw_instance)
+        # Tolerated, not validated. This field is not the reviewing agent's
+        # to set -- ``record_sparring`` overwrites whatever arrives here --
+        # so a malformed one is a field about to be discarded, and raising
+        # would throw away an otherwise good verdict because an agent copied
+        # a mangled id out of the sparring.md it was shown. Reading it as
+        # absent is also the right answer for a genuinely corrupt recorded
+        # file: which asking it was is then unknown, which is exactly what
+        # ``None`` means. The engine validates what it *mints*
+        # (:meth:`asked_again`), and tolerates what it reads.
+        instance_id = _instance_id_or_none(payload.get("instance_id"))
         return cls(category=category, title=title, checks=checks, instance_id=instance_id)
+
+
+def _instance_id_or_none(value: Any) -> str | None:
+    """A readable instance id, or ``None`` for anything this cannot trust."""
+
+    try:
+        return _valid_instance_id(value)
+    except HumanGateError:
+        return None
 
 
 def _valid_instance_id(value: Any) -> str:

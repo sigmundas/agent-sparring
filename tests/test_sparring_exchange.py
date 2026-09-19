@@ -219,17 +219,28 @@ class GateInstanceIdentityTests(unittest.TestCase):
         self.assertNotIn("instance_id", content)
         self.assertNotIn("Gate instance:", content)
 
-    def test_a_malformed_instance_id_is_refused(self):
+    def test_a_malformed_instance_id_reads_as_absent(self):
+        # Not an error: this field is not the reviewing agent's to set, and
+        # rejecting the verdict because an agent echoed a mangled id out of
+        # the sparring.md it was shown would throw away a good verdict over a
+        # field that is about to be overwritten anyway.
+        for bad in ("has space", "back`tick", "", 7, {"a": 1}, "x" * 129):
+            gate = HumanGate.from_dict(
+                {
+                    "category": "OTHER",
+                    "title": "t",
+                    "checks": [{"id": "c", "instruction": "i", "pass_criteria": "p"}],
+                    "instance_id": bad,
+                }
+            )
+            self.assertIsNone(gate.instance_id, f"{bad!r} is not an identity")
+
+    def test_a_malformed_instance_id_is_still_refused_when_minting(self):
+        # What the engine writes is held to the contract, because everything
+        # downstream compares these strings for equality.
         for bad in ("has space", "back`tick", "", "x" * 129):
             with self.assertRaises(HumanGateError):
-                HumanGate.from_dict(
-                    {
-                        "category": "OTHER",
-                        "title": "t",
-                        "checks": [{"id": "c", "instruction": "i", "pass_criteria": "p"}],
-                        "instance_id": bad,
-                    }
-                )
+                self._gate().asked_again(bad)
 
     def test_minted_ids_are_usable_and_distinct(self):
         minted = {new_gate_instance_id() for _ in range(100)}
