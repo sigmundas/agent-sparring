@@ -155,6 +155,7 @@ from agent_sparring.deferred_gate import (
     CheckResult,
     DeferredAnswer,
     DeferredGateError,
+    DeferredHumanGate,
     DeferredObligation,
     DeferredVerificationRequired,
 )
@@ -1853,7 +1854,7 @@ def _reconcile_deferred(
     if recorded is not None:
         sources.append(recorded)
 
-    changed = False
+    raised: list[DeferredHumanGate] = []
     for source in sources:
         deferred = source.deferred_human_gate
         if deferred is None:
@@ -1865,11 +1866,21 @@ def _reconcile_deferred(
             # rather than as an unanswerable one.
             if isinstance(source, RecordedOutcome):
                 continue
-            raise PlanRunError(
-                f"stage {stage.stage_id!r} deferred human verification without an "
-                "engine-minted gate instance; refusing to record an obligation nothing "
-                "can answer"
+            raise _fail(
+                state,
+                state_path,
+                activity,
+                why="deferral without a gate instance",
+                message=(
+                    f"plan {state.plan} stopped at stage {stage.stage_id!r}: its review "
+                    "deferred human verification without an engine-minted gate instance, "
+                    "and an obligation nothing can answer must not be recorded"
+                ),
             )
+        _fold_deferral(raised, deferred)
+
+    changed = False
+    for deferred in raised:
         if state.record_deferred(DeferredObligation.from_gate(stage.stage_id, deferred)):
             changed = True
             activity.emit(
@@ -1911,6 +1922,52 @@ def _reconcile_deferred(
             )
     if changed:
         state.save(state_path)
+
+
+def _fold_deferral(raised: list[DeferredHumanGate], deferred: DeferredHumanGate) -> None:
+    """Add ``deferred`` to ``raised``, or replace the same question already in
+    it with this later asking of it.
+
+    One stage's loop can write the same deferral twice. A READY over an
+    uncommitted candidate routes a commit-and-review cycle, and the reviewer
+    of that second turn is looking at the same work with the same reservation
+    -- so it restates the deferral, and ``record_sparring`` mints it a fresh
+    instance, because every write is a new asking and the engine cannot tell
+    a restatement from a materially different question by looking at one
+    verdict.
+
+    Here it can tell, because it has both. Two deferrals with the same
+    category, title, checkpoint and checks are one question, and recording
+    them as two obligations would ask a person the same thing twice under two
+    ids -- and make the bare check id ambiguous, so neither could be answered
+    without naming an instance. The *later* asking wins: it is the one whose
+    instance is in ``sparring.md``, which is what every other reader of this
+    stage sees.
+
+    A reviewer that changes the question -- different checks, a different
+    title -- is doing the thing a new asking is for, and gets a second
+    obligation. That is the same rule as everywhere else: same unresolved
+    obligation, same instance; materially reissued, new instance.
+    """
+
+    for position, existing in enumerate(raised):
+        if _same_question(existing, deferred):
+            raised[position] = deferred
+            return
+    raised.append(deferred)
+
+
+def _same_question(a: DeferredHumanGate, b: DeferredHumanGate) -> bool:
+    """Are these two deferrals the same thing to ask, ignoring which asking
+    they are? ``checks`` are frozen dataclasses, so this compares the
+    reviewer's ids, instructions, pass criteria and sources exactly."""
+
+    return (
+        a.category == b.category
+        and a.title == b.title
+        and a.checkpoint == b.checkpoint
+        and a.checks == b.checks
+    )
 
 
 def _loop_routings(result: "LoopResult | None") -> tuple[RoutingResult, ...]:

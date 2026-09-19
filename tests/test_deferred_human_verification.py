@@ -730,6 +730,60 @@ class ObligationCannotBeLostTests(_DeferredRunCase):
         self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
         self.assertIs(result.status, PlanRunStatus.PAUSED)
 
+    def test_a_deferral_restated_across_the_finalization_cycle_is_one_obligation(self):
+        # Both sparring turns of the finalization cycle are the same review
+        # looking at the same work, so the second one restating the deferral
+        # is the likely behaviour -- and record_sparring mints it a fresh
+        # instance, because every write is a new asking. Recording both would
+        # ask a person the same question twice under two ids, and make the
+        # bare check id ambiguous so neither could be answered plainly.
+        sparring = _SparringAdapter([READY_WITH_DEFERRAL, READY_WITH_DEFERRAL, READY])
+        self._start(_FinalizingStageAdapter(self.repo), sparring, stop_after_stage=S1)
+
+        owed = self._plan_state().deferred_human_checks
+        self.assertEqual(len(owed), 1)
+        # The later asking wins: its instance is the one in sparring.md, which
+        # is what every other reader of this stage sees.
+        recorded = read_recorded_outcome(self._stage(S1))
+        self.assertEqual(owed[0].instance_id, recorded.deferred_human_gate.instance_id)
+
+        # ... and a bare check id is therefore still answerable, which two
+        # obligations under one check id would have made impossible.
+        self._resume(self.stage_adapter, _SparringAdapter([READY]))
+        result = self._resume(
+            self.stage_adapter,
+            _SparringAdapter([]),
+            deferred_results=(DeferredAnswer.parse("resize-readability=pass"),),
+        )
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+
+    def test_a_materially_different_deferral_is_a_second_obligation(self):
+        # The other half of the same rule: a reviewer that changes the
+        # question is doing what a new asking is for.
+        second = verdict(
+            "READY",
+            "and one more thing",
+            deferred=deferred_gate(
+                checks=[
+                    {
+                        "id": "contrast",
+                        "instruction": "Check the contrast in the dark theme.",
+                        "pass_criteria": "Legible.",
+                        "source": None,
+                    }
+                ]
+            ),
+        )
+        sparring = _SparringAdapter([READY_WITH_DEFERRAL, second, READY])
+        self._start(_FinalizingStageAdapter(self.repo), sparring, stop_after_stage=S1)
+
+        owed = self._plan_state().deferred_human_checks
+        self.assertEqual(len(owed), 2)
+        self.assertEqual(
+            sorted(check.id for entry in owed for check in entry.gate.checks),
+            ["contrast", "resize-readability"],
+        )
+
     def test_a_deferral_survives_a_resume_that_only_pushes_an_authorized_candidate(self):
         # The run stops for push permission *before* the ledger is written,
         # and the resume that answers it runs no agent at all -- so there is
