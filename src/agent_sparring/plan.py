@@ -1936,16 +1936,16 @@ def _fold_deferral(raised: list[DeferredHumanGate], deferred: DeferredHumanGate)
     a restatement from a materially different question by looking at one
     verdict.
 
-    Here it can tell, because it has both. Two deferrals with the same
-    category, title, checkpoint and checks are one question, and recording
-    them as two obligations would ask a person the same thing twice under two
-    ids -- and make the bare check id ambiguous, so neither could be answered
-    without naming an instance. The *later* asking wins: it is the one whose
-    instance is in ``sparring.md``, which is what every other reader of this
-    stage sees.
+    Here it can tell, because it has both. Two deferrals asking the same
+    questions are one deferral, and recording them as two obligations would
+    ask a person the same thing twice under two ids -- and make the bare
+    check id ambiguous, so neither could be answered without naming an
+    instance. The *later* asking wins: it is the one whose instance is in
+    ``sparring.md``, which is what every other reader of this stage sees, and
+    it supplies the contents, so any rewording the reviewer settled on is the
+    one a person reads.
 
-    A reviewer that changes the question -- different checks, a different
-    title -- is doing the thing a new asking is for, and gets a second
+    A reviewer that changes *which* checks it is asking for gets a second
     obligation. That is the same rule as everywhere else: same unresolved
     obligation, same instance; materially reissued, new instance.
     """
@@ -1958,15 +1958,27 @@ def _fold_deferral(raised: list[DeferredHumanGate], deferred: DeferredHumanGate)
 
 
 def _same_question(a: DeferredHumanGate, b: DeferredHumanGate) -> bool:
-    """Are these two deferrals the same thing to ask, ignoring which asking
-    they are? ``checks`` are frozen dataclasses, so this compares the
-    reviewer's ids, instructions, pass criteria and sources exactly."""
+    """Are these two deferrals asking for the same checks?
+
+    Compared by the reviewer's **check ids**, because that is what a check id
+    is for: :mod:`agent_sparring.human_gate` defines it as stable across
+    sparring turns for the same check, precisely so a recorded outcome
+    survives the reviewer restating its gate. Comparing the instructions
+    instead would miss the ordinary case this fold exists for -- a second
+    generation of the same review re-emitting the same check id with one word
+    changed -- and hand back the duplicate obligation.
+
+    ``category`` and ``checkpoint`` are compared because they are closed
+    values a reviewer chooses deliberately; ``title`` and ``rationale`` are
+    not, because they are prose and drift between two generations of the same
+    judgement. The later gate supplies all of it anyway, so the wording a
+    person reads is the wording the reviewer settled on.
+    """
 
     return (
         a.category == b.category
-        and a.title == b.title
         and a.checkpoint == b.checkpoint
-        and a.checks == b.checks
+        and tuple(check.id for check in a.checks) == tuple(check.id for check in b.checks)
     )
 
 

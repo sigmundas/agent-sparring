@@ -757,6 +757,36 @@ class ObligationCannotBeLostTests(_DeferredRunCase):
         )
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
 
+    def test_a_reworded_restatement_under_the_same_check_id_is_one_obligation(self):
+        # The second turn is a fresh generation of the same review. Re-emitting
+        # the same check id with the wording slightly different is exactly what
+        # a stable check id exists to absorb, so it must fold -- comparing the
+        # instructions would hand back the duplicate this fold removes.
+        reworded = verdict(
+            "READY",
+            "looks good",
+            deferred=deferred_gate(
+                checks=[
+                    {
+                        "id": "resize-readability",
+                        "instruction": "Open the summary dialog and drag it from 1400px to 700px.",
+                        "pass_criteria": "Labels stay legible. Fail if text overlaps.",
+                        "source": None,
+                    }
+                ],
+                rationale="Nothing downstream reads the layout; a failure is a local fix.",
+            ),
+        )
+        sparring = _SparringAdapter([READY_WITH_DEFERRAL, reworded, READY])
+        self._start(_FinalizingStageAdapter(self.repo), sparring, stop_after_stage=S1)
+
+        owed = self._plan_state().deferred_human_checks
+        self.assertEqual(len(owed), 1)
+        # The later asking supplies the contents, so the wording a person is
+        # shown is the wording the reviewer settled on.
+        self.assertIn("drag it from 1400px", owed[0].gate.checks[0].instruction)
+        self.assertIn("Nothing downstream reads the layout", owed[0].rationale)
+
     def test_a_materially_different_deferral_is_a_second_obligation(self):
         # The other half of the same rule: a reviewer that changes the
         # question is doing what a new asking is for.
