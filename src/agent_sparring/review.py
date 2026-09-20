@@ -69,6 +69,7 @@ from agent_sparring.acceptance import (
     pin_sibling_candidates,
     unrepresented_dirty,
 )
+from agent_sparring.deferred_gate import DeferredObligation
 from agent_sparring.git_context import GitContextError, current_branch, is_full_sha, resolve_commit
 from agent_sparring.plan_model import PlannedStage
 from agent_sparring.providers import SparringAgentAdapter
@@ -395,6 +396,7 @@ def run_independent_review(
     expected_branch: str,
     subject: ReviewSubject,
     evidence_first: bool = False,
+    pending_deferred: tuple[DeferredObligation, ...] = (),
 ) -> ReviewResult:
     """Run exactly one independent-review turn and return its outcome.
 
@@ -420,6 +422,7 @@ def run_independent_review(
             reviewer_adapter,
             expected_branch=expected_branch,
             evidence_first=evidence_first,
+            pending_deferred=pending_deferred,
             review_candidate_set=describe_candidate_set(stage, subject),
         )
     except SparringAgentRunError as exc:

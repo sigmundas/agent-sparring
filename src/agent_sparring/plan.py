@@ -141,7 +141,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from agent_sparring.acceptance import (
     AcceptanceError,
@@ -150,11 +150,21 @@ from agent_sparring.acceptance import (
     freeze_candidate,
 )
 from agent_sparring.activity import ActivityEmitter
+from agent_sparring.deferred_gate import (
+    DEFERRED_VERIFICATION_REQUIRED,
+    CheckResult,
+    DeferredAnswer,
+    DeferredGateError,
+    DeferredHumanGate,
+    DeferredObligation,
+    DeferredVerificationRequired,
+)
 from agent_sparring.finalization import FinalizationError, pending_finalization
 from agent_sparring.git_context import GitContextError, is_ignored, resolve_commit
 from agent_sparring.loop import (
     DEFAULT_MAX_SEND_BACK_CYCLES,
     LoopError,
+    LoopResult,
     run_unattended_loop,
 )
 from agent_sparring.manifest import ManifestError, ManifestPlanSource, load_manifest_source
@@ -175,6 +185,7 @@ from agent_sparring.review import (
     enter_review,
     run_independent_review,
 )
+from agent_sparring.human_gate import HumanCheck
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import RecordedOutcome, read_recorded_outcome
 from agent_sparring.stage import (
@@ -396,11 +407,25 @@ class PlanRunState:
     #: the run and asks.
     push_authorization: PushAuthorization | None = None
     #: Why this run is stopped, when the reason is a typed one the runner
-    #: itself recorded rather than a reviewer's verdict. Today that is only
-    #: :class:`~agent_sparring.push_gate.PushRequired`. Cleared whenever the
-    #: run enters a stage for execution, so it can never describe an older
-    #: pause than the one the run is actually in.
-    awaiting: PushRequired | None = None
+    #: itself recorded rather than a reviewer's verdict:
+    #: :class:`~agent_sparring.push_gate.PushRequired`, or
+    #: :class:`~agent_sparring.deferred_gate.DeferredVerificationRequired`.
+    #: Cleared whenever the run enters a stage for execution, so it can never
+    #: describe an older pause than the one the run is actually in.
+    awaiting: PushRequired | DeferredVerificationRequired | None = None
+    #: The obligation ledger: human verification a reviewer deferred rather
+    #: than stopped for (see :mod:`agent_sparring.deferred_gate`).
+    #:
+    #: It lives here, and not in a stage's ``state.json`` or in
+    #: ``sparring.md``, because of what has to be true of it. It must outlive
+    #: the stage that raised it, since the whole point is that later stages
+    #: run first; it must survive SEND_BACK cycles, which rewrite
+    #: ``sparring.md`` wholesale; and the thing that must refuse to finish
+    #: while an entry is unresolved is the plan run, which is exactly what
+    #: this file is the state of. Empty for every run recorded before
+    #: deferral existed, which is also the correct reading of "this run owes
+    #: nothing".
+    deferred_human_checks: tuple[DeferredObligation, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -409,13 +434,64 @@ class PlanRunState:
             self.push_authorization.to_dict() if self.push_authorization is not None else None
         )
         payload["awaiting"] = self.awaiting.to_dict() if self.awaiting is not None else None
+        payload["deferred_human_checks"] = [
+            obligation.to_dict() for obligation in self.deferred_human_checks
+        ]
         return payload
+
+    # -- the obligation ledger -------------------------------------------
+
+    def obligation(self, instance_id: str) -> DeferredObligation | None:
+        for entry in self.deferred_human_checks:
+            if entry.instance_id == instance_id:
+                return entry
+        return None
+
+    @property
+    def unresolved_deferred(self) -> tuple[DeferredObligation, ...]:
+        """Every obligation a person has not finished answering, in the order
+        they were raised. The plan may not complete while this is non-empty,
+        and that is the whole of the completion rule."""
+
+        return tuple(entry for entry in self.deferred_human_checks if not entry.resolved)
+
+    @property
+    def promoted_deferred(self) -> tuple[DeferredObligation, ...]:
+        """Unresolved obligations a later reviewer said can wait no longer."""
+
+        return tuple(entry for entry in self.unresolved_deferred if entry.promoted)
+
+    def record_deferred(self, obligation: DeferredObligation) -> bool:
+        """Add ``obligation`` to the ledger unless its asking is already
+        there. Returns whether it was added.
+
+        Keyed on the gate instance, which is what makes re-entering a stage
+        idempotent: a resumed run that re-reads the same recorded verdict
+        must not raise the same obligation twice, and a reviewer that writes
+        a genuinely new deferral gets a new instance and so a new entry.
+        """
+
+        if self.obligation(obligation.instance_id) is not None:
+            return False
+        self.deferred_human_checks = self.deferred_human_checks + (obligation,)
+        return True
+
+    def replace_obligation(self, obligation: DeferredObligation) -> None:
+        """Substitute the ledger entry with the same gate instance."""
+
+        self.deferred_human_checks = tuple(
+            obligation if entry.instance_id == obligation.instance_id else entry
+            for entry in self.deferred_human_checks
+        )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PlanRunState":
         try:
             authorization = payload.get("push_authorization")
             awaiting = payload.get("awaiting")
+            raw_deferred = payload.get("deferred_human_checks") or []
+            if not isinstance(raw_deferred, (list, tuple)):
+                raise PlanError("malformed plan-run state: deferred_human_checks must be an array")
             return cls(
                 plan=str(payload["plan"]),
                 plan_digest=str(payload["plan_digest"]),
@@ -427,9 +503,12 @@ class PlanRunState:
                 push_authorization=(
                     PushAuthorization.from_dict(authorization) if authorization else None
                 ),
-                awaiting=PushRequired.from_dict(awaiting) if awaiting else None,
+                awaiting=_awaiting_from_dict(awaiting),
+                deferred_human_checks=tuple(
+                    DeferredObligation.from_dict(entry) for entry in raw_deferred
+                ),
             )
-        except PushError as exc:
+        except (PushError, DeferredGateError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -447,6 +526,26 @@ class PlanRunState:
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _awaiting_from_dict(
+    payload: Any,
+) -> "PushRequired | DeferredVerificationRequired | None":
+    """The typed pause a recorded run is stopped on.
+
+    Dispatched on ``kind`` and on nothing else, so adding a reason is adding
+    a value rather than changing a format. An unknown kind is a state file
+    written by a newer engine; refusing it is right, because continuing
+    would mean resuming a run whose reason for being stopped this version
+    does not understand.
+    """
+
+    if not payload:
+        return None
+    kind = payload.get("kind") if isinstance(payload, Mapping) else None
+    if kind == DEFERRED_VERIFICATION_REQUIRED:
+        return DeferredVerificationRequired.from_dict(payload)
+    return PushRequired.from_dict(payload)
 
 
 def plan_label(plan_path: Path, repo_root: Path) -> str:
@@ -573,7 +672,19 @@ class PlanRunResult:
     #: needs push authorization (see :mod:`agent_sparring.push_gate`). The
     #: reviewer said READY; what is missing is a person's permission, not a
     #: review outcome, so this is not dressed up as one.
-    awaiting: PushRequired | None = None
+    #:
+    #: The same field also carries
+    #: :class:`~agent_sparring.deferred_gate.DeferredVerificationRequired`,
+    #: for the run that has nothing left to implement but still owes a
+    #: person the verification an earlier reviewer deferred. It is the same
+    #: kind of fact -- the engine stopped on a typed reason of its own, not
+    #: on a verdict -- so a consumer switches on ``kind`` rather than on
+    #: which field is populated.
+    awaiting: PushRequired | DeferredVerificationRequired | None = None
+    #: The obligations a :class:`DeferredVerificationRequired` pause is
+    #: about, in full, so a caller can render them without re-reading the
+    #: run state. Empty otherwise.
+    deferred: tuple[DeferredObligation, ...] = field(default_factory=tuple)
 
 
 def _verify_source_unchanged(source: PlanSource, state: PlanRunState) -> tuple[PlannedStage, ...]:
@@ -881,6 +992,7 @@ def resume_plan(
     *,
     expected_branch: str,
     evidence: str | None = None,
+    deferred_results: tuple[DeferredAnswer, ...] = (),
     allow_push_candidate: str | None = None,
     allow_push_for_run: bool = False,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
@@ -983,6 +1095,11 @@ def resume_plan(
         allow_push_for_run=allow_push_for_run,
         report=report,
     )
+
+    # Before anything runs, and before the ordinary evidence path: these
+    # answer the run's own checkpoint rather than a stage's review, and a
+    # refusal here must stop the resume rather than leave half of it applied.
+    _answer_deferred(state, state_path, sparring_dir, deferred_results, report=report)
 
     sparrer_first = False
     if evidence is not None and evidence.strip():
@@ -1232,6 +1349,147 @@ def _unreadable_resume_input(
     )
 
 
+def _answer_deferred(
+    state: PlanRunState,
+    state_path: Path,
+    sparring_dir: Path,
+    answers: tuple[DeferredAnswer, ...],
+    *,
+    report: Reporter,
+) -> None:
+    """Record a person's results for the deferred checks the run is stopped
+    on, or refuse.
+
+    Refused unless the run is *in fact* stopped on deferred verification and
+    the check being answered is one of the askings that pause named. That
+    refusal is the same rule ``--allow-push-candidate`` follows and exists
+    for the same reason: a surface rendered from an older state must not be
+    able to answer a question the run has since replaced, and an answer to
+    an earlier asking of a check must never satisfy a later one.
+
+    Each result is written in two places, both engine-owned, neither
+    derived from the other: the run's ledger, which decides whether the plan
+    may complete, and the *originating* stage's ``notes.md``, which is what
+    both agents read on their next turn. The second is why provenance
+    matters -- an obligation raised by stage 2 and answered after stage 7 is
+    recorded against stage 2, where the review that raised it lives.
+    """
+
+    if not answers:
+        return
+    awaiting = state.awaiting
+    if not isinstance(awaiting, DeferredVerificationRequired):
+        raise PlanError(
+            "this run is not stopped for deferred human verification, so there is nothing "
+            "here to answer. Deferred results are only accepted at the checkpoint that "
+            "asked for them; resume without --deferred-result."
+        )
+    asked = tuple(
+        obligation
+        for instance_id in awaiting.instance_ids
+        if (obligation := state.obligation(instance_id)) is not None
+    )
+    # Every answer is resolved against an asking *before* any of them is
+    # applied. Recording results one at a time and refusing half-way through
+    # would leave the first answer's line in one stage's notes.md with no
+    # ledger entry behind it -- a written result the plan does not know about
+    # is worse than a refused resume.
+    located = [_locate_deferred_check(asked, answer) for answer in answers]
+
+    for answer, (obligation, check) in zip(answers, located):
+        # Re-read: an earlier answer in this same call may have updated the
+        # obligation this one also belongs to, and applying the stale copy
+        # would drop that earlier result.
+        current = state.obligation(obligation.instance_id) or obligation
+        state.replace_obligation(
+            current.with_result(
+                CheckResult(check_id=check.id, outcome=answer.outcome, note=answer.note)
+            )
+        )
+        stage = Stage.resolve(sparring_dir, obligation.stage_id)
+        if stage.exists():
+            record_human_evidence(stage, _deferred_evidence_line(obligation, check, answer))
+        report(
+            f"recorded {answer.outcome.word} for deferred check {check.id!r} of gate "
+            f"instance {obligation.instance_id} (raised by {obligation.stage_id})"
+        )
+    state.save(state_path)
+
+
+def _locate_deferred_check(
+    asked: tuple[DeferredObligation, ...], answer: DeferredAnswer
+) -> tuple[DeferredObligation, HumanCheck]:
+    """Which obligation and which check one answer is about.
+
+    A qualified ref names both outright. A bare check id is resolved only
+    when exactly one of the askings in front of the person has a check by
+    that name -- two askings of the same check id is precisely the situation
+    the gate instance exists for, so guessing between them would undo it.
+    """
+
+    # Two readings of the same text, because a reviewer's check id is free
+    # text and may itself contain a colon: the whole reference as a bare
+    # check id, and the qualified ``<instance>:<check id>`` split. Both are
+    # tried and the results unioned, so a colon in an id cannot make a check
+    # unanswerable -- which would leave a plan that can never complete.
+    matches: list[tuple[DeferredObligation, HumanCheck]] = []
+    for obligation in asked:
+        for check in obligation.gate.checks:
+            bare = check.id == answer.check_ref
+            qualified = (
+                answer.instance_id == obligation.instance_id and check.id == answer.check_id
+            )
+            if (bare or qualified) and (obligation, check) not in matches:
+                matches.append((obligation, check))
+    if not matches:
+        known = ", ".join(
+            f"{obligation.instance_id}:{check.id}"
+            for obligation in asked
+            for check in obligation.gate.checks
+        )
+        raise PlanError(
+            f"{answer.check_ref!r} is not one of the deferred checks this run is stopped "
+            f"on. It is asking about: {known or '(nothing)'}"
+        )
+    if len(matches) > 1:
+        qualified = ", ".join(
+            f"{obligation.instance_id}:{check.id}" for obligation, check in matches
+        )
+        raise PlanError(
+            f"check id {answer.check_id!r} belongs to more than one asking in this "
+            f"checkpoint; say which one: {qualified}"
+        )
+    return matches[0]
+
+
+def _deferred_evidence_line(
+    obligation: DeferredObligation, check: HumanCheck, answer: DeferredAnswer
+) -> str:
+    """The ``## Human evidence`` entry for one answered deferred check.
+
+    Deliberately the same line shape a human-gate result is recorded in --
+    outcome, the check's own wording, its id and the gate instance it
+    answers -- so everything that already reads that section keeps working
+    and nothing has to learn a second format. The extra sentence says this
+    was a deferred obligation, because "answered five stages later" is a
+    fact a reader of the stage's notes would otherwise have no way to see.
+    """
+
+    lines = [
+        f"- {answer.outcome.word} — {check.instruction} · check `{check.id}` · gate "
+        f"`{obligation.instance_id}`",
+    ]
+    if answer.note:
+        for note_line in answer.note.splitlines():
+            lines.append(f"  {note_line}")
+    lines.append(
+        f"  (deferred human verification raised by this stage's review and answered at the "
+        f"plan's verification checkpoint; the reviewer deferred it because: "
+        f"{obligation.rationale})"
+    )
+    return "\n".join(lines)
+
+
 def record_human_evidence(stage: Stage, evidence: str) -> None:
     """Append ``evidence`` under ``## Human evidence`` in the stage's notes.md
     (creating the heading on first use). Prose only; nothing parses it."""
@@ -1433,6 +1691,7 @@ def _run_review(
     *,
     position: str,
     evidence_first: bool,
+    pending_deferred: tuple[DeferredObligation, ...] = (),
     report: Reporter,
 ) -> ReviewResult:
     """Enter a review-only stage and run its one independent-review turn.
@@ -1511,6 +1770,7 @@ def _run_review(
             expected_branch=state.expected_branch,
             subject=subject,
             evidence_first=evidence_first,
+            pending_deferred=pending_deferred,
         )
     except ReviewError as exc:
         raise _fail(
@@ -1549,6 +1809,258 @@ def _recorded_pause(stage: Stage) -> RecordedOutcome | None:
 def _pause(state: PlanRunState, state_path: Path) -> None:
     state.status = PlanRunStatus.PAUSED
     state.save(state_path)
+
+
+def _reconcile_deferred(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    stage: Stage,
+    routings: tuple[RoutingResult, ...] = (),
+    *,
+    report: Reporter,
+) -> None:
+    """Bring the run's obligation ledger up to date with one accepted stage.
+
+    Called after every acceptance, and on every pass over an
+    already-accepted stage. It is idempotent on the gate instance, so
+    repeating it records nothing new -- which is what lets it be called from
+    every one of those places rather than from the single one that happens
+    to be convenient.
+
+    It reads **two** sources, because neither alone is complete, and an
+    obligation that never reaches the ledger is an obligation that cannot
+    stop the plan completing -- the one property this whole feature is for:
+
+    - ``routings``, every sparring verdict this stage's loop produced. The
+      loop does not stop at the first READY: a READY over an uncommitted
+      candidate routes one more commit-and-review cycle, whose sparring turn
+      *overwrites* ``sparring.md``. A deferral raised by the first READY is
+      then on disk nowhere, and only the cycle records still hold it;
+    - the verdict actually recorded in ``sparring.md``, which covers every
+      path where this process did not produce the verdict at all: a resume
+      that only pushes an already-authorized candidate and runs no agent, a
+      stage accepted by hand, and a run killed between ``accept_candidate``
+      and this write.
+
+    Reconciling after acceptance rather than at verdict time is deliberate:
+    a stage that did not accept leaves no obligation behind, so a run that
+    stopped at the gate and was later reset does not carry a deferral for
+    work that was never accepted.
+    """
+
+    recorded = read_recorded_outcome(stage)
+    sources: list[RoutingResult | RecordedOutcome] = [*routings]
+    if recorded is not None:
+        sources.append(recorded)
+
+    raised: list[DeferredHumanGate] = []
+    for source in sources:
+        deferred = source.deferred_human_gate
+        if deferred is None:
+            continue
+        if deferred.instance_id is None:
+            # An obligation nothing could ever answer. Unreachable through
+            # run_sparring_agent, which mints the instance before this is
+            # read; a recorded file that lost it is read as no deferral
+            # rather than as an unanswerable one.
+            if isinstance(source, RecordedOutcome):
+                continue
+            raise _fail(
+                state,
+                state_path,
+                activity,
+                why="deferral without a gate instance",
+                message=(
+                    f"plan {state.plan} stopped at stage {stage.stage_id!r}: its review "
+                    "deferred human verification without an engine-minted gate instance, "
+                    "and an obligation nothing can answer must not be recorded"
+                ),
+            )
+        _fold_deferral(raised, deferred)
+
+    changed = False
+    for deferred in raised:
+        if state.record_deferred(DeferredObligation.from_gate(stage.stage_id, deferred)):
+            changed = True
+            activity.emit(
+                "plan.deferred_recorded",
+                summary=f"{len(deferred.checks)} manual check(s) owed by {deferred.checkpoint}",
+            )
+            report(
+                f"stage {stage.stage_id}: accepted, and {len(deferred.checks)} manual "
+                f"{'check is' if len(deferred.checks) == 1 else 'checks are'} deferred "
+                f"until plan completion — {deferred.title}. The reviewer's reason: "
+                f"{deferred.rationale}"
+            )
+
+    # Promotions come only from verdicts this run produced. A recorded file
+    # is re-read on every pass over an accepted stage, and re-applying an old
+    # promotion from it would re-raise a checkpoint a person had already been
+    # through.
+    for routing in routings:
+        for instance_id in routing.promote_deferred:
+            obligation = state.obligation(instance_id)
+            if obligation is None:
+                # The reviewer named something this run does not owe. Said out
+                # loud rather than silently dropped, and never fatal: a mistyped
+                # id must not destroy an otherwise good accepted stage.
+                report(
+                    f"stage {stage.stage_id}: the reviewer asked to promote deferred gate "
+                    f"instance {instance_id!r}, which is not in this run's ledger; ignoring it"
+                )
+                continue
+            if obligation.resolved or obligation.promoted:
+                continue
+            state.replace_obligation(obligation.promote())
+            changed = True
+            activity.emit("plan.deferred_promoted", summary=obligation.describe)
+            report(
+                f"stage {stage.stage_id}: the reviewer promoted the deferred check "
+                f"{obligation.gate.title!r} (raised by {obligation.stage_id}) to immediate; "
+                "the run stops for it before going further"
+            )
+    if changed:
+        state.save(state_path)
+
+
+def _fold_deferral(raised: list[DeferredHumanGate], deferred: DeferredHumanGate) -> None:
+    """Add ``deferred`` to ``raised``, or replace the same question already in
+    it with this later asking of it.
+
+    One stage's loop can write the same deferral twice. A READY over an
+    uncommitted candidate routes a commit-and-review cycle, and the reviewer
+    of that second turn is looking at the same work with the same reservation
+    -- so it restates the deferral, and ``record_sparring`` mints it a fresh
+    instance, because every write is a new asking and the engine cannot tell
+    a restatement from a materially different question by looking at one
+    verdict.
+
+    Here it can tell, because it has both. Two deferrals asking the same
+    questions are one deferral, and recording them as two obligations would
+    ask a person the same thing twice under two ids -- and make the bare
+    check id ambiguous, so neither could be answered without naming an
+    instance. The *later* asking wins: it is the one whose instance is in
+    ``sparring.md``, which is what every other reader of this stage sees, and
+    it supplies the contents, so any rewording the reviewer settled on is the
+    one a person reads.
+
+    A reviewer that changes *which* checks it is asking for gets a second
+    obligation. That is the same rule as everywhere else: same unresolved
+    obligation, same instance; materially reissued, new instance.
+    """
+
+    for position, existing in enumerate(raised):
+        if _same_question(existing, deferred):
+            raised[position] = deferred
+            return
+    raised.append(deferred)
+
+
+def _same_question(a: DeferredHumanGate, b: DeferredHumanGate) -> bool:
+    """Are these two deferrals asking for the same checks?
+
+    Compared by the reviewer's **check ids**, because that is what a check id
+    is for: :mod:`agent_sparring.human_gate` defines it as stable across
+    sparring turns for the same check, precisely so a recorded outcome
+    survives the reviewer restating its gate. Comparing the instructions
+    instead would miss the ordinary case this fold exists for -- a second
+    generation of the same review re-emitting the same check id with one word
+    changed -- and hand back the duplicate obligation.
+
+    ``category`` and ``checkpoint`` are compared because they are closed
+    values a reviewer chooses deliberately; ``title`` and ``rationale`` are
+    not, because they are prose and drift between two generations of the same
+    judgement. The later gate supplies all of it anyway, so the wording a
+    person reads is the wording the reviewer settled on.
+    """
+
+    return (
+        a.category == b.category
+        and a.checkpoint == b.checkpoint
+        and tuple(check.id for check in a.checks) == tuple(check.id for check in b.checks)
+    )
+
+
+def _loop_routings(result: "LoopResult | None") -> tuple[RoutingResult, ...]:
+    """Every verdict a stage's loop produced, in order.
+
+    Not just ``result.routing``: that is the *last* one, and a loop that
+    finalized an uncommitted candidate produced an earlier READY whose
+    ``sparring.md`` has since been overwritten.
+    """
+
+    if result is None:
+        return ()
+    return tuple(cycle.routing for cycle in result.cycles) or (result.routing,)
+
+
+def _stop_for_deferred(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    obligations: tuple[DeferredObligation, ...],
+    *,
+    reason: str,
+    stage_id: str,
+    accepted: list[tuple[str, str]],
+    report: Reporter,
+) -> PlanRunResult:
+    """Stop the run for verification a person already owes.
+
+    One pause, however many obligations accumulated, and however many stages
+    they came from: interrupting somebody four times for four checks that
+    have been waiting anyway is worse than asking once with all four in
+    front of them. Provenance is not lost by doing that -- every obligation
+    still names the stage that raised it and the asking it belongs to.
+    """
+
+    state.awaiting = DeferredVerificationRequired.for_obligations(obligations, reason=reason)
+    _pause(state, state_path)
+    activity.emit("plan.paused", summary=state.awaiting.describe)
+    failed = [entry for entry in obligations if entry.failed]
+    report(f"plan {state.plan}: {state.awaiting.describe}.")
+    for obligation in obligations:
+        report(
+            f"  {obligation.gate.title} — raised by {obligation.stage_id}, gate instance "
+            f"{obligation.instance_id}"
+        )
+        for check in obligation.unanswered:
+            answered = obligation.result_for(check.id)
+            state_word = (
+                "recorded as Blocked — no verification result was obtained, so this is "
+                "still owed"
+                if answered is not None
+                else "not answered yet"
+            )
+            report(f"    {check.id}: {state_word}")
+        for result in obligation.failed:
+            note = f" — {result.note}" if result.note else ""
+            report(f"    {result.check_id}: FAILED{note}")
+    if failed:
+        # The recovery path, stated rather than implied. Nothing is rewound
+        # automatically: the stage that raised the obligation is accepted,
+        # and un-accepting it is a real integrity action that belongs to a
+        # person, not to a plan runner reacting to a check result. What the
+        # engine guarantees is that the plan does not finish, that the
+        # failure is durable in this run's ledger, and that it is written
+        # into the originating stage's notes.md where both agents read it.
+        report(
+            "A deferred check failed. This plan will not complete, and nothing is rewound: "
+            "the stage that raised the check is accepted, and un-accepting accepted work is "
+            "a person's decision, not a plan runner's reaction to a check result. The "
+            "failure is recorded in that stage's notes.md, so its agents read it on their "
+            "next turn. Decide where the correction belongs — usually a further stage — and "
+            "re-answer the check with --deferred-result once the behaviour is right."
+        )
+    return PlanRunResult(
+        status=PlanRunStatus.PAUSED,
+        plan=state.plan,
+        stage_id=stage_id,
+        awaiting=state.awaiting,
+        deferred=obligations,
+        accepted=tuple(accepted),
+    )
 
 
 def _plan_emitter(stage: Stage) -> ActivityEmitter:
@@ -1642,7 +2154,7 @@ def _drive(
     # The typed reason this run was stopped, if it was. Consumed by the first
     # stage entered, exactly like ``sparrer_first``: it is a fact about where
     # the run stopped, not about every stage that follows.
-    pending_push = state.awaiting
+    pending_push = state.awaiting if isinstance(state.awaiting, PushRequired) else None
     # Only for the observational plan.paused event: the run state, not this,
     # is the authority for where a stopped run is positioned.
     last_activity: ActivityEmitter | None = None
@@ -1703,6 +2215,11 @@ def _drive(
             report(f"stage {position} {stage.stage_id}: already ACCEPTED at "
                    f"{stage_state.candidate_sha}; advancing")
             accepted.append((stage.stage_id, str(stage_state.candidate_sha)))
+            # Nothing ran here, and something may still be owed: a stage
+            # accepted by hand, or by a run killed between the acceptance
+            # gate and the ledger write, carries its reviewer's deferral in
+            # sparring.md and nowhere else. Idempotent on the gate instance.
+            _reconcile_deferred(state, state_path, activity, stage, report=report)
         else:
             waiting = None if sparrer_first else _recorded_pause(stage)
             if waiting is not None:
@@ -1763,6 +2280,7 @@ def _drive(
                     activity,
                     position=position,
                     evidence_first=sparrer_first,
+                    pending_deferred=state.unresolved_deferred,
                     report=report,
                 )
                 sparrer_first = False  # only the stage this resume entered
@@ -1828,12 +2346,25 @@ def _drive(
                     )
                 accepted.append((stage.stage_id, result.candidate_sha))
                 activity.emit("plan.stage.accepted", sha=result.candidate_sha)
+                _reconcile_deferred(
+                    state,
+                    state_path,
+                    activity,
+                    stage,
+                    (review.routing,) if review.routing is not None else (),
+                    report=report,
+                )
 
             else:
                 # A run stopped for push permission, resumed with it, and
                 # still at the exact commit it stopped over, has nothing left
                 # for either agent: the READY is recorded, the candidate is
                 # that commit, and the only missing step is the push itself.
+                # None on the authorized-push path below, where no agent
+                # runs at all: there is no fresh verdict then, and the
+                # obligations the recorded one raised were folded into the
+                # ledger by the run that produced it.
+                loop_result: LoopResult | None = None
                 authorized_push = _resuming_authorized_push(repo_root, stage, pending_push)
                 pending_push = None  # only the stage this resume entered
                 if authorized_push is not None:
@@ -1915,6 +2446,7 @@ def _drive(
                             max_send_back_cycles=max_send_back_cycles,
                             self_check=self_check,
                             start_with=start_with,
+                            pending_deferred=state.unresolved_deferred,
                         )
                     except LoopError as exc:
                         raise _fail(
@@ -1989,8 +2521,54 @@ def _drive(
                     )
                 accepted.append((stage.stage_id, result.candidate_sha))
                 activity.emit("plan.stage.accepted", sha=result.candidate_sha)
+                # The reviewer's own words for what this acceptance does and
+                # does not claim. A stage accepted with a deferred obligation
+                # is accepted *and* still owes verification, and the report
+                # says both rather than letting "accepted" read as "verified".
+                _reconcile_deferred(
+                    state, state_path, activity, stage, _loop_routings(loop_result), report=report
+                )
+
+        # A later reviewer decided one of the run's standing obligations can
+        # wait no longer. The stage it said that in is finished either way --
+        # promotion is not a verdict on this stage -- so the run stops here,
+        # before entering the next one, and asks.
+        promoted = state.promoted_deferred
+        if promoted:
+            return _stop_for_deferred(
+                state,
+                state_path,
+                activity,
+                promoted,
+                reason=DeferredVerificationRequired.PROMOTED,
+                stage_id=stage.stage_id,
+                accepted=accepted,
+                report=report,
+            )
 
         if state.current_stage_index + 1 >= total:
+            # NON-NEGOTIABLE: every executable stage is finished, and the
+            # plan still may not report completion while a person owes it
+            # verification. The run stops instead, with one checkpoint
+            # covering everything that accumulated, and completes only once
+            # those are answered -- without re-running anything that is
+            # already accepted, because this loop skips accepted stages.
+            owed = state.unresolved_deferred
+            if owed:
+                return _stop_for_deferred(
+                    state,
+                    state_path,
+                    activity,
+                    owed,
+                    reason=DeferredVerificationRequired.PLAN_COMPLETION,
+                    stage_id=stage.stage_id,
+                    accepted=accepted,
+                    report=report,
+                )
+            # Nothing is owed any more, so the run is not stopped on
+            # anything: leaving a stale reason on a completed run would say
+            # it finished while waiting.
+            state.awaiting = None
             state.status = PlanRunStatus.COMPLETE
             state.save(state_path)
             activity.emit("plan.completed", summary=f"{total} stage(s) accepted")

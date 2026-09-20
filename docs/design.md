@@ -644,6 +644,90 @@ refspec of the run's own branch, built in one function; reachability is then
 re-proven and the gate itself runs unchanged. Nothing about acceptance is
 relaxed by any of it, and no sibling repository is ever pushed.
 
+### Deferred human verification
+
+`NEEDS_YOU` with a `human_gate` means *stop now*, and every check in it must
+be done before the stage can be `READY`. That contract is right for a product
+choice the next stage builds on, and wrong for "resize the finished dialog and
+check it is still readable": expressed as an immediate gate, a cosmetic check
+stops the whole implementation/sparring loop the moment it is raised, and an
+unattended run cannot get past it.
+
+So there is a second shape, and **which one to use is the reviewer's
+judgement, not a rule the engine applies**:
+
+    NEEDS_YOU + human_gate            a person must answer before this stage
+                                      can be READY
+    READY     + deferred_human_gate   no implementation issue blocks this
+                                      stage, a person still owes this
+                                      verification, and the reviewer recorded
+                                      why continuing first is low risk
+
+Nothing in the engine inspects a check's category, wording or subject to
+decide which it should have been; a `UI_VISUAL_CHECK` is immediate when the
+reviewer says so and deferred when the reviewer says so. The sparring prompt
+gives the reviewer the questions to reason with (does the answer change what
+subsequent implementation should be; would later work be expensive or
+misleading if it failed; is the correction local and bounded), and the four
+categorically non-deferrable boundaries — irreversible/destructive approval,
+production release authorization, a credential or security boundary, and an
+explicit plan requirement for human approval before proceeding.
+
+What the engine owns is the part a reviewer cannot do for itself
+(`agent_sparring.deferred_gate`):
+
+- **rationale or refusal.** A deferral without a reviewer-authored rationale
+  is an invalid verdict. It is the only record of why an unattended run was
+  allowed to continue, and the human, the next reviewer and anyone debugging
+  the decision all read it.
+- **real asking identity.** A deferred gate is minted an `instance_id` in
+  `record_sparring`, exactly like an immediate one and in the same place, so
+  an answer to an earlier asking can never satisfy a later one. Deferring,
+  carrying across stages and later promoting are all the *same* asking; a
+  reviewer that materially reissues writes a new gate and gets a new instance.
+- **a durable ledger.** Obligations live on `PlanRunState.deferred_human_checks`
+  and nowhere else. A stage's `sparring.md` is rewritten by every `SEND_BACK`
+  cycle and an obligation deliberately outlives the stage that raised it; the
+  thing that must refuse to finish while one is open is the plan run, which is
+  what that file is the state of. An entry is keyed by its gate instance, so
+  re-entering an accepted stage records nothing new.
+- **a plan may not complete while one is open.** When every executable stage
+  is accepted and anything is still owed, the run pauses with a typed reason
+  (`awaiting.kind = deferred_verification_required`) instead of reporting
+  `complete` — one coherent checkpoint for everything that accumulated, rather
+  than four separate interruptions. Answering it completes the plan without
+  re-running anything already accepted, because the loop skips accepted stages.
+- **a checkpoint value, not a checkpoint convention.** v1 implements
+  `before_plan_completion` only, and refuses any other value rather than
+  storing a deadline nothing honours; the field exists so a later
+  `before_stage:<id>` is a new value and not a new format.
+
+Answers arrive as data, not prose: `resume-plan --deferred-result
+'<check>=<pass|fail|blocked>[=<note>]'`, refused unless the run is in fact
+stopped on that asking, and addressed as `<gate instance>:<check id>` whenever
+a bare id would be ambiguous. Each result is written in two places, neither
+derived from the other — the ledger, which decides completion, and the
+*originating* stage's `notes.md`, in the same line shape a human-gate answer
+uses, so both agents see it on their next turn and provenance survives an
+obligation raised by stage 2 and answered after stage 7.
+
+`blocked` resolves nothing. "I could not test it" is not a result, and a plan
+completed on one would be a plan completed on a verification nobody made. A
+`fail` keeps the plan stopped too, and the engine deliberately does **not**
+rewind: un-accepting a stage is a real integrity action that belongs to a
+person. What it guarantees is that the plan does not finish, that the failure
+is durable, and that it is where the correcting agents will read it.
+
+Deferred is not permanently deferred. Every sparring turn of a managed run is
+shown the ledger and may name an entry in `promote_deferred`; the engine then
+stops the run before the next stage under the *same* asking. The engine never
+promotes anything on its own initiative and never re-evaluates a reviewer's
+timing judgement.
+
+A stage accepted with an open obligation is *accepted and still owes a check*,
+and both halves are reported. Acceptance copy never claims everything was
+verified when something was deliberately deferred.
+
 The runner takes an adapter factory (`make_adapters(stage)`) rather than
 finished adapters and calls it once per stage it enters, so each planned
 stage's provider telemetry is bound to that stage's own `activity.jsonl`;

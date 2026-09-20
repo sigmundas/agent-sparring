@@ -96,6 +96,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
+from agent_sparring.deferred_gate import CHECKPOINTS
 from agent_sparring.human_gate import HUMAN_GATE_CATEGORIES
 from agent_sparring.providers import ProviderError, Runner, SparringAgentResult
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
@@ -179,6 +180,24 @@ _HUMAN_GATE_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+# The deferred counterpart. Same checks, plus the reviewer's rationale and
+# the checkpoint by which the answer is owed. Nullable at the schema level
+# for the same reason the immediate gate is -- it is legal only with READY,
+# and that half of the contract is stated in the prompt and enforced by
+# RoutingResult (see agent_sparring.deferred_gate).
+_DEFERRED_GATE_SCHEMA: dict[str, Any] = {
+    "type": ["object", "null"],
+    "properties": {
+        "category": {"type": "string", "enum": list(HUMAN_GATE_CATEGORIES)},
+        "title": {"type": "string"},
+        "checks": _HUMAN_GATE_SCHEMA["properties"]["checks"],
+        "rationale": {"type": "string"},
+        "checkpoint": {"type": "string", "enum": list(CHECKPOINTS)},
+    },
+    "required": ["category", "title", "checks", "rationale", "checkpoint"],
+    "additionalProperties": False,
+}
+
 VERDICT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -191,6 +210,8 @@ VERDICT_SCHEMA: dict[str, Any] = {
         "findings": {"type": "string"},
         "deferred": {"type": ["string", "null"]},
         "human_gate": _HUMAN_GATE_SCHEMA,
+        "deferred_human_gate": _DEFERRED_GATE_SCHEMA,
+        "promote_deferred": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "action",
@@ -199,6 +220,8 @@ VERDICT_SCHEMA: dict[str, Any] = {
         "findings",
         "deferred",
         "human_gate",
+        "deferred_human_gate",
+        "promote_deferred",
     ],
     "additionalProperties": False,
 }

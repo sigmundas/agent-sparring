@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
+from agent_sparring.deferred_gate import DeferredGateError, DeferredHumanGate
 from agent_sparring.human_gate import HumanGate, HumanGateError
 
 
@@ -69,6 +70,22 @@ class RoutingResult:
     back, ready, or escalated is not waiting on a human check list. Making
     that list structured is what lets a UI render it without mining prose;
     everything that is *not* a blocking human check stays prose.
+
+    ``deferred_human_gate`` is the other half of that decision, and it is
+    deliberately a *different field* rather than a flag on the first one (see
+    :mod:`agent_sparring.deferred_gate`). It is legal only on READY, and it
+    means: no implementation issue blocks this stage, a person still owes
+    this verification, and the reviewer has judged that later work may
+    continue first. Overloading NEEDS_YOU to mean both "stop now" and "maybe
+    later" would make the one distinction every consumer has to act on
+    unreadable, so the two are structurally separate and the immediate
+    contract above is untouched.
+
+    ``promote_deferred`` names gate instances of obligations already in the
+    run's ledger that this reviewer has decided can wait no longer. It is
+    allowed with any action, because it is an annotation on the ledger rather
+    than a routing decision: the engine stops the run for a promoted
+    obligation whatever this stage's own verdict turned out to be.
     """
 
     action: RoutingAction
@@ -76,6 +93,8 @@ class RoutingResult:
     needs_you_reason: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
     human_gate: HumanGate | None = None
+    deferred_human_gate: DeferredHumanGate | None = None
+    promote_deferred: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.action, RoutingAction):
@@ -101,6 +120,26 @@ class RoutingResult:
                 f"human_gate must be null for {self.action.value}; only NEEDS_YOU stops "
                 "the stage on a human check list"
             )
+        if self.deferred_human_gate is not None:
+            if not isinstance(self.deferred_human_gate, DeferredHumanGate):
+                raise RoutingResultError(
+                    "deferred_human_gate must be a DeferredHumanGate if present, got "
+                    f"{self.deferred_human_gate!r}"
+                )
+            if self.action is not RoutingAction.READY:
+                raise RoutingResultError(
+                    f"deferred_human_gate must be null for {self.action.value}; deferring a "
+                    "human check is a statement that nothing about the implementation "
+                    "blocks this stage, which only READY makes"
+                )
+        if not isinstance(self.promote_deferred, tuple) or any(
+            not isinstance(value, str) or not value.strip() for value in self.promote_deferred
+        ):
+            raise RoutingResultError(
+                "promote_deferred must be a tuple of non-empty gate instance ids"
+            )
+        if len(set(self.promote_deferred)) != len(self.promote_deferred):
+            raise RoutingResultError("promote_deferred must not repeat a gate instance id")
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -113,6 +152,10 @@ class RoutingResult:
             payload["details"] = dict(self.details)
         if self.human_gate is not None:
             payload["human_gate"] = self.human_gate.to_dict()
+        if self.deferred_human_gate is not None:
+            payload["deferred_human_gate"] = self.deferred_human_gate.to_dict()
+        if self.promote_deferred:
+            payload["promote_deferred"] = list(self.promote_deferred)
         return payload
 
     @classmethod
@@ -145,10 +188,29 @@ class RoutingResult:
             except HumanGateError as exc:
                 raise RoutingResultError(str(exc)) from exc
 
+        raw_deferred = payload.get("deferred_human_gate")
+        deferred_gate: DeferredHumanGate | None = None
+        if isinstance(raw_deferred, DeferredHumanGate):
+            deferred_gate = raw_deferred
+        elif raw_deferred is not None:
+            try:
+                deferred_gate = DeferredHumanGate.from_dict(raw_deferred)
+            except DeferredGateError as exc:
+                raise RoutingResultError(str(exc)) from exc
+
+        raw_promote = payload.get("promote_deferred") or ()
+        if isinstance(raw_promote, str) or not isinstance(raw_promote, (list, tuple)):
+            raise RoutingResultError(
+                f"routing result 'promote_deferred' must be an array, got {raw_promote!r}"
+            )
+        promote = tuple(str(value).strip() for value in raw_promote if str(value).strip())
+
         return cls(
             action=action,
             summary=summary,
             needs_you_reason=reason,
             details=dict(details),
             human_gate=gate,
+            deferred_human_gate=deferred_gate,
+            promote_deferred=promote,
         )

@@ -376,6 +376,77 @@ a stage, and when evidence was recorded. That is telemetry for watching the
 run; the plan's position lives in `.sparring/plans/` and is never read from
 `activity.jsonl`.
 
+### A check that is owed, but not now
+
+Not every manual check has to interrupt the run. A product choice the next
+stage builds on does; "resize the finished dialog and check it is still
+readable" does not — nothing downstream depends on the answer, and a failure
+would be a bounded local fix. The reviewer makes that call, and there are two
+shapes for it:
+
+```text
+NEEDS_YOU + human_gate            stop now; this must be answered before the
+                                  stage can be READY
+READY + deferred_human_gate       the stage is accepted, a person still owes
+                                  this check, and the reviewer said why
+                                  continuing first is low risk
+```
+
+The second one keeps the run going:
+
+```text
+Stage 1 … READY, with "check comparison readability" deferred
+    -> stage 1 accepted; 1 manual check deferred until plan completion
+Stage 2 … READY                 (nobody was interrupted)
+Stage 3 … READY                 (nobody was interrupted)
+    -> every stage accepted, and one check is still owed
+    -> the plan PAUSES instead of completing
+```
+
+The engine will not forget it and will not complete the plan on it. The
+obligation is recorded in the run's own state — the stage that raised it, the
+reviewer's rationale, the checks, and the engine-minted gate instance an
+answer must belong to — so it survives the next stage, a process exit, a
+reload, further `SEND_BACK` cycles and `resume-plan`. Deferring is not
+waiving: the stage is *accepted **and** still owes a check*, and both are
+reported.
+
+A deferral without a rationale is refused. So is a checkpoint this version
+does not implement; today that is `before_plan_completion` only.
+
+The final pause is typed, like the push one:
+
+```json
+"awaiting": {
+  "kind": "deferred_verification_required",
+  "reason": "plan_completion",
+  "instance_ids": ["5b22e1c0…"]
+}
+```
+
+Answer it, and the plan finishes without re-running anything already
+accepted:
+
+```sh
+sparring resume-plan … \
+  --deferred-result 'resize-readability=pass=legible down to 700px'
+```
+
+Outcomes are `pass`, `fail` and `blocked`. `blocked` records that the check
+could not be performed, which resolves nothing — a plan completed on it would
+be a plan completed on a verification nobody made. A `fail` also keeps the
+plan open, and is written into the originating stage's `notes.md`, where that
+stage's agents read it on their next turn; the engine does not rewind a stage
+by itself, because un-accepting accepted work is a person's decision. Where
+the same check id is owed by more than one asking, address it as
+`'<gate instance>:<check id>=pass'`; a bare ambiguous id is refused rather
+than guessed.
+
+Deferred is not permanently deferred. Every sparring turn of a managed run is
+shown what the run already owes, and may decide that a later stage now depends
+on one of those answers; naming its gate instance in `promote_deferred` stops
+the run for it before the next stage, under the same asking.
+
 ### Pushing a verified candidate
 
 Acceptance only ever freezes a commit that is already reachable from the

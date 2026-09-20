@@ -109,6 +109,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_sparring.deferred_gate import DeferredObligation
 from agent_sparring.finalization import (
     FinalizationError,
     PendingFinalization,
@@ -225,8 +226,15 @@ def run_unattended_loop(
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
     start_with: str = "stage",
+    pending_deferred: tuple[DeferredObligation, ...] = (),
 ) -> LoopResult:
     """Drive the stage<->sparring loop until a terminal routing action.
+
+    ``pending_deferred`` is the managed run's ledger of human verification
+    already owed, passed straight through to every sparring turn of this
+    loop (see :func:`~agent_sparring.sparring_agent.run_sparring_agent`).
+    This module neither reads nor interprets it: it is context for the
+    reviewer's judgement, and the plan runner owns the ledger itself.
 
     Each cycle runs exactly one stage-agent turn (fresh session on the
     stage's first cycle, resumed on every later cycle -- entirely decided
@@ -431,6 +439,7 @@ def run_unattended_loop(
                 expected_branch=expected_branch,
                 finalization=finalization_note,
                 evidence_first=evidence_first,
+                pending_deferred=pending_deferred,
             )
         except SparringAgentRunError as exc:
             activity.emit("loop.stopped", cycle=cycle, summary="sparring-agent turn failed")
