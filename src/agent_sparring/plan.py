@@ -141,7 +141,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from agent_sparring.acceptance import (
     AcceptanceError,
@@ -805,10 +805,19 @@ def start_plan(
     worth refusing. With it, each existing stage is checked against
     :func:`_check_adoption`'s rules and every adoption is reported.
 
+    What ``adopt`` never does is take over a stage some *other* managed plan
+    run owns. Stage instances are identified by ``(run, stage)``, recorded
+    as :attr:`~agent_sparring.stage.StageState.plan`, so a follow-up plan
+    started on the same branch -- even one whose sections are numbered Stage
+    1..3 again, and even one whose generated stage ids would collide -- gets
+    stage instances of its own and the earlier plan's accepted history stays
+    the earlier plan's. See :func:`_refuse_foreign_stages`.
+
     Refuses (:class:`PlanError`, before any provider is invoked) if the plan
     is malformed, if a run for this plan is already recorded (use
-    :func:`resume_plan`), if a stage directory exists that adoption does not
-    allow, or if the run-state location is not git-ignored.
+    :func:`resume_plan`), if one of its stages belongs to another managed
+    run, if a stage directory exists that adoption does not allow, or if the
+    run-state location is not git-ignored.
     """
 
     if not expected_branch or not expected_branch.strip():
@@ -827,9 +836,14 @@ def start_plan(
             "that file; nothing is deleted automatically."
         )
 
+    owner = _PlanOwner.of(label)
     leftovers = [
         stage for stage in stages if Stage.resolve(sparring_dir, stage.stage_id).directory.exists()
     ]
+    # Ownership first, and it is not a thing --adopt can answer: a stage
+    # another managed run owns is that run's stage instance, whatever its
+    # directory happens to be called.
+    _refuse_foreign_stages(sparring_dir, leftovers, owner=owner)
     if leftovers and not adopt:
         listed = ", ".join(
             str(Stage.resolve(sparring_dir, stage.stage_id).directory) for stage in leftovers
@@ -841,8 +855,9 @@ def start_plan(
             "those directories deliberately, or pass --adopt to continue the existing "
             "sequence (each stage is then checked and reported, never silently inherited)."
         )
+    adopted: tuple[str, ...] = ()
     if leftovers:
-        _check_adoption(sparring_dir, stages, leftovers, report=report)
+        adopted = _check_adoption(sparring_dir, stages, leftovers, report=report)
     _require_state_ignored(repo_root, state_path)
 
     state = PlanRunState(
@@ -863,6 +878,10 @@ def start_plan(
             raise PlanError(str(exc)) from exc
         report(f"push authorization recorded for this run: {state.push_authorization.describe}")
     state.save(state_path)
+    # Claimed only now that the run exists: a refusal above must not leave a
+    # stage marked as owned by a run that was never recorded.
+    for stage_id in adopted:
+        _claim_stage(sparring_dir, stage_id, owner=owner, report=report)
     report(
         f"{describe_source(source)}: {len(stages)} stage(s) from {source.kind}; "
         f"run state at {state_path}"
@@ -882,13 +901,117 @@ def start_plan(
     )
 
 
+@dataclass(frozen=True)
+class _PlanOwner:
+    """The managed plan run that owns the stage instances it drives.
+
+    ``key`` is what is recorded in each stage's ``state.json`` (it is stable
+    across renames of nothing and unique per plan label -- see
+    :func:`plan_key`); ``label`` is only ever used to say which plan a
+    refusal is about.
+    """
+
+    key: str
+    label: str
+
+    @classmethod
+    def of(cls, label: str) -> "_PlanOwner":
+        return cls(key=plan_key(label), label=label)
+
+
+def _recorded_owner(sparring_dir: Path, stage_id: str) -> str | None:
+    """The plan key recorded as owning ``stage_id``, or None.
+
+    None both for a stage that records no owner and for one whose state
+    cannot be read: this answers "is it *provably* another run's stage", and
+    an unreadable state proves nothing. The ordinary adoption and brief
+    checks still see that stage and refuse it on their own terms.
+    """
+
+    try:
+        return Stage.resolve(sparring_dir, stage_id).read_state().plan
+    except StageError:
+        return None
+
+
+def _refuse_foreign_stages(
+    sparring_dir: Path,
+    planned: Sequence[PlannedStage],
+    *,
+    owner: _PlanOwner,
+) -> None:
+    """Refuse if any of ``planned`` is a stage another managed run owns.
+
+    This is the invariant that makes execution-stage identity
+    ``(run, stage)``: an accepted stage of managed run A is never the stage
+    instance of managed run B, however alike their generated stage ids are.
+    A follow-up plan in the same worktree whose sections are numbered Stage
+    1..3 again is an ordinary workflow, and it gets its own stage
+    instances -- it does not get A's.
+
+    Deliberately unconditional. ``--adopt`` says "these stages were executed
+    independently and I want this plan to adopt them", which is true of
+    hand-driven stages that no run owns; it does not say "take another
+    plan's accepted work as my own", and no flag here does. The way out is
+    to give this plan's stages ids of their own (the plan-key-prefixed ones
+    every managed run now generates), which needs nothing removed from
+    disk.
+    """
+
+    conflicts = [
+        (stage.stage_id, recorded)
+        for stage in planned
+        for recorded in (_recorded_owner(sparring_dir, stage.stage_id),)
+        if recorded is not None and recorded != owner.key
+    ]
+    if not conflicts:
+        return
+    listed = "\n  - ".join(
+        f"{stage_id} is owned by the managed run of plan {recorded}"
+        for stage_id, recorded in conflicts
+    )
+    raise PlanError(
+        f"refusing to run {owner.label} over {len(conflicts)} stage(s) that belong to another "
+        f"managed plan run:\n  - {listed}\n"
+        "Those are that run's stage instances, not this plan's, and an accepted stage of "
+        "one plan never answers for another plan's stage of the same name. This plan needs "
+        "stage ids of its own; nothing has to be deleted, and that run's history stays "
+        "exactly as it is."
+    )
+
+
+def _claim_stage(
+    sparring_dir: Path, stage_id: str, *, owner: _PlanOwner, report: Reporter
+) -> None:
+    """Record ``owner`` as this stage's owning plan run, if nothing else has.
+
+    Monotone: an already-recorded owner is never rewritten (a foreign one
+    has already been refused by :func:`_refuse_foreign_stages` before
+    anything gets here), so ownership cannot drift and an accepted stage
+    cannot be re-pointed at a different plan. A state that cannot be read is
+    left alone; whoever needs to read it will fail with its own message
+    rather than this one.
+    """
+
+    stage = Stage.resolve(sparring_dir, stage_id)
+    try:
+        state = stage.read_state()
+    except StageError:
+        return
+    if state.plan is not None:
+        return
+    state.plan = owner.key
+    stage.write_state(state)
+    report(f"stage {stage_id} is now recorded as owned by the managed run of {owner.label}")
+
+
 def _check_adoption(
     sparring_dir: Path,
     stages: tuple[PlannedStage, ...],
     existing: list[PlannedStage],
     *,
     report: Reporter,
-) -> None:
+) -> tuple[str, ...]:
     """Decide, per already-existing stage, whether this run may take it over.
 
     Three cases, and nothing in between is guessed:
@@ -916,12 +1039,19 @@ def _check_adoption(
     check passes on the truth rather than on a coincidence, and neither the
     brief nor the plan document has to be rolled back to run the sequence.
 
+    A stage owned by *another* managed run never reaches here: it is refused
+    before this by :func:`_refuse_foreign_stages`, whatever its status. So
+    what this decides about is only ever an unowned stage (the hand-driven
+    sequence adoption exists for) or one this same plan already owns.
+
     Reports every adoption, including what is being inherited, so nothing is
-    taken over quietly.
+    taken over quietly. Returns the ids actually adopted, for the caller to
+    claim once the run is recorded.
     """
 
     known = {stage.stage_id for stage in existing}
     problems: list[str] = []
+    adopted: list[str] = []
     for planned in stages:
         if planned.stage_id not in known:
             continue
@@ -941,6 +1071,7 @@ def _check_adoption(
                 f"adopting {planned.display} [{planned.stage_id}]: already ACCEPTED at "
                 f"{state.candidate_sha}; it will be advanced past, not re-run"
             )
+            adopted.append(planned.stage_id)
             continue
         try:
             brief = stage.read_brief()
@@ -971,6 +1102,7 @@ def _check_adoption(
             f"{state.status.value}, brief matches; inheriting "
             f"{inherited or 'no recorded sessions or candidate'}"
         )
+        adopted.append(planned.stage_id)
 
     if problems:
         listed = "\n  - ".join(problems)
@@ -982,6 +1114,7 @@ def _check_adoption(
             "or align the plan's text with it, or remove the stage directory deliberately -- "
             "rather than running a started stage against a different brief."
         )
+    return tuple(adopted)
 
 
 def resume_plan(
@@ -1086,6 +1219,12 @@ def resume_plan(
             f"recorded stage index {state.current_stage_index} is out of range for "
             f"{len(stages)} stage(s)"
         )
+    owner = _PlanOwner.of(label)
+    # The same invariant as a fresh run's, checked here too because a resume
+    # rebuilds its manifest from a living plan document: a rebuild that
+    # drifted onto another run's stage ids must refuse rather than execute
+    # over that run's stages.
+    _refuse_foreign_stages(sparring_dir, stages, owner=owner)
     _require_state_ignored(repo_root, state_path)
     _grant_push_authorization(
         state,
@@ -1104,7 +1243,7 @@ def resume_plan(
     sparrer_first = False
     if evidence is not None and evidence.strip():
         current = stages[state.current_stage_index]
-        stage = _ensure_stage(sparring_dir, current)
+        stage = _ensure_stage(sparring_dir, current, owner=owner, report=report)
         record_human_evidence(stage, evidence)
         report(f"recorded human evidence in {stage.directory / 'notes.md'}")
         # Observational only: that evidence was recorded, never what it says.
@@ -1497,11 +1636,24 @@ def record_human_evidence(stage: Stage, evidence: str) -> None:
     stage.append_note(HUMAN_EVIDENCE_HEADING, evidence)
 
 
-def _ensure_stage(sparring_dir: Path, planned: PlannedStage) -> Stage:
+def _ensure_stage(
+    sparring_dir: Path,
+    planned: PlannedStage,
+    *,
+    owner: _PlanOwner | None = None,
+    report: Reporter = lambda message: None,
+) -> Stage:
     """Create the planned stage (fresh state.json, so fresh sessions) with
     the plan's brief, or continue the existing one whose brief is exactly
     that. A differing brief is refused: the plan is the source of truth for
     what a planned stage is.
+
+    ``owner`` is the plan key of the managed run entering this stage (see
+    :attr:`~agent_sparring.stage.StageState.plan`). A stage created here is
+    owned by that run from the moment it exists, and an existing unowned one
+    is claimed as it is entered, so a later plan cannot mistake it for its
+    own. None means no managed run is driving, which leaves the stage
+    unowned exactly as before.
 
     An ACCEPTED stage is the one exception, and it is returned without the
     brief being compared. Acceptance is terminal: nothing will run for that
@@ -1510,12 +1662,16 @@ def _ensure_stage(sparring_dir: Path, planned: PlannedStage) -> Stage:
     today's plan text would refuse a completed sequence for a wording change
     that can no longer affect anything."""
 
+    if owner is not None:
+        _refuse_foreign_stages(sparring_dir, (planned,), owner=owner)
     try:
         stage = Stage.resolve(sparring_dir, planned.stage_id)
         if not stage.exists():
-            stage.create(brief=planned.brief)
+            stage.create(brief=planned.brief, plan=owner.key if owner else None)
             return stage
         state = stage.read_state()
+        if owner is not None and state.plan is None:
+            _claim_stage(sparring_dir, planned.stage_id, owner=owner, report=report)
         if state.status is StageStatus.ACCEPTED:
             return stage
         if stage.read_brief() != planned.brief:
@@ -2178,7 +2334,9 @@ def _drive(
                 accepted=tuple(accepted),
             )
         try:
-            stage = _ensure_stage(sparring_dir, plan_stage)
+            stage = _ensure_stage(
+                sparring_dir, plan_stage, owner=_PlanOwner.of(state.plan), report=report
+            )
         except PlanError:
             # The authoritative refusal is unchanged; only mirror it, if the
             # stage directory is even addressable.

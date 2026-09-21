@@ -13,6 +13,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -29,6 +30,7 @@ from agent_sparring.plan import (
     PlanError,
     PlanRunState,
     PlanRunStatus,
+    plan_key,
     plan_state_path,
     resume_plan,
     start_plan,
@@ -517,8 +519,14 @@ class ManifestAdoptionTests(_ManifestRepoTestCase):
         self.assertEqual(sparring_adapter.start_calls, [])
         self.assertEqual(sparring_adapter.resume_calls, [])
         # The recorded review, the candidate and both sessions are untouched.
+        # Everything except the ownership this adoption deliberately records:
+        # the stage is now this run's stage instance, which is what stops a
+        # later plan from taking it as its own.
         self.assertEqual(stage.read_sparring(), sparring)
-        self.assertEqual(stage.read_state(), before)
+        after = stage.read_state()
+        self.assertEqual(replace(after, plan=None), replace(before, plan=None))
+        self.assertIsNone(before.plan, "it was an unowned, hand-driven stage")
+        self.assertEqual(after.plan, plan_key(PLAN_LABEL))
         # The accepted history was still walked past, and the run is now a
         # managed one, paused where the human already was.
         self.assertEqual(result.accepted, (("stage-3c-cloud-schema", "a" * 40),))

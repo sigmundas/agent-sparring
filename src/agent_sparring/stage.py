@@ -251,6 +251,24 @@ class StageState:
     # IMPLEMENTATION mode, so every existing file stays byte-identical and
     # reads back as the mode it in fact ran under.
     mode: StageMode = StageMode.IMPLEMENTATION
+    # Which managed plan run owns this stage *instance*: the owning plan's
+    # key (see :func:`agent_sparring.plan.plan_key`), written once by the
+    # run that creates or deliberately adopts the stage and never rewritten
+    # to a different value.
+    #
+    # This is what makes execution-stage identity ``(run, stage)`` rather
+    # than a globally reusable directory name. Stage ids can collide across
+    # plans -- two plans in one worktree both saying "Stage 1 -- Foundation"
+    # is an ordinary follow-up workflow -- and without a recorded owner an
+    # accepted stage of one plan would silently answer for the same-named
+    # stage of the next one.
+    #
+    # ``None`` means no managed run has claimed this stage: a hand-driven
+    # standalone stage, or one written before ownership was recorded. That
+    # is the only case adoption may take over, and it is why absence is not
+    # an error -- every state.json on disk today reads back as unowned, and
+    # stays byte-identical until a run claims it.
+    plan: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -263,6 +281,10 @@ class StageState:
             payload.pop("mode", None)
         else:
             payload["mode"] = self.mode.value
+        # Omitted while unowned, so a hand-driven stage's state.json is
+        # exactly the file it was before ownership existed.
+        if self.plan is None:
+            payload.pop("plan", None)
         return payload
 
     @classmethod
@@ -297,6 +319,7 @@ class StageState:
             candidate_sha=_optional_str_field(payload, "candidate_sha"),
             repositories=repositories,
             mode=mode,
+            plan=_optional_str_field(payload, "plan"),
         )
 
 
@@ -341,6 +364,7 @@ class Stage:
         exist_ok: bool = False,
         brief: str | None = None,
         mode: StageMode = StageMode.IMPLEMENTATION,
+        plan: str | None = None,
     ) -> "Stage":
         """Create a new stage skeleton with initial state and templates.
 
@@ -357,6 +381,12 @@ class Stage:
         only written with the initial state: an existing ``state.json``
         (``exist_ok``) keeps whatever mode it already ran under.
 
+        ``plan`` is the key of the managed plan run creating this stage (see
+        :attr:`StageState.plan`), recorded with the same initial state so
+        the stage is owned from the moment it exists. A stage created
+        without one is unowned, which is what a hand-driven
+        ``sparring new-stage`` means.
+
         Raises :class:`StageError` if the stage already exists and
         ``exist_ok`` is False.
         """
@@ -368,7 +398,7 @@ class Stage:
 
         state_path = self.directory / STATE_FILENAME
         if not state_path.is_file():
-            self.write_state(StageState(mode=mode))
+            self.write_state(StageState(mode=mode, plan=plan))
 
         initial_brief = (
             brief if brief is not None else templates.BRIEF_TEMPLATE.format(stage_id=self.stage_id)

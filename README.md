@@ -569,6 +569,14 @@ a tool may regenerate the file on every invocation.
 repository; see "Cross-repository candidates" below. `mode` is for a stage
 that is a review and nothing else; see "Review-only stages" below.
 
+`stage_id` is the caller's to choose, and a caller that builds manifests from
+plan documents should namespace fresh ids by the plan the way the Markdown
+convention does (`<plan key>-stage-<label>-<slug>`). Otherwise two plans in
+one worktree that both define "Stage 1 — Foundation" name the same directory,
+and the second plan's run is refused as reaching into the first plan's stages
+— see "Whose stage is whose" below. A stage that already exists keeps
+whatever id it was created under; only new stages need the namespace.
+
 #### The Markdown convention
 
 Stages are level-2 headings numbered 1..N in document order:
@@ -607,11 +615,37 @@ them. Nothing is deleted for you: to genuinely start over, remove the
 run-state file *and* those stage directories deliberately, otherwise old
 sessions or an old `accepted` status would be inherited.
 
+#### Whose stage is whose
+
+A stage instance belongs to the managed run that made it. The owning plan's
+key is recorded in the stage's own `state.json` as `plan`, written once when
+a run creates or deliberately adopts the stage and never repointed, so
+execution-stage identity is `(run, stage)` rather than a directory name that
+anything may claim.
+
+This is what makes the ordinary follow-up workflow work. Finish a plan, stay
+on the same branch, and start a *different* plan whose sections are numbered
+`Stage 1` again: its stages are new work. The plan-key prefix in each stage
+id already keeps the two apart on disk, and ownership keeps them apart even
+when something generates colliding ids — a run is refused, naming the
+stages, rather than quietly answering a new plan with an old plan's accepted
+work. `--adopt` does not override this and no flag does; the earlier run's
+history stays exactly where it is, and nothing has to be removed from
+`.sparring` for the next plan to start.
+
+A `state.json` with no `plan` key is **unowned**: a stage driven by hand with
+`new-stage`, or one written before ownership was recorded. Unowned is the
+only thing `--adopt` may take over, which is precisely what it is for.
+
 #### Adopting a sequence that is already under way
 
 `--adopt` is the deliberate way to take over stages that already exist —
 typically a sequence that was driven stage by stage before it was managed.
-Each existing stage is checked, and every adoption is reported:
+It means "these stages were executed independently and I want this managed
+plan to adopt them", never "a directory with this generated id exists, so
+reuse it": an existing stage another managed run owns is refused first, and
+a caller must not infer `--adopt` from finding stage state on disk. Each
+remaining stage is checked, and every adoption is reported:
 
 * **accepted**, with a real candidate commit → adopted and advanced past. Its
   brief is history and is not compared: the work is already through the hard
