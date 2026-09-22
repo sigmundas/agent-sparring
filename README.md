@@ -557,8 +557,10 @@ carries no status, position, transition or verdict — those stay in
 `.sparring/plans/` and each stage's `state.json`, exactly as for a Markdown
 plan, and both inputs run through the same code. Unknown fields are refused
 rather than ignored, so a manifest written against a later contract fails
-loudly. `plan_label` is what the run is keyed and reported by, so a manifest
-and the plan it was built from share one managed run.
+loudly. `plan_label` is which document the run executes and what it is
+reported by; the run's own identity is its `--run-key`, so a manifest and the
+plan it was built from describe the same run rather than merely sharing a
+name.
 
 The digest covers everything executable *and* `source_digest`, so re-emitting
 a manifest from an edited plan refuses to continue an existing run — the same
@@ -570,10 +572,12 @@ repository; see "Cross-repository candidates" below. `mode` is for a stage
 that is a review and nothing else; see "Review-only stages" below.
 
 `stage_id` is the caller's to choose, and a caller that builds manifests from
-plan documents should namespace fresh ids by the plan the way the Markdown
-convention does (`<plan key>-stage-<label>-<slug>`). Otherwise two plans in
-one worktree that both define "Stage 1 — Foundation" name the same directory,
-and the second plan's run is refused as reaching into the first plan's stages
+plan documents should namespace fresh ids by the *run* the way the Markdown
+convention does (`<run key>-stage-<label>-<slug>`), passing that run key to
+`run-plan --run-key` so the run is filed under it. Otherwise two runs in one
+worktree — two plans that both define "Stage 1 — Foundation", or two runs of
+one plan — name the same directory, and the second run is refused as reaching
+into the first run's stages
 — see "Whose stage is whose" below. A stage that already exists keeps
 whatever id it was created under; only new stages need the namespace.
 
@@ -594,9 +598,11 @@ A hyphen, en dash or colon works as the separator too. Everything from the
 heading to the next `#`/`##` heading is that stage's section, and becomes
 the stage's `brief.md` verbatim; deeper headings belong to the stage. The
 stage id is derived deterministically as
-`<plan key>-stage-<n>-<slugified title>`, where the plan key is the plan's
-file stem plus a short hash of its path (for example `foo-3f9a2c1b`), so two
-plans with the same headings never share stage artifacts.
+`<run key>-stage-<n>-<slugified title>`, where the run key is this execution's
+identity — the plan's file stem, a short hash of its path, and a short hash
+for the run itself (for example `foo-3f9a2c1b-91af03d4`) — so two runs with
+the same headings never share stage artifacts, whether they are two plans or
+two runs of one plan.
 Nothing is inferred from prose: a plan with no such headings, a heading that
 starts with `## Stage` but does not fit, a numbering gap or duplicate, or an
 empty section is refused before any agent runs. A reviewed plan written
@@ -604,47 +610,88 @@ another way either needs a small edit to mark its stages, or a manifest.
 
 ### Pause and resume
 
-Run position lives in `.sparring/plans/<plan key>.json`: the plan, a digest
-of its executable content, the branch, the current stage, which kind of input
-it runs from, and a status (`running`/`paused`/`complete`). Candidate SHAs,
-sessions and acceptance stay in each stage's own `state.json`.
+Run position lives in `.sparring/plans/<run key>.json`: the plan document, a
+digest of its executable content, the branch, the current stage, which kind of
+input it runs from, this run's own key, and a status
+(`running`/`paused`/`complete`). Candidate SHAs, sessions and acceptance stay
+in each stage's own `state.json`.
 
-A fresh `run-plan` means fresh stages. It refuses if a run is already
-recorded, or if any of the plan's stage directories already exist, and names
-them. Nothing is deleted for you: to genuinely start over, remove the
-run-state file *and* those stage directories deliberately, otherwise old
-sessions or an old `accepted` status would be inherited.
+`resume-plan` continues a recorded run. Given a plan document with exactly one
+open run it continues that one; `--run-key <key>` says which, and is needed
+only for a document with several open runs.
+
+#### Run instances: a plan document is an input, not a run
+
+A plan document can be executed more than once. Each execution is a **run
+instance** with a key of its own, `<plan key>-<8 hex>` (for example
+`mosaic-fix-7c1e42a9-3b4d0f16`), minted per `run-plan`:
+
+```
+repository
+  plan.md                    <- a document. Input to a run.
+      run A                  <- .sparring/plans/mosaic-fix-7c1e42a9-3b4d0f16.json
+          stage 1, stage 2
+      run B                  <- .sparring/plans/mosaic-fix-7c1e42a9-91af03d4.json
+          stage 1, stage 2
+```
+
+**`run-plan` always starts a new run.** The same repository, the same branch,
+the same plan file and the same `Stage 1` headings as a run that already
+finished do not change that: it is new work, it starts fresh Stage-agent and
+Sparrer sessions, and it does not advance past the earlier run's accepted
+stages. The earlier run stays on disk as inspectable history, and nothing has
+to be removed for the next one to start.
+
+The one thing that *is* refused is a second **open** run of the same document
+in the same worktree — running or paused. That is not about identity; two live
+managed runs would compete for the same candidate. The refusal names the open
+run and how to continue it. A complete run never refuses a fresh one.
 
 #### Whose stage is whose
 
-A stage instance belongs to the managed run that made it. The owning plan's
-key is recorded in the stage's own `state.json` as `plan`, written once when
-a run creates or deliberately adopts the stage and never repointed, so
-execution-stage identity is `(run, stage)` rather than a directory name that
-anything may claim.
+A stage instance belongs to the managed **run instance** that made it. That
+run's key is recorded in the stage's own `state.json` as `run`, written once
+when the run creates or deliberately adopts the stage and never repointed, so
+execution-stage identity is `(run instance, stage)` rather than a directory
+name that anything may claim.
 
-This is what makes the ordinary follow-up workflow work. Finish a plan, stay
-on the same branch, and start a *different* plan whose sections are numbered
-`Stage 1` again: its stages are new work. The plan-key prefix in each stage
-id already keeps the two apart on disk, and ownership keeps them apart even
-when something generates colliding ids — a run is refused, naming the
-stages, rather than quietly answering a new plan with an old plan's accepted
-work. `--adopt` does not override this and no flag does; the earlier run's
-history stays exactly where it is, and nothing has to be removed from
-`.sparring` for the next plan to start.
+This is what makes both ordinary workflows work. Finish a plan, stay on the
+same branch, and start a *different* plan whose sections are numbered
+`Stage 1` again — or run the *same* plan again. Either way the new run's
+stages are new work. The run-key prefix in each stage id keeps them apart on
+disk, and ownership keeps them apart even when something generates colliding
+ids: the run is refused, naming the stages, rather than quietly answering new
+work with an old run's accepted work. `--adopt` does not override this and no
+flag does.
 
-A `state.json` with no `plan` key is **unowned**: a stage driven by hand with
-`new-stage`, or one written before ownership was recorded. Unowned is the
-only thing `--adopt` may take over, which is precisely what it is for.
+Note that the owner is a *run* key and not a plan key. "Owned by plan X" would
+still let a second run of X inherit the first run's accepted stages, which is
+the same defect one step removed.
+
+A `state.json` with no owner is **unowned**: a stage driven by hand with
+`new-stage`, or one written before ownership was recorded. Unowned is the only
+thing `--adopt` may take over, which is precisely what it is for.
+
+#### Runs recorded before run instances existed
+
+Nothing needs migrating. A run recorded at `.sparring/plans/<plan key>.json`
+with no `run` field is read as that document's one legacy run instance, keyed
+by the plan key — which is exactly what it was, since at the time a document
+had a single execution. Its stages record that same key (under the older
+`plan` spelling, which is read as the owner), so they stay owned by it, and a
+fresh run of the same document gets stage ids and stage instances of its own.
+Neither file is rewritten to say so.
 
 #### Adopting a sequence that is already under way
 
 `--adopt` is the deliberate way to take over stages that already exist —
 typically a sequence that was driven stage by stage before it was managed.
 It means "these stages were executed independently and I want this managed
-plan to adopt them", never "a directory with this generated id exists, so
-reuse it": an existing stage another managed run owns is refused first, and
-a caller must not infer `--adopt` from finding stage state on disk. Each
+run to adopt them", never "a directory with this generated id exists, so
+reuse it": an existing stage another managed run owns is refused first, and a
+caller must not infer `--adopt` from finding stage state on disk. It plays no
+part in an ordinary *select repository -> select plan -> run*, which needs no
+adoption decision at all. Each
 remaining stage is checked, and every adoption is reported:
 
 * **accepted**, with a real candidate commit → adopted and advanced past. Its

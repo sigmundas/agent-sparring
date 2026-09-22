@@ -749,6 +749,13 @@ class PushAuthorizationCliTests(_RemoteAwareTestCase):
     """The command-line contract, end to end through ``main``."""
 
     def _main(self, *args: str) -> tuple[int, str, str]:
+        # `run-plan` is given this suite's run key explicitly, because the
+        # stage ids these tests assert (S1/S2) are namespaced by it. Left
+        # out, every run would mint its own key and its own stage ids --
+        # which is the point of run instances, and not what is under test
+        # here.
+        if args and args[0] == "run-plan":
+            args = (*args, "--run-key", self.run_key)
         out, err = io.StringIO(), io.StringIO()
         adapters = (_Implementer(self.repo), _SparringAdapter([READY]))
         with mock.patch("agent_sparring.cli._build_loop_adapters", return_value=adapters):

@@ -19,7 +19,7 @@ import conftest_path  # noqa: F401
 
 from agent_sparring.cli import main
 from agent_sparring.manifest import load_manifest_source
-from agent_sparring.plan import PlanRunState, PlanRunStatus, plan_state_path
+from agent_sparring.plan import PlanRunState, PlanRunStatus, plan_key, run_state_path
 from agent_sparring.recovery import RecoveryError, reset_stage, turn_touched_paths
 from agent_sparring.stage import Stage, StageMode, StageState, StageStatus
 from test_independent_review import BUILD_STAGE, REVIEW_STAGE, _review_manifest
@@ -65,7 +65,8 @@ class ResetStageTestCase(unittest.TestCase):
         self.sparring_dir = self.repo / ".sparring"
         self.manifest_path = root / "manifest.json"
         self.write_manifest()
-        self.state_path = plan_state_path(self.sparring_dir, PLAN_LABEL)
+        self.run_key = plan_key(PLAN_LABEL)
+        self.state_path = run_state_path(self.sparring_dir, self.run_key)
 
         # Stage 4, accepted. Never written to by the recovery.
         self.build = Stage.resolve(self.sparring_dir, BUILD_STAGE).create()

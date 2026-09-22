@@ -19,7 +19,7 @@ from agent_sparring.plan import (
     parse_plan,
     plan_digest,
     plan_key,
-    plan_state_path,
+    run_state_path,
     record_human_evidence,
     resume_plan,
     start_plan,
@@ -267,12 +267,13 @@ class _PlanRepoTestCase(unittest.TestCase):
         _run_git(self.repo, "push", "-q", "-u", "origin", "feature/x")
 
         self.sparring_dir = self.repo / ".sparring"
-        self.state_path = plan_state_path(self.sparring_dir, "docs/plan.md")
+        self.run_key = plan_key("docs/plan.md")
+        self.state_path = run_state_path(self.sparring_dir, self.run_key)
 
     def _start(self, stage_adapter, sparring_adapter, **kwargs):
         return start_plan(
             self.plan_path, self.sparring_dir, self.repo, _fixed(stage_adapter, sparring_adapter),
-            expected_branch="feature/x", **kwargs,
+            expected_branch="feature/x", run_key=kwargs.pop("run_key", self.run_key), **kwargs,
         )
 
     def _resume(self, stage_adapter, sparring_adapter, **kwargs):
@@ -759,14 +760,15 @@ class PlanRunTests(_PlanRepoTestCase):
         _run_git(self.repo, "add", "docs-plan.md")
         _run_git(self.repo, "commit", "-q", "-m", "second plan")
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
-        other_state = plan_state_path(self.sparring_dir, "docs-plan.md")
+        other_label = "docs-plan.md"
+        other_state = run_state_path(self.sparring_dir, plan_key(other_label))
         self.assertNotEqual(other_state, self.state_path)
 
         self._start(_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU]))
         start_plan(
             other, self.sparring_dir, self.repo,
             _fixed(_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU])),
-            expected_branch="feature/x",
+            expected_branch="feature/x", run_key=plan_key(other_label),
         )
 
         self.assertTrue(self.state_path.is_file())
@@ -788,7 +790,7 @@ class PlanRunTests(_PlanRepoTestCase):
         start_plan(
             other, self.sparring_dir, self.repo,
             _fixed(other_stage_adapter, _SparringAdapter([NEEDS_YOU])),
-            expected_branch="feature/x",
+            expected_branch="feature/x", run_key=plan_key("docs/other.md"),
         )
 
         other_s1 = self._stage(f"{plan_key('docs/other.md')}-stage-1-foundation")
@@ -844,6 +846,12 @@ class PlanCliTests(_PlanRepoTestCase):
             if adapters is not None
             else contextlib.nullcontext()
         )
+        if argv and argv[0] == "run-plan":
+            # Named, because the stage ids these tests assert (S1/S2) are
+            # namespaced by it. Omitted, run-plan mints a key of its own --
+            # which is the ordinary behaviour, exercised where it is what is
+            # under test rather than here.
+            argv = (*argv, "--run-key", self.run_key)
         with patch, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = main(["--sparring-dir", str(self.sparring_dir), *argv])
         return code, out.getvalue(), err.getvalue()

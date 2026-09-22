@@ -26,7 +26,8 @@ from agent_sparring.plan import (
     PlanRunError,
     PlanRunState,
     PlanRunStatus,
-    plan_state_path,
+    plan_key,
+    run_state_path,
     resume_plan,
     start_plan,
 )
@@ -164,7 +165,8 @@ class _ReviewRepoTestCase(unittest.TestCase):
         self.sparring_dir = self.repo / ".sparring"
         self.manifest_path = root / "manifest.json"
         self.write_manifest()
-        self.state_path = plan_state_path(self.sparring_dir, PLAN_LABEL)
+        self.run_key = plan_key(PLAN_LABEL)
+        self.state_path = run_state_path(self.sparring_dir, self.run_key)
 
     def write_manifest(self, *, mode: str | None = "independent_review") -> None:
         self.manifest_path.write_text(
@@ -189,6 +191,7 @@ class _ReviewRepoTestCase(unittest.TestCase):
             self.repo,
             _fixed(stage_adapter, sparring_adapter),
             expected_branch="feature/x",
+            run_key=kwargs.pop("run_key", self.run_key),
             **kwargs,
         )
 
@@ -199,6 +202,7 @@ class _ReviewRepoTestCase(unittest.TestCase):
             self.repo,
             _fixed(stage_adapter, sparring_adapter),
             expected_branch="feature/x",
+            run_key=kwargs.pop("run_key", self.run_key),
             **kwargs,
         )
 

@@ -31,7 +31,7 @@ from agent_sparring.plan import (
     PlanRunState,
     PlanRunStatus,
     plan_key,
-    plan_state_path,
+    run_state_path,
     resume_plan,
     start_plan,
 )
@@ -206,7 +206,8 @@ class _ManifestRepoTestCase(unittest.TestCase):
         self.sparring_dir = self.repo / ".sparring"
         self.manifest_path = root / "manifest.json"
         self.write_manifest(manifest_payload())
-        self.state_path = plan_state_path(self.sparring_dir, PLAN_LABEL)
+        self.run_key = plan_key(PLAN_LABEL)
+        self.state_path = run_state_path(self.sparring_dir, self.run_key)
 
     def write_manifest(self, payload: dict) -> None:
         self.manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -217,7 +218,7 @@ class _ManifestRepoTestCase(unittest.TestCase):
     def _start(self, stage_adapter, sparring_adapter, **kwargs):
         return start_plan(
             self.source(), self.sparring_dir, self.repo, _fixed(stage_adapter, sparring_adapter),
-            expected_branch="feature/x", **kwargs,
+            expected_branch="feature/x", run_key=kwargs.pop("run_key", self.run_key), **kwargs,
         )
 
     def _resume(self, stage_adapter, sparring_adapter, **kwargs):
@@ -283,7 +284,7 @@ class ManifestRunTests(_ManifestRepoTestCase):
         start_plan(
             plan, self.sparring_dir, self.repo,
             _fixed(_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU])),
-            expected_branch="feature/x",
+            expected_branch="feature/x", run_key=self.run_key,
         )
 
         with self.assertRaises(PlanError) as ctx:
@@ -524,9 +525,9 @@ class ManifestAdoptionTests(_ManifestRepoTestCase):
         # later plan from taking it as its own.
         self.assertEqual(stage.read_sparring(), sparring)
         after = stage.read_state()
-        self.assertEqual(replace(after, plan=None), replace(before, plan=None))
-        self.assertIsNone(before.plan, "it was an unowned, hand-driven stage")
-        self.assertEqual(after.plan, plan_key(PLAN_LABEL))
+        self.assertEqual(replace(after, run=None), replace(before, run=None))
+        self.assertIsNone(before.run, "it was an unowned, hand-driven stage")
+        self.assertEqual(after.run, self.run_key)
         # The accepted history was still walked past, and the run is now a
         # managed one, paused where the human already was.
         self.assertEqual(result.accepted, (("stage-3c-cloud-schema", "a" * 40),))

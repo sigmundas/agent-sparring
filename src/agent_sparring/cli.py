@@ -51,7 +51,6 @@ from agent_sparring.plan import (
     load_plan_source,
     plan_label,
     plan_state_not_ignored_message,
-    plan_state_path,
     resume_plan,
     start_plan,
 )
@@ -760,11 +759,19 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
     return 0
 
 
-def _plan_input_args(args: argparse.Namespace) -> str:
+def _plan_input_args(args: argparse.Namespace, run: str = "") -> str:
     """How this plan run is addressed on the command line, for the copyable
-    resume hint: the manifest flag or the plan's own path."""
+    resume hint: the manifest flag or the plan's own path, and which run of
+    it this is.
 
-    return f"--manifest {args.manifest}" if args.manifest else str(args.plan_path)
+    The run key is included because a plan document can have been executed
+    more than once, and a hint that named only the document would be
+    ambiguous exactly when it matters -- after the person has run the same
+    plan again. It is omitted only when the caller has no run key to give.
+    """
+
+    addressed = f"--manifest {args.manifest}" if args.manifest else str(args.plan_path)
+    return f"{addressed} --run-key {run}" if run else addressed
 
 
 def _report_plan_result(
@@ -805,7 +812,7 @@ def _report_plan_result(
         print()
         print("Continue when you are ready:")
         print(
-            f"  sparring resume-plan {_plan_input_args(args)} "
+            f"  sparring resume-plan {_plan_input_args(args, result.run)} "
             f"--repo-root {args.repo_root or '.'} --expected-branch {args.expected_branch}"
         )
         return
@@ -832,7 +839,7 @@ def _report_plan_result(
     print(stage.read_sparring().rstrip())
     print()
     resume = (
-        f"sparring resume-plan {_plan_input_args(args)} --repo-root {args.repo_root or '.'} "
+        f"sparring resume-plan {_plan_input_args(args, result.run)} --repo-root {args.repo_root or '.'} "
         f"--expected-branch {args.expected_branch}"
     )
     if routing.action is RoutingAction.ESCALATE:
@@ -869,7 +876,7 @@ def _report_deferred_verification_required(
     awaiting = result.awaiting
     assert isinstance(awaiting, DeferredVerificationRequired)  # the caller checked
     resume = (
-        f"sparring resume-plan {_plan_input_args(args)} --repo-root {args.repo_root or '.'} "
+        f"sparring resume-plan {_plan_input_args(args, result.run)} --repo-root {args.repo_root or '.'} "
         f"--expected-branch {args.expected_branch}"
     )
     print(f"plan paused: {result.plan}")
@@ -932,7 +939,7 @@ def _report_push_authorization_required(
     awaiting = result.awaiting
     assert awaiting is not None  # the caller checked
     resume = (
-        f"sparring resume-plan {_plan_input_args(args)} --repo-root {args.repo_root or '.'} "
+        f"sparring resume-plan {_plan_input_args(args, result.run)} --repo-root {args.repo_root or '.'} "
         f"--expected-branch {args.expected_branch}"
     )
     print(f"plan paused: {result.plan}")
@@ -1001,6 +1008,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
 
         common = dict(
             expected_branch=args.expected_branch,
+            run_key=getattr(args, "run_key", None),
             max_send_back_cycles=args.max_send_back_cycles,
             self_check=self_check,
             stop_after_stage=args.stop_after_stage,
@@ -1107,7 +1115,7 @@ def _cmd_reset_stage(args: argparse.Namespace) -> int:
     print()
     print("The stage is fresh and the run is paused at it. Continue with:")
     print(
-        f"  sparring resume-plan {_plan_input_args(args)} "
+        f"  sparring resume-plan {_plan_input_args(args, result.run)} "
         f"--repo-root {args.repo_root or '.'} --expected-branch {args.expected_branch}"
     )
     return 0
@@ -1634,6 +1642,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_plan.add_argument("--manifest", default=None, metavar="PATH", help=manifest_help)
     run_plan.add_argument(
+        "--run-key",
+        default=None,
+        metavar="KEY",
+        help=(
+            "this execution's identity, which the stage ids of its stages are namespaced "
+            "by. One is minted per run when this is omitted, which is the ordinary case; "
+            "supply it when the caller has to know the run's identity before the run "
+            "exists, as a caller that writes the stage ids into a --manifest does. Every "
+            "run-plan starts a new run: running the same plan document again is ordinary "
+            "work and leaves the earlier run's stages alone"
+        ),
+    )
+    run_plan.add_argument(
         "--adopt",
         action="store_true",
         help=(
@@ -1676,6 +1697,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume_plan_parser.add_argument(
         "--manifest", default=None, metavar="PATH", help=manifest_help
+    )
+    resume_plan_parser.add_argument(
+        "--run-key",
+        default=None,
+        metavar="KEY",
+        help=(
+            "which run of this plan document to continue, for a document that has been "
+            "executed more than once. Omitted, its one open run is resumed; if several are "
+            "open the refusal lists them"
+        ),
     )
     _add_loop_arguments(
         resume_plan_parser,

@@ -121,6 +121,9 @@ class ResetResult:
     """What the recovery did, in enough detail to report without guessing."""
 
     stage_id: str
+    #: The key of the run instance whose current stage this was, so the
+    #: resume hint can name the run rather than only the document.
+    run: str
     from_mode: StageMode
     to_mode: StageMode
     archive: Path
@@ -364,11 +367,11 @@ def reset_stage(
     there so the intent is stated at the call site and a stale plan input is
     caught rather than quietly obeyed.
 
-    Refuses (:class:`RecoveryError`) without touching anything if: no run is
-    recorded for this plan, or it is complete; the run's source kind differs
-    from this input's; ``stage_id`` is not the run's *current* stage (a stage
-    the run has already moved past is history, not something to restart);
-    the stage does not exist; the stage is ACCEPTED; the plan input declares
+    Refuses (:class:`RecoveryError`) without touching anything if: no
+    recorded run of this plan is currently at ``stage_id`` (a stage a run
+    has already moved past is history, not something to restart, and one
+    document may have several recorded runs); the run's source kind differs
+    from this input's; the stage does not exist; the stage is ACCEPTED; the plan input declares
     the mode the stage already ran under, so there is nothing to recover
     from; ``expect_mode`` disagrees with the plan input; the stages before
     this one are not the same stages in the same order, or any of them is
@@ -380,25 +383,47 @@ def reset_stage(
     # Imported here rather than at module import time: plan.py imports the
     # review lifecycle, which imports the acceptance gate, and this module
     # is a peer of plan.py rather than a dependency of it.
-    from agent_sparring.plan import PlanError, PlanRunState, PlanRunStatus, plan_state_path
+    from agent_sparring.plan import (
+        PLANS_DIRNAME,
+        MarkdownPlanSource,
+        PlanRunStatus,
+        find_runs,
+        legacy_run_key,
+    )
 
-    stages = source.stages()
-    state_path = plan_state_path(sparring_dir, source.label)
-    if not state_path.is_file():
+    # Which run's current stage this is. One document may have been executed
+    # more than once, and ``stage_id`` says which of those executions is
+    # meant, because a stage instance belongs to exactly one run.
+    recorded = find_runs(sparring_dir, source.label)
+    owning = [run for run in recorded if run.state.current_stage == stage_id]
+    if not owning:
+        if not recorded:
+            raise RecoveryError(
+                f"no plan run is recorded for {source.label} in "
+                f"{Path(sparring_dir) / PLANS_DIRNAME}; there is no run whose current "
+                "stage could be reset"
+            )
         raise RecoveryError(
-            f"no plan run is recorded for {source.label} at {state_path}; there is no "
-            "run whose current stage could be reset"
+            f"no recorded run of {source.label} is currently at {stage_id!r} "
+            f"(recorded: {', '.join(f'{run.key} at {run.state.current_stage!r}' for run in recorded)}). "
+            "Only the current stage can be reset: a stage a run has already moved past "
+            "was accepted, and restarting it would rewrite history the later stages were "
+            "built on."
         )
-    try:
-        run_state = PlanRunState.load(state_path)
-    except PlanError as exc:
-        raise RecoveryError(str(exc)) from exc
+    run = owning[0]
+    state_path = run.path
+    run_state = run.state
 
     if run_state.status is PlanRunStatus.COMPLETE:
         raise RecoveryError(
-            f"the plan run for {source.label} is complete; nothing is current, so there "
-            "is no stage to reset"
+            f"the plan run {run.key} of {source.label} is complete; nothing is current, so "
+            "there is no stage to reset"
         )
+    # The stage ids this reset reasons about are the owning run's, not the
+    # ones the document would generate on its own.
+    if isinstance(source, MarkdownPlanSource):
+        source = source.in_namespace(run_state.run or legacy_run_key(run_state.plan))
+    stages = source.stages()
     if run_state.source != source.kind:
         raise RecoveryError(
             f"the plan run for {source.label} was started from a {run_state.source} plan "
@@ -411,14 +436,6 @@ def reset_stage(
             f"{run_state.expected_branch!r}, not {expected_branch!r}; refusing to reset a "
             "stage of it for a different branch"
         )
-    if run_state.current_stage != stage_id:
-        raise RecoveryError(
-            f"the plan run for {source.label} is currently at "
-            f"{run_state.current_stage!r}, not {stage_id!r}. Only the current stage can "
-            "be reset: a stage the run has already moved past was accepted, and "
-            "restarting it would rewrite history the later stages were built on."
-        )
-
     index = run_state.current_stage_index
     if not 0 <= index < len(stages):
         raise RecoveryError(
@@ -572,6 +589,7 @@ def reset_stage(
 
     result = ResetResult(
         stage_id=stage_id,
+        run=run.key,
         from_mode=stage_state.mode,
         to_mode=planned.mode,
         archive=attempt,

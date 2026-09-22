@@ -44,7 +44,7 @@ from agent_sparring.plan import (
     PlanRunState,
     PlanRunStatus,
     plan_key,
-    plan_state_path,
+    run_state_path,
     record_human_evidence,
     resume_plan,
     start_plan,
@@ -269,7 +269,8 @@ class _RepoCase(unittest.TestCase):
         _run_git(self.repo, "push", "-q", "-u", "origin", "feature/x")
 
         self.sparring_dir = self.repo / ".sparring"
-        self.state_path = plan_state_path(self.sparring_dir, "docs/plan.md")
+        self.run_key = plan_key("docs/plan.md")
+        self.state_path = run_state_path(self.sparring_dir, self.run_key)
 
     def _adapters(self, stage_adapter, sparring_adapter):
         return lambda _stage: (stage_adapter, sparring_adapter)
@@ -281,6 +282,7 @@ class _RepoCase(unittest.TestCase):
             self.repo,
             self._adapters(stage_adapter, sparring_adapter),
             expected_branch="feature/x",
+            run_key=kwargs.pop("run_key", self.run_key),
             **kwargs,
         )
 

@@ -138,7 +138,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, field
+import uuid
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -400,6 +401,18 @@ class PlanRunState:
     #: ``"markdown"`` then; a resume with a different kind is refused, since
     #: the two describe different execution content for the same plan.
     source: str = "markdown"
+    #: This run instance's own key (see :func:`new_run_key`): which execution
+    #: of :attr:`plan` this is, and the namespace its stage instances are
+    #: owned by. Recorded here as well as in the file name so a resume knows
+    #: its identity from its content -- a run that had to learn its own key
+    #: from where it happened to be filed could be given another run's
+    #: stages by a rename.
+    #:
+    #: ``None`` for every run recorded before run instances existed, and
+    #: read as :func:`legacy_run_key` of its plan: at the time, a plan
+    #: document had exactly one execution and its key named it, so that is
+    #: not a guess about the file, it is what the file means.
+    run: str | None = None
     #: What a person has allowed this run to push, and for exactly what (see
     #: :mod:`agent_sparring.push_gate`). ``None`` -- including for every run
     #: recorded before push authorization existed -- means no authorization:
@@ -437,6 +450,12 @@ class PlanRunState:
         payload["deferred_human_checks"] = [
             obligation.to_dict() for obligation in self.deferred_human_checks
         ]
+        # Omitted rather than written as null, so a run recorded before run
+        # instances existed stays exactly the file it was through every
+        # resume that rewrites it. Its key is then its file name, which is
+        # the plan key it was always filed under.
+        if self.run is None:
+            payload.pop("run", None)
         return payload
 
     # -- the obligation ledger -------------------------------------------
@@ -500,6 +519,7 @@ class PlanRunState:
                 current_stage=str(payload["current_stage"]),
                 status=PlanRunStatus(str(payload["status"])),
                 source=str(payload.get("source", "markdown")),
+                run=(str(payload["run"]) if payload.get("run") else None),
                 push_authorization=(
                     PushAuthorization.from_dict(authorization) if authorization else None
                 ),
@@ -559,8 +579,99 @@ def plan_label(plan_path: Path, repo_root: Path) -> str:
         return resolved.as_posix()
 
 
-def plan_state_path(sparring_dir: Path, label: str) -> Path:
-    return Path(sparring_dir) / PLANS_DIRNAME / f"{plan_key(label)}.json"
+def new_run_key(label: str) -> str:
+    """Mint an identity for one execution of a plan document.
+
+    The plan document's key, so the run is still recognisable at a glance
+    and everything belonging to one plan sorts together, plus eight hex
+    digits that are this *execution*: ``follow-up-7c1e42a9-3b4d0f16``.
+
+    Random rather than a counter, for the reason
+    :func:`~agent_sparring.human_gate.new_gate_instance_id` gives: the only
+    place a counter could be derived from is the very directory a person is
+    free to prune, so it would restart -- and a restarted counter is worse
+    than no identity, because run B would inherit run A's stage
+    directories, which is exactly the accident this identity exists to
+    prevent. Nothing orders runs by their key; ``plans/*.json`` records when
+    each one started what it started.
+
+    A plan document is the *input* to a run, not the run. Running the same
+    document again is ordinary work (a second attempt, a rerun after the
+    code moved on), and it gets a run of its own.
+    """
+
+    return f"{plan_key(label)}-{uuid.uuid4().hex[:8]}"
+
+
+def legacy_run_key(label: str) -> str:
+    """The run key of a run recorded before run instances existed.
+
+    Such a run's state lives at ``plans/<plan key>.json`` and its stages
+    record ``<plan key>`` as their owner, because at the time a plan
+    document had exactly one execution and its key named it. Reading that as
+    the key of that document's one legacy run instance keeps every existing
+    run readable, keeps its stages owned by it, and needs nothing rewritten
+    on disk.
+    """
+
+    return plan_key(label)
+
+
+def run_state_path(sparring_dir: Path, run_key: str) -> Path:
+    """Where one run instance's state lives.
+
+    Still ``.sparring/plans/``, deliberately: that directory is what every
+    project's ``.gitignore`` already names (see
+    :func:`plan_state_not_ignored_message`), and a second one would make
+    every existing project fail a check it has already satisfied. What
+    changed is only the file name -- a run key rather than a plan key -- so
+    two runs of one document are two files instead of one.
+    """
+
+    return Path(sparring_dir) / PLANS_DIRNAME / f"{run_key}.json"
+
+
+@dataclass(frozen=True)
+class RecordedRun:
+    """One run instance found on disk, with the key it is filed under."""
+
+    key: str
+    path: Path
+    state: PlanRunState
+
+    @property
+    def open(self) -> bool:
+        return self.state.status is not PlanRunStatus.COMPLETE
+
+
+def find_runs(sparring_dir: Path, label: str) -> tuple[RecordedRun, ...]:
+    """Every recorded run of the plan document ``label``, oldest file first.
+
+    Found by reading the states rather than by computing a file name, which
+    is what makes one pass cover both spellings: a run instance's file is
+    named by its run key, a run recorded before run instances existed is
+    named by its plan key, and both say which plan they execute in their
+    own ``plan`` field. Unparseable files are skipped -- this answers "which
+    runs of this plan exist", and a file that cannot be read is not an
+    answer to it; whoever addresses that run directly still fails on it
+    with its own message.
+    """
+
+    plans = Path(sparring_dir) / PLANS_DIRNAME
+    try:
+        entries = sorted(plans.glob("*.json"))
+    except OSError:
+        return ()
+    found: list[RecordedRun] = []
+    for path in entries:
+        try:
+            state = PlanRunState.load(path)
+        except PlanError:
+            continue
+        if state.plan != label:
+            continue
+        found.append(RecordedRun(key=state.run or path.stem, path=path, state=state))
+    return tuple(found)
 
 
 # -- plan sources ------------------------------------------------------------
@@ -574,16 +685,47 @@ class MarkdownPlanSource:
 
     ``digest`` is still :func:`plan_digest` over the parsed stage numbers,
     titles and sections, so a run recorded before manifests existed
-    re-validates against exactly the same value.
+    re-validates against exactly the same value. Note what that means for
+    ``namespace``: the digest is over what the plan *says*, never over the
+    ids its stages were given, so re-namespacing a source cannot invalidate
+    a recorded run.
     """
 
     path: Path
     label: str
     parsed: tuple[PlanStage, ...]
     kind: str = "markdown"
+    #: What the parsed stage ids are prefixed with -- the owning run's key
+    #: for a managed run, and carried as a field so it survives
+    #: :meth:`reload`. ``None`` produces the bare ``stage-<n>-<slug>`` ids,
+    #: which is what a caller that is not a managed run gets.
+    namespace: str | None = None
 
     def digest(self) -> str:
         return plan_digest(self.parsed)
+
+    def in_namespace(self, namespace: str) -> "MarkdownPlanSource":
+        """The same plan, with its stage ids minted under ``namespace``.
+
+        Used by :func:`start_plan` and :func:`resume_plan` once the run's
+        own key is known, which is the only moment it can be: a fresh run's
+        key does not exist when the CLI reads the document, and a resume's
+        belongs to the recorded run rather than to the file.
+        """
+
+        if namespace == self.namespace:
+            return self
+        # Re-derived from the stages already parsed rather than by re-reading
+        # the document: the validated content must not be able to change
+        # between being checked and being run.
+        return replace(
+            self,
+            parsed=tuple(
+                replace(stage, stage_id=_stage_id_for(stage.number, stage.title, namespace))
+                for stage in self.parsed
+            ),
+            namespace=namespace,
+        )
 
     def stages(self) -> tuple[PlannedStage, ...]:
         total = len(self.parsed)
@@ -599,19 +741,35 @@ class MarkdownPlanSource:
         )
 
     def reload(self) -> "MarkdownPlanSource":
-        return load_markdown_source(self.path, self.label)
+        return load_markdown_source(self.path, self.label, namespace=self.namespace)
 
     def describe(self) -> str:
         return f"plan {self.label}"
 
 
-def load_markdown_source(plan_path: Path, label: str) -> MarkdownPlanSource:
+def load_markdown_source(
+    plan_path: Path, label: str, *, namespace: str | None = None
+) -> MarkdownPlanSource:
+    """Read and validate a reviewed Markdown plan.
+
+    ``namespace`` prefixes the generated stage ids. It defaults to
+    :func:`legacy_run_key` -- the plan's own key -- which is exactly what
+    every run recorded before run instances existed used, so re-reading such
+    a run's plan reproduces its stage ids unchanged. A managed run replaces
+    it with its own key (:meth:`MarkdownPlanSource.in_namespace`) as soon as
+    that key is known.
+    """
+
     try:
         text = Path(plan_path).read_text(encoding="utf-8")
     except OSError as exc:
         raise PlanError(f"cannot read plan {plan_path}: {exc}") from exc
+    prefix = namespace if namespace is not None else legacy_run_key(label)
     return MarkdownPlanSource(
-        path=Path(plan_path), label=label, parsed=parse_plan(text, plan_key=plan_key(label))
+        path=Path(plan_path),
+        label=label,
+        parsed=parse_plan(text, plan_key=prefix),
+        namespace=prefix,
     )
 
 
@@ -661,6 +819,12 @@ class PlanRunResult:
     status: PlanRunStatus
     plan: str
     stage_id: str
+    #: Which run instance of ``plan`` this result is about (see
+    #: :func:`new_run_key`). Empty only for a result built by a caller that
+    #: predates run instances; every result the runner produces carries it,
+    #: because a resume hint that named the document but not the run would
+    #: be ambiguous the moment a document has been executed twice.
+    run: str = ""
     routing: RoutingResult | None = None
     accepted: tuple[tuple[str, str], ...] = field(default_factory=tuple)  # (stage_id, sha)
     #: Set instead of ``routing`` when the run stopped at a verdict that was
@@ -775,6 +939,7 @@ def start_plan(
     make_adapters: AdapterFactory,
     *,
     expected_branch: str,
+    run_key: str | None = None,
     adopt: bool = False,
     allow_push_for_run: bool = False,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
@@ -791,6 +956,15 @@ def start_plan(
     entered for execution, with that stage, and returns the stage and
     sparring adapters to drive it with.
 
+    ``run_key`` is this execution's identity (see :func:`new_run_key`), and
+    one is minted when none is given. A caller supplies it when it needs to
+    know the run's identity before the run exists -- the VS Code extension
+    does, because it names the stage ids in the manifest it hands over and
+    tracks the terminal it launched. Every call starts a *new* run: running
+    the same plan document again is ordinary work and gets a run of its own,
+    with stage instances of its own, while the earlier run stays on disk
+    exactly as it is.
+
     ``allow_push_for_run`` records, as part of creating the run, that this
     run may push the verified candidates it produces to their intended remote
     branch (see :mod:`agent_sparring.push_gate`). Without it the run has no
@@ -805,19 +979,21 @@ def start_plan(
     worth refusing. With it, each existing stage is checked against
     :func:`_check_adoption`'s rules and every adoption is reported.
 
-    What ``adopt`` never does is take over a stage some *other* managed plan
-    run owns. Stage instances are identified by ``(run, stage)``, recorded
-    as :attr:`~agent_sparring.stage.StageState.plan`, so a follow-up plan
-    started on the same branch -- even one whose sections are numbered Stage
-    1..3 again, and even one whose generated stage ids would collide -- gets
-    stage instances of its own and the earlier plan's accepted history stays
-    the earlier plan's. See :func:`_refuse_foreign_stages`.
+    What ``adopt`` never does is take over a stage some *other* managed run
+    owns. Stage instances are identified by ``(run instance, stage)``,
+    recorded as :attr:`~agent_sparring.stage.StageState.run`, so a follow-up
+    plan started on the same branch -- even one whose sections are numbered
+    Stage 1..3 again -- and a second run of the very same document both get
+    stage instances of their own, while the earlier run's accepted history
+    stays the earlier run's. See :func:`_refuse_foreign_stages`.
 
     Refuses (:class:`PlanError`, before any provider is invoked) if the plan
-    is malformed, if a run for this plan is already recorded (use
-    :func:`resume_plan`), if one of its stages belongs to another managed
-    run, if a stage directory exists that adoption does not allow, or if the
-    run-state location is not git-ignored.
+    is malformed, if a run of this plan is already *open* -- running or
+    paused -- because two live managed runs of one document in one worktree
+    would compete for the same candidate (finish or resume that one first),
+    if one of its stages belongs to another run, if a stage directory exists
+    that adoption does not allow, or if the run-state location is not
+    git-ignored. A *complete* run never refuses a fresh one.
     """
 
     if not expected_branch or not expected_branch.strip():
@@ -825,18 +1001,40 @@ def start_plan(
 
     source = _coerce_source(plan, repo_root)
     label = source.label
-    stages = source.stages()
-    state_path = plan_state_path(sparring_dir, label)
-    if state_path.is_file():
-        existing = PlanRunState.load(state_path)
+    # Open runs are looked for before the run's own identity is minted, so a
+    # refusal costs nothing and leaves nothing behind.
+    live = [run for run in find_runs(sparring_dir, label) if run.open]
+    if live:
+        listed = "\n  - ".join(
+            f"{run.key} (status {run.state.status.value}, current stage "
+            f"{run.state.current_stage!r}) at {run.path}"
+            for run in live
+        )
         raise PlanError(
-            f"refusing a fresh run of {label}: a run is already recorded at {state_path} "
-            f"(status {existing.status.value}, current stage {existing.current_stage!r}); "
-            "use resume-plan to continue it. To genuinely start over, deliberately remove "
-            "that file; nothing is deleted automatically."
+            f"refusing a fresh run of {label}: {len(live)} run(s) of it are still open:\n"
+            f"  - {listed}\n"
+            "Two live managed runs of one plan in one worktree would compete for the same "
+            "candidate, so finish or resume that one first (resume-plan --run-key <key>). "
+            "A *complete* run never blocks a fresh one; this is only about runs still in "
+            "flight."
         )
 
-    owner = _PlanOwner.of(label)
+    key = run_key or new_run_key(label)
+    if isinstance(source, MarkdownPlanSource):
+        # Stage ids are namespaced by the run that owns them, which is why
+        # this cannot happen when the document is read: the key is this
+        # run's, not the document's.
+        source = source.in_namespace(key)
+    stages = source.stages()
+    state_path = run_state_path(sparring_dir, key)
+    if state_path.is_file():
+        raise PlanError(
+            f"refusing a fresh run of {label}: run key {key} is already recorded at "
+            f"{state_path}. Run keys are minted per execution, so this means one was "
+            "supplied that has been used before; leave it out and a fresh one is minted."
+        )
+
+    owner = _RunOwner(key=key, label=label)
     leftovers = [
         stage for stage in stages if Stage.resolve(sparring_dir, stage.stage_id).directory.exists()
     ]
@@ -868,6 +1066,7 @@ def start_plan(
         current_stage=stages[0].stage_id,
         status=PlanRunStatus.RUNNING,
         source=source.kind,
+        run=key,
     )
     if allow_push_for_run:
         try:
@@ -902,21 +1101,27 @@ def start_plan(
 
 
 @dataclass(frozen=True)
-class _PlanOwner:
-    """The managed plan run that owns the stage instances it drives.
+class _RunOwner:
+    """The managed run instance that owns the stage instances it drives.
 
-    ``key`` is what is recorded in each stage's ``state.json`` (it is stable
-    across renames of nothing and unique per plan label -- see
-    :func:`plan_key`); ``label`` is only ever used to say which plan a
-    refusal is about.
+    ``key`` is this run's key, and it is what is recorded in each stage's
+    ``state.json`` (see :attr:`~agent_sparring.stage.StageState.run`);
+    ``label`` is only ever used to say which plan document a refusal is
+    about, and is never the identity -- that was the whole defect: one
+    document can be executed more than once.
     """
 
     key: str
     label: str
 
     @classmethod
-    def of(cls, label: str) -> "_PlanOwner":
-        return cls(key=plan_key(label), label=label)
+    def of(cls, state: PlanRunState) -> "_RunOwner":
+        """The owner a recorded run is. A run with no key of its own is one
+        recorded before run instances existed, and its key is its plan's
+        (see :func:`legacy_run_key`) -- which is what its stages already
+        record as their owner, so nothing has to be rewritten."""
+
+        return cls(key=state.run or legacy_run_key(state.plan), label=state.plan)
 
 
 def _recorded_owner(sparring_dir: Path, stage_id: str) -> str | None:
@@ -929,7 +1134,7 @@ def _recorded_owner(sparring_dir: Path, stage_id: str) -> str | None:
     """
 
     try:
-        return Stage.resolve(sparring_dir, stage_id).read_state().plan
+        return Stage.resolve(sparring_dir, stage_id).read_state().run
     except StageError:
         return None
 
@@ -938,22 +1143,23 @@ def _refuse_foreign_stages(
     sparring_dir: Path,
     planned: Sequence[PlannedStage],
     *,
-    owner: _PlanOwner,
+    owner: _RunOwner,
 ) -> None:
-    """Refuse if any of ``planned`` is a stage another managed run owns.
+    """Refuse if any of ``planned`` is a stage another run instance owns.
 
     This is the invariant that makes execution-stage identity
-    ``(run, stage)``: an accepted stage of managed run A is never the stage
-    instance of managed run B, however alike their generated stage ids are.
-    A follow-up plan in the same worktree whose sections are numbered Stage
-    1..3 again is an ordinary workflow, and it gets its own stage
-    instances -- it does not get A's.
+    ``(run instance, stage)``: an accepted stage of run A is never the stage
+    instance of run B, however alike their generated stage ids are. Two
+    ordinary workflows depend on it. A follow-up plan in the same worktree
+    numbered Stage 1..3 again gets its own stage instances rather than the
+    previous plan's; and so does a second run of the *same* document, which
+    is why the owner recorded is a run key and not a plan key.
 
     Deliberately unconditional. ``--adopt`` says "these stages were executed
-    independently and I want this plan to adopt them", which is true of
+    independently and I want this run to adopt them", which is true of
     hand-driven stages that no run owns; it does not say "take another
-    plan's accepted work as my own", and no flag here does. The way out is
-    to give this plan's stages ids of their own (the plan-key-prefixed ones
+    run's accepted work as my own", and no flag here does. The way out is
+    for this run to use stage ids of its own (the run-key-prefixed ones
     every managed run now generates), which needs nothing removed from
     disk.
     """
@@ -967,28 +1173,27 @@ def _refuse_foreign_stages(
     if not conflicts:
         return
     listed = "\n  - ".join(
-        f"{stage_id} is owned by the managed run of plan {recorded}"
-        for stage_id, recorded in conflicts
+        f"{stage_id} is owned by managed run {recorded}" for stage_id, recorded in conflicts
     )
     raise PlanError(
         f"refusing to run {owner.label} over {len(conflicts)} stage(s) that belong to another "
         f"managed plan run:\n  - {listed}\n"
-        "Those are that run's stage instances, not this plan's, and an accepted stage of "
-        "one plan never answers for another plan's stage of the same name. This plan needs "
+        "Those are that run's stage instances, not this run's, and an accepted stage of "
+        "one run never answers for another run's stage of the same name. This run needs "
         "stage ids of its own; nothing has to be deleted, and that run's history stays "
         "exactly as it is."
     )
 
 
 def _claim_stage(
-    sparring_dir: Path, stage_id: str, *, owner: _PlanOwner, report: Reporter
+    sparring_dir: Path, stage_id: str, *, owner: _RunOwner, report: Reporter
 ) -> None:
-    """Record ``owner`` as this stage's owning plan run, if nothing else has.
+    """Record ``owner`` as this stage's owning run, if nothing else has.
 
     Monotone: an already-recorded owner is never rewritten (a foreign one
     has already been refused by :func:`_refuse_foreign_stages` before
     anything gets here), so ownership cannot drift and an accepted stage
-    cannot be re-pointed at a different plan. A state that cannot be read is
+    cannot be re-pointed at a different run. A state that cannot be read is
     left alone; whoever needs to read it will fail with its own message
     rather than this one.
     """
@@ -998,11 +1203,11 @@ def _claim_stage(
         state = stage.read_state()
     except StageError:
         return
-    if state.plan is not None:
+    if state.run is not None:
         return
-    state.plan = owner.key
+    state.run = owner.key
     stage.write_state(state)
-    report(f"stage {stage_id} is now recorded as owned by the managed run of {owner.label}")
+    report(f"stage {stage_id} is now recorded as owned by managed run {owner.key} of {owner.label}")
 
 
 def _check_adoption(
@@ -1117,6 +1322,50 @@ def _check_adoption(
     return tuple(adopted)
 
 
+def _run_to_resume(sparring_dir: Path, label: str, run_key: str | None) -> RecordedRun:
+    """Which recorded run of ``label`` a resume means, or refuse.
+
+    Named explicitly, it must be that run, and a complete one is refused by
+    name -- "resume this" answered by resuming a different run would be the
+    same silent substitution this whole identity model exists to stop.
+    Unnamed, the plan's single open run is it; several open runs are an
+    ambiguity a person resolves, and it is spelled out with the keys to
+    resolve it with.
+    """
+
+    runs = find_runs(sparring_dir, label)
+    if run_key is not None:
+        for run in runs:
+            if run.key == run_key:
+                if not run.open:
+                    raise PlanError(
+                        f"plan run {run_key} of {label} is already complete; nothing to "
+                        "resume. Run Plan starts a new run of the same document."
+                    )
+                return run
+        raise PlanError(
+            f"no run {run_key} of {label} is recorded in {Path(sparring_dir) / PLANS_DIRNAME}"
+            + (f"; recorded runs are {', '.join(run.key for run in runs)}" if runs else "")
+        )
+    open_runs = [run for run in runs if run.open]
+    if len(open_runs) == 1:
+        return open_runs[0]
+    if not open_runs:
+        if not runs:
+            raise PlanError(f"no plan run is recorded for {label}; start one with run-plan")
+        keys = ", ".join(run.key for run in runs)
+        which = f"the recorded run {keys} of {label} is" if len(runs) == 1 else f"every recorded run of {label} ({keys}) is"
+        raise PlanError(
+            f"{which} already complete; nothing to resume. Run Plan starts a new run of "
+            "the same document, which does not disturb it."
+        )
+    listed = ", ".join(f"{run.key} ({run.state.status.value})" for run in open_runs)
+    raise PlanError(
+        f"{len(open_runs)} runs of {label} are open ({listed}); say which one with "
+        "--run-key <key>"
+    )
+
+
 def resume_plan(
     plan: "Path | str | PlanSource",
     sparring_dir: Path,
@@ -1124,6 +1373,7 @@ def resume_plan(
     make_adapters: AdapterFactory,
     *,
     expected_branch: str,
+    run_key: str | None = None,
     evidence: str | None = None,
     deferred_results: tuple[DeferredAnswer, ...] = (),
     allow_push_candidate: str | None = None,
@@ -1137,6 +1387,13 @@ def resume_plan(
 
     ``plan`` is the same source (or Markdown plan path) the run was started
     with; resuming with a different *kind* of source is refused.
+
+    ``run_key`` names *which* run of that document to continue, since one
+    document may have been executed more than once. Left out, the plan's
+    one open run is resumed; if several are open the refusal names them and
+    asks, and a document whose only runs are complete has nothing to
+    resume. Naming a complete run is refused by name rather than silently
+    treated as the open one.
 
     ``make_adapters`` is the same per-stage :data:`AdapterFactory` as for
     :func:`start_plan`.
@@ -1195,31 +1452,35 @@ def resume_plan(
     except (PlanError, ManifestError) as exc:
         raise _unreadable_resume_input(plan, repo_root, sparring_dir, exc) from exc
     label = source.label
-    state_path = plan_state_path(sparring_dir, label)
-    if not state_path.is_file():
-        raise PlanError(f"no plan run is recorded for {label}; start one with run-plan")
-    state = PlanRunState.load(state_path)
+    recorded = _run_to_resume(sparring_dir, label, run_key)
+    state_path = recorded.path
+    state = recorded.state
+    owner = _RunOwner.of(state)
 
-    if state.status is PlanRunStatus.COMPLETE:
-        raise PlanError(f"plan run for {label} is already complete; nothing to resume")
     if state.expected_branch != expected_branch:
         raise PlanError(
-            f"plan run for {label} was started for branch {state.expected_branch!r}, "
-            f"not {expected_branch!r}; refusing to resume on a different branch"
+            f"plan run {owner.key} of {label} was started for branch "
+            f"{state.expected_branch!r}, not {expected_branch!r}; refusing to resume on a "
+            "different branch"
         )
     if state.source != source.kind:
         raise PlanError(
-            f"plan run for {label} was started from a {state.source} plan input, not a "
-            f"{source.kind} one; refusing to resume the same run from a different kind of "
-            "input, which would describe different execution content"
+            f"plan run {owner.key} of {label} was started from a {state.source} plan input, "
+            f"not a {source.kind} one; refusing to resume the same run from a different kind "
+            "of input, which would describe different execution content"
         )
+    if isinstance(source, MarkdownPlanSource):
+        # The stage ids this resume works on are the *recorded run's*, never
+        # the ones the document would generate on its own. That is the whole
+        # of what makes a rerun of the same document a different run: its
+        # stages are namespaced by whichever run owns them.
+        source = source.in_namespace(owner.key)
     stages = _verify_source_unchanged(source, state)
     if not 0 <= state.current_stage_index < len(stages):
         raise PlanError(
             f"recorded stage index {state.current_stage_index} is out of range for "
             f"{len(stages)} stage(s)"
         )
-    owner = _PlanOwner.of(label)
     # The same invariant as a fresh run's, checked here too because a resume
     # rebuilds its manifest from a living plan document: a rebuild that
     # drifted onto another run's stage ids must refuse rather than execute
@@ -1478,13 +1739,13 @@ def _unreadable_resume_input(
     if not isinstance(plan, (str, Path)):
         return exc if isinstance(exc, PlanError) else PlanError(str(exc))
     label = plan_label(Path(plan), Path(repo_root))
-    if not plan_state_path(sparring_dir, label).is_file():
+    if not any(run.open for run in find_runs(sparring_dir, label)):
         return exc if isinstance(exc, PlanError) else PlanError(str(exc))
     return PlanError(
         f"{label} can no longer be read as the plan this run started against ({exc}); "
         "a managed run's plan must not be edited while it is running. Restore it as it "
-        "was, or deliberately start over (see run-plan's refusal message for what to "
-        "remove)."
+        "was, or start a new run of the document as it now is, which leaves the stopped "
+        "run untouched."
     )
 
 
@@ -1640,7 +1901,7 @@ def _ensure_stage(
     sparring_dir: Path,
     planned: PlannedStage,
     *,
-    owner: _PlanOwner | None = None,
+    owner: _RunOwner | None = None,
     report: Reporter = lambda message: None,
 ) -> Stage:
     """Create the planned stage (fresh state.json, so fresh sessions) with
@@ -1667,10 +1928,10 @@ def _ensure_stage(
     try:
         stage = Stage.resolve(sparring_dir, planned.stage_id)
         if not stage.exists():
-            stage.create(brief=planned.brief, plan=owner.key if owner else None)
+            stage.create(brief=planned.brief, run=owner.key if owner else None)
             return stage
         state = stage.read_state()
-        if owner is not None and state.plan is None:
+        if owner is not None and state.run is None:
             _claim_stage(sparring_dir, planned.stage_id, owner=owner, report=report)
         if state.status is StageStatus.ACCEPTED:
             return stage
@@ -2212,6 +2473,7 @@ def _stop_for_deferred(
     return PlanRunResult(
         status=PlanRunStatus.PAUSED,
         plan=state.plan,
+        run=_RunOwner.of(state).key,
         stage_id=stage_id,
         awaiting=state.awaiting,
         deferred=obligations,
@@ -2330,12 +2592,13 @@ def _drive(
             return PlanRunResult(
                 status=PlanRunStatus.PAUSED,
                 plan=state.plan,
+                run=_RunOwner.of(state).key,
                 stage_id=plan_stage.stage_id,
                 accepted=tuple(accepted),
             )
         try:
             stage = _ensure_stage(
-                sparring_dir, plan_stage, owner=_PlanOwner.of(state.plan), report=report
+                sparring_dir, plan_stage, owner=_RunOwner.of(state), report=report
             )
         except PlanError:
             # The authoritative refusal is unchanged; only mirror it, if the
@@ -2404,6 +2667,7 @@ def _drive(
                 return PlanRunResult(
                     status=PlanRunStatus.PAUSED,
                     plan=state.plan,
+                    run=_RunOwner.of(state).key,
                     stage_id=stage.stage_id,
                     recorded=waiting,
                     accepted=tuple(accepted),
@@ -2459,6 +2723,7 @@ def _drive(
                     return PlanRunResult(
                         status=PlanRunStatus.PAUSED,
                         plan=state.plan,
+                        run=_RunOwner.of(state).key,
                         stage_id=stage.stage_id,
                         routing=review.routing,
                         accepted=tuple(accepted),
@@ -2627,6 +2892,7 @@ def _drive(
                         return PlanRunResult(
                             status=PlanRunStatus.PAUSED,
                             plan=state.plan,
+                            run=_RunOwner.of(state).key,
                             stage_id=stage.stage_id,
                             routing=loop_result.routing,
                             accepted=tuple(accepted),
@@ -2649,6 +2915,7 @@ def _drive(
                     return PlanRunResult(
                         status=PlanRunStatus.PAUSED,
                         plan=state.plan,
+                        run=_RunOwner.of(state).key,
                         stage_id=stage.stage_id,
                         awaiting=required,
                         accepted=tuple(accepted),
@@ -2734,6 +3001,7 @@ def _drive(
             return PlanRunResult(
                 status=PlanRunStatus.COMPLETE,
                 plan=state.plan,
+                run=_RunOwner.of(state).key,
                 stage_id=stage.stage_id,
                 accepted=tuple(accepted),
             )
@@ -2758,7 +3026,10 @@ __all__ = [
     "PlanSource",
     "PlanStage",
     "PlannedStage",
+    "RecordedRun",
     "describe_source",
+    "find_runs",
+    "legacy_run_key",
     "load_markdown_source",
     "load_plan_source",
     "parse_plan",
@@ -2766,9 +3037,10 @@ __all__ = [
     "plan_key",
     "plan_label",
     "plan_state_not_ignored_message",
-    "plan_state_path",
     "record_human_evidence",
+    "new_run_key",
     "render_brief",
     "resume_plan",
+    "run_state_path",
     "start_plan",
 ]

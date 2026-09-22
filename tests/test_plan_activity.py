@@ -35,7 +35,8 @@ from agent_sparring.cli import main
 from agent_sparring.plan import (
     PlanRunError,
     PlanRunStatus,
-    plan_state_path,
+    plan_key,
+    run_state_path,
     resume_plan,
     start_plan,
 )
@@ -205,6 +206,9 @@ open(out, "w").write(json.dumps(verdict))
                 [
                     "--sparring-dir", str(self.sparring_dir),
                     "run-plan", str(self.plan_path),
+                    # Named, because S1/S2 are namespaced by it; an
+                    # unnamed run mints its own key and its own stage ids.
+                    "--run-key", self.run_key,
                     "--repo-root", str(self.repo),
                     "--expected-branch", "feature/x",
                     "--claude-executable", str(self.claude),
@@ -384,13 +388,13 @@ class AdapterFactoryTests(_PlanActivityCase):
     def _start_with(self, make_adapters, **kwargs):
         return start_plan(
             self.plan_path, self.sparring_dir, self.repo, make_adapters,
-            expected_branch="feature/x", **kwargs,
+            expected_branch="feature/x", run_key=kwargs.pop("run_key", self.run_key), **kwargs,
         )
 
     def _resume_with(self, make_adapters, **kwargs):
         return resume_plan(
             self.plan_path, self.sparring_dir, self.repo, make_adapters,
-            expected_branch="feature/x", **kwargs,
+            expected_branch="feature/x", run_key=kwargs.pop("run_key", self.run_key), **kwargs,
         )
 
 
@@ -589,7 +593,8 @@ class _Env:
         _run_git(self.repo, "checkout", "-q", "-b", "feature/x")
         _run_git(self.repo, "push", "-q", "-u", "origin", "feature/x")
         self.sparring_dir = self.repo / ".sparring"
-        self.state_path = plan_state_path(self.sparring_dir, "docs/plan.md")
+        self.run_key = plan_key("docs/plan.md")
+        self.state_path = run_state_path(self.sparring_dir, self.run_key)
 
     def snapshot(self) -> dict[str, str]:
         snapshot = {"plan": self.state_path.read_text(encoding="utf-8")}
@@ -628,7 +633,7 @@ class NonAuthorityTests(_PlanActivityCase):
                 return stage_adapter, sparring_adapter
 
             start_plan(env.plan_path, env.sparring_dir, env.repo, make_adapters,
-                       expected_branch="feature/x")
+                       expected_branch="feature/x", run_key=env.run_key)
             if sabotage:
                 # Stage 1's log becomes a directory between pause and resume.
                 s1 = Stage.resolve(env.sparring_dir, S1)
@@ -728,7 +733,7 @@ class NonAuthorityTests(_PlanActivityCase):
             sparring_adapter = _SparringAdapter([SEND_BACK, READY, SEND_BACK, READY])
             result = start_plan(
                 env.plan_path, env.sparring_dir, env.repo, _fixed(stage_adapter, sparring_adapter),
-                expected_branch="feature/x",
+                expected_branch="feature/x", run_key=env.run_key,
             )
             return result, stage_adapter
 
