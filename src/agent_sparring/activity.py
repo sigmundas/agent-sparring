@@ -69,6 +69,22 @@ OPTIONAL_FIELDS = frozenset(
         "resumed",  # whether a turn resumed an existing provider session
         "parent_id",  # provider-established parent tool-use id for nested-agent activity
         "tool_use_id",  # provider-issued id of the tool call an event is about
+        # -- what a provider said about its own budget, on provider.usage --
+        #
+        # Every one of these is written only when the provider's own output
+        # states it. There is no default and nothing is computed from a
+        # model name: a number here is a quotation, and its absence means
+        # "this provider did not say", which a reader must show as unknown
+        # rather than as zero. That distinction is the whole reason these
+        # are separate optional fields instead of one always-present blob.
+        "input_tokens",  # prompt tokens the provider reported for the session
+        "output_tokens",  # completion tokens likewise
+        "total_tokens",  # the provider's own total, cumulative over the session
+        "context_window",  # the model's context size *as the provider stated it*
+        "rate_limit_percent",  # primary window usage, 0-100, when reported
+        "rate_limit_window_minutes",  # the primary window that percentage is of
+        "rate_limit_secondary_percent",  # the longer window (e.g. weekly), when reported
+        "rate_limit_secondary_window_minutes",  # its length
     }
 )
 

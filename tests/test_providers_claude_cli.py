@@ -347,7 +347,7 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         self.assertEqual(
             [e["event"] for e in events],
             ["session.observed", "file.changed", "command.started", "command.finished",
-             "tool.call", "provider.result"],
+             "tool.call", "provider.usage", "provider.result"],
         )
         session = events[0]
         self.assertEqual((session["session_id"], session["model"], session["provider"]),
@@ -359,7 +359,16 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         self.assertEqual((started["tool"], started["tool_use_id"]), ("Bash", "toolu_bash"))
         self.assertEqual(finished["tool_use_id"], "toolu_bash")
         self.assertEqual(events[4]["tool"], "Read")
-        self.assertEqual(events[5]["summary"], "success, 4 turn(s)")
+        # Tokens as flat fields, never the provider's `usage` object: the
+        # leak guard below asserts that key never reaches the log at all.
+        usage = events[5]
+        self.assertEqual((usage["input_tokens"], usage["output_tokens"]), (10, 5))
+        # The Claude CLI states no context window and no rate limits, so
+        # those stay absent and the panel shows them as unknown. Inferring
+        # a window from the model name would be a guess shown as a fact.
+        for absent in ("context_window", "rate_limit_percent", "rate_limit_secondary_percent"):
+            self.assertNotIn(absent, usage)
+        self.assertEqual(events[6]["summary"], "success, 4 turn(s)")
 
     def test_forbidden_content_never_reaches_the_activity_log(self):
         adapter = ClaudeCliAdapter(

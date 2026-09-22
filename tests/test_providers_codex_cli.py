@@ -446,7 +446,7 @@ class CodexCliAdapterStreamingTests(unittest.TestCase):
             [e["event"] for e in events],
             ["session.observed", "command.started", "command.finished", "tool.call",
              "file.changed", "file.changed", "subagent.started", "tool.call",
-             "provider.result"],
+             "provider.usage", "provider.result"],
         )
         self.assertEqual(events[0]["session_id"], "thread-abc")
         self.assertEqual(events[0]["provider"], "codex-cli")
@@ -458,7 +458,8 @@ class CodexCliAdapterStreamingTests(unittest.TestCase):
         self.assertEqual((events[5]["path"], events[5]["kind"]), ("src/b.py", "add"))
         self.assertEqual(events[6]["tool"], "spawn_agent")
         self.assertEqual(events[7]["tool"], "web_search")
-        self.assertEqual(events[8]["summary"], "tokens in=24763 out=122")
+        self.assertEqual((events[8]["input_tokens"], events[8]["output_tokens"]), (24763, 122))
+        self.assertEqual(events[9]["summary"], "tokens in=24763 out=122")
 
     def test_forbidden_content_never_reaches_the_activity_log(self):
         CodexCliAdapter(
@@ -567,3 +568,130 @@ class CodexCliAdapterPathNormalizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexBudgetTelemetryTests(unittest.TestCase):
+    """What the provider says about tokens, context and rate limits.
+
+    All of it is a quotation. The panel draws a dial from these numbers, so
+    a value that was never reported has to stay absent rather than become a
+    zero or a guess -- a context ring filled in from a model name would be
+    an invention shown as a measurement.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo_root = Path(self._tmp.name)
+        self.activity_path = self.repo_root / "activity.jsonl"
+        self.emitter = ActivityLog(self.activity_path).bind("sparrer", provider="codex-cli")
+        self.verdict = json.dumps(
+            {"action": "READY", "summary": "looks good", "needs_you_reason": None,
+             "findings": "fine", "deferred": None}
+        )
+
+    def _run(self, *events) -> list[dict]:
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            Path(args[args.index("-o") + 1]).write_text(self.verdict, encoding="utf-8")
+            stdout = _jsonl(*events)
+            if on_line is not None:
+                for line in stdout.splitlines():
+                    on_line(line)
+            return _fake_result(0, stdout)
+
+        CodexCliAdapter(repo_root=self.repo_root, runner=runner, activity=self.emitter).start(_PROMPT)
+        return [e for e in _read_events(self.activity_path) if e["event"] == "provider.usage"]
+
+    def test_the_cumulative_totals_context_window_and_both_limits_are_recorded(self):
+        # The shape a real session reports: cumulative usage with the
+        # context window beside it, and the account's two rate-limit
+        # windows. This is what every dial needs.
+        usage = self._run(
+            {"type": "thread.started", "thread_id": "t"},
+            {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"input_tokens": 135812, "output_tokens": 665,
+                                          "total_tokens": 136477},
+                    "model_context_window": 258400,
+                },
+                "rate_limits": {
+                    "primary": {"used_percent": 8.0, "window_minutes": 300},
+                    "secondary": {"used_percent": 39.0, "window_minutes": 10080},
+                },
+            },
+        )
+
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["total_tokens"], 136477)
+        self.assertEqual(usage[0]["context_window"], 258400)
+        self.assertEqual((usage[0]["rate_limit_percent"], usage[0]["rate_limit_window_minutes"]), (8, 300))
+        self.assertEqual(
+            (usage[0]["rate_limit_secondary_percent"], usage[0]["rate_limit_secondary_window_minutes"]),
+            (39, 10080),
+        )
+
+    def test_a_turn_that_reports_only_tokens_leaves_the_rest_absent(self):
+        # Older Codex, and the plain `turn.completed` path: tokens and
+        # nothing else. The context window must not be invented.
+        usage = self._run(
+            {"type": "thread.started", "thread_id": "t"},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 7}},
+        )
+
+        self.assertEqual(len(usage), 1)
+        self.assertEqual((usage[0]["input_tokens"], usage[0]["output_tokens"]), (100, 7))
+        for absent in ("context_window", "rate_limit_percent", "rate_limit_secondary_percent"):
+            self.assertNotIn(absent, usage[0])
+
+    def test_cumulative_totals_win_over_one_response_s_usage(self):
+        # Both in one event. The context dial is about how full the session
+        # is, so the cumulative figure is the one recorded.
+        usage = self._run(
+            {"type": "thread.started", "thread_id": "t"},
+            {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 136477}},
+                "usage": {"total_tokens": 44085},
+            },
+        )
+
+        self.assertEqual(usage[0]["total_tokens"], 136477)
+
+    def test_unchanged_numbers_are_not_re_emitted(self):
+        usage = self._run(
+            {"type": "thread.started", "thread_id": "t"},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 7}},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 7}},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 9}},
+        )
+
+        self.assertEqual([e["output_tokens"] for e in usage], [7, 9])
+
+    def test_a_nonsense_value_is_read_as_not_stated(self):
+        # Another program's JSON: a string where a count belongs, a
+        # percentage out of range, a negative total. None of it becomes a
+        # dial, and none of it stops the rest being recorded.
+        usage = self._run(
+            {"type": "thread.started", "thread_id": "t"},
+            {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": "lots", "total_tokens": -1,
+                                               "output_tokens": 12}},
+                "rate_limits": {"primary": {"used_percent": 400, "window_minutes": 300}},
+            },
+        )
+
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["output_tokens"], 12)
+        for absent in ("input_tokens", "total_tokens", "rate_limit_percent"):
+            self.assertNotIn(absent, usage[0])
+        self.assertEqual(usage[0]["rate_limit_window_minutes"], 300)
+
+    def test_events_that_say_nothing_about_budget_emit_nothing(self):
+        usage = self._run(
+            {"type": "thread.started", "thread_id": "t"},
+            {"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": "hi"}},
+        )
+
+        self.assertEqual(usage, [])

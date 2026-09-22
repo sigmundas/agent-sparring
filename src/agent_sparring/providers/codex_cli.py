@@ -93,7 +93,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
 from agent_sparring.deferred_gate import CHECKPOINTS
@@ -232,6 +232,95 @@ def _default_runner(
     return run_streaming(args, cwd, timeout_seconds, on_line, stdin_devnull=True)
 
 
+def _int_in(payload: Any, *keys: str) -> int | None:
+    """A non-negative integer at ``payload[keys[0]][keys[1]]...``, or None.
+
+    Tolerant on purpose: this reads another program's JSON, where a field
+    may be absent, null, nested one level deeper than last version, or a
+    string. Anything that is not a plain non-negative integer is treated as
+    "not stated", because a wrong number shown as a budget is worse than no
+    number at all.
+    """
+
+    for key in keys:
+        if not isinstance(payload, Mapping):
+            return None
+        payload = payload.get(key)
+    if isinstance(payload, bool) or not isinstance(payload, int):
+        return None
+    return payload if payload >= 0 else None
+
+
+def _percent_in(payload: Any, *keys: str) -> int | None:
+    """A 0-100 percentage, rounded, or None. Floats are expected here."""
+
+    for key in keys:
+        if not isinstance(payload, Mapping):
+            return None
+        payload = payload.get(key)
+    if isinstance(payload, bool) or not isinstance(payload, (int, float)):
+        return None
+    if not 0 <= payload <= 100:
+        return None
+    return round(payload)
+
+
+def _budget_fields(event: Mapping[str, Any]) -> dict[str, Any]:
+    """What one Codex stream event says about tokens, context and limits.
+
+    Keyed on where the numbers are rather than on the event's ``type``,
+    which differs between the ``codex exec --json`` stream and Codex's own
+    session log and has moved between releases. Both shapes seen in the
+    wild are read: ``usage`` on a completed turn, and ``info`` carrying
+    cumulative totals with the context window beside them.
+
+    Returns only the fields actually present. An empty result means this
+    event said nothing about budget, which is the common case.
+    """
+
+    fields: dict[str, Any] = {}
+    # Cumulative first, so a per-response `usage` cannot overwrite it: the
+    # context dial is about how full the session is, not about one reply.
+    for source in (event.get("info"), event):
+        if not isinstance(source, Mapping):
+            continue
+        for container in ("total_token_usage", "usage"):
+            usage = source.get(container)
+            if not isinstance(usage, Mapping):
+                continue
+            for field, key in (
+                ("input_tokens", "input_tokens"),
+                ("output_tokens", "output_tokens"),
+                ("total_tokens", "total_tokens"),
+            ):
+                value = _int_in(usage, key)
+                if value is not None:
+                    fields.setdefault(field, value)
+        window = _int_in(source, "model_context_window")
+        if window:
+            fields.setdefault("context_window", window)
+
+    limits = event.get("rate_limits")
+    if not isinstance(limits, Mapping):
+        limits = event.get("info", {})
+        limits = limits.get("rate_limits") if isinstance(limits, Mapping) else None
+    if isinstance(limits, Mapping):
+        for field, (group, key) in (
+            ("rate_limit_percent", ("primary", "used_percent")),
+            ("rate_limit_window_minutes", ("primary", "window_minutes")),
+            ("rate_limit_secondary_percent", ("secondary", "used_percent")),
+            ("rate_limit_secondary_window_minutes", ("secondary", "window_minutes")),
+        ):
+            value = (
+                _percent_in(limits, group, key)
+                if key == "used_percent"
+                else _int_in(limits, group, key)
+            )
+            if value is not None:
+                fields[field] = value
+    return fields
+
+
 def _str_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -251,6 +340,7 @@ class _CodexStreamTranslator:
         self._emitter = emitter
         self._repo_root = repo_root
         self._started_items: set[str] = set()
+        self._last_usage: dict[str, Any] = {}
 
     def feed(self, line: str) -> None:
         if self._emitter is None:
@@ -264,6 +354,12 @@ class _CodexStreamTranslator:
             return
         if not isinstance(event, dict):
             return
+        # Budget first, and on *every* event: which event type carries the
+        # numbers is the provider's business and has changed between
+        # versions, so this looks for the numbers rather than for a type
+        # name it would have to guess right. An event that carries none
+        # emits nothing.
+        self._usage(event)
         kind = event.get("type")
         if kind == "thread.started":
             emit(
@@ -281,6 +377,28 @@ class _CodexStreamTranslator:
             # The provider reported a failure. Its message text is not
             # recorded here; the adapter's final parse raises with it.
             emit(self._emitter, "provider.error")
+
+    def _usage(self, event: dict[str, Any]) -> None:
+        """Emit ``provider.usage`` for whatever this event says about budget.
+
+        Codex reports tokens on a completed turn, and — in the versions
+        that do — the model's context window and the account's rate-limit
+        windows alongside them. All of it is optional and all of it is
+        quoted rather than derived: nothing here fills in a context window
+        from the model name, because a guessed denominator would turn an
+        unknown into a number a person would act on.
+
+        Re-emitted only when something changed, since the same totals
+        arriving twice is not an event. The log is telemetry and no
+        orchestration reads it, so a dropped or duplicated line costs
+        nothing but noise.
+        """
+
+        fields = _budget_fields(event)
+        if not fields or fields == self._last_usage:
+            return
+        self._last_usage = fields
+        emit(self._emitter, "provider.usage", **fields)
 
     @staticmethod
     def _usage_summary(event: dict[str, Any]) -> str | None:

@@ -113,6 +113,7 @@ class _ClaudeStreamTranslator:
         self._on_session = on_session
         self._tool_names: dict[str, str] = {}
         self._session_announced = False
+        self._last_usage: dict[str, object] = {}
 
     def feed(self, line: str) -> None:
         if self._emitter is None and self._on_session is None:
@@ -126,6 +127,10 @@ class _ClaudeStreamTranslator:
             return
         if not isinstance(message, dict):
             return
+        # Budget first, and on every message: the CLI attaches usage to
+        # assistant messages and to the final result, and which of those a
+        # given version populates is its business.
+        self._usage(message)
         kind = message.get("type")
         if kind == "system":
             self._system(message)
@@ -136,6 +141,38 @@ class _ClaudeStreamTranslator:
         elif kind == "result":
             self._result(message)
         # "stream_event" (partial deltas) and anything unknown: ignored.
+
+    def _usage(self, message: dict[str, Any]) -> None:
+        """Emit ``provider.usage`` for what this message says about tokens.
+
+        The Claude CLI reports token counts and nothing else: no context
+        window and no rate limits. So those fields are simply absent here,
+        and a reader must show them as unknown — not as zero, and not
+        filled in from the model name. A context window inferred from
+        ``claude-opus-5`` would be a guess presented as a measurement, and
+        the two models behind that name do not share one.
+        """
+
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            inner = message.get("message")
+            usage = inner.get("usage") if isinstance(inner, dict) else None
+        if not isinstance(usage, dict):
+            return
+        fields: dict[str, Any] = {}
+        for field_name, keys in (
+            ("input_tokens", ("input_tokens",)),
+            ("output_tokens", ("output_tokens",)),
+        ):
+            for key in keys:
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    fields[field_name] = value
+                    break
+        if not fields or fields == self._last_usage:
+            return
+        self._last_usage = fields
+        emit(self._emitter, "provider.usage", **fields)
 
     def _system(self, message: dict[str, Any]) -> None:
         if message.get("subtype") != "init":

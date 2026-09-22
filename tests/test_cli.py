@@ -746,6 +746,11 @@ open(out, "w").write(json.dumps(verdict))
             "sparrer:session.observed",
             "sparrer:command.started",
             "sparrer:command.finished",
+            # What the sparrer's provider said about its own budget. The
+            # fake stage agent reports no usage, so only the sparrer has
+            # one here -- which is the asymmetry the panel has to show
+            # honestly rather than smooth over.
+            "sparrer:provider.usage",
             "sparrer:provider.result",
             "sparrer:verdict",
         ]

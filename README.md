@@ -241,6 +241,20 @@ line per observable event (turn started, file edited, command finished,
 verdict, ...). It is telemetry for watching a stage, never an input to the
 workflow; see the "Activity stream" section of `docs/design.md`.
 
+One of those events is `provider.usage`: what a provider said about its own
+budget — tokens in/out, its cumulative total, the model's context window,
+and the account's rate-limit windows as percentages. Every field is
+optional, and each one is written **only when that provider's own output
+states it**. Codex reports all of them; the Claude CLI reports token counts
+and nothing else, so its context window and rate limits are simply absent.
+
+That absence is load-bearing. Nothing infers a context window from a model
+name and nothing defaults a percentage to zero, because a denominator
+guessed from `claude-opus-5` would be an invention presented as a
+measurement — and the two models behind that name do not share one. A
+reader showing these numbers must render "not stated" differently from
+"zero".
+
 ### What each agent was actually told
 
 Every turn writes the exact prompt it handed to its provider into the
