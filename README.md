@@ -242,11 +242,29 @@ verdict, ...). It is telemetry for watching a stage, never an input to the
 workflow; see the "Activity stream" section of `docs/design.md`.
 
 One of those events is `provider.usage`: what a provider said about its own
-budget — tokens in/out, its cumulative total, the model's context window,
-and the account's rate-limit windows as percentages. Every field is
-optional, and each one is written **only when that provider's own output
-states it**. Codex reports all of them; the Claude CLI reports token counts
-and nothing else, so its context window and rate limits are simply absent.
+budget — tokens in/out, its cumulative total, how full the context window
+is, the size of that window, and the account's rate-limit windows as
+percentages. Every field is optional, and each one is written **only when
+that provider's own output states it**. Codex reports all of them; the
+Claude CLI reports no rate limits, so those are simply absent for it.
+
+`context_used_tokens` and `total_tokens` are different facts and only the
+first is a share of `context_window`. Both CLIs re-send the conversation on
+every request, so the cumulative total passes the window several times over
+in an ordinary session; the occupancy is the tokens the model was holding on
+its latest request, cached prompt included. For Claude that means summing
+`input_tokens` with the two cache fields — `input_tokens` alone is the
+newest slice of the prompt and reports a 200k-token session as eighteen
+tokens. Subagent messages are skipped: a `Task` subagent is a separate,
+much smaller conversation, and letting one land would make the figure
+collapse whenever work was delegated.
+
+Codex's `--json` stream carries neither its context window nor its rate
+limits (verified against codex-cli 0.153.4). Those are read, for the thread
+the engine itself started, from the `token_count` record in Codex's own
+rollout file under `CODEX_HOME`. Only the numbers of that one record type
+are read; the transcript in the same file is not touched, and a missing or
+changed file means "not reported" rather than an error.
 
 That absence is load-bearing. Nothing infers a context window from a model
 name and nothing defaults a percentage to zero, because a denominator

@@ -269,6 +269,15 @@ def _stream_fixture(*, with_model: bool = True, session_id: str = "abc-123") -> 
                     {"type": "tool_use", "id": "toolu_read", "name": "Read",
                      "input": {"file_path": "src/other.py"}}
                 ],
+                # Shaped as the real CLI reports it: nearly the whole
+                # conversation sits in the cache fields, and `input_tokens`
+                # is only the newest slice.
+                "usage": {
+                    "input_tokens": 9,
+                    "cache_read_input_tokens": 120_000,
+                    "cache_creation_input_tokens": 30_000,
+                    "output_tokens": 35,
+                },
             },
         },
         {"type": "stream_event", "session_id": session_id,
@@ -282,6 +291,9 @@ def _stream_fixture(*, with_model: bool = True, session_id: str = "abc-123") -> 
             "num_turns": 4,
             "total_cost_usd": 0.01,
             "usage": {"input_tokens": 10, "output_tokens": 5},
+            "modelUsage": {
+                "claude-fable-5-1": {"contextWindow": 200_000, "canonicalModel": "claude-fable-5-1"}
+            },
         },
     )
 
@@ -347,7 +359,7 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         self.assertEqual(
             [e["event"] for e in events],
             ["session.observed", "file.changed", "command.started", "command.finished",
-             "tool.call", "provider.usage", "provider.result"],
+             "provider.usage", "tool.call", "provider.usage", "provider.result"],
         )
         session = events[0]
         self.assertEqual((session["session_id"], session["model"], session["provider"]),
@@ -358,17 +370,25 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         started, finished = events[2], events[3]
         self.assertEqual((started["tool"], started["tool_use_id"]), ("Bash", "toolu_bash"))
         self.assertEqual(finished["tool_use_id"], "toolu_bash")
-        self.assertEqual(events[4]["tool"], "Read")
+        self.assertEqual(events[5]["tool"], "Read")
         # Tokens as flat fields, never the provider's `usage` object: the
         # leak guard below asserts that key never reaches the log at all.
-        usage = events[5]
-        self.assertEqual((usage["input_tokens"], usage["output_tokens"]), (10, 5))
-        # The Claude CLI states no context window and no rate limits, so
-        # those stay absent and the panel shows them as unknown. Inferring
-        # a window from the model name would be a guess shown as a fact.
-        for absent in ("context_window", "rate_limit_percent", "rate_limit_secondary_percent"):
-            self.assertNotIn(absent, usage)
-        self.assertEqual(events[6]["summary"], "success, 4 turn(s)")
+        # The occupancy counts the cached prompt (9 + 120000 + 30000 + 35),
+        # which is the whole point -- `input_tokens` alone would report a
+        # 150k-token conversation as nine.
+        usage = events[4]
+        self.assertEqual((usage["input_tokens"], usage["output_tokens"]), (9, 35))
+        self.assertEqual(usage["context_used_tokens"], 150_044)
+        # The window comes off the final `result` line, where the CLI
+        # states it per model. It is quoted, never derived from the model
+        # name, which for `claude-opus-5` would cover two different sizes.
+        self.assertEqual(events[6]["context_window"], 200_000)
+        # No rate limits anywhere: this CLI does not report them, so they
+        # stay absent and the panel shows unknown rather than zero.
+        for event in events:
+            for absent in ("rate_limit_percent", "rate_limit_secondary_percent"):
+                self.assertNotIn(absent, event)
+        self.assertEqual(events[7]["summary"], "success, 4 turn(s)")
 
     def test_forbidden_content_never_reaches_the_activity_log(self):
         adapter = ClaudeCliAdapter(
@@ -530,6 +550,127 @@ class ClaudeCliAdapterStreamJsonTests(unittest.TestCase):
         self.assertEqual([e["event"] for e in _read_events(self.activity_path)][:2],
                          ["session.observed", "file.changed"])
 
+
+
+class ClaudeContextOccupancyTests(unittest.TestCase):
+    """How full the window is, as the Claude CLI actually states it.
+
+    The CLI puts nearly the whole conversation in the cache fields and
+    only the newest slice in `input_tokens`, so reading `input_tokens`
+    alone reported a 200k-token session as eighteen tokens. These tests
+    pin the arithmetic and the two lines it must not be taken from.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo_root = Path(self._tmp.name)
+        self.activity_path = self.repo_root / "activity.jsonl"
+        self.emitter = ActivityLog(self.activity_path).bind("stage", provider="claude-cli")
+
+    def _usage(self, *messages) -> list[dict]:
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            stdout = _jsonl(
+                {"type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5"},
+                *messages,
+                {"type": "result", "subtype": "success", "is_error": False,
+                 "result": "done", "session_id": "s"},
+            )
+            if on_line is not None:
+                for line in stdout.splitlines():
+                    on_line(line)
+            return _fake_result(0, stdout)
+
+        ClaudeCliAdapter(repo_root=self.repo_root, runner=runner, activity=self.emitter).start("hi")
+        return [e for e in _read_events(self.activity_path) if e["event"] == "provider.usage"]
+
+    @staticmethod
+    def _assistant(usage: dict, *, parent: str | None = None) -> dict:
+        return {
+            "type": "assistant",
+            "session_id": "s",
+            "parent_tool_use_id": parent,
+            "message": {"role": "assistant", "content": [], "usage": usage},
+        }
+
+    def test_the_cached_prompt_counts_toward_the_window(self):
+        usage = self._usage(
+            self._assistant({"input_tokens": 2, "cache_read_input_tokens": 180_000,
+                             "cache_creation_input_tokens": 1_200, "output_tokens": 16})
+        )
+
+        self.assertEqual(usage[0]["context_used_tokens"], 181_218)
+        # The provider's own two figures are still quoted as it stated them.
+        self.assertEqual((usage[0]["input_tokens"], usage[0]["output_tokens"]), (2, 16))
+
+    def test_the_latest_message_replaces_the_previous_one_rather_than_adding(self):
+        # Each request re-sends the conversation, so summing messages
+        # would count the same prompt once per request.
+        usage = self._usage(
+            self._assistant({"input_tokens": 1, "cache_read_input_tokens": 50_000,
+                             "output_tokens": 10}),
+            self._assistant({"input_tokens": 1, "cache_read_input_tokens": 90_000,
+                             "output_tokens": 10}),
+        )
+
+        self.assertEqual([e["context_used_tokens"] for e in usage], [50_011, 90_011])
+
+    def test_a_subagent_s_context_is_not_the_stage_s_context(self):
+        # A Task subagent is a separate, much smaller conversation. Letting
+        # one land would make the dial collapse whenever work was delegated.
+        usage = self._usage(
+            self._assistant({"input_tokens": 1, "cache_read_input_tokens": 190_000,
+                             "output_tokens": 10}),
+            self._assistant({"input_tokens": 1, "cache_read_input_tokens": 300,
+                             "output_tokens": 5}, parent="toolu_task"),
+        )
+
+        self.assertEqual([e["context_used_tokens"] for e in usage], [190_011])
+
+    def test_a_line_that_states_no_prompt_side_is_not_an_occupancy(self):
+        usage = self._usage(self._assistant({"output_tokens": 16}))
+
+        self.assertEqual(usage[0]["output_tokens"], 16)
+        self.assertNotIn("context_used_tokens", usage[0])
+
+    def test_no_window_is_reported_when_the_turn_states_several_that_disagree(self):
+        # A turn that ran a subagent on another model lists both. Where the
+        # stage's own model cannot be matched and the sizes differ, the
+        # window is left unstated rather than picked from.
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            stdout = _jsonl(
+                {"type": "system", "subtype": "init", "session_id": "s", "model": "unmatched"},
+                {"type": "result", "subtype": "success", "is_error": False, "result": "d",
+                 "session_id": "s",
+                 "modelUsage": {"claude-opus-5": {"contextWindow": 1_000_000},
+                                "claude-haiku-4-5": {"contextWindow": 200_000}}},
+            )
+            if on_line is not None:
+                for line in stdout.splitlines():
+                    on_line(line)
+            return _fake_result(0, stdout)
+
+        ClaudeCliAdapter(repo_root=self.repo_root, runner=runner, activity=self.emitter).start("hi")
+        events = [e for e in _read_events(self.activity_path) if e["event"] == "provider.usage"]
+        self.assertEqual(events, [])
+
+    def test_the_stage_s_own_model_picks_the_window_among_several(self):
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            stdout = _jsonl(
+                {"type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5"},
+                {"type": "result", "subtype": "success", "is_error": False, "result": "d",
+                 "session_id": "s",
+                 "modelUsage": {"claude-opus-5": {"contextWindow": 1_000_000},
+                                "claude-haiku-4-5": {"contextWindow": 200_000}}},
+            )
+            if on_line is not None:
+                for line in stdout.splitlines():
+                    on_line(line)
+            return _fake_result(0, stdout)
+
+        ClaudeCliAdapter(repo_root=self.repo_root, runner=runner, activity=self.emitter).start("hi")
+        events = [e for e in _read_events(self.activity_path) if e["event"] == "provider.usage"]
+        self.assertEqual(events[0]["context_window"], 1_000_000)
 
 
 class ClaudeCliAdapterPathNormalizationTests(unittest.TestCase):

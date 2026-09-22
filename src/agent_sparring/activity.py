@@ -80,6 +80,12 @@ OPTIONAL_FIELDS = frozenset(
         "input_tokens",  # prompt tokens the provider reported for the session
         "output_tokens",  # completion tokens likewise
         "total_tokens",  # the provider's own total, cumulative over the session
+        # How full the window is *right now*: the tokens the model was
+        # holding on its latest request, cached prompt included. A
+        # different fact from "total_tokens", which only ever grows and
+        # routinely exceeds the window; only this one is a share of
+        # "context_window".
+        "context_used_tokens",
         "context_window",  # the model's context size *as the provider stated it*
         "rate_limit_percent",  # primary window usage, 0-100, when reported
         "rate_limit_window_minutes",  # the primary window that percentage is of

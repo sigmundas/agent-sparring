@@ -84,6 +84,87 @@ def _str_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _non_negative_int(value: Any) -> int | None:
+    """``value`` as a token count, or None when it is not one.
+
+    Tolerant on purpose: this reads another program's JSON, where a field
+    may be absent, null or a string. Anything that is not a plain
+    non-negative integer is "not stated", because a wrong number shown as
+    a budget is worse than no number.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
+# What the model was actually holding when it produced a message: the
+# fresh prompt tokens, the cached prompt it read, the prompt it wrote to
+# cache, and its own reply. Together these are the context occupancy the
+# ctx dial is about. ``input_tokens`` alone is a small remainder.
+_CONTEXT_TOKEN_KEYS = (
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+)
+
+
+def _assistant_usage(message: dict[str, Any]) -> dict[str, Any]:
+    """Tokens stated by one ``assistant`` line, including its cache."""
+
+    inner = message.get("message")
+    usage = inner.get("usage") if isinstance(inner, dict) else None
+    if not isinstance(usage, dict):
+        usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    stated = {key: _non_negative_int(usage.get(key)) for key in _CONTEXT_TOKEN_KEYS}
+    fields: dict[str, Any] = {}
+    for key in ("input_tokens", "output_tokens"):
+        if stated[key] is not None:
+            fields[key] = stated[key]
+    present = [value for value in stated.values() if value is not None]
+    # The prompt side must be stated for this to be an occupancy at all; a
+    # line carrying only `output_tokens` says nothing about how full the
+    # window is.
+    if present and stated["input_tokens"] is not None:
+        fields["context_used_tokens"] = sum(present)
+    return fields
+
+
+def _result_usage(message: dict[str, Any], model: str | None) -> dict[str, Any]:
+    """The context window the final ``result`` line states, if it does.
+
+    ``modelUsage`` is keyed by model id and one turn may list several of
+    them, because a subagent can run on a different model with a different
+    window. The stage's own model -- the one the ``init`` line announced --
+    is the one whose window the dial is a share of. Where that cannot be
+    matched, a single entry, or several that agree, still says the window
+    unambiguously; anything else is left unstated rather than picked from.
+    """
+
+    usage = message.get("modelUsage")
+    if not isinstance(usage, dict):
+        return {}
+    windows: dict[str, int] = {}
+    for name, entry in usage.items():
+        if not isinstance(entry, dict) or not isinstance(name, str):
+            continue
+        window = _non_negative_int(entry.get("contextWindow"))
+        if window:
+            windows[name] = window
+    if not windows:
+        return {}
+    if model:
+        for name, window in windows.items():
+            canonical = _str_or_none(usage[name].get("canonicalModel"))
+            if model in (name, canonical) or name.startswith(model):
+                return {"context_window": window}
+    distinct = set(windows.values())
+    return {"context_window": distinct.pop()} if len(distinct) == 1 else {}
+
+
 class _ClaudeStreamTranslator:
     """Turns Claude stream-json lines into activity events.
 
@@ -114,6 +195,9 @@ class _ClaudeStreamTranslator:
         self._tool_names: dict[str, str] = {}
         self._session_announced = False
         self._last_usage: dict[str, object] = {}
+        # The model the `init` line announced, kept only so the final
+        # `result` line's per-model context windows can be told apart.
+        self._model: str | None = None
 
     def feed(self, line: str) -> None:
         if self._emitter is None and self._on_session is None:
@@ -127,11 +211,11 @@ class _ClaudeStreamTranslator:
             return
         if not isinstance(message, dict):
             return
-        # Budget first, and on every message: the CLI attaches usage to
-        # assistant messages and to the final result, and which of those a
-        # given version populates is its business.
-        self._usage(message)
         kind = message.get("type")
+        # Budget first: which line carries which number is the CLI's
+        # business, but *what* each line's numbers mean is not
+        # interchangeable, so `_usage` is told which kind it is reading.
+        self._usage(message, kind)
         if kind == "system":
             self._system(message)
         elif kind == "assistant":
@@ -142,33 +226,41 @@ class _ClaudeStreamTranslator:
             self._result(message)
         # "stream_event" (partial deltas) and anything unknown: ignored.
 
-    def _usage(self, message: dict[str, Any]) -> None:
+    def _usage(self, message: dict[str, Any], kind: Any) -> None:
         """Emit ``provider.usage`` for what this message says about tokens.
 
-        The Claude CLI reports token counts and nothing else: no context
-        window and no rate limits. So those fields are simply absent here,
-        and a reader must show them as unknown — not as zero, and not
-        filled in from the model name. A context window inferred from
-        ``claude-opus-5`` would be a guess presented as a measurement, and
-        the two models behind that name do not share one.
+        Two different facts come off two different lines, and conflating
+        them is how this first got the number wrong:
+
+        - An ``assistant`` line's ``usage`` describes *that one request*:
+          how much context the model was just handed, and what it wrote
+          back. Summing those across a turn would double-count a prompt
+          that is re-sent on every request, so the occupancy reported here
+          is the latest message's, not a running total.
+        - The final ``result`` line states the model's context window,
+          under ``modelUsage.<model>.contextWindow``. That is the provider
+          stating it, which is the only reason a window may be reported at
+          all -- nothing here derives one from a model name.
+
+        Occupancy must count the cached prompt. The CLI puts almost the
+        whole conversation in ``cache_read_input_tokens`` and only the
+        newest slice in ``input_tokens``, so reading ``input_tokens``
+        alone reports a 200k-token session as eighteen tokens.
+
+        Subagent messages (those carrying ``parent_tool_use_id``) are a
+        different conversation with its own much smaller context, and are
+        skipped: letting one land would make the dial collapse whenever
+        the agent delegated.
         """
 
-        usage = message.get("usage")
-        if not isinstance(usage, dict):
-            inner = message.get("message")
-            usage = inner.get("usage") if isinstance(inner, dict) else None
-        if not isinstance(usage, dict):
+        if kind == "assistant":
+            if _str_or_none(message.get("parent_tool_use_id")):
+                return
+            fields = _assistant_usage(message)
+        elif kind == "result":
+            fields = _result_usage(message, self._model)
+        else:
             return
-        fields: dict[str, Any] = {}
-        for field_name, keys in (
-            ("input_tokens", ("input_tokens",)),
-            ("output_tokens", ("output_tokens",)),
-        ):
-            for key in keys:
-                value = usage.get(key)
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    fields[field_name] = value
-                    break
         if not fields or fields == self._last_usage:
             return
         self._last_usage = fields
@@ -178,11 +270,12 @@ class _ClaudeStreamTranslator:
         if message.get("subtype") != "init":
             return
         session_id = _str_or_none(message.get("session_id"))
+        self._model = _str_or_none(message.get("model"))
         emit(
             self._emitter,
             "session.observed",
             session_id=session_id,
-            model=_str_or_none(message.get("model")),
+            model=self._model,
         )
         if session_id and self._on_session and not self._session_announced:
             self._session_announced = True

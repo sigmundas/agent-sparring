@@ -8,6 +8,7 @@ import conftest_path  # noqa: F401
 
 from agent_sparring.activity import ActivityLog
 from agent_sparring.providers import ProviderError
+from agent_sparring.providers import codex_cli
 from agent_sparring.providers.codex_cli import CodexCliAdapter
 
 
@@ -590,7 +591,7 @@ class CodexBudgetTelemetryTests(unittest.TestCase):
              "findings": "fine", "deferred": None}
         )
 
-    def _run(self, *events) -> list[dict]:
+    def _run(self, *events, codex_home: Path | None = None) -> list[dict]:
         def runner(args, cwd, timeout_seconds, on_line=None):
             Path(args[args.index("-o") + 1]).write_text(self.verdict, encoding="utf-8")
             stdout = _jsonl(*events)
@@ -599,8 +600,23 @@ class CodexBudgetTelemetryTests(unittest.TestCase):
                     on_line(line)
             return _fake_result(0, stdout)
 
-        CodexCliAdapter(repo_root=self.repo_root, runner=runner, activity=self.emitter).start(_PROMPT)
+        CodexCliAdapter(
+            repo_root=self.repo_root,
+            runner=runner,
+            activity=self.emitter,
+            codex_home=codex_home,
+        ).start(_PROMPT)
         return [e for e in _read_events(self.activity_path) if e["event"] == "provider.usage"]
+
+    def _rollout(self, thread_id: str, *records) -> Path:
+        """A Codex session log for ``thread_id``, laid out as Codex lays it out."""
+
+        home = self.repo_root / "codex-home"
+        day = home / "sessions" / "2026" / "09" / "22"
+        day.mkdir(parents=True, exist_ok=True)
+        path = day / f"rollout-2026-09-22T12-42-24-{thread_id}.jsonl"
+        path.write_text(_jsonl(*records), encoding="utf-8")
+        return home
 
     def test_the_cumulative_totals_context_window_and_both_limits_are_recorded(self):
         # The shape a real session reports: cumulative usage with the
@@ -695,3 +711,130 @@ class CodexBudgetTelemetryTests(unittest.TestCase):
         )
 
         self.assertEqual(usage, [])
+
+    def test_the_last_request_s_total_is_the_context_occupancy(self):
+        # `total_token_usage` grows all session and passes the window
+        # several times over, because Codex re-sends the conversation on
+        # every request. Only `last_token_usage` is a share of the window.
+        usage = self._run(
+            {"type": "thread.started", "thread_id": "t"},
+            {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"total_tokens": 653353},
+                    "last_token_usage": {"total_tokens": 220354},
+                    "model_context_window": 258400,
+                },
+            },
+        )
+
+        self.assertEqual(usage[0]["context_used_tokens"], 220354)
+        self.assertEqual(usage[0]["total_tokens"], 653353)
+
+
+class CodexRolloutBudgetTests(unittest.TestCase):
+    """The budget facts that exist only in Codex's own session log.
+
+    Verified against codex-cli 0.153.4: `codex exec --json` emits
+    `turn.completed` with per-turn token counts and nothing else, while
+    the rollout file for the same thread states the context window, the
+    last request's occupancy and both rate-limit windows.
+    """
+
+    setUp = CodexBudgetTelemetryTests.setUp
+    _run = CodexBudgetTelemetryTests._run
+    _rollout = CodexBudgetTelemetryTests._rollout
+
+    @staticmethod
+    def _token_count_record(**info) -> dict:
+        return {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"input_tokens": 652332, "output_tokens": 1021,
+                                          "total_tokens": 653353},
+                    "last_token_usage": {"total_tokens": 220354},
+                    "model_context_window": 258400,
+                    **info,
+                },
+                "rate_limits": {
+                    "primary": {"used_percent": 34.0, "window_minutes": 300},
+                    "secondary": {"used_percent": 59.0, "window_minutes": 10080},
+                },
+            },
+        }
+
+    def test_the_window_and_both_limits_are_read_from_the_session_log(self):
+        home = self._rollout(
+            "01a0c8b5-ac2b-7083-bd82-9a0472a666a5",
+            {"type": "response_item", "payload": {"type": "message", "content": "secret"}},
+            self._token_count_record(),
+        )
+
+        usage = self._run(
+            {"type": "thread.started", "thread_id": "01a0c8b5-ac2b-7083-bd82-9a0472a666a5"},
+            {"type": "turn.completed", "usage": {"input_tokens": 652332, "output_tokens": 1021}},
+            codex_home=home,
+        )
+
+        # The stream's own event first, then what the log adds.
+        window = usage[-1]
+        self.assertEqual(window["context_window"], 258400)
+        self.assertEqual(window["context_used_tokens"], 220354)
+        self.assertEqual((window["rate_limit_percent"], window["rate_limit_window_minutes"]), (34, 300))
+        self.assertEqual(
+            (window["rate_limit_secondary_percent"], window["rate_limit_secondary_window_minutes"]),
+            (59, 10080),
+        )
+
+    def test_only_the_numbers_are_read_never_the_transcript(self):
+        # The same file holds prompts, reasoning and command output. None
+        # of it may reach the activity log.
+        home = self._rollout(
+            "01a0c8b5-ac2b-7083-bd82-9a0472a666a5",
+            {"type": "response_item",
+             "payload": {"type": "message", "content": "SECRET-TRANSCRIPT"}},
+            self._token_count_record(),
+        )
+
+        self._run(
+            {"type": "thread.started", "thread_id": "01a0c8b5-ac2b-7083-bd82-9a0472a666a5"},
+            {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+            codex_home=home,
+        )
+
+        self.assertNotIn("SECRET-TRANSCRIPT", self.activity_path.read_text(encoding="utf-8"))
+
+    def test_the_latest_record_is_the_one_read(self):
+        home = self._rollout(
+            "01a0c8b5-ac2b-7083-bd82-9a0472a666a5",
+            self._token_count_record(last_token_usage={"total_tokens": 1000}),
+            self._token_count_record(last_token_usage={"total_tokens": 220354}),
+        )
+
+        usage = self._run(
+            {"type": "thread.started", "thread_id": "01a0c8b5-ac2b-7083-bd82-9a0472a666a5"},
+            {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+            codex_home=home,
+        )
+
+        self.assertEqual(usage[-1]["context_used_tokens"], 220354)
+
+    def test_a_missing_session_log_leaves_the_dials_unreported(self):
+        usage = self._run(
+            {"type": "thread.started", "thread_id": "01a0c8b5-ac2b-7083-bd82-9a0472a666a5"},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 7}},
+            codex_home=self.repo_root / "nowhere",
+        )
+
+        self.assertEqual(len(usage), 1)
+        for absent in ("context_window", "context_used_tokens", "rate_limit_percent"):
+            self.assertNotIn(absent, usage[0])
+
+    def test_a_thread_id_that_is_not_an_id_is_never_globbed(self):
+        # The id goes into a glob pattern, so anything that could act as
+        # one is refused outright rather than matched loosely.
+        self.assertIsNone(codex_cli._rollout_path("../*", self.repo_root))
+        self.assertIsNone(codex_cli._rollout_path("", self.repo_root))
+        self.assertIsNone(codex_cli._rollout_path(None, self.repo_root))

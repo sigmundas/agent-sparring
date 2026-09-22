@@ -89,6 +89,7 @@ SparringAgentAdapter` protocol, not to ``codex`` flags directly.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -296,6 +297,14 @@ def _budget_fields(event: Mapping[str, Any]) -> dict[str, Any]:
                 value = _int_in(usage, key)
                 if value is not None:
                     fields.setdefault(field, value)
+        # How full the window is, which is the last request's total and
+        # not the cumulative one above: Codex re-sends the conversation
+        # every request, so `total_token_usage` passes the context window
+        # several times over in an ordinary session and is not a share of
+        # anything.
+        used = _int_in(source, "last_token_usage", "total_tokens")
+        if used is not None:
+            fields.setdefault("context_used_tokens", used)
         window = _int_in(source, "model_context_window")
         if window:
             fields.setdefault("context_window", window)
@@ -325,6 +334,75 @@ def _str_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+# Codex's own session log, which is the only place some budget facts
+# exist. Verified against codex-cli 0.153.4: `codex exec --json` prints
+# `{"type":"turn.completed","usage":{...}}` and nothing else about
+# budget -- no context window, no rate limits -- while the rollout file
+# for the same thread carries an `event_msg`/`token_count` payload with
+# `info.model_context_window`, `info.last_token_usage` and the account's
+# `rate_limits.primary`/`.secondary` percentages.
+#
+# Reading it is a deliberate, narrow exception to "the stream is the
+# only source". Only the numeric fields of that one payload type are
+# ever read. The same file also holds prompts, reasoning and command
+# output, and none of it is read, recorded or emitted; nothing here
+# parses a `response_item`. Every failure -- no file, unreadable file, a
+# format that has moved -- is "the provider did not say", never an
+# error and never a guess.
+_ROLLOUT_TOKEN_EVENT = "token_count"
+_ROLLOUT_GLOB = "sessions/*/*/*/rollout-*-{thread_id}.jsonl"
+# A thread id goes into a glob pattern, so it must be an id and not a
+# pattern. Codex issues UUID-shaped ids; anything else is not looked up.
+_THREAD_ID_CHARS = set("0123456789abcdefABCDEF-")
+
+
+def _codex_home() -> Path:
+    """Where Codex keeps its sessions, honouring ``CODEX_HOME``."""
+
+    raw = os.environ.get("CODEX_HOME")
+    return Path(raw).expanduser() if raw else Path.home() / ".codex"
+
+
+def _rollout_path(thread_id: str | None, home: Path | None = None) -> Path | None:
+    """The newest rollout file for ``thread_id``, or None."""
+
+    if not thread_id or not set(thread_id) <= _THREAD_ID_CHARS:
+        return None
+    root = home if home is not None else _codex_home()
+    try:
+        matches = sorted(root.glob(_ROLLOUT_GLOB.format(thread_id=thread_id)))
+    except OSError:
+        return None
+    return matches[-1] if matches else None
+
+
+def _rollout_budget(path: Path) -> dict[str, Any]:
+    """Budget fields from the last ``token_count`` record in ``path``.
+
+    Scanned from the end, because the latest record is the current state
+    and the file is mostly transcript this has no business reading.
+    """
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    for line in reversed(lines):
+        if _ROLLOUT_TOKEN_EVENT not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = record.get("payload") if isinstance(record, dict) else None
+        if not isinstance(payload, Mapping):
+            continue
+        if payload.get("type") != _ROLLOUT_TOKEN_EVENT:
+            continue
+        return _budget_fields(payload)
+    return {}
+
+
 class _CodexStreamTranslator:
     """Turns ``codex exec --json`` lines into activity events.
 
@@ -336,11 +414,20 @@ class _CodexStreamTranslator:
     ``repo_root`` is omitted, never leaked.
     """
 
-    def __init__(self, emitter: ActivityEmitter | None, repo_root: Path) -> None:
+    def __init__(
+        self,
+        emitter: ActivityEmitter | None,
+        repo_root: Path,
+        codex_home: Path | None = None,
+    ) -> None:
         self._emitter = emitter
         self._repo_root = repo_root
         self._started_items: set[str] = set()
         self._last_usage: dict[str, Any] = {}
+        # Where to look for this thread's rollout file; injectable so tests
+        # can point at a fixture instead of the developer's own sessions.
+        self._codex_home = codex_home
+        self._thread_id: str | None = None
 
     def feed(self, line: str) -> None:
         if self._emitter is None:
@@ -362,16 +449,20 @@ class _CodexStreamTranslator:
         self._usage(event)
         kind = event.get("type")
         if kind == "thread.started":
+            self._thread_id = _str_or_none(event.get("thread_id"))
             emit(
                 self._emitter,
                 "session.observed",
-                session_id=_str_or_none(event.get("thread_id")),
+                session_id=self._thread_id,
             )
         elif kind in ("item.started", "item.completed"):
             item = event.get("item")
             if isinstance(item, dict):
                 self._item(kind, item)
         elif kind == "turn.completed":
+            # The turn is over, so Codex has written its own session log
+            # for it. That log states the two things the stream does not.
+            self._rollout_usage()
             emit(self._emitter, "provider.result", summary=self._usage_summary(event))
         elif kind in ("turn.failed", "error"):
             # The provider reported a failure. Its message text is not
@@ -381,12 +472,36 @@ class _CodexStreamTranslator:
     def _usage(self, event: dict[str, Any]) -> None:
         """Emit ``provider.usage`` for whatever this event says about budget.
 
-        Codex reports tokens on a completed turn, and — in the versions
-        that do — the model's context window and the account's rate-limit
-        windows alongside them. All of it is optional and all of it is
-        quoted rather than derived: nothing here fills in a context window
-        from the model name, because a guessed denominator would turn an
-        unknown into a number a person would act on.
+        Codex's ``--json`` stream reports tokens on a completed turn, and
+        — in the versions that carry them in the stream — the context
+        window and rate limits alongside. Version 0.153.4 does not: those
+        come from :meth:`_rollout_usage` instead. All of it is optional
+        and all of it is quoted rather than derived: nothing here fills in
+        a context window from the model name, because a guessed
+        denominator would turn an unknown into a number a person would act
+        on.
+        """
+
+        self._emit_usage(_budget_fields(event))
+
+    def _rollout_usage(self) -> None:
+        """Emit what Codex's own session log says that the stream omits.
+
+        The context window and the account's rate limits exist only there
+        (see :data:`_ROLLOUT_GLOB`). Called once a turn has completed, so
+        the record being read is the one Codex just wrote for it; a
+        missing or unreadable file leaves every one of these unreported,
+        which is the honest state and not an error worth raising during
+        telemetry.
+        """
+
+        path = _rollout_path(self._thread_id, self._codex_home)
+        if path is None:
+            return
+        self._emit_usage(_rollout_budget(path))
+
+    def _emit_usage(self, fields: dict[str, Any]) -> None:
+        """One ``provider.usage``, unless it would repeat the last one.
 
         Re-emitted only when something changed, since the same totals
         arriving twice is not an event. The log is telemetry and no
@@ -394,7 +509,6 @@ class _CodexStreamTranslator:
         nothing but noise.
         """
 
-        fields = _budget_fields(event)
         if not fields or fields == self._last_usage:
             return
         self._last_usage = fields
@@ -500,6 +614,11 @@ class CodexCliAdapter:
     # Optional observational emitter; None means no telemetry, nothing else
     # changes. Never consulted by the final parse.
     activity: ActivityEmitter | None = None
+    # Where Codex keeps its sessions, for the budget facts its stream does
+    # not carry (see _ROLLOUT_GLOB). None means the real location, honouring
+    # CODEX_HOME; this exists so tests can point at a fixture. Telemetry
+    # only -- nothing about the verdict depends on it.
+    codex_home: Path | None = None
 
     provider_id: str = PROVIDER_ID
 
@@ -575,7 +694,9 @@ class CodexCliAdapter:
             output_path = Path(tmp_dir) / "last_message.txt"
 
             args = self._build_args(prompt, resume_session_id, schema_path, output_path)
-            translator = _CodexStreamTranslator(self.activity, self.repo_root)
+            translator = _CodexStreamTranslator(
+                self.activity, self.repo_root, self.codex_home
+            )
             try:
                 result = self.runner(
                     args, self.repo_root, self.timeout_seconds, translator.feed

@@ -473,7 +473,8 @@ One JSON object per line, schema version 1, with a fixed envelope
 
 and a small closed set of optional fields used only when genuinely known:
 `provider`, `session_id`, `model`, `summary`, `action`, `cycle`, `sha`,
-`tool`, `path`, `kind`, `exit_code`, `resumed`, `parent_id`, `tool_use_id`.
+`tool`, `path`, `kind`, `exit_code`, `resumed`, `parent_id`, `tool_use_id`,
+and the budget fields listed under `provider.usage` below.
 Anything else passed to the writer is dropped. No prompt text, reasoning,
 tool input or output, diff, replacement string or shell command text is ever
 recorded.
@@ -483,11 +484,13 @@ Actors and events:
     stage    turn.started, turn.finished, turn.failed, handoff.ready
              (orchestration) and session.observed, tool.call, file.changed,
              command.started, command.finished, subagent.started,
-             provider.result (translated from the implementation provider)
+             provider.usage, provider.result (translated from the
+             implementation provider)
     sparrer  sparring.started, sparring.failed, verdict (orchestration) and
              session.observed, tool.call, file.changed, command.started,
-             command.finished, subagent.started, provider.result,
-             provider.error (translated from the sparring provider)
+             command.finished, subagent.started, provider.usage,
+             provider.result, provider.error (translated from the sparring
+             provider)
     loop     loop.started, loop.send_back, loop.stopped, loop.runaway
     gate     candidate.frozen, candidate.accepted, gate.refused
     plan     plan.stage.entered, plan.stage.accepted, plan.paused,
@@ -520,6 +523,33 @@ and `sparring.started` lines say, via `resumed`.
 File paths in `file.changed` are repository-relative with `/` separators.
 A provider path outside the repository, or one that escapes it via `..`,
 is omitted rather than recorded; an absolute path never appears verbatim.
+
+`provider.usage` carries what a provider said about its own budget:
+`input_tokens`, `output_tokens`, `total_tokens`, `context_used_tokens`,
+`context_window`, and the two rate-limit windows as
+`rate_limit_percent`/`rate_limit_window_minutes` and their `_secondary_`
+counterparts. Each is written only when that provider's own output states
+it; nothing is inferred from a model name, and a reader must render an
+absent field as "not stated" rather than as zero.
+
+`context_used_tokens` and `total_tokens` are not interchangeable. The
+second is cumulative and only grows; because both CLIs re-send the
+conversation on every request it passes `context_window` several times
+over in an ordinary session, so only the first is a share of the window.
+Occupancy is the latest request's, never a sum over requests: for Claude,
+one assistant line's `input_tokens` plus both cache fields plus its
+`output_tokens`, skipping subagent lines (`parent_tool_use_id`), whose
+conversation is a different and much smaller one; for Codex,
+`last_token_usage.total_tokens`.
+
+Codex's `--json` stream states neither its context window nor the
+account's rate limits (verified against codex-cli 0.153.4). For the thread
+the engine itself started, those are read from the last `token_count`
+record of Codex's own rollout file under `CODEX_HOME`. This is a
+deliberate, narrow exception to "the provider's stream is the only
+source": only that record type's numbers are read, never the prompts,
+reasoning or command output in the same file, and any failure to find or
+parse it leaves the fields unstated rather than raising.
 
 ---
 
