@@ -68,7 +68,7 @@ from agent_sparring.providers.claude_cli import (
 )
 from agent_sparring.providers import ProviderError
 from agent_sparring.providers.codex_cli import PROVIDER_ID as CODEX_PROVIDER_ID, CodexCliAdapter
-from agent_sparring.recovery import RecoveryError, reset_stage
+from agent_sparring.recovery import RecoveryError, reopen_for_failed_check, reset_stage
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.sparring_exchange import record_sparring
@@ -1121,6 +1121,54 @@ def _cmd_reset_stage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reopen_stage(args: argparse.Namespace) -> int:
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        source = _plan_source(args, repo_root)
+
+        def report(message: str) -> None:
+            print(message, file=sys.stderr)
+
+        result = reopen_for_failed_check(
+            source,
+            sparring_dir,
+            repo_root,
+            instance_id=args.gate_instance,
+            expected_branch=args.expected_branch,
+            report=report,
+        )
+    except (
+        RecoveryError,
+        PlanError,
+        ManifestError,
+        StageError,
+        ProjectConfigError,
+        GitContextError,
+    ) as exc:
+        print(f"could not reopen the stage: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"reopened stage: {result.stage_id}")
+    print(f"run: {result.run}")
+    print(f"withdrew asking: {result.instance_id} ({result.title})")
+    for check_id in result.failed_checks:
+        print(f"  reported failing: {check_id}")
+    print(f"candidate kept: {result.candidate_sha}")
+    print(f"stage directory: {result.stage_directory}")
+    print()
+    print(
+        "The stage is open again with its candidate, both sessions and its notes "
+        "intact, and the failure you reported is in its notes.md as human evidence. "
+        "Continue with:"
+    )
+    print(
+        f"  sparring resume-plan {_plan_input_args(args, result.run)} "
+        f"--repo-root {args.repo_root or '.'} --expected-branch {args.expected_branch}"
+    )
+    return 0
+
+
 def _resolved_stage(args: argparse.Namespace, sparring_dir: Path) -> Stage:
     stage = Stage.resolve(sparring_dir, args.stage_id)
     if not stage.exists():
@@ -1807,6 +1855,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="the branch the plan run was started for; required and verified",
     )
     reset_stage_parser.set_defaults(func=_cmd_reset_stage)
+
+    reopen_parser = subparsers.add_parser(
+        "reopen-stage",
+        help=(
+            "reopen a plan run's current stage so its agents can repair a manual check "
+            "its review deferred and you reported failing: the asking is withdrawn, the "
+            "stage goes from ACCEPTED back to WORKING keeping its candidate, both "
+            "sessions and its notes, and nothing is archived. Only the current stage; "
+            "earlier stages' acceptance stays terminal"
+        ),
+    )
+    reopen_parser.add_argument(
+        "gate_instance",
+        help=(
+            "the gate instance of the asking to repair, as the verification checkpoint "
+            "reports it; it must be one this run is stopped on and something about it "
+            "must have been reported failing"
+        ),
+    )
+    reopen_parser.add_argument(
+        "plan_path",
+        nargs="?",
+        default=None,
+        help="path to the same reviewed plan file the run will continue with "
+        "(omit when using --manifest)",
+    )
+    reopen_parser.add_argument(
+        "--manifest", default=None, metavar="PATH", help=manifest_help
+    )
+    reopen_parser.add_argument("--repo-root", default=None, help=repo_root_help)
+    reopen_parser.add_argument(
+        "--expected-branch",
+        required=True,
+        help="the branch the plan run was started for; required and verified",
+    )
+    reopen_parser.set_defaults(func=_cmd_reopen_stage)
 
     freeze = subparsers.add_parser(
         "freeze-candidate",

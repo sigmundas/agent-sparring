@@ -1,4 +1,14 @@
-"""Supported recovery: restart an unaccepted stage under the right mode.
+"""Supported recovery, for two situations a person cannot otherwise get out
+of without editing engine state by hand.
+
+:func:`reset_stage` restarts an unaccepted stage under the right mode, and
+the rest of this docstring is about it. :func:`reopen_for_failed_check`
+reopens the run's current stage when a manual check its review deferred has
+been reported failing -- a lighter operation that archives nothing, keeps
+the candidate, both sessions and the notes, and is documented on itself.
+
+reset_stage
+-----------
 
 A stage can be started through the wrong lifecycle. The plan declares a
 stage as an independent review; the run reaches it before that declaration
@@ -68,7 +78,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -143,6 +153,190 @@ class ResetResult:
     @property
     def already_absent(self) -> tuple[str, ...]:
         return tuple(f.path for f in self.files if f.disposition == "absent")
+
+
+@dataclass(frozen=True)
+class ReopenResult:
+    """What reopening a stage for a failed deferred check did."""
+
+    stage_id: str
+    #: The run instance whose current stage was reopened.
+    run: str
+    #: The withdrawn asking, and the checks it was asking about.
+    instance_id: str
+    title: str
+    failed_checks: tuple[str, ...]
+    stage_directory: Path
+    candidate_sha: str | None
+
+
+def reopen_for_failed_check(
+    source: PlanSource,
+    sparring_dir: Path,
+    repo_root: Path,
+    *,
+    instance_id: str,
+    expected_branch: str,
+    report=lambda message: None,
+) -> ReopenResult:
+    """Reopen the current stage so its agents can repair a deferred human
+    check that failed, and withdraw the asking that failed.
+
+    This is the way out of an otherwise closed loop. A reviewer may accept a
+    stage while deferring a manual check until plan completion; if the
+    person then reports a Fail, the obligation is unresolved, so the run
+    stops at its verification checkpoint -- but every stage is accepted, the
+    run loop skips accepted stages, and only a Pass settles an obligation.
+    The reported failure therefore had no consequence at all, and the one
+    exit was to make the check pass by hand.
+
+    Deliberately **not** :func:`reset_stage`, which is a different
+    operation for a different problem. That one recovers an attempt that ran
+    through the wrong lifecycle: it archives the whole stage directory,
+    quarantines what the attempt wrote, requires the repository to be back
+    at the *preceding* stage's candidate, and re-records the plan digest.
+    None of that applies here. The work is not wrong, it is incomplete: the
+    right candidate, the right sessions and the right notes all stay, and
+    what changes is only that the stage is open again.
+
+    So this writes exactly two things:
+
+    1. the stage's status, ACCEPTED back to WORKING. Re-entering a stage
+       whose ``sparring.md`` records READY is an ordinary, supported path
+       (see ``plan._recorded_pause``): the sparrer confirms it on its own
+       terms before the hard acceptance gate runs again. The stage agent
+       reads the Fail first, because the engine wrote it into this stage's
+       ``notes.md`` when it was recorded;
+    2. the ledger, minus the failed asking. See
+       :meth:`~agent_sparring.plan.PlanRunState.withdraw_obligation` for
+       why withdrawing is right rather than clearing the result: the
+       question was about a candidate that is about to be replaced, and if
+       it still applies the new review asks it again as a new asking.
+
+    Acceptance is still terminal for every stage a run has moved past. This
+    reopens the run's **current** stage only, which is why an obligation
+    raised by an earlier stage is refused rather than reached for: restarting
+    it would rewrite history the later accepted stages were built on. The
+    honest answer in that case is a follow-up stage, and the refusal says so.
+
+    Refuses (:class:`RecoveryError`), before writing anything, if: no
+    recorded run of this plan is stopped for deferred verification; the
+    asking is not in that run's ledger, or is not one the current pause
+    named; nothing about it has actually failed; the stage that raised it is
+    not the run's current stage; that stage does not exist or is not
+    ACCEPTED; or the repository is on another branch.
+    """
+
+    from agent_sparring.deferred_gate import DeferredVerificationRequired
+    from agent_sparring.plan import PLANS_DIRNAME, PlanRunStatus, find_runs
+
+    recorded = find_runs(sparring_dir, source.label)
+    stopped = [
+        run
+        for run in recorded
+        if run.state.status is not PlanRunStatus.COMPLETE
+        and isinstance(run.state.awaiting, DeferredVerificationRequired)
+        and run.state.obligation(instance_id) is not None
+    ]
+    if not stopped:
+        if not recorded:
+            raise RecoveryError(
+                f"no plan run is recorded for {source.label} in "
+                f"{Path(sparring_dir) / PLANS_DIRNAME}; there is no verification "
+                "checkpoint to repair"
+            )
+        raise RecoveryError(
+            f"no recorded run of {source.label} is stopped at a verification checkpoint "
+            f"that owes the asking {instance_id!r}. A failed check is repaired at the "
+            "checkpoint that reported it; nothing was changed."
+        )
+    run = stopped[0]
+    run_state = run.state
+    awaiting = run_state.awaiting
+    assert isinstance(awaiting, DeferredVerificationRequired)  # filtered above
+    if instance_id not in awaiting.instance_ids:
+        raise RecoveryError(
+            f"asking {instance_id!r} is in the ledger of run {run.key} but is not one this "
+            "checkpoint is stopped on, so a surface rendered from an older state is asking "
+            "to repair a question the run has since replaced; nothing was changed"
+        )
+    obligation = run_state.obligation(instance_id)
+    assert obligation is not None  # filtered above
+    if not obligation.failed:
+        raise RecoveryError(
+            f"nothing has failed for asking {instance_id!r} ({obligation.gate.title!r}): "
+            "it is still waiting for an answer. Reopening a stage to repair a check nobody "
+            "reported failing would throw away an accepted candidate over a question that "
+            "was never answered; answer it first."
+        )
+    if obligation.stage_id != run_state.current_stage:
+        raise RecoveryError(
+            f"asking {instance_id!r} was raised by {obligation.stage_id!r}, but run "
+            f"{run.key} is now at {run_state.current_stage!r}. Only the current stage can "
+            "be reopened: the raising stage was accepted and the stages after it were built "
+            "on that acceptance, so restarting it would rewrite their history. Put the "
+            "repair in a follow-up stage instead; the Fail stays recorded in that stage's "
+            "notes.md either way."
+        )
+
+    stage = _resolve(sparring_dir, obligation.stage_id)
+    if not stage.exists():
+        raise RecoveryError(
+            f"stage {obligation.stage_id!r} does not exist at {stage.directory}; there is "
+            "nothing to reopen"
+        )
+    try:
+        stage_state = stage.read_state()
+    except StageError as exc:
+        raise RecoveryError(
+            f"cannot read the state of stage {obligation.stage_id!r}: {exc}"
+        ) from exc
+    if stage_state.status is not StageStatus.ACCEPTED:
+        raise RecoveryError(
+            f"stage {obligation.stage_id!r} is {stage_state.status.value}, not ACCEPTED; it "
+            "is already open and resuming the plan will run it. Nothing was changed."
+        )
+    try:
+        branch = current_branch(repo_root)
+    except GitContextError as exc:
+        raise RecoveryError(str(exc)) from exc
+    if branch != expected_branch:
+        raise RecoveryError(
+            f"expected branch {expected_branch!r} but {repo_root} is on {branch!r}; "
+            "refusing to reopen a stage from the wrong branch"
+        )
+
+    # Verified. The stage is written first: a run whose ledger no longer owes
+    # the asking but whose stage is still ACCEPTED would complete the plan
+    # over the failure, which is the one outcome this must never produce.
+    # The reverse order -- an open stage still owing a withdrawn asking --
+    # merely stops again and asks, which is safe.
+    failed = tuple(result.check_id for result in obligation.failed)
+    stage.write_state(replace(stage_state, status=StageStatus.WORKING))
+    report(
+        f"stage {obligation.stage_id}: ACCEPTED -> WORKING; its candidate "
+        f"{stage_state.candidate_sha}, both sessions and its notes are unchanged, and the "
+        "reported failure is already in its notes.md as human evidence"
+    )
+    run_state.withdraw_obligation(instance_id)
+    # The checkpoint this pause named is gone, so the recorded stop would
+    # describe a question that is no longer asked.
+    run_state.awaiting = None
+    run_state.status = PlanRunStatus.PAUSED
+    run_state.save(run.path)
+    report(
+        f"withdrew asking {instance_id} ({obligation.gate.title}); if it still applies to "
+        "the repaired candidate the next review raises it again. Continue with resume-plan."
+    )
+    return ReopenResult(
+        stage_id=obligation.stage_id,
+        run=run.key,
+        instance_id=instance_id,
+        title=obligation.gate.title,
+        failed_checks=failed,
+        stage_directory=stage.directory,
+        candidate_sha=stage_state.candidate_sha,
+    )
 
 
 def _utc_stamp() -> str:
@@ -715,8 +909,10 @@ def _verify_repository(
 __all__ = [
     "ARCHIVE_DIRNAME",
     "RecoveryError",
+    "ReopenResult",
     "ResetResult",
     "TouchedFile",
+    "reopen_for_failed_check",
     "reset_stage",
     "turn_touched_paths",
 ]

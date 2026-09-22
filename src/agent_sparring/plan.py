@@ -503,6 +503,31 @@ class PlanRunState:
             for entry in self.deferred_human_checks
         )
 
+    def withdraw_obligation(self, instance_id: str) -> DeferredObligation | None:
+        """Drop the ledger entry for ``instance_id``, returning it.
+
+        Used when the stage that raised the obligation is reopened for
+        repair: the asking was a question about a candidate that is about to
+        be replaced, and a question about a candidate that no longer exists
+        can neither be answered truthfully nor left to block completion
+        forever. If it still applies to the repaired candidate, the review
+        that ends the reopened stage raises it again -- with a new gate
+        instance, because it is a new asking about new work.
+
+        Nothing is lost by this. Every answer the obligation ever held was
+        written to the raising stage's ``notes.md`` when it was recorded, and
+        that file is never rewritten; the ledger holds what is true now, the
+        same rule :meth:`DeferredObligation.with_result` follows.
+        """
+
+        found = self.obligation(instance_id)
+        if found is None:
+            return None
+        self.deferred_human_checks = tuple(
+            entry for entry in self.deferred_human_checks if entry.instance_id != instance_id
+        )
+        return found
+
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PlanRunState":
         try:

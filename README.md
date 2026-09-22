@@ -449,10 +449,11 @@ sparring resume-plan … \
 Outcomes are `pass`, `fail` and `blocked`. `blocked` records that the check
 could not be performed, which resolves nothing — a plan completed on it would
 be a plan completed on a verification nobody made. A `fail` also keeps the
-plan open, and is written into the originating stage's `notes.md`, where that
-stage's agents read it on their next turn; the engine does not rewind a stage
-by itself, because un-accepting accepted work is a person's decision. Where
-the same check id is owed by more than one asking, address it as
+plan open, and is written into the originating stage's `notes.md`. The engine
+does not rewind a stage by itself, because un-accepting accepted work is a
+person's decision — see [repairing a check that
+failed](#repairing-a-check-that-failed) for making that decision. Where the
+same check id is owed by more than one asking, address it as
 `'<gate instance>:<check id>=pass'`; a bare ambiguous id is refused rather
 than guessed.
 
@@ -460,6 +461,50 @@ Deferred is not permanently deferred. Every sparring turn of a managed run is
 shown what the run already owes, and may decide that a later stage now depends
 on one of those answers; naming its gate instance in `promote_deferred` stops
 the run for it before the next stage, under the same asking.
+
+### Repairing a check that failed
+
+Only a `pass` settles an obligation, and the run loop skips accepted stages.
+So at the checkpoint, where every stage is already accepted, reporting a
+`fail` on its own goes nowhere: the run records it, stops again, and asks the
+same question. Nothing is wrong about that — the plan genuinely is not
+verified — but it is not a way forward either, and the way forward is not to
+make the check pass by hand.
+
+`reopen-stage` is the decision to put the work back in front of the agents:
+
+```sh
+sparring reopen-stage 5b22e1c0 docs/plan.md \
+  --repo-root . --expected-branch feature/x
+```
+
+It names the *asking*, not the stage, because the asking is what failed. Two
+things change, and nothing else does:
+
+- the stage goes from `ACCEPTED` back to `WORKING`, keeping its candidate,
+  both sessions and its notes. Re-entering a stage whose `sparring.md` records
+  `READY` is an ordinary path: the sparrer confirms it on its own terms before
+  the hard acceptance gate runs again. The stage agent reads the `fail` first,
+  because the engine already wrote it into this stage's `notes.md`;
+- the failed asking is **withdrawn** from the ledger. It was a question about
+  a candidate that is about to be replaced, and if it still applies to the
+  repaired one the new review raises it again — as a new asking, with a new
+  gate instance, because it is a new question about new work. The answer that
+  failed stays in `notes.md`, which is never rewritten.
+
+This is not [`reset-stage`](#restarting-a-stage-started-under-the-wrong-mode),
+which solves a different problem: that one archives the whole attempt,
+quarantines what it wrote and requires the repository to be back at the
+preceding stage's candidate, because the work there ran through the wrong
+lifecycle. Here the work is not wrong, it is incomplete.
+
+Only the run's **current** stage can be reopened. An obligation raised by an
+earlier stage is refused, because the stages after it were built on its
+acceptance and restarting it would rewrite their history; that repair belongs
+in a follow-up stage, and the refusal says so. Also refused: an asking this
+checkpoint is not stopped on, and one nobody has reported failing — reopening
+a stage over a question that was never answered would throw away an accepted
+candidate for nothing.
 
 ### Pushing a verified candidate
 

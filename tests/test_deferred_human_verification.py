@@ -29,7 +29,8 @@ from agent_sparring.deferred_gate import (
     ObligationStatus,
 )
 from agent_sparring.human_gate import HumanGate, new_gate_instance_id
-from agent_sparring.plan import PlanError, PlanRunState, PlanRunStatus
+from agent_sparring.plan import PlanError, PlanRunState, PlanRunStatus, load_plan_source
+from agent_sparring.recovery import RecoveryError, reopen_for_failed_check
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
 from agent_sparring.sparring_exchange import read_recorded_outcome, record_sparring_result
 from agent_sparring.stage import Stage, StageStatus
@@ -917,3 +918,149 @@ class AnsweringEdgeCaseTests(_DeferredRunCase):
             deferred_results=(DeferredAnswer.parse("a=pass"), DeferredAnswer.parse("b=pass")),
         )
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
+
+
+# ---------------------------------------------------------------- repairing a failed check
+
+
+class ReopenForFailedCheckTests(_DeferredRunCase):
+    """The way out of the loop a reported Fail otherwise lands in.
+
+    A reviewer accepts a stage and defers a manual check. The person runs
+    the check and it fails. Before ``reopen_for_failed_check`` that Fail had
+    no consequence available to it: the obligation stays unresolved so the
+    run re-stops at its checkpoint, but every stage is accepted and the run
+    loop skips accepted stages, so no agent ever sees the failure -- and
+    only a Pass settles an obligation. The one exit was to make the check
+    pass by hand.
+    """
+
+    def _at_failed_checkpoint(self):
+        """A run stopped at its checkpoint with the *last* stage's deferred
+        check reported failing, so the raising stage is the current one."""
+
+        self._start(self.stage_adapter, _SparringAdapter([READY, READY_WITH_DEFERRAL]))
+        result = self._resume(
+            self.stage_adapter,
+            _SparringAdapter([]),
+            deferred_results=(DeferredAnswer.parse("resize-readability=fail=no mosaic images"),),
+        )
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        state = self._plan_state()
+        self.assertEqual(state.current_stage, S2)
+        obligation = state.deferred_human_checks[0]
+        self.assertEqual(obligation.stage_id, S2)
+        self.assertIs(obligation.status, ObligationStatus.FAILED)
+        return obligation.instance_id
+
+    def _reopen(self, instance_id, **kwargs):
+        return reopen_for_failed_check(
+            load_plan_source(self.plan_path, self.repo),
+            self.sparring_dir,
+            self.repo,
+            instance_id=instance_id,
+            expected_branch=kwargs.pop("expected_branch", "feature/x"),
+            **kwargs,
+        )
+
+    def test_without_this_a_reported_failure_goes_nowhere(self):
+        """The loop itself, asserted so the fix has something to be a fix of."""
+
+        self._at_failed_checkpoint()
+        # Answering again, however many times, cannot move it: only a Pass
+        # settles the obligation, and no agent runs to make one true.
+        for _ in range(2):
+            again = self._resume(
+                self.stage_adapter,
+                _SparringAdapter([]),
+                deferred_results=(DeferredAnswer.parse("resize-readability=fail=still broken"),),
+            )
+            self.assertIs(again.status, PlanRunStatus.PAUSED)
+        self.assertIs(self._stage(S2).read_state().status, StageStatus.ACCEPTED)
+        self.assertEqual(self._turns(), 2, "no agent turn was spent on the failure")
+
+    def test_reopening_puts_the_stage_back_to_work_and_withdraws_the_asking(self):
+        instance_id = self._at_failed_checkpoint()
+        before = self._stage(S2).read_state()
+
+        result = self._reopen(instance_id)
+
+        self.assertEqual(result.stage_id, S2)
+        self.assertEqual(result.failed_checks, ("resize-readability",))
+        after = self._stage(S2).read_state()
+        self.assertIs(after.status, StageStatus.WORKING)
+        # Not a reset: this is the same work, continued.
+        self.assertEqual(after.candidate_sha, before.candidate_sha)
+        self.assertEqual(after.implementation_session_id, before.implementation_session_id)
+        self.assertEqual(after.sparring_session_id, before.sparring_session_id)
+        state = self._plan_state()
+        self.assertEqual(state.deferred_human_checks, ())
+        self.assertIsNone(state.awaiting, "the checkpoint it named is no longer asked")
+        self.assertIs(state.status, PlanRunStatus.PAUSED)
+
+    def test_the_failure_is_still_on_record_for_the_agents_to_read(self):
+        instance_id = self._at_failed_checkpoint()
+        self._reopen(instance_id)
+        notes = self._stage(S2).read_notes()
+        self.assertIn("no mosaic images", notes)
+        self.assertIn("Fail", notes)
+
+    def test_resuming_after_a_reopen_runs_the_stage_again_and_can_complete(self):
+        instance_id = self._at_failed_checkpoint()
+        turns_before = self._turns()
+        self._reopen(instance_id)
+
+        result = self._resume(self.stage_adapter, _SparringAdapter([READY]))
+
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        self.assertGreater(self._turns(), turns_before, "the stage agent worked on the repair")
+        self.assertIs(self._stage(S2).read_state().status, StageStatus.ACCEPTED)
+
+    def test_a_check_raised_by_an_earlier_stage_is_refused_with_the_honest_route(self):
+        # Stage 1 defers, stage 2 is accepted on top of it. Reopening stage 1
+        # would rewrite the history stage 2's acceptance was built on, so it
+        # is refused -- the caveat this operation was chosen with.
+        self._start(self.stage_adapter, _SparringAdapter([READY_WITH_DEFERRAL, READY]))
+        self._resume(
+            self.stage_adapter,
+            _SparringAdapter([]),
+            deferred_results=(DeferredAnswer.parse("resize-readability=fail"),),
+        )
+        state = self._plan_state()
+        instance_id = state.deferred_human_checks[0].instance_id
+        self.assertEqual(state.deferred_human_checks[0].stage_id, S1)
+
+        with self.assertRaises(RecoveryError) as caught:
+            self._reopen(instance_id)
+
+        message = str(caught.exception)
+        self.assertIn("follow-up stage", message)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+        self.assertEqual(len(self._plan_state().deferred_human_checks), 1)
+
+    def test_an_unanswered_check_is_not_something_to_repair(self):
+        self._start(self.stage_adapter, _SparringAdapter([READY, READY_WITH_DEFERRAL]))
+        state = self._plan_state()
+        instance_id = state.deferred_human_checks[0].instance_id
+
+        with self.assertRaises(RecoveryError) as caught:
+            self._reopen(instance_id)
+
+        self.assertIn("answer it first", str(caught.exception))
+        self.assertIs(self._stage(S2).read_state().status, StageStatus.ACCEPTED)
+
+    def test_an_asking_this_checkpoint_never_named_is_refused(self):
+        self._at_failed_checkpoint()
+        with self.assertRaises(RecoveryError) as caught:
+            self._reopen("00000000")
+        self.assertIn("checkpoint", str(caught.exception))
+        self.assertEqual(len(self._plan_state().deferred_human_checks), 1)
+
+    def test_the_wrong_branch_changes_nothing(self):
+        instance_id = self._at_failed_checkpoint()
+        with self.assertRaises(RecoveryError) as caught:
+            self._reopen(instance_id, expected_branch="main")
+        self.assertIn("refusing to reopen", str(caught.exception))
+        self.assertIs(self._stage(S2).read_state().status, StageStatus.ACCEPTED)
+        self.assertEqual(len(self._plan_state().deferred_human_checks), 1)
+        self.assertIsInstance(self._plan_state().awaiting, DeferredVerificationRequired)
