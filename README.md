@@ -94,7 +94,7 @@ aliases, and gain new ones without an engine release.
 Every command takes overrides, and the precedence is the same everywhere:
 
 ```text
-explicit CLI flag  >  .sparring/project.toml  >  the provider's own default
+explicit CLI flag  >  SPARRING_* environment  >  .sparring/project.toml  >  the provider's own default
 ```
 
 `run-stage` and `run-sparring` take `--model` / `--effort`; `run-loop`,
@@ -116,20 +116,54 @@ sparring show-config --json     # the same answer, machine-readable
 ```
 
 The JSON form reports `provider`, `model`, `effort` and a `*_source` for each
-(`cli`, `project`, `engine-default` or `provider-default`) per role, plus the
-path of the `project.toml` it read. It reports configuration only — never
-environment variables or credentials. This is how the VS Code extension shows
+(`cli`, `env`, `project`, `engine-default` or `provider-default`) per role,
+plus the path of the `project.toml` it read. It reports only the resolved
+values — it never enumerates the environment and never prints a credential. This is how the VS Code extension shows
 the effective configuration, so that "this provider plus this file plus an
 omitted model means X" is answered in one place. Each role also reports
 `provider_choices`: every provider implemented for that role, with its own
 effort vocabulary, so a UI can offer the real choice without keeping a list
 of providers that goes stale.
 
-### Changing it without editing the file
+### Trying a different model without touching the repository
 
-`project.toml` is yours to edit, and usually that is the right way. For the
-times something else needs to change it — the VS Code cockpit's inline
-selectors, a script — there is one typed command:
+`project.toml` is tracked in your repository. That is right for the project's
+agreed configuration, but it makes a one-off experiment awkward: editing the
+file dirties the working tree, and finalization treats any dirty path that is
+not a stage artifact as candidate content, so a model change ends up staged
+and committed alongside the work it was only supposed to observe.
+
+Set the same three fields in the environment instead. They leave no trace in
+the repository:
+
+```sh
+export SPARRING_SPARRING_MODEL=gpt-6-astra    # just this shell
+SPARRING_STAGE_EFFORT=high sparring resume-plan docs/plans/active/x.md
+```
+
+The names are mechanical — `SPARRING_` plus the role plus the field, upper
+case — for the two roles `STAGE` and `SPARRING` and the three fields
+`PROVIDER`, `MODEL` and `EFFORT`. (Yes, the sparring role's variables read
+`SPARRING_SPARRING_*`.) Per role and per field, so setting a model leaves the
+project's effort alone.
+
+They are validated exactly as the file's values are: an effort level the
+resolved provider does not accept, or a provider not implemented for that
+role, is a configuration error raised before any provider process starts, and
+the message names the variable that set it. A variable that is present but
+empty is an error too, rather than a silent fall back to the file — unset it
+to stop overriding.
+
+Because an environment override leaves nothing behind, the stage's own
+`activity.jsonl` is the only record that it happened. Every run writes an
+`agents.resolved` event per role, naming the provider, model and effort it
+resolved and which layer supplied each. `sparring usage` reads it back — see
+[What a stage actually used](#what-a-stage-actually-used).
+
+### Changing the file itself
+
+For the times something else needs to change `project.toml` — the VS Code
+cockpit's inline selectors, a script — there is one typed command:
 
 ```sh
 sparring set-config stage --model opus --effort high
@@ -272,6 +306,36 @@ guessed from `claude-opus-5` would be an invention presented as a
 measurement — and the two models behind that name do not share one. A
 reader showing these numbers must render "not stated" differently from
 "zero".
+
+### What a stage actually used
+
+`activity.jsonl` holds the facts, but it holds them as one JSON object per
+line, interleaved with every tool call the providers made. `sparring usage`
+reads them back as the short answer:
+
+```sh
+sparring usage                      # every stage, oldest first
+sparring usage <stage-id>           # one stage
+sparring usage <stage-id> --json    # the same records, machine-readable
+```
+
+For each role it reports the provider, model and effort the turn ran with
+and **where each was set** (`cli`, `env`, `project`, `engine-default` or
+`provider-default`), then the token totals the providers reported, then one
+row per provider turn: when it started, how long it took, whether it resumed
+an existing session, and how it ended (`finished`, `failed`, or the verdict's
+action).
+
+Two distinctions are kept rather than smoothed over. The model the engine
+*asked for* and the model the provider *said it ran* are separate fields, so
+a disagreement between them is visible instead of hidden behind one number.
+And a duration the engine measured is printed plainly, while one derived
+from a start and end timestamp — all a log written before the engine
+measured turns can offer — is prefixed with `~`.
+
+The report is a reader, not an authority: it decides nothing, and a missing,
+truncated or partly corrupt log produces a partial report rather than an
+error.
 
 ### What each agent was actually told
 

@@ -74,6 +74,7 @@ snapshot from before the (possibly long) provider turn.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -389,6 +390,12 @@ def _run_sparring_agent_locked(
 
     result: SparringAgentResult | None = None
     provider_error: ProviderError | None = None
+    # Monotonic so a system clock adjustment mid-turn cannot produce a
+    # negative duration. Measured around the adapter call alone and then
+    # reused by every event below, so "how long did the sparrer take" means
+    # the provider turn rather than the provider turn plus whichever checks
+    # happened to run before the event that reports it.
+    started_at = time.monotonic()
     try:
         if resume_id:
             result = adapter.resume(resume_id, prompt)
@@ -396,6 +403,7 @@ def _run_sparring_agent_locked(
             result = adapter.start(prompt)
     except ProviderError as exc:
         provider_error = exc
+    duration_ms = int((time.monotonic() - started_at) * 1000)
 
     # The integrity check runs after every attempted turn, whether the
     # provider raised or not: a provider that fails may still have written
@@ -415,19 +423,30 @@ def _run_sparring_agent_locked(
         if provider_error is not None:
             detail += f"; the provider also failed: {provider_error}"
         activity.emit(
-            "sparring.failed", resumed=resumed, summary="read-only contract violated"
+            "sparring.failed",
+            resumed=resumed,
+            duration_ms=duration_ms,
+            summary="read-only contract violated",
         )
         raise SparringAgentRunError(detail)
 
     if provider_error is not None:
-        activity.emit("sparring.failed", resumed=resumed, summary="provider error")
+        activity.emit(
+            "sparring.failed",
+            resumed=resumed,
+            duration_ms=duration_ms,
+            summary="provider error",
+        )
         raise SparringAgentRunError(str(provider_error))
 
     assert result is not None  # provider_error is None, so the call above succeeded
 
     if resume_id and result.session_id != resume_id:
         activity.emit(
-            "sparring.failed", resumed=resumed, summary="session identity mismatch"
+            "sparring.failed",
+            resumed=resumed,
+            duration_ms=duration_ms,
+            summary="session identity mismatch",
         )
         raise SparringAgentRunError(
             f"provider was asked to resume session {resume_id!r} but returned "
@@ -442,6 +461,7 @@ def _run_sparring_agent_locked(
             "sparring.failed",
             resumed=resumed,
             session_id=result.session_id,
+            duration_ms=duration_ms,
             summary="unusable routing verdict",
         )
         raise SparringAgentRunError(
@@ -483,6 +503,7 @@ def _run_sparring_agent_locked(
         "verdict",
         resumed=resumed,
         session_id=result.session_id,
+        duration_ms=duration_ms,
         action=routing.action.value,
         summary=routing.summary,
     )

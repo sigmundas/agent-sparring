@@ -10,13 +10,26 @@ quietly disagree about what the project configured.
 
 Precedence, per role and per field:
 
-    explicit CLI override  >  .sparring/project.toml  >  provider default
+    explicit CLI override  >  environment  >  .sparring/project.toml  >  provider default
 
 "Provider default" means the engine passes no flag at all and the provider
 CLI does whatever it normally does. The engine never writes a guessed model
 name into that gap, and :func:`resolve_agent_configs` reports the source of
 each value so a UI can say "provider default" honestly instead of inventing
 one.
+
+The environment layer exists because ``project.toml`` is a tracked file in
+the consuming repository: changing a model there dirties the working tree,
+and :mod:`agent_sparring.finalization` then treats that edit as candidate
+content. Trying a different model for one run should not require staging and
+committing a configuration change, so the same three fields can be set as
+environment variables, which leave no trace in the repository. It sits below
+the command line (an explicit flag is still the most specific thing a person
+can say) and above ``project.toml`` (a shell-local choice overrides the
+committed project default, which is the entire point). The variables are
+listed in :data:`ENV_VARS` and validated exactly as the file's values are --
+an unsupported effort level or an unimplemented provider is the same
+configuration error whichever layer supplied it.
 
 Provider capabilities below were probed against the installed CLIs, not
 assumed -- see :data:`PROVIDER_CAPABILITIES` for what was verified and how.
@@ -31,6 +44,7 @@ raised before any provider process starts.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -41,12 +55,40 @@ ROLE_STAGE = "stage"
 ROLE_SPARRING = "sparring"
 ROLES: tuple[str, ...] = (ROLE_STAGE, ROLE_SPARRING)
 
+# The three fields a role can have set, in the order they are reported.
+FIELDS: tuple[str, ...] = ("provider", "model", "effort")
+
 # Where a resolved value came from. Reported verbatim in the effective-config
 # output so a UI never has to guess.
 SOURCE_CLI = "cli"
+SOURCE_ENV = "env"
 SOURCE_PROJECT = "project"
 SOURCE_ENGINE_DEFAULT = "engine-default"
 SOURCE_PROVIDER_DEFAULT = "provider-default"
+
+# The environment variable that sets one role's one field. Mechanically
+# derived rather than hand-picked so the rule can be stated in a sentence --
+# ``SPARRING_`` + the role name + ``_`` + the field name, upper-cased -- and
+# so a new role or field cannot gain a variable name by accident. The
+# sparring role's variables do read ``SPARRING_SPARRING_*``; the doubling is
+# the honest spelling of "the sparring role of the sparring engine" and is
+# preferred over a second, prettier name for the same role.
+ENV_PREFIX = "SPARRING_"
+
+
+def env_var(role: str, field: str) -> str:
+    """The environment variable name for one role's one field."""
+
+    return f"{ENV_PREFIX}{role.upper()}_{field.upper()}"
+
+
+#: Every variable this module reads, as ``{role: {field: variable}}``.
+#: Nothing outside this mapping is consulted, so an unrecognised
+#: ``SPARRING_*`` variable in the environment is inert rather than
+#: mysteriously effective.
+ENV_VARS: Mapping[str, Mapping[str, str]] = {
+    role: {field: env_var(role, field) for field in FIELDS} for role in ROLES
+}
 
 
 class AgentConfigError(ProjectConfigError):
@@ -179,8 +221,10 @@ class ResolvedAgentConfig:
     def as_dict(self) -> dict[str, object]:
         """Machine-readable form for ``sparring show-config --json``.
 
-        Contains configuration only: no environment variables, no secrets,
-        no provider credentials.
+        Contains resolved configuration only. A value the environment
+        supplied appears as an ordinary value with source ``env``; the
+        environment itself is never enumerated here, and no secret or
+        provider credential is ever included.
         """
 
         return {
@@ -216,6 +260,36 @@ class RoleOverrides:
     effort: str | None = None
 
 
+def read_role_env(
+    role: str, environ: Mapping[str, str] | None = None
+) -> RoleOverrides:
+    """One role's settings as the environment states them.
+
+    A variable that is absent is simply not set. A variable that is present
+    but empty or whitespace is an error rather than a silent fallback to
+    ``project.toml``: someone who exported the name meant to select
+    something, and quietly running the previous model instead is exactly the
+    failure this module exists to prevent. To stop overriding, unset the
+    variable.
+    """
+
+    source = os.environ if environ is None else environ
+    values: dict[str, str | None] = {}
+    for field in FIELDS:
+        name = ENV_VARS[role][field]
+        if name not in source:
+            values[field] = None
+            continue
+        raw = source[name]
+        if not raw.strip():
+            raise AgentConfigError(
+                f"environment variable {name} is set but empty; unset it to use "
+                f"the project's configured {role} agent {field}"
+            )
+        values[field] = raw.strip()
+    return RoleOverrides(**values)
+
+
 def capability(provider: str) -> ProviderCapability:
     """The capability record for ``provider``, or raise :class:`AgentConfigError`."""
 
@@ -228,12 +302,31 @@ def capability(provider: str) -> ProviderCapability:
         ) from None
 
 
-def _resolve_provider(role: str, override: str | None, configured: str | None) -> tuple[str, str]:
-    if override:
+def _layered(
+    override: str | None, env: str | None, configured: str | None
+) -> tuple[str | None, str | None]:
+    """The most specific value of the three layers, and which one supplied it.
+
+    ``(None, None)`` means no layer set the field, which each caller turns
+    into the right kind of default for what it is resolving.
+    """
+
+    if override is not None:
         return override, SOURCE_CLI
-    if configured:
+    if env is not None:
+        return env, SOURCE_ENV
+    if configured is not None:
         return configured, SOURCE_PROJECT
-    return DEFAULT_PROVIDERS[role], SOURCE_ENGINE_DEFAULT
+    return None, None
+
+
+def _resolve_provider(
+    role: str, override: str | None, env: str | None, configured: str | None
+) -> tuple[str, str]:
+    value, source = _layered(override or None, env or None, configured or None)
+    if value is None or source is None:
+        return DEFAULT_PROVIDERS[role], SOURCE_ENGINE_DEFAULT
+    return value, source
 
 
 def _require_role(role: str, cap: ProviderCapability) -> None:
@@ -257,17 +350,22 @@ def _resolve_effort(
     role: str,
     cap: ProviderCapability,
     override: str | None,
+    env: str | None,
     configured: str | None,
 ) -> tuple[str | None, str]:
-    if override is not None:
-        # Spelled --effort by run-stage/run-sparring and --stage-effort /
-        # --sparring-effort by the loop commands, so name the role rather
-        # than one command's flag.
-        value, source, where = override, SOURCE_CLI, f"the {role} agent effort override"
-    elif configured is not None:
-        value, source, where = configured, SOURCE_PROJECT, f"[agents.{role}] effort"
-    else:
+    value, source = _layered(override, env, configured)
+    if value is None or source is None:
         return None, SOURCE_PROVIDER_DEFAULT
+    # Name the layer the value actually came from, so a rejected level sends
+    # the reader to the right place to change it. The CLI flag is spelled
+    # --effort by run-stage/run-sparring and --stage-effort /
+    # --sparring-effort by the loop commands, so name the role rather than
+    # one command's flag.
+    where = {
+        SOURCE_CLI: f"the {role} agent effort override",
+        SOURCE_ENV: env_var(role, "effort"),
+        SOURCE_PROJECT: f"[agents.{role}] effort",
+    }[source]
 
     if not cap.supports_effort:
         raise AgentConfigError(
@@ -285,15 +383,21 @@ def _resolve_effort(
 
 
 def _resolve_model(
-    cap: ProviderCapability, override: str | None, configured: str | None, *, where: str
+    role: str,
+    cap: ProviderCapability,
+    override: str | None,
+    env: str | None,
+    configured: str | None,
 ) -> tuple[str | None, str]:
-    if override is not None:
-        value, source = override, SOURCE_CLI
-    elif configured is not None:
-        value, source = configured, SOURCE_PROJECT
-    else:
+    value, source = _layered(override, env, configured)
+    if value is None or source is None:
         return None, SOURCE_PROVIDER_DEFAULT
     if not cap.supports_model:
+        where = {
+            SOURCE_CLI: f"the {role} agent model override",
+            SOURCE_ENV: env_var(role, "model"),
+            SOURCE_PROJECT: f"[agents.{role}] model",
+        }[source]
         raise AgentConfigError(
             f"{where} is not supported by provider {cap.provider_id!r}: that provider "
             f"does not accept a model selection"
@@ -308,15 +412,21 @@ def resolve_role_config(
     role: str,
     config: ProjectConfig | None,
     overrides: RoleOverrides = RoleOverrides(),
+    *,
+    environ: Mapping[str, str] | None = None,
 ) -> ResolvedAgentConfig:
     """Resolve one role's effective provider/model/effort.
 
     ``config`` may be ``None`` when the project has no ``project.toml`` at
-    all; the command line and the engine defaults then supply everything.
+    all; the command line, the environment and the engine defaults then
+    supply everything. ``environ`` defaults to the real process environment
+    and exists so tests can supply one without mutating it.
     """
 
     if role not in ROLES:
         raise AgentConfigError(f"unknown agent role {role!r}; known roles: {', '.join(ROLES)}")
+
+    env = read_role_env(role, environ)
 
     configured_provider = configured_model = configured_effort = None
     if config is not None:
@@ -329,14 +439,18 @@ def resolve_role_config(
             configured_model = config.sparring_agent_model
             configured_effort = config.sparring_agent_effort
 
-    provider, provider_source = _resolve_provider(role, overrides.provider, configured_provider)
+    provider, provider_source = _resolve_provider(
+        role, overrides.provider, env.provider, configured_provider
+    )
     cap = capability(provider)
     _require_role(role, cap)
 
     model, model_source = _resolve_model(
-        cap, overrides.model, configured_model, where=f"[agents.{role}] model"
+        role, cap, overrides.model, env.model, configured_model
     )
-    effort, effort_source = _resolve_effort(role, cap, overrides.effort, configured_effort)
+    effort, effort_source = _resolve_effort(
+        role, cap, overrides.effort, env.effort, configured_effort
+    )
 
     return ResolvedAgentConfig(
         role=role,
@@ -384,12 +498,13 @@ def resolve_agent_configs(
     *,
     stage: RoleOverrides = RoleOverrides(),
     sparring: RoleOverrides = RoleOverrides(),
+    environ: Mapping[str, str] | None = None,
 ) -> EffectiveAgents:
     """Resolve both roles. The single entry point every command goes through."""
 
     return EffectiveAgents(
-        stage=resolve_role_config(ROLE_STAGE, config, stage),
-        sparring=resolve_role_config(ROLE_SPARRING, config, sparring),
+        stage=resolve_role_config(ROLE_STAGE, config, stage, environ=environ),
+        sparring=resolve_role_config(ROLE_SPARRING, config, sparring, environ=environ),
     )
 
 
@@ -398,7 +513,10 @@ __all__ = [
     "CLAUDE_EFFORT_LEVELS",
     "CODEX_EFFORT_LEVELS",
     "DEFAULT_PROVIDERS",
+    "ENV_PREFIX",
+    "ENV_VARS",
     "EffectiveAgents",
+    "FIELDS",
     "PROVIDER_CAPABILITIES",
     "ProviderCapability",
     "ROLES",
@@ -408,10 +526,13 @@ __all__ = [
     "RoleOverrides",
     "SOURCE_CLI",
     "SOURCE_ENGINE_DEFAULT",
+    "SOURCE_ENV",
     "SOURCE_PROJECT",
     "SOURCE_PROVIDER_DEFAULT",
     "capability",
+    "env_var",
     "providers_for_role",
+    "read_role_env",
     "resolve_agent_configs",
     "resolve_role_config",
 ]

@@ -74,6 +74,7 @@ from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_ag
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.sparring_prompt import build_sparring_prompt
 from agent_sparring.stage import Stage, StageError, StageMode
+from agent_sparring.usage import collect_stage_usage, render_report
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 from agent_sparring.stage_prompt import build_stage_prompt
 from agent_sparring.templates import render_project_config
@@ -164,8 +165,11 @@ def _cmd_show_config(args: argparse.Namespace) -> int:
 
     This exists so a UI never has to re-derive "claude-cli plus this
     project.toml plus no model means X": the resolution lives in the engine
-    (:mod:`agent_sparring.agent_config`) and is reported from there.
-    Configuration only -- no environment variables, no credentials.
+    (:mod:`agent_sparring.agent_config`) and is reported from there. That
+    includes the environment layer, so a value set by ``SPARRING_*`` appears
+    here with source ``env`` rather than silently disagreeing with the file
+    this command prints the path of. Only the resolved values are shown:
+    this never dumps the environment and never prints a credential.
     """
 
     sparring_dir = Path(args.sparring_dir)
@@ -475,6 +479,47 @@ def _optional_project_config(sparring_dir: Path) -> ProjectConfig | None:
     return None
 
 
+def _cmd_usage(args: argparse.Namespace) -> int:
+    """Report what a stage's provider turns used: agents, timing, tokens.
+
+    Reads the stage's observational ``activity.jsonl`` (see
+    :mod:`agent_sparring.usage`) and decides nothing. A stage with no log
+    reports that it has none and still exits 0: an absent telemetry file is
+    not a run failure.
+    """
+
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        if args.stage_id:
+            stages = [Stage.resolve(sparring_dir, stage_id) for stage_id in args.stage_id]
+            for stage in stages:
+                if not stage.exists():
+                    raise StageError(
+                        f"stage {stage.stage_id!r} does not exist at {stage.directory}"
+                    )
+        else:
+            stages_root = sparring_dir / "stages"
+            stages = [
+                Stage.resolve(sparring_dir, path.name)
+                for path in sorted(stages_root.iterdir())
+                if path.is_dir()
+            ] if stages_root.is_dir() else []
+            if not stages:
+                print(f"no stages under {stages_root}", file=sys.stderr)
+                return 1
+    except (StageError, OSError) as exc:
+        print(f"could not read stage usage: {exc}", file=sys.stderr)
+        return 1
+
+    usages = [collect_stage_usage(stage) for stage in stages]
+    if args.json:
+        json.dump([usage.as_dict() for usage in usages], sys.stdout, indent=2)
+        print()
+    else:
+        print(render_report(usages))
+    return 0
+
+
 def _resolve_role(
     role: str,
     sparring_dir: Path,
@@ -495,6 +540,42 @@ def _resolve_role(
         role,
         _optional_project_config(sparring_dir),
         RoleOverrides(provider=provider, model=model, effort=effort),
+    )
+
+
+#: Which activity actor speaks for which agent role.
+_ROLE_ACTORS: dict[str, str] = {ROLE_STAGE: "stage", ROLE_SPARRING: "sparrer"}
+
+
+def _emit_resolved(
+    activity_log: ActivityLog | None, resolved: ResolvedAgentConfig
+) -> None:
+    """Record what this role was configured to run with, before it runs.
+
+    Written once per role per adapter construction -- which is once per
+    planned stage in a managed run -- so the stage's ``activity.jsonl``
+    answers "what did this actually use, and where was it set" without
+    anyone having to reconstruct it from a shell history, an untracked
+    environment variable and the current contents of ``project.toml``. That
+    reconstruction is not possible after the fact, which is the whole
+    reason the event exists: an environment override leaves no other trace.
+
+    Observational only, like everything in ``activity.jsonl``: nothing reads
+    it back, and :meth:`ActivityLog.emit` cannot fail a turn.
+    """
+
+    if activity_log is None:
+        return
+    activity_log.emit(
+        _ROLE_ACTORS[resolved.role],
+        "agents.resolved",
+        role=resolved.role,
+        provider=resolved.provider,
+        provider_source=resolved.provider_source,
+        requested_model=resolved.model,
+        model_source=resolved.model_source,
+        requested_effort=resolved.effort,
+        effort_source=resolved.effort_source,
     )
 
 
@@ -564,6 +645,7 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
             model=args.model,
             effort=args.effort,
         )
+        _emit_resolved(stage.activity_log(), effective)
         adapter = ClaudeCliAdapter(
             repo_root=repo_root,
             executable=args.claude_executable,
@@ -623,6 +705,7 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
         # sandbox field or extra_args passthrough at all -- read-only is
         # hard-coded (see providers/codex_cli.py), so there is no
         # writable-sandbox escape hatch for this adapter.
+        _emit_resolved(stage.activity_log(), effective)
         adapter = CodexCliAdapter(
             repo_root=repo_root,
             executable=args.codex_executable,
@@ -692,6 +775,8 @@ def _build_loop_adapters(
     """
 
     effective = _resolve_agents(args, sparring_dir)
+    _emit_resolved(activity_log, effective.stage)
+    _emit_resolved(activity_log, effective.sparring)
     stage_adapter = ClaudeCliAdapter(
         repo_root=repo_root,
         executable=args.claude_executable,
@@ -1380,6 +1465,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_role_model_arguments(show_config)
     show_config.set_defaults(func=_cmd_show_config)
+
+    usage_parser = subparsers.add_parser(
+        "usage",
+        help="report what a stage's provider turns used: agents, timing, tokens",
+        description=(
+            "Read a stage's observational activity.jsonl and report which "
+            "provider, model and effort each agent role ran with and where "
+            "that selection came from, how long each provider turn took, and "
+            "the token totals the providers themselves reported. Everything "
+            "shown is a quotation: a number a provider never reported is "
+            "shown as '-' rather than guessed or defaulted to zero. This "
+            "command reads telemetry and decides nothing; a missing or "
+            "damaged log produces a partial report, not an error."
+        ),
+    )
+    usage_parser.add_argument(
+        "stage_id",
+        nargs="*",
+        help="stage id(s) to report on (default: every stage, oldest first)",
+    )
+    usage_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the collected records as JSON instead of the text report",
+    )
+    usage_parser.set_defaults(func=_cmd_usage)
 
     init_config = subparsers.add_parser(
         "init-config",

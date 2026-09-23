@@ -756,7 +756,13 @@ open(out, "w").write(json.dumps(verdict))
         ]
         self.assertEqual(
             names,
-            ["loop:loop.started"] + expected_cycle + ["loop:loop.send_back"]
+            # The two resolution events come first because the adapters are
+            # built -- and therefore the provider/model/effort selection is
+            # made and recorded -- before the loop starts. Recording it
+            # ahead of the first turn is the point: it is what the turn then
+            # runs with.
+            ["stage:agents.resolved", "sparrer:agents.resolved", "loop:loop.started"]
+            + expected_cycle + ["loop:loop.send_back"]
             + expected_cycle + ["loop:loop.stopped"],
         )
 

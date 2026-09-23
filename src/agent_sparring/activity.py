@@ -69,6 +69,31 @@ OPTIONAL_FIELDS = frozenset(
         "resumed",  # whether a turn resumed an existing provider session
         "parent_id",  # provider-established parent tool-use id for nested-agent activity
         "tool_use_id",  # provider-issued id of the tool call an event is about
+        # -- what the engine asked the provider for, on agents.resolved --
+        #
+        # Deliberately separate from "model" above, which is only ever what
+        # the provider said about itself. These are the other half of that
+        # pair: what the engine selected and passed on the command line.
+        # Keeping them distinct is what makes the two comparable -- a
+        # requested_model that does not match the model the provider
+        # reported is a real and visible fact, which one shared field would
+        # hide. ``None`` means the engine passed no flag and the provider
+        # used its own default, which is not the same as "unknown".
+        "requested_model",
+        "requested_effort",
+        # Which precedence layer supplied each value: "cli", "env",
+        # "project", "engine-default" or "provider-default", verbatim from
+        # agent_config. This is what makes an unexpected model traceable to
+        # the place it was actually set.
+        "provider_source",
+        "model_source",
+        "effort_source",
+        "role",  # which agent role a resolution event describes
+        # Wall-clock milliseconds the provider turn took, measured by the
+        # engine around the adapter call. The engine's own measurement, not
+        # a provider claim, and therefore always present on a finished or
+        # failed turn.
+        "duration_ms",
         # -- what a provider said about its own budget, on provider.usage --
         #
         # Every one of these is written only when the provider's own output

@@ -296,7 +296,27 @@ stage and the finalization turn — builds its adapters from it. The
 alternative, each command consulting the config for itself, is how one path
 ends up quietly ignoring it.
 
-    explicit CLI override  >  .sparring/project.toml  >  provider default
+    explicit CLI override  >  SPARRING_* environment  >  .sparring/project.toml  >  provider default
+
+The environment layer is there because `project.toml` is a tracked file in
+the consuming repository. Changing a model in it dirties the working tree,
+and finalization treats a dirty path that is not a stage artifact as
+candidate content — so trying a different model for one run would otherwise
+mean staging and committing a configuration change along with the work. The
+`SPARRING_<ROLE>_<FIELD>` variables set the same three fields and leave
+nothing behind in the repository. They sit below the command line, because an
+explicit flag is still the most specific thing a person can say, and above
+the file, because a shell-local choice overriding the committed project
+default is the entire point. Being applied inside the one resolver means
+every orchestration path honours them without any of them knowing they
+exist.
+
+Leaving nothing behind is also the layer's one real cost: after the fact,
+nothing in the repository says which model ran. That is why every run records
+an `agents.resolved` event per role in the stage's activity log, carrying
+each value *and the layer that supplied it*, and why the variables are
+validated rather than quietly ignored — a set-but-empty variable is an error,
+because someone who exported the name meant to select something.
 
 "Provider default" is a real state, not a missing answer: the engine passes
 no flag and reports the value as unset with source `provider-default`. It
@@ -474,19 +494,21 @@ One JSON object per line, schema version 1, with a fixed envelope
 and a small closed set of optional fields used only when genuinely known:
 `provider`, `session_id`, `model`, `summary`, `action`, `cycle`, `sha`,
 `tool`, `path`, `kind`, `exit_code`, `resumed`, `parent_id`, `tool_use_id`,
-and the budget fields listed under `provider.usage` below.
+`role`, `duration_ms`, the resolution fields listed under `agents.resolved`
+below, and the budget fields listed under `provider.usage` below.
 Anything else passed to the writer is dropped. No prompt text, reasoning,
 tool input or output, diff, replacement string or shell command text is ever
 recorded.
 
 Actors and events:
 
-    stage    turn.started, turn.finished, turn.failed, handoff.ready
-             (orchestration) and session.observed, tool.call, file.changed,
-             command.started, command.finished, subagent.started,
-             provider.usage, provider.result (translated from the
-             implementation provider)
-    sparrer  sparring.started, sparring.failed, verdict (orchestration) and
+    stage    agents.resolved, turn.started, turn.finished, turn.failed,
+             handoff.ready (orchestration) and session.observed, tool.call,
+             file.changed, command.started, command.finished,
+             subagent.started, provider.usage, provider.result (translated
+             from the implementation provider)
+    sparrer  agents.resolved, sparring.started, sparring.failed, verdict
+             (orchestration) and
              session.observed, tool.call, file.changed, command.started,
              command.finished, subagent.started, provider.usage,
              provider.result, provider.error (translated from the sparring
@@ -496,6 +518,20 @@ Actors and events:
     plan     plan.stage.entered, plan.stage.accepted, plan.paused,
              plan.failed, plan.completed, plan.evidence_recorded,
              gate.repeated
+
+`agents.resolved` is written once per role when a stage's adapters are built,
+before its first turn, carrying `role`, `provider`, `requested_model`,
+`requested_effort` and a `*_source` for each. It is the only durable record
+of a selection that came from the environment, which by construction leaves
+nothing in the repository (see "Model and effort"). `requested_model` is
+deliberately a different field from `model`: `model` is only ever what a
+provider said about itself, so the two can be compared and a provider that
+ran something other than what it was asked for stays visible.
+
+`turn.finished`, `turn.failed`, `sparring.failed` and `verdict` carry
+`duration_ms`: the engine's own monotonic measurement around the provider
+call. Unlike the budget fields it is not a provider claim, so it is present
+on every outcome including failure.
 
 `plan` lines are written by the plan runner into whichever planned stage's
 log is current, in the order things happened: `plan.paused` only for a

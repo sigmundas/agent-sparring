@@ -11,6 +11,7 @@ turn. It does not implement any provider itself (see
 
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -233,6 +234,16 @@ def run_stage_agent(
             activity = _stage_emitter(stage, adapter)
             resumed = resume_id is not None
             activity.emit("turn.started", resumed=resumed, session_id=resume_id)
+            # Measured with a monotonic clock so a system clock adjustment
+            # mid-turn cannot produce a negative or absurd duration. This is
+            # the engine's own wall-clock observation of the provider call,
+            # not something the provider reported, so unlike the token
+            # fields it is present on every outcome including failure.
+            started_at = time.monotonic()
+
+            def _elapsed_ms() -> int:
+                return int((time.monotonic() - started_at) * 1000)
+
             try:
                 if resume_id:
                     result = adapter.resume(resume_id, prompt)
@@ -240,12 +251,20 @@ def run_stage_agent(
                     with _session_recorded_early(adapter, stage, state):
                         result = adapter.start(prompt)
             except ProviderError as exc:
-                activity.emit("turn.failed", resumed=resumed, summary="provider error")
+                activity.emit(
+                    "turn.failed",
+                    resumed=resumed,
+                    duration_ms=_elapsed_ms(),
+                    summary="provider error",
+                )
                 raise StageAgentRunError(str(exc)) from exc
 
             if resume_id and result.session_id != resume_id:
                 activity.emit(
-                    "turn.failed", resumed=resumed, summary="session identity mismatch"
+                    "turn.failed",
+                    resumed=resumed,
+                    duration_ms=_elapsed_ms(),
+                    summary="session identity mismatch",
                 )
                 raise StageAgentRunError(
                     f"provider was asked to resume session {resume_id!r} but "
@@ -260,6 +279,7 @@ def run_stage_agent(
                     "turn.failed",
                     resumed=resumed,
                     session_id=result.session_id,
+                    duration_ms=_elapsed_ms(),
                     summary="worktree left the expected branch",
                 )
                 raise StageAgentRunError(
@@ -274,6 +294,7 @@ def run_stage_agent(
                 "turn.finished",
                 resumed=resumed,
                 session_id=result.session_id,
+                duration_ms=_elapsed_ms(),
                 summary="provider reported is_error=true" if result.is_error else None,
             )
 
