@@ -41,12 +41,19 @@ from agent_sparring.stage import ACTIVITY_FILENAME, Stage
 ROLE_ACTORS: tuple[tuple[str, str], ...] = (("stage", "stage"), ("sparring", "sparrer"))
 
 #: Events that begin a provider turn, by actor.
-_TURN_STARTED = {"turn.started", "sparring.started"}
+#: ``dialogue.started`` is one of them because a reviewer conversation
+#: (``sparring ask``) spends the same context window and the same money as a
+#: review turn, and does so inside the reviewer's own thread. Leaving it out
+#: would make the report understate what the stage cost, and would hide the
+#: one kind of turn whose cost a person chooses to incur directly.
+_TURN_STARTED = {"turn.started", "sparring.started", "dialogue.started"}
 #: Events that end one, mapped to the outcome word the report prints.
 _TURN_ENDED = {
     "turn.finished": "finished",
     "turn.failed": "failed",
     "sparring.failed": "failed",
+    "dialogue.finished": "asked",
+    "dialogue.failed": "failed",
     "verdict": "verdict",
 }
 

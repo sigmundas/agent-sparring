@@ -73,6 +73,8 @@ from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultEr
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.sparring_prompt import build_sparring_prompt
+from agent_sparring.dialogue import DialogueError, resolve_check, run_dialogue_turn
+from agent_sparring.dialogue_prompt import assemble_dialogue_prompt
 from agent_sparring.stage import Stage, StageError, StageMode
 from agent_sparring.usage import collect_stage_usage, render_report
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
@@ -673,6 +675,87 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return 1 if run_result.result.is_error else 0
+
+
+def _cmd_ask(args: argparse.Namespace) -> int:
+    """Ask the stage's reviewer a question and print its answer.
+
+    Read-only and stateless with respect to the run: no verdict, no
+    lifecycle transition, no plan advance. See
+    :mod:`agent_sparring.dialogue` for what that costs and buys.
+    """
+
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        stage = Stage.resolve(sparring_dir, args.stage_id)
+        if not stage.exists():
+            raise StageError(f"stage {args.stage_id!r} does not exist at {stage.directory}")
+
+        if args.dry_run:
+            check = resolve_check(stage, args.check_id)
+            print(
+                assemble_dialogue_prompt(
+                    stage,
+                    message=args.message,
+                    check=check,
+                    expected_branch=args.expected_branch,
+                ).text
+            )
+            return 0
+
+        effective = _resolve_role(
+            ROLE_SPARRING,
+            sparring_dir,
+            provider=args.provider,
+            model=args.model,
+            effort=args.effort,
+        )
+        _emit_resolved(stage.activity_log(), effective)
+        adapter = CodexCliAdapter(
+            repo_root=repo_root,
+            executable=args.codex_executable,
+            model=effective.model,
+            effort=effective.effort,
+            activity=stage.activity_log().bind("sparrer", provider=CODEX_PROVIDER_ID),
+        )
+        turn = run_dialogue_turn(
+            stage,
+            repo_root,
+            adapter,
+            message=args.message,
+            check_id=args.check_id,
+            gate_instance=args.gate_instance,
+            expected_branch=args.expected_branch,
+            activity=stage.activity_log().bind("sparrer", provider=CODEX_PROVIDER_ID),
+        )
+    except (StageError, DialogueError, ProjectConfigError, GitContextError) as exc:
+        print(f"could not ask the reviewer: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        json.dump(
+            {
+                "stage_id": stage.stage_id,
+                "session_id": turn.session_id,
+                "check_id": turn.check_id,
+                "gate_instance": turn.gate_instance,
+                "question": turn.question,
+                "answer": turn.answer,
+                "duration_ms": turn.duration_ms,
+            },
+            sys.stdout,
+            indent=2,
+        )
+        print()
+    else:
+        print(turn.answer)
+        print(
+            f"session_id={turn.session_id} duration_ms={turn.duration_ms} "
+            f"recorded={stage.dialogue_path()}",
+            file=sys.stderr,
+        )
+    return 0
 
 
 def _cmd_run_sparring(args: argparse.Namespace) -> int:
@@ -1759,6 +1842,90 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_sparring.set_defaults(func=_cmd_run_sparring)
+
+    ask = subparsers.add_parser(
+        "ask",
+        help="ask this stage's reviewer a question, read-only, without changing anything",
+        description=(
+            "Continue the reviewer's own conversation to ask it about its "
+            "review: what evidence it used, why it concluded what it did, "
+            "what a gate check actually requires, what happens if you pass "
+            "or fail it. The turn resumes the recorded sparring session, so "
+            "the answer comes from the reviewer that wrote the verdict "
+            "rather than a fresh one reconstructing it from artifacts. "
+            "It is read-only and verified to be: the worktree is "
+            "fingerprinted before and after. It writes no verdict and "
+            "changes no run state -- not state.json, not sparring.md, not "
+            "the plan run -- so a recorded verdict still changes only when a "
+            "real sparring turn writes a new one. The exchange is appended "
+            "to the stage's dialogue.jsonl. Note that it does enter the "
+            "reviewer's thread, so a later sparring turn has seen it, and it "
+            "spends the reviewer's context window; 'sparring usage' reports "
+            "both."
+        ),
+    )
+    ask.add_argument("stage_id")
+    ask.add_argument(
+        "--message",
+        required=True,
+        help="the question to put to the reviewer",
+    )
+    ask.add_argument(
+        "--check-id",
+        default=None,
+        help=(
+            "the gate check this question is about; quoted to the reviewer "
+            "verbatim from the recorded verdict. An id the gate does not ask "
+            "is refused, listing the ones it does"
+        ),
+    )
+    ask.add_argument(
+        "--gate-instance",
+        default=None,
+        help=(
+            "the gate instance this question belongs to, recorded in the "
+            "transcript so an exchange stays tied to the asking it answers"
+        ),
+    )
+    ask.add_argument(
+        "--repo-root",
+        default=None,
+        help=(
+            "repository root; overrides project.toml's [repo].root if set "
+            "(default: [repo].root from project.toml, resolved against the "
+            "project root, else the parent of --sparring-dir)"
+        ),
+    )
+    ask.add_argument(
+        "--expected-branch",
+        default=None,
+        help="the branch under review, shown to the reviewer for orientation",
+    )
+    ask.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "sparring agent provider (default: project.toml's "
+            "[agents.sparring].provider, else codex-cli)"
+        ),
+    )
+    ask.add_argument(
+        "--codex-executable",
+        default="codex",
+        help="codex CLI executable to invoke (default: codex)",
+    )
+    _add_single_role_model_arguments(ask)
+    ask.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the prompt this question would send, without invoking any provider",
+    )
+    ask.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the exchange as JSON instead of printing the answer",
+    )
+    ask.set_defaults(func=_cmd_ask)
 
     repo_root_help = (
         "repository root; overrides project.toml's [repo].root if set "

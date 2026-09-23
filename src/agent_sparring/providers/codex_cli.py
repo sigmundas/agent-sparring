@@ -650,15 +650,43 @@ class CodexCliAdapter:
             )
         return self._invoke(prompt, resume_session_id=session_id)
 
+    def converse(self, session_id: str, prompt: str) -> SparringAgentResult:
+        """Resume the session for a free-form answer instead of a verdict.
+
+        Same session, same hard-coded read-only sandbox, same everything --
+        the one difference is that no output schema is imposed, so the final
+        message is whatever prose the reviewer writes. See
+        :meth:`_build_args` for why that difference cannot be achieved by
+        asking nicely in the prompt.
+        """
+
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ProviderError(
+                "converse requires a non-empty session_id obtained from a prior "
+                "provider result, not an empty/invented value"
+            )
+        return self._invoke(prompt, resume_session_id=session_id, schema=False)
+
     # -- internals ----------------------------------------------------
 
     def _build_args(
         self,
         prompt: str,
         resume_session_id: str | None,
-        schema_path: Path,
+        schema_path: Path | None,
         output_path: Path,
     ) -> list[str]:
+        """``schema_path`` of ``None`` asks for a free-form final message.
+
+        Every review turn is schema-constrained, because a verdict that does
+        not parse is useless. A conversation turn is the opposite: it is
+        read by a person, and constraining it to the verdict schema does not
+        merely permit a JSON answer, it *compels* one -- the model has no way
+        to emit anything else, and no prompt wording can override an output
+        schema. Verified live: a dialogue turn asked for prose came back as a
+        verdict envelope with the prose stuffed into ``findings``.
+        """
+
         args = [self.executable, "exec"]
         if resume_session_id:
             args += ["resume", resume_session_id]
@@ -675,22 +703,27 @@ class CodexCliAdapter:
             # appended after the sandbox arg, but a later "-c" for a
             # different key does not disturb it.
             args += ["-c", f'model_reasoning_effort="{self.effort}"']
-        args += [
-            "--json",
-            "--output-schema",
-            str(schema_path),
-            "-o",
-            str(output_path),
-        ]
+        args += ["--json"]
+        if schema_path is not None:
+            args += ["--output-schema", str(schema_path)]
+        args += ["-o", str(output_path)]
         if self.model:
             args += ["--model", self.model]
         args.append(prompt)
         return args
 
-    def _invoke(self, prompt: str, resume_session_id: str | None) -> SparringAgentResult:
+    def _invoke(
+        self,
+        prompt: str,
+        resume_session_id: str | None,
+        *,
+        schema: bool = True,
+    ) -> SparringAgentResult:
         with tempfile.TemporaryDirectory(prefix="agent-sparring-codex-") as tmp_dir:
-            schema_path = Path(tmp_dir) / "verdict_schema.json"
-            schema_path.write_text(json.dumps(VERDICT_SCHEMA), encoding="utf-8")
+            schema_path: Path | None = None
+            if schema:
+                schema_path = Path(tmp_dir) / "verdict_schema.json"
+                schema_path.write_text(json.dumps(VERDICT_SCHEMA), encoding="utf-8")
             output_path = Path(tmp_dir) / "last_message.txt"
 
             args = self._build_args(prompt, resume_session_id, schema_path, output_path)

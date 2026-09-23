@@ -110,6 +110,17 @@ class SparringAgentAdapter(Protocol):
     def resume(self, session_id: str, prompt: str) -> SparringAgentResult:
         """Resume an existing sparring session by its provider-issued id."""
 
+    def converse(self, session_id: str, prompt: str) -> SparringAgentResult:
+        """Resume a session for a free-form answer rather than a verdict.
+
+        The same read-only session as :meth:`resume`, but the final message
+        is prose meant for a person (see :mod:`agent_sparring.dialogue`), so
+        an implementation must not impose whatever structured-output
+        constraint it uses for verdicts. That constraint is not advisory: a
+        provider given an output schema *cannot* answer outside it, however
+        the prompt is worded.
+        """
+
 
 __all__ = [
     "LineSink",

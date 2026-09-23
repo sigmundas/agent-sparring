@@ -838,3 +838,49 @@ class CodexRolloutBudgetTests(unittest.TestCase):
         self.assertIsNone(codex_cli._rollout_path("../*", self.repo_root))
         self.assertIsNone(codex_cli._rollout_path("", self.repo_root))
         self.assertIsNone(codex_cli._rollout_path(None, self.repo_root))
+
+
+class ConverseArgvTests(unittest.TestCase):
+    """A conversation turn must not carry the verdict output schema.
+
+    This is the one difference between `converse` and `resume`, and it is
+    not cosmetic: `--output-schema` makes the verdict envelope the only
+    thing the model can emit. A dialogue run on the `resume` path came back
+    as a verdict with the prose stuffed into `findings`, which no prompt
+    wording could have prevented.
+    """
+
+    def _capture(self, method):
+        seen = {}
+
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            seen["args"] = list(args)
+            Path(args[args.index("-o") + 1]).write_text("prose", encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps({"type": "thread.started", "thread_id": "t-1"}) + "\n",
+                stderr="",
+            )
+
+        adapter = CodexCliAdapter(repo_root=Path("."), runner=runner)
+        method(adapter)
+        return seen["args"]
+
+    def test_converse_passes_no_output_schema(self):
+        args = self._capture(lambda a: a.converse("t-1", "why?"))
+        self.assertNotIn("--output-schema", args)
+        # Everything else that makes the turn safe is unchanged.
+        self.assertIn("--json", args)
+        self.assertIn("-o", args)
+        self.assertIn("resume", args)
+        self.assertIn('sandbox_mode="read-only"', " ".join(args))
+
+    def test_resume_still_passes_the_schema(self):
+        args = self._capture(lambda a: a.resume("t-1", "verdict please"))
+        self.assertIn("--output-schema", args)
+
+    def test_converse_refuses_an_empty_session_id(self):
+        adapter = CodexCliAdapter(repo_root=Path("."))
+        with self.assertRaises(ProviderError):
+            adapter.converse("  ", "why?")

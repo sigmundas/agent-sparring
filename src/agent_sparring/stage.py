@@ -36,6 +36,13 @@ SPARRING_FILENAME = "sparring.md"
 # Append-only observational telemetry. Never read by orchestration; not
 # created by Stage.create (it appears on first emit, if writable).
 ACTIVITY_FILENAME = "activity.jsonl"
+# Append-only record of the human <-> reviewer side conversation (see
+# agent_sparring.dialogue). Like activity.jsonl it is not created by
+# Stage.create -- it appears when someone first asks the reviewer something
+# -- but unlike activity.jsonl it is provenance rather than telemetry: it is
+# the only record of what was said in a conversation that happens inside the
+# provider's own thread, where nothing else can see it.
+DIALOGUE_FILENAME = "dialogue.jsonl"
 
 # The notes.md heading under which a human's answer/check result/evidence is
 # recorded (by `resume-plan --evidence`, or by hand). Prose only: the handoff
@@ -487,6 +494,48 @@ class Stage:
 
     def read_sparring(self) -> str:
         return self._read_text(SPARRING_FILENAME)
+
+    def dialogue_path(self) -> Path:
+        return self.directory / DIALOGUE_FILENAME
+
+    def read_dialogue(self) -> tuple[dict[str, Any], ...]:
+        """Every recorded reviewer exchange, oldest first.
+
+        A line that does not parse is skipped rather than raising: this is
+        an append-only log that a crash can truncate mid-write, and one
+        damaged line must not make the rest of a conversation unreadable.
+        """
+
+        path = self.dialogue_path()
+        if not path.is_file():
+            return ()
+        records: list[dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                records.append(parsed)
+        return tuple(records)
+
+    def append_dialogue(self, record: dict[str, Any]) -> None:
+        """Append one exchange. Unlike telemetry, a failure here is real.
+
+        activity.jsonl may silently give up on a write because nothing
+        depends on it. This file is the conversation's only record, so a
+        caller that cannot write it should hear about it rather than
+        discover later that an exchange it reported to a person was never
+        kept.
+        """
+
+        self.directory.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+        with self.dialogue_path().open("a", encoding="utf-8") as handle:
+            handle.write(line)
 
     def append_note(self, heading: str, entry: str) -> None:
         """Append ``entry`` at the end of notes.md's ``heading`` section,

@@ -163,6 +163,17 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
         purpose="stage status, candidate identity and provider session ids",
     ),
     ArtifactOwnership(
+        path="stages/<stage>/dialogue.jsonl",
+        owner="engine",
+        provider_writable=False,
+        lifetime="append-only; one record per human question and reviewer answer",
+        purpose=(
+            "provenance for the read-only side conversation a person holds "
+            "with the reviewer ('sparring ask'), which otherwise exists only "
+            "inside the provider's own thread"
+        ),
+    ),
+    ArtifactOwnership(
         path="stages/<stage>/activity.jsonl",
         owner="engine",
         provider_writable=False,

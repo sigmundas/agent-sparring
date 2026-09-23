@@ -343,6 +343,21 @@ def _routing_block(text: str) -> list[str]:
     return block
 
 
+def recorded_gate(text: str) -> HumanGate | None:
+    """The structured human gate a ``sparring.md`` carries, if it has one.
+
+    Public because the gate is the one part of a recorded verdict another
+    command legitimately needs in machine-readable form: ``sparring ask``
+    quotes a named check back to the reviewer verbatim (see
+    :mod:`agent_sparring.dialogue_prompt`), and paraphrasing a check the
+    person is being asked to answer would be the engine rewording the
+    question. Reading is all this offers -- the gate is written only by
+    :func:`record_sparring`, which mints its ``instance_id``.
+    """
+
+    return _recorded_gate(text)
+
+
 def _recorded_gate(text: str) -> HumanGate | None:
     """The canonical JSON block behind :data:`HUMAN_GATE_MARKER`, if the file
     has one and it still parses."""

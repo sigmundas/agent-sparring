@@ -199,6 +199,38 @@ Use a fresh sparrer for acceptance in that case.
 Do not mechanically enforce freshness with elaborate session state unless
 experience shows that this is necessary.
 
+#### The human may talk to the sparrer, and that costs some independence
+
+`sparring ask` (see "Asking the reviewer" in the README, and
+`agent_sparring/dialogue.py`) lets a person put questions to the sparrer in
+its own thread and get prose back. It exists because a `NEEDS_YOU` gate was
+able to demand judgement while withholding the material to exercise it: the
+evidence and the reasoning were in the provider's conversation, which the
+gate could cite and nobody could read. The rule that follows is that **when
+the sparrer emits `NEEDS_YOU`, every check must carry enough evidence to
+decide, or an interactive path to obtain it.**
+
+The turn is read-only, verified by the same before/after repository
+fingerprint an ordinary sparring turn takes, and it writes no workflow state
+at all — no verdict, no `state.json`, no `sparring.md`. A recorded verdict
+changes only when a real sparring turn writes a new one.
+
+What it does change is this principle, and the change is deliberate rather
+than overlooked. Because the exchange happens in the reviewer's own thread,
+a later sparring turn has seen it, so a person can argue a sparrer out of a
+finding by talking to it. The alternative — a fresh session seeded from the
+artifacts — keeps independence perfectly and answers "why did you conclude
+that?" with a reconstruction by a reviewer who did not conclude it, which is
+worse than useless for the question being asked. So the trade is taken
+knowingly: the sparrer stays independent of the *implementation* agent,
+which is the separation that matters, while being explicitly open to the
+human it is reporting to. The prompt says as much, and says the turn decides
+nothing.
+
+The second cost is ordinary but easy to forget: the conversation spends the
+reviewer's context window, which is shared with the review. `sparring usage`
+counts dialogue turns so that is visible rather than inferred.
+
 ### 8. Acceptance is the hard gate
 
 Normal sparring is soft.
@@ -507,7 +539,8 @@ Actors and events:
              file.changed, command.started, command.finished,
              subagent.started, provider.usage, provider.result (translated
              from the implementation provider)
-    sparrer  agents.resolved, sparring.started, sparring.failed, verdict
+    sparrer  agents.resolved, sparring.started, sparring.failed, verdict,
+             dialogue.started, dialogue.finished, dialogue.failed
              (orchestration) and
              session.observed, tool.call, file.changed, command.started,
              command.finished, subagent.started, provider.usage,

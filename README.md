@@ -337,6 +337,54 @@ The report is a reader, not an authority: it decides nothing, and a missing,
 truncated or partly corrupt log produces a partial report rather than an
 error.
 
+### Asking the reviewer
+
+A `NEEDS_YOU` gate asks for your judgement. Until you can see what the
+reviewer saw, you cannot exercise it — and the reviewer's evidence and
+reasoning live in its own provider thread, where the gate can cite them but
+nothing can show them to you. `sparring ask` is the way back into that
+thread:
+
+```sh
+sparring ask <stage-id> --message "Show me the evidence for 53482 -> 39ZCL."
+sparring ask <stage-id> --check-id review-nortaxa-53482-bridge \
+    --message "If I pass this, what changes and what happens next?"
+```
+
+It **resumes the recorded sparring session**, so the answer comes from the
+reviewer that wrote the verdict, quoting the evidence it actually used —
+not a fresh reviewer reconstructing a plausible rationale from artifacts.
+With `--check-id` the named check is quoted into the prompt verbatim from
+the recorded gate; an id the gate does not ask is refused, listing the ones
+it does.
+
+It changes nothing. No verdict, no `state.json`, no `sparring.md`, no plan
+run. A recorded verdict still changes only when a real sparring turn writes
+a new one, and the prompt tells the reviewer so: if you show it something
+that changes its mind, it says what it would conclude instead rather than
+claiming to have revised anything. Read-only is verified rather than
+trusted — the worktree is fingerprinted before and after the turn, the same
+check an ordinary sparring turn makes — and the turn holds the worktree
+lock, so asking while a provider turn is in flight is refused rather than
+answered against a tree being edited.
+
+Two costs are worth knowing, because both are real:
+
+- the exchange **enters the reviewer's thread**, so a later sparring turn
+  has seen it. That is deliberate — a reviewer that will not reconsider
+  when shown something it missed is not much of a reviewer — but it means
+  you can argue one out of a finding, which narrows the independence the
+  sparring role otherwise has;
+- it **spends the reviewer's context window**, which is shared with the
+  review itself.
+
+`sparring usage` reports both: a dialogue turn appears in the turn table
+with outcome `asked`, and the role's token totals include it.
+
+Every exchange is appended to the stage's `dialogue.jsonl` with the check
+and gate instance it belongs to, and the prompt is captured under
+`prompts/` like any other turn's.
+
 ### What each agent was actually told
 
 Every turn writes the exact prompt it handed to its provider into the
@@ -1134,6 +1182,7 @@ itself, which is an ordinary repository file.
 | `stages/<stage>/handoff.md` | engine | no | regenerated in full by every implementation turn | that turn's claims, git identity and evidence, for the sparrer |
 | `stages/<stage>/sparring.md` | engine | no | rewritten in full by every sparring exchange | the latest verdict, rendered from the structured routing result |
 | `stages/<stage>/state.json` | engine | no | rewritten on every lifecycle change | status, candidate identity, provider session ids |
+| `stages/<stage>/dialogue.jsonl` | engine | no | append-only; one record per question and answer | provenance for the read-only conversation a person holds with the reviewer (`sparring ask`) |
 | `stages/<stage>/activity.jsonl` | engine | no | append-only, never read by orchestration | observational telemetry only |
 
 **No artifact is provider-writable, including `notes.md`.** Despite its

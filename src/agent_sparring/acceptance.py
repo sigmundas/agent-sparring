@@ -99,6 +99,7 @@ from agent_sparring.prompt_capture import PROMPTS_DIRNAME, is_prompt_artifact
 from agent_sparring.stage import (
     ACTIVITY_FILENAME,
     BRIEF_FILENAME,
+    DIALOGUE_FILENAME,
     HANDOFF_FILENAME,
     NOTES_FILENAME,
     SPARRING_FILENAME,
@@ -129,6 +130,11 @@ STAGE_ARTIFACT_FILENAMES = (
     HANDOFF_FILENAME,
     SPARRING_FILENAME,
     ACTIVITY_FILENAME,
+    # A reviewer conversation is bookkeeping about the candidate, never part
+    # of it. Without this entry, asking the reviewer a question would dirty
+    # the worktree and the stage's own acceptance gate would then refuse the
+    # candidate because someone had asked about it.
+    DIALOGUE_FILENAME,
 )
 
 # The one artifact that is not a flat file beside the others: every turn's

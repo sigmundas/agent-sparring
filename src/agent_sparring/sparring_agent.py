@@ -110,9 +110,15 @@ class SparringAgentRunResult:
     sparring: str
 
 
-def _repo_fingerprint(repo_root: Path) -> tuple[str, str, tuple[str, ...]]:
+def repo_fingerprint(repo_root: Path) -> tuple[str, str, tuple[str, ...]]:
     """A cheap (branch, head commit, dirty paths) snapshot used to detect
     writes or a branch switch.
+
+    Public so every read-only provider turn proves read-only the same way.
+    :mod:`agent_sparring.dialogue` takes the same before/after snapshot
+    around its own turn: a second implementation of "did the reviewer write
+    anything" could drift from this one, and the weaker of the two would be
+    the one that mattered.
 
     Not a cryptographic guarantee -- a provider could in principle modify
     and then restore files without changing any of these -- but it catches
@@ -372,7 +378,7 @@ def _run_sparring_agent_locked(
     capture_prompt(stage.directory, assembled)
 
     try:
-        before_branch, before_head, before_dirty = _repo_fingerprint(repo_root)
+        before_branch, before_head, before_dirty = repo_fingerprint(repo_root)
     except GitContextError as exc:
         raise SparringAgentRunError(str(exc)) from exc
 
@@ -409,7 +415,7 @@ def _run_sparring_agent_locked(
     # provider raised or not: a provider that fails may still have written
     # to the repository first (see module docstring).
     try:
-        after_branch, after_head, after_dirty = _repo_fingerprint(repo_root)
+        after_branch, after_head, after_dirty = repo_fingerprint(repo_root)
     except GitContextError as exc:
         raise SparringAgentRunError(str(exc)) from exc
 
