@@ -16,7 +16,12 @@ import conftest_path  # noqa: F401
 
 from agent_sparring.activity import ActivityLog
 from agent_sparring.human_gate import HumanCheck, HumanGate
-from agent_sparring.plan import _note_repeat_asking, record_human_evidence
+from agent_sparring.deferred_gate import DeferredHumanGate
+from agent_sparring.plan import (
+    _carry_blocked_checks,
+    _note_repeat_asking,
+    record_human_evidence,
+)
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import record_sparring_result
 from agent_sparring.sparring_prompt import build_sparring_prompt
@@ -225,6 +230,72 @@ class RepeatAskingStopTests(unittest.TestCase):
 
     def test_a_stage_with_no_recorded_gate_is_not_a_repetition(self):
         self.assertIsNone(self.note())
+
+
+class CarryBlockedChecksTests(unittest.TestCase):
+    """A check a person could not do must not vanish when the stage accepts.
+
+    Observed on the first real run after the Blocked guidance shipped: told
+    that deferring was the way past a Blocked check, the reviewer chose
+    READY, reasoned correctly about all three checks in its findings -- and
+    wrote no `deferred_human_gate` at all. Two checks a person had answered
+    Blocked twice were simply gone, owed by nobody.
+    """
+
+    setUp = BlockedAnswerPromptTests.setUp
+    ask = BlockedAnswerPromptTests.ask
+    answer = BlockedAnswerPromptTests.answer
+
+    def carried(self):
+        return _carry_blocked_checks(self.stage, [])
+
+    def test_a_blocked_check_is_carried_into_an_obligation(self):
+        instance = self.ask("device-restart", "round-trip")
+        self.answer(instance, **{"device-restart": "Blocked", "round-trip": "Pass"})
+
+        gate = self.carried()
+
+        self.assertIsNotNone(gate)
+        self.assertEqual([check.id for check in gate.checks], ["device-restart"])
+        self.assertEqual(gate.checkpoint, "before_plan_completion")
+        # Whose decision this was is on the record: a reviewer's rationale
+        # and an engine's carry-forward must never read as the same thing.
+        self.assertIn("Carried forward by the engine, not weighed by a reviewer", gate.rationale)
+        self.assertIn("Blocked resolves nothing", gate.rationale)
+
+    def test_the_instance_id_is_stable_so_a_second_pass_records_nothing_new(self):
+        # _reconcile_deferred runs on every pass over an accepted stage. A
+        # freshly minted id each time would ask a person the same thing
+        # again under a new id.
+        instance = self.ask("device-restart")
+        self.answer(instance, **{"device-restart": "Blocked"})
+
+        self.assertEqual(self.carried().instance_id, self.carried().instance_id)
+        self.assertTrue(self.carried().instance_id.startswith("carried-"))
+
+    def test_a_check_the_reviewer_deferred_itself_is_not_carried_twice(self):
+        instance = self.ask("device-restart")
+        self.answer(instance, **{"device-restart": "Blocked"})
+        mine = DeferredHumanGate(
+            gate=gate("device-restart").asked_again("reviewers-own"),
+            rationale="nothing later depends on it",
+        )
+
+        self.assertIsNone(_carry_blocked_checks(self.stage, [mine]))
+
+    def test_a_failed_check_is_a_result_and_is_not_carried(self):
+        # The reviewer may accept a stage over a Fail with its reasons
+        # stated. Only "I tried and could not" is the fact this refuses to
+        # lose.
+        instance = self.ask("device-restart")
+        self.answer(instance, **{"device-restart": "Fail"})
+
+        self.assertIsNone(self.carried())
+
+    def test_a_check_nobody_answered_is_not_carried(self):
+        self.ask("device-restart")
+
+        self.assertIsNone(self.carried())
 
 
 if __name__ == "__main__":

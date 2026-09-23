@@ -795,6 +795,19 @@ Three things close it, and the split matters:
   merely carries such a check alongside ones the reviewer is still working is
   reported, never stopped — that reviewer is making progress, and stopping it
   would stop the work. Both emit `gate.repeated`.
+- **A `Blocked` check cannot be waived by omission.** Told that deferring was
+  the way past a Blocked check, the first reviewer to see that guidance chose
+  `READY`, reasoned correctly about all three of its checks in `findings`, and
+  wrote no `deferred_human_gate` — dropping two checks a person had answered
+  Blocked twice. Nobody decided that; it is what falls out of doing half of
+  the instruction. So `_carry_blocked_checks` records those checks as an
+  obligation at acceptance if no deferral covers them. Its `instance_id` is
+  derived from the stage and the check ids, not minted, because reconciliation
+  runs on every pass over an accepted stage. This is bookkeeping and not a
+  timing judgement: the rationale says in as many words that the engine
+  carried it and no reviewer weighed it, and only an explicit `Blocked` is
+  carried — a `Fail` is a result a reviewer may accept a stage over, and a
+  check nobody answered may have been overtaken by the code.
 
 The runner takes an adapter factory (`make_adapters(stage)`) rather than
 finished adapters and calls it once per stage it enters, so each planned

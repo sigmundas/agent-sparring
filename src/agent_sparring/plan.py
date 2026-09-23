@@ -166,6 +166,7 @@ from agent_sparring.acceptance import (
 )
 from agent_sparring.activity import ActivityEmitter
 from agent_sparring.deferred_gate import (
+    CHECKPOINT_PLAN_COMPLETION,
     DEFERRED_VERIFICATION_REQUIRED,
     CheckResult,
     DeferredAnswer,
@@ -206,7 +207,7 @@ from agent_sparring.review import (
     enter_review,
     run_independent_review,
 )
-from agent_sparring.human_gate import HumanCheck
+from agent_sparring.human_gate import HumanCheck, HumanGate
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import RecordedOutcome, read_recorded_outcome
 from agent_sparring.stage import (
@@ -2428,6 +2429,10 @@ def _reconcile_deferred(
             )
         _fold_deferral(raised, deferred)
 
+    carried = _carry_blocked_checks(stage, raised)
+    if carried is not None:
+        _fold_deferral(raised, carried)
+
     changed = False
     for deferred in raised:
         if state.record_deferred(DeferredObligation.from_gate(stage.stage_id, deferred)):
@@ -2471,6 +2476,81 @@ def _reconcile_deferred(
             )
     if changed:
         state.save(state_path)
+
+
+def _carry_blocked_checks(
+    stage: Stage, raised: list[DeferredHumanGate]
+) -> DeferredHumanGate | None:
+    """Keep a check a person could not perform from vanishing at acceptance.
+
+    ``Blocked`` resolves nothing -- that is what it means, on both sides of
+    the gate. So a check a person answered Blocked is still owed, and a
+    stage accepting with it neither answered nor deferred would waive it
+    silently. Nobody decided that; it is what falls out when a reviewer,
+    told that deferring is the way past a Blocked check, chooses READY and
+    then simply does not write the ``deferred_human_gate``. Observed on the
+    first run after that guidance shipped: three checks, two of them
+    answered Blocked twice, dropped by a READY that reasoned correctly about
+    every one of them.
+
+    The engine does not decide the reviewer's timing judgement here, and
+    this is not that. It is bookkeeping, and it is strictly conservative:
+    the obligation is kept, the plan cannot report complete until a person
+    answers it, and the rationale says plainly that the engine carried it
+    rather than pretending a reviewer weighed it.
+
+    Only checks with a recorded ``Blocked`` answer, and only ones no
+    deferral in ``raised`` already covers. A ``Fail`` is a result and a
+    reviewer may accept a stage over one with its reasons; a check nobody
+    answered at all may genuinely have been overtaken by the code. Neither
+    is a person saying "I tried and could not", which is the one fact this
+    refuses to lose.
+    """
+
+    recorded = read_recorded_outcome(stage)
+    gate = recorded.human_gate if recorded is not None else None
+    if gate is None or not gate.checks:
+        return None
+    try:
+        answers = parse_gate_answers(stage.read_notes())
+    except (StageError, OSError):
+        return None
+    already = {
+        check.id for deferred in raised for check in deferred.checks
+    }
+    stalled = [
+        history for history in stalled_checks(gate, answers) if history.check_id not in already
+    ]
+    if not stalled:
+        return None
+
+    by_id = {check.id: check for check in gate.checks}
+    checks = tuple(by_id[history.check_id] for history in stalled)
+    # Derived from what it carries, not minted fresh, because this runs on
+    # every pass over an accepted stage: a new instance each time would
+    # record the same obligation again under a new id, and ask a person the
+    # same thing twice.
+    digest = hashlib.sha256(
+        "\n".join([stage.stage_id, *(check.id for check in checks)]).encode("utf-8")
+    ).hexdigest()[:16]
+    return DeferredHumanGate(
+        gate=HumanGate(
+            category=gate.category,
+            title=f"Still owed from {gate.title}",
+            checks=checks,
+            instance_id=f"carried-{digest}",
+        ),
+        rationale=(
+            "Carried forward by the engine, not weighed by a reviewer: a person reported "
+            "they could not perform "
+            + ("this check" if len(checks) == 1 else "these checks")
+            + ", and the stage was accepted without answering or deferring "
+            + ("it" if len(checks) == 1 else "them")
+            + ". Blocked resolves nothing, so the verification is still owed and the plan "
+            "may not complete until it is answered."
+        ),
+        checkpoint=CHECKPOINT_PLAN_COMPLETION,
+    )
 
 
 def _fold_deferral(raised: list[DeferredHumanGate], deferred: DeferredHumanGate) -> None:
