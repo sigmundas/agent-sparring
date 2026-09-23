@@ -17,7 +17,9 @@ from pathlib import Path
 from agent_sparring.artifact_ownership import ownership_section
 from agent_sparring.config import CONTEXT_FILENAME, load_project_markdown
 from agent_sparring.deferred_gate import DeferredObligation
+from agent_sparring.gate_answers import check_histories, parse_gate_answers
 from agent_sparring.handoff import human_evidence_section
+from agent_sparring.sparring_exchange import read_recorded_outcome
 from agent_sparring.prompt_sections import (
     ROLE_SPARRER,
     AssembledPrompt,
@@ -87,6 +89,107 @@ def pending_deferred_section(
         "already recorded and nothing here needs to restate them.",
     ]
     return section("Human verification already owed", lines)
+
+
+def gate_answer_tally_section(stage: Stage) -> PromptSection | None:
+    """The engine's own tally of what has been answered, per check id.
+
+    The ``Human evidence`` section already carries the person's words. This
+    carries the fact those words do not state and a reviewer reading one
+    turn cannot see: **how many times it has now asked the same thing, and
+    which of its checks the person has reported they cannot do.**
+
+    That blind spot is a real failure, not a hypothetical. A reviewer with
+    no implementation defect to send back, holding acceptance checks a
+    person has twice answered ``Blocked``, has only NEEDS_YOU left under the
+    routing rules -- so it re-issues the same gate, every turn, forever. It
+    is not ignoring the answer; it cannot see that it is repeating itself.
+
+    Engine-authored and computed fresh, like the deferred ledger above: the
+    gate comes from the recorded verdict in sparring.md and the answers from
+    notes.md, so neither the reviewer nor the handoff can restate it
+    wrongly. Absent when this reviewer has no recorded gate, or when nothing
+    has been answered against it.
+    """
+
+    recorded = read_recorded_outcome(stage)
+    gate = recorded.human_gate if recorded is not None else None
+    if gate is None or not gate.checks:
+        return None
+    try:
+        notes = stage.read_notes()
+    except (StageError, OSError):
+        return None
+    answers = parse_gate_answers(notes)
+    histories = check_histories(answers)
+    answered = [(check, histories.get(check.id)) for check in gate.checks]
+    if not any(history is not None for _, history in answered):
+        return None
+
+    lines = [
+        "## What has already been answered",
+        "",
+        "Your last gate asked "
+        + (f"{len(gate.checks)} check(s)" if gate.instance_id is None else f"{len(gate.checks)} check(s) as gate `{gate.instance_id}`")
+        + ". This is the engine's tally of what a person has recorded against "
+        "those check ids, counted from notes.md rather than from anyone's "
+        "summary of it:",
+        "",
+    ]
+    for check, history in answered:
+        if history is None:
+            lines.append(f"- `{check.id}` — no answer recorded yet")
+            continue
+        asked = history.askings_answered
+        times = "once" if asked == 1 else f"{asked} times"
+        lines.append(
+            f"- `{check.id}` — latest answer **{history.latest.outcome.word}**, "
+            f"asked and answered {times}"
+        )
+    stalled = [history for _, history in answered if history is not None and history.stalled]
+    lines += ["", _BLOCKED_GUIDANCE if stalled else _ANSWERED_GUIDANCE]
+    return section("What has already been answered", lines)
+
+
+_ANSWERED_GUIDANCE = (
+    "Judge the candidate with these answers. Re-issuing a check the person "
+    "has already answered is legitimate when the answer did not settle the "
+    "question -- keep its id and say in `findings` what was insufficient -- "
+    "but a check they have answered well is finished, and listing it again "
+    "asks them to do work twice."
+)
+
+_BLOCKED_GUIDANCE = """\
+At least one of those checks is marked **Blocked**, which is not a result:
+the person is telling you they could not perform it. Asking it again in the
+same words cannot produce a different answer, and doing so every turn is
+how this run stops making progress while appearing to. Do not re-issue a
+Blocked check unless you have changed what it asks, or something it
+depended on has changed -- and if you do, say which, in `findings`.
+
+When a Blocked check is the only thing between this candidate and READY,
+these are your routes, and one of them applies:
+
+- The block is about **timing or environment** -- the candidate is not
+  frozen yet, the test backend does not exist yet, the device is not to
+  hand -- and you have found no implementation defect. Choose READY and put
+  those checks in `deferred_human_gate`, with a `rationale` saying what
+  later work does and does not depend on them. The engine keeps the
+  obligation in the run's durable state and refuses to report the plan
+  complete until a person answers it: deferring is not waiving, and it is
+  the designed way out of exactly this position. The one thing that rules
+  it out is later work in this plan depending on the answer.
+- The block means the work **cannot be verified because the implementation
+  is wrong, incomplete or not yet frozen in a form anyone can test**. That
+  is an implementation problem: SEND_BACK, and say what would make it
+  testable.
+- The check is genuinely one that must not be deferred (see "Deciding when
+  a human check has to happen"), and later work depends on its answer. Then
+  the run does stop here: keep it as NEEDS_YOU, and say plainly in
+  `findings` that you are holding the run for a check the person has
+  reported they cannot yet perform, and what has to change for them to be
+  able to. Do not pad that gate with the checks they have already answered.
+"""
 
 
 _VERDICT_INSTRUCTIONS = """\
@@ -241,6 +344,17 @@ irreversible or destructive action awaiting approval; production deployment
 or release authorization; a credential or security boundary; and anything
 the plan itself states must be approved by a human before proceeding. Those
 are NEEDS_YOU.
+
+One thing that sounds like the fourth but is not: a check the *plan* defines
+as part of this stage's acceptance is not thereby undeferrable. The plan
+saying "verify this before the stage is accepted" is a statement about what
+must be verified, not a boundary that continuing would cross, and the
+deferred ledger still refuses to let the plan complete until it is answered.
+So when such a check cannot be performed yet -- the person has answered it
+Blocked because the candidate is not frozen or the environment does not
+exist -- deferring it is available and is usually right. What rules it out
+is later work in this plan depending on the answer, not where the check was
+written down.
 
 ``deferred_human_gate`` has the same shape as ``human_gate``, plus two
 fields:
@@ -418,10 +532,16 @@ def assemble_sparring_prompt(
                     "recorded manual-check results, read live from the stage's notes.md. It is "
                     "current as of this turn and supersedes any copy of it inside the handoff "
                     "above. Judge the candidate with it: if it satisfies what you asked for, say "
-                    "so and route accordingly rather than asking for it again."
+                    "so and route accordingly rather than asking for it again. If it says they "
+                    "could not do what you asked, that is an answer too, and the section below "
+                    "says what to do with it."
                 ],
             )
         )
+
+    tally = gate_answer_tally_section(stage)
+    if tally is not None:
+        parts.append(tally)
 
     owed = pending_deferred_section(pending_deferred)
     if owed is not None:

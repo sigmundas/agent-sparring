@@ -80,6 +80,20 @@ asked about. If the sparrer then says SEND_BACK there *is* implementation
 work and the ordinary loop takes over from the stage agent; READY accepts
 and advances; NEEDS_YOU and ESCALATE leave the plan paused.
 
+An answer of ``Blocked`` -- the person reporting they could not perform the
+check -- resolves nothing, and a reviewer with no implementation defect to
+send back cannot make such a stage READY under its own rules. Left alone
+that is a treadmill: the same gate, re-issued every turn, each round costing
+a person real time. Two things break it. The reviewer's next prompt carries
+the engine's tally of what has already been answered and the routes out of a
+Blocked check (see
+:func:`~agent_sparring.sparring_prompt.gate_answer_tally_section`), the
+usual one being READY with the check moved to ``deferred_human_gate``, where
+the run's ledger still refuses to let the plan complete until it is
+answered. And :func:`_note_repeat_asking` stops the run rather than pause it
+again when a gate is wholly checks a person has already declined
+:data:`_MAX_ANSWERED_ASKINGS` times.
+
 That READY is where a human-gated stage differs from every other one, and
 the loop -- not this module -- is what closes the difference. A stage whose
 implementation was deliberately left uncommitted until a human verified it
@@ -161,6 +175,12 @@ from agent_sparring.deferred_gate import (
     DeferredVerificationRequired,
 )
 from agent_sparring.finalization import FinalizationError, pending_finalization
+from agent_sparring.gate_answers import (
+    is_repeat_asking,
+    parse_gate_answers,
+    repeat_asking_count,
+    stalled_checks,
+)
 from agent_sparring.git_context import GitContextError, is_ignored, resolve_commit
 from agent_sparring.loop import (
     DEFAULT_MAX_SEND_BACK_CYCLES,
@@ -2253,6 +2273,93 @@ def _pause(state: PlanRunState, state_path: Path) -> None:
     state.save(state_path)
 
 
+#: How many times a person may answer the *same* wholly-unperformable gate
+#: before the run refuses to stop for it again. Two, so the reviewer gets one
+#: full turn with the engine's tally in front of it (see
+#: :func:`~agent_sparring.sparring_prompt.gate_answer_tally_section`) to
+#: choose a different route, and the third asking stops the run instead of
+#: the person.
+_MAX_ANSWERED_ASKINGS = 2
+
+
+def _note_repeat_asking(
+    stage: Stage, activity: ActivityEmitter, *, report: Reporter
+) -> str | None:
+    """Notice a gate that asks only what a person has said they cannot do.
+
+    A reviewer holding unsatisfied acceptance checks, with no implementation
+    defect to send back, has only NEEDS_YOU left -- so it re-issues the same
+    gate, the person answers ``Blocked`` again, and the run treadmills. Every
+    iteration needs a human, so nothing spins on its own; what it costs is
+    the person's time, repeatedly, with no route out visible from inside any
+    single turn.
+
+    Two different things, deliberately:
+
+    - Any re-asked ``Blocked`` check is *reported*, because the person is
+      being asked again for something they have already declined once and
+      should be told the engine can see that.
+    - The run only *stops* when the gate is wholly such checks and they have
+      been answered :data:`_MAX_ANSWERED_ASKINGS` times. A gate that adds a
+      check, or re-asks one the person failed rather than could not attempt,
+      is a reviewer making progress, and stopping it would be stopping the
+      work.
+
+    Returns a message when the run must stop instead of pausing for the same
+    thing again, and ``None`` otherwise.
+    """
+
+    recorded = read_recorded_outcome(stage)
+    gate = recorded.human_gate if recorded is not None else None
+    if gate is None:
+        return None
+    try:
+        answers = parse_gate_answers(stage.read_notes())
+    except (StageError, OSError):
+        return None
+    stalled = stalled_checks(gate, answers)
+    if not stalled:
+        return None
+
+    answered = repeat_asking_count(gate, answers)
+    named = ", ".join(f"`{history.check_id}`" for history in stalled)
+    wholly = is_repeat_asking(gate, answers)
+    activity.emit(
+        "gate.repeated",
+        summary=(
+            f"asking {answered + 1} of the same blocked checks"
+            if wholly
+            else f"{len(stalled)} of {len(gate.checks)} checks already answered Blocked"
+        ),
+    )
+    if not (wholly and answered >= _MAX_ANSWERED_ASKINGS):
+        report(
+            f"stage {stage.stage_id}: this gate re-asks {named}, which you have already "
+            "answered Blocked. The reviewer now has that tally in its prompt, along with "
+            "the routes out of it."
+            + (
+                " If it asks only these again, the run will stop rather than ask you a "
+                "third time."
+                if wholly
+                else ""
+            )
+        )
+        return None
+    return (
+        f"plan stopped at stage {stage.stage_id!r}: its reviewer has now asked the same "
+        f"checks {answered + 1} times ({named}), and every earlier asking was answered "
+        "Blocked -- the person reported they could not perform them. Asking again cannot "
+        "resolve them, so the run stops here rather than pausing for the same question "
+        "once more. Nothing was discarded: the verdict is recorded in sparring.md and the "
+        "answers in notes.md. Three ways forward, all of which change what the next turn "
+        "sees: make the checks performable (freeze the candidate, provide the environment) "
+        "and answer them; answer them Fail with what you did observe, which is a result a "
+        "reviewer can act on; or record evidence saying the checks must be deferred, which "
+        "lets the reviewer accept the stage with the verification still owed in the run's "
+        "ledger."
+    )
+
+
 def _reconcile_deferred(
     state: PlanRunState,
     state_path: Path,
@@ -2745,6 +2852,15 @@ def _drive(
                             else ""
                         )
                     )
+                    stuck = _note_repeat_asking(stage, activity, report=report)
+                    if stuck is not None:
+                        raise _fail(
+                            state,
+                            state_path,
+                            activity,
+                            why="gate re-asked what a person cannot do",
+                            message=stuck,
+                        )
                     return PlanRunResult(
                         status=PlanRunStatus.PAUSED,
                         plan=state.plan,
@@ -2914,6 +3030,15 @@ def _drive(
                         report(
                             f"stage {stage.stage_id}: {loop_result.outcome.value}; plan paused"
                         )
+                        stuck = _note_repeat_asking(stage, activity, report=report)
+                        if stuck is not None:
+                            raise _fail(
+                                state,
+                                state_path,
+                                activity,
+                                why="gate re-asked what a person cannot do",
+                                message=stuck,
+                            )
                         return PlanRunResult(
                             status=PlanRunStatus.PAUSED,
                             plan=state.plan,

@@ -494,7 +494,8 @@ Actors and events:
     loop     loop.started, loop.send_back, loop.stopped, loop.runaway
     gate     candidate.frozen, candidate.accepted, gate.refused
     plan     plan.stage.entered, plan.stage.accepted, plan.paused,
-             plan.failed, plan.completed, plan.evidence_recorded
+             plan.failed, plan.completed, plan.evidence_recorded,
+             gate.repeated
 
 `plan` lines are written by the plan runner into whichever planned stage's
 log is current, in the order things happened: `plan.paused` only for a
@@ -757,6 +758,43 @@ timing judgement.
 A stage accepted with an open obligation is *accepted and still owes a check*,
 and both halves are reported. Acceptance copy never claims everything was
 verified when something was deliberately deferred.
+
+### A gate a person cannot answer
+
+`blocked` resolving nothing has a consequence on the immediate side too, and
+it produced a real deadlock before it was closed. A reviewer that finds no
+implementation defect, holding acceptance checks a person has answered
+`Blocked`, has no legal action but `NEEDS_YOU` — `READY` is barred by the
+unsatisfied checks and `deferred_human_gate` is legal only with `READY`. So it
+re-issues the same gate. The person answers `Blocked` again, for the same
+structural reason ("I can test this once the candidate is frozen"), and the
+exchange repeats. Nothing spun on its own; every round cost a person real time
+instead.
+
+Three things close it, and the split matters:
+
+- **Answers are read as data.** `agent_sparring.gate_answers` parses the
+  `Pass|Fail|Blocked — … · check … · gate …` lines a UI writes under
+  `## Human evidence` back into results per check id and gate instance. It is
+  a reader of prose, not a format: `resume-plan --evidence` still takes free
+  text, nothing unparseable is rejected, and no outcome is ever inferred from
+  a line's wording.
+- **The reviewer is told what it cannot see from one turn.** The prompt
+  carries the engine's own tally — latest outcome per check, and how many
+  askings a person has answered — plus the routes out of a `Blocked` check.
+  The usual one is `READY` with the check moved to `deferred_human_gate`: the
+  ledger still refuses to complete the plan, so nothing is waived. The
+  never-deferrable list is narrowed by one clarification, because it was being
+  read as a prohibition it never was: a check the *plan* defines as part of a
+  stage's acceptance is not thereby undeferrable. What rules deferral out is
+  later work depending on the answer.
+- **The run stops instead of the person.** A gate that is *wholly* checks
+  already answered `Blocked` twice stops the run (`plan.failed`, still
+  resumable) rather than pausing for the same question a third time; the
+  message names the routes that change what the next turn sees. A gate that
+  merely carries such a check alongside ones the reviewer is still working is
+  reported, never stopped — that reviewer is making progress, and stopping it
+  would stop the work. Both emit `gate.repeated`.
 
 The runner takes an adapter factory (`make_adapters(stage)`) rather than
 finished adapters and calls it once per stage it enters, so each planned
