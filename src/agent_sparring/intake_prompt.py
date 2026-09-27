@@ -192,11 +192,23 @@ every stage that needs them. Stages must still be assembled from exact
 source ranges; a refined stage may take part of a section plus a narrowing
 `intake_scope`.
 
-If you propose a substantive change to the plan's content, put the complete
-revised plan document in `amended_plan`. The engine shows the person a diff
-against the source; nothing is applied to the source plan. The manifest
-executes the source text as you sliced it, never the amendment, so do not
-rely on amended text in any stage. Use null when no amendment is needed.""",
+Refine mode exists to hand the person a concrete fix, not only a diagnosis.
+Whenever a blocking finding could be resolved by changing the plan's text --
+a stage that must be split by repository, an approval that must move
+between an evidence stage and an implementation stage, acceptance criteria
+that mix candidate work with a production outcome -- you MUST put the
+complete revised plan document in `amended_plan`, with the new stage
+headings, labels, repositories, gates and acceptance criteria written out.
+Change only what your findings justify; keep every requirement, decision
+and constraint of the source (move text, do not drop or soften it), and
+keep the document's own style. A person reviews it as a diff against the
+source; nothing is applied to the source plan.
+
+The stages and run slices you return still describe the SOURCE plan as it
+stands (the manifest executes the source text as you sliced it, never the
+amendment), so do not rely on amended text in any stage. Once the person
+adopts the amendment, running intake again interprets the amended plan.
+Use null only when no change to the plan's text is needed.""",
 }
 
 
