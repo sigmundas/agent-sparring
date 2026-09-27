@@ -82,9 +82,9 @@ plan below.
   to be implemented or reviewed correctly without the rest of the document --
   principles, invariants, approved decisions, definitions, starting-point
   facts. Give each an id. Attach a context block to EVERY stage whose work it
-  constrains (`context_ids`); one block may serve many stages. Leaving a
-  global constraint out of a stage that it governs is the most important
-  mistake to avoid.
+  constrains (`context_ids`); one block may serve many stages. A block no
+  stage attaches counts as unaccounted text. Leaving a global constraint out
+  of a stage that it governs is the most important mistake to avoid.
 - `runs`: ordered run slices. Each has an id, its `primary_repository` (one
   of the repository names listed below, or a name the plan uses), its
   `expected_branch`, a rationale, and its ordered `stages`. The expected
@@ -106,8 +106,11 @@ plan below.
   activation, production data runs, owner go-aheads, security sign-offs that
   gate later work. `after_stage`: the stage it follows (or null).
   `blocks_stages`: labels of executable stages that must not start until the
-  gate is satisfied (empty if nothing executable depends on it). A gate that
-  blocks stages must separate runs, as described above.
+  gate is satisfied (empty if nothing executable depends on it). Gates sit
+  only at run boundaries: `after_stage` must be the LAST stage of its run,
+  and every blocked stage must be the FIRST stage of a later run. The engine
+  refuses anything else, including a gate that "blocks nothing" but sits
+  between two stages of one run.
 - `excluded`: text that is neither stage text, context nor a gate, with the
   reason (history, references, open questions outside scope, and so on).
 - `findings`: your plan-quality review (see below).

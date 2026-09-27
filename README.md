@@ -810,8 +810,9 @@ mode, `amendment.diff`. None of these is in manifest format.
   boundary explicit or defer to a gate, and yields to the plan text. A
   substantive change goes in refine mode's proposed amendment, which is
   shown as a diff and never applied.
-- **Source coverage.** Every non-blank line of the plan must be stage text,
-  context, a gate, or an exclusion with a reason. Anything else is a
+- **Source coverage.** Every non-blank line of the plan (horizontal rules
+  aside) must be stage text, context that at least one stage attaches, a
+  gate, or an exclusion with a reason. Anything else is a
   blocking finding, so a plan-wide constraint cannot silently drop out of
   the briefs.
 - **Run slices.** A manifest runs in one primary repository on one branch;
@@ -821,7 +822,9 @@ mode, `amendment.diff`. None of these is in manifest format.
   project.
 - **Gates are boundaries.** The runtime cannot wait for a deployment or a
   go-ahead between two stages of one run, so a gate that blocks later work
-  must fall between slices — a gate inside a slice is a blocking finding.
+  must fall between slices: a gate may follow only a slice's last stage, and
+  may block only the first stage of a slice. Anything else is a blocking
+  finding.
   Approving a slice requires `--confirm-prerequisite` for every gate it
   waits for and every earlier slice it depends on; the confirmations are
   recorded in `approval.json`.

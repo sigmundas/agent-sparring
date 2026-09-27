@@ -582,8 +582,11 @@ def check_interpretation(
         for r in ranges:
             covered.update(range(r.start, r.end + 1))
 
-    # Context blocks.
+    # Context blocks. Their text counts as accounted for only once a stage
+    # attaches them (below): a block no brief carries is text that has
+    # silently dropped out, which is exactly what coverage exists to catch.
     context_ids: set[str] = set()
+    context_ranges: dict[str, list[LineRange]] = {}
     for block in interpretation.context:
         if block.id in context_ids:
             add("duplicate_id", f"context id {block.id!r} is declared twice")
@@ -591,22 +594,31 @@ def check_interpretation(
         good = valid(block.ranges, f"context block {block.id!r}")
         if not good:
             add("empty_reference", f"context block {block.id!r} cites no source text")
-        cover(good)
+        context_ranges.setdefault(block.id, []).extend(good)
 
-    # Run slices and stages.
+    # Run slices and stages. Ids and labels must also be unique once
+    # slugged: they name brief files, run directories and stage ids.
     if not interpretation.runs:
         add("no_stages", "the interpretation defines no run slice and no stage")
     run_ids: set[str] = set()
+    run_slugs: set[str] = set()
+    label_slugs: set[str] = set()
     position: dict[str, tuple[int, int]] = {}
     for run_index, run in enumerate(interpretation.runs):
-        if run.id in run_ids:
-            add("duplicate_id", f"run slice id {run.id!r} is declared twice")
+        if run.id in run_ids or _slug(run.id) in run_slugs:
+            add("duplicate_id", f"run slice id {run.id!r} is not unique (ids are compared as slugs)")
         run_ids.add(run.id)
+        run_slugs.add(_slug(run.id))
         if not run.stages:
             add("empty_run", f"run slice {run.id!r} has no stages")
         for stage_index, stage in enumerate(run.stages):
-            if stage.label in position:
-                add("duplicate_id", f"stage label {stage.label!r} is used twice", stages=[stage.label])
+            if stage.label in position or _slug(stage.label) in label_slugs:
+                add(
+                    "duplicate_id",
+                    f"stage label {stage.label!r} is not unique (labels are compared as slugs)",
+                    stages=[stage.label],
+                )
+            label_slugs.add(_slug(stage.label))
             position.setdefault(stage.label, (run_index, stage_index))
 
     for run_index, stage_index, run, stage in interpretation.stages():
@@ -637,7 +649,23 @@ def check_interpretation(
                     stages=[stage.label, dependency],
                 )
 
-    # Gates: a gate that blocks executable work must separate run slices.
+    attached = {cid for _, _, _, stage in interpretation.stages() for cid in stage.context_ids}
+    for block in interpretation.context:
+        if block.id in attached:
+            cover(context_ranges.get(block.id, ()))
+        else:
+            add(
+                "unused_context",
+                f"context block {block.id!r} is attached to no stage, so its text reaches no "
+                "brief; attach it to the stages it constrains, or exclude it with a reason",
+                ranges=block.ranges,
+            )
+
+    # Gates may only sit at run-slice boundaries. The runtime cannot wait for
+    # anything between two stages of one run, so a gate after a stage that is
+    # not its slice's last one would let the next stage run straight past it
+    # -- whatever the agent said it blocks. A gate that blocks a stage must
+    # come before that stage's slice starts, and is confirmed at approval.
     gate_ids: set[str] = set()
     for gate in interpretation.gates:
         owner = f"gate {gate.id!r}"
@@ -651,29 +679,42 @@ def check_interpretation(
         after = position.get(gate.after_stage) if gate.after_stage else None
         if gate.after_stage and after is None:
             add("unknown_reference", f"{owner} follows unknown stage {gate.after_stage!r}")
+        if after is not None:
+            slice_ = interpretation.runs[after[0]]
+            if after[1] != len(slice_.stages) - 1:
+                following = slice_.stages[after[1] + 1].label
+                add(
+                    "gate_inside_run",
+                    f"{owner} ({gate.kind}) follows stage {gate.after_stage}, but stage {following} "
+                    f"runs straight after it in run slice {slice_.id!r}. The runtime cannot wait "
+                    "for a gate between two stages of one run; end the slice at "
+                    f"{gate.after_stage} and start a new one after the gate",
+                    stages=[gate.after_stage or "", following],
+                    ranges=good,
+                )
         for blocked in gate.blocks_stages:
             where = position.get(blocked)
             if where is None:
                 add("unknown_reference", f"{owner} blocks unknown stage {blocked!r}")
                 continue
-            if after is None:
-                continue
-            if where[0] == after[0]:
+            if after is not None and where[0] <= after[0]:
                 add(
-                    "gate_inside_run",
-                    f"{owner} ({gate.kind}) must be satisfied after stage {gate.after_stage} and "
-                    f"before stage {blocked}, but both are in run slice "
-                    f"{interpretation.runs[where[0]].id!r}. The runtime cannot wait for it "
-                    "between two stages of one run; the blocked stage belongs in a later run slice",
+                    "dependency_not_satisfied",
+                    f"{owner} follows stage {gate.after_stage} but blocks stage {blocked}, which "
+                    "does not run in a later run slice",
                     stages=[gate.after_stage or "", blocked],
                     ranges=good,
                 )
-            elif where[0] < after[0]:
+            elif where[1] != 0:
+                first = interpretation.runs[where[0]].stages[0].label
                 add(
-                    "dependency_not_satisfied",
-                    f"{owner} blocks stage {blocked}, which runs in an earlier run slice than "
-                    f"the stage {gate.after_stage} it follows",
-                    stages=[gate.after_stage or "", blocked],
+                    "gate_inside_run",
+                    f"{owner} ({gate.kind}) blocks stage {blocked}, which is not the first stage "
+                    f"of its run slice (stage {first} is). Either the gate really comes before "
+                    f"{first}, or the slice must start at {blocked}; state `after_stage` and put "
+                    "the blocked stage first in a later slice",
+                    stages=[blocked],
+                    ranges=good,
                 )
 
     for exclusion in interpretation.excluded:
@@ -799,7 +840,8 @@ def render_brief(
     own ranges, verbatim; then the labelled intake note, if any. Line
     numbers are cited so a reviewer can find every excerpt in the plan.
     The brief's own sections are level-1 headings so that the quoted
-    plan's headings, which are never rewritten, nest beneath them.
+    plan's section headings, which are never rewritten, nest beneath them
+    (a quoted level-1 document title sits beside them).
     """
 
     blocks = {block.id: block for block in interpretation.context}
@@ -1274,6 +1316,12 @@ def approve_plan(
     source snapshot and interpretation the report was rendered from, with
     the same deterministic checks, so it holds exactly what the person
     reviewed. It is then validated with the engine's own manifest parser.
+
+    The digests in ``intake.json`` detect accidental or partial edits of the
+    intake directory, not a deliberate rewrite of all of it: the directory
+    is not a trust anchor. What does not depend on it is checked against
+    something that is -- the source plan on disk, and the amendment, which
+    is derived from the interpretation rather than read from the record.
     """
 
     intake_dir = Path(intake_dir)
@@ -1281,6 +1329,8 @@ def approve_plan(
     if record.get("version") != INTAKE_VERSION:
         raise IntakeError(f"unsupported intake record version {record.get('version')!r}")
     mode = str(record.get("mode"))
+    if mode not in MODES:
+        raise IntakeError(f"intake.json records an unknown mode {mode!r}; run prepare-plan again")
 
     snapshot = _read_text(intake_dir / "source.md")
     if sha256_text(snapshot) != record.get("source_digest"):
@@ -1299,13 +1349,17 @@ def approve_plan(
     source = SourcePlan(label=str(record["plan_label"]), text=snapshot)
     interpretation = parse_interpretation(interpretation_text)
     findings = all_findings(interpretation, source, mode=mode)
+    # Derived from the interpretation itself, never taken from intake.json.
+    amendment_proposed = (
+        interpretation.amended_plan is not None and interpretation.amended_plan != source.text
+    )
     blocking = [f for f in findings if f.blocking]
     if blocking:
         listed = "\n".join(f"- {f.code}: {f.message}" for f in blocking)
         raise IntakeError(f"approval refused: {len(blocking)} blocking finding(s)\n{listed}")
     if interpretation.verdict == VERDICT_CANNOT_INTERPRET:
         raise IntakeError("approval refused: the intake agent could not interpret the plan faithfully")
-    if record.get("amendment_proposed") and not without_amendment:
+    if amendment_proposed and not without_amendment:
         raise IntakeError(
             "intake proposed an amendment to the source plan (amendment.diff). Either apply it "
             "to the plan and run prepare-plan again, or pass --without-amendment to approve the "
@@ -1358,10 +1412,12 @@ def approve_plan(
         )
 
     run_keys = record.get("run_keys") or {}
-    run_key = run_keys.get(run_id)
-    if not isinstance(run_key, str) or not run_key:
-        raise IntakeError(f"intake.json records no run key for run slice {run_id!r}")
-    briefs = _render_briefs(source, interpretation, {run_id: run_key, **run_keys})
+    if not isinstance(run_keys, Mapping) or any(
+        not isinstance(run_keys.get(slice_id), str) or not run_keys.get(slice_id) for slice_id in runs
+    ):
+        raise IntakeError("intake.json does not record a run key for every run slice; run prepare-plan again")
+    run_key = run_keys[run_id]
+    briefs = _render_briefs(source, interpretation, run_keys)
     recorded_briefs = record.get("briefs") or {}
 
     stages = []
@@ -1413,6 +1469,17 @@ def approve_plan(
                 f"run slice {run_id!r} was already approved with a different manifest "
                 f"({manifest_path}); an approval is not rewritten. Run prepare-plan again"
             )
+        # Branch and confirmations are not in the manifest, so an identical
+        # manifest does not make a repeat approval identical: it must also
+        # agree with what was recorded, or it would print a run-plan command
+        # the approval never covered.
+        previous = _read_json(run_dir / "approval.json")
+        if previous.get("expected_branch") != branch or previous.get("confirmed_prerequisites") != sorted(confirmed):
+            raise IntakeError(
+                f"run slice {run_id!r} was already approved for branch "
+                f"{previous.get('expected_branch')!r} with confirmations "
+                f"{previous.get('confirmed_prerequisites')}; an approval is not rewritten"
+            )
         return Approval(manifest_path=manifest_path, run_key=run_key, expected_branch=branch, manifest_digest=digest, created=False)
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1429,7 +1496,7 @@ def approve_plan(
         "interpretation_digest": record.get("interpretation_digest"),
         "manifest_digest": digest,
         "confirmed_prerequisites": sorted(confirmed),
-        "without_amendment": bool(without_amendment and record.get("amendment_proposed")),
+        "without_amendment": bool(without_amendment and amendment_proposed),
     }
     _write(run_dir / "approval.json", json.dumps(approval, indent=2) + "\n")
     return Approval(manifest_path=manifest_path, run_key=run_key, expected_branch=branch, manifest_digest=digest, created=True)

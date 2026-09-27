@@ -228,6 +228,37 @@ class CheckTests(unittest.TestCase):
         payload["runs"][0]["stages"].extend(web["stages"])
         self.assertIn("gate_inside_run", codes(self.check(payload)))
 
+    def test_a_gate_mid_slice_blocks_even_if_it_claims_to_block_nothing(self):
+        payload = good_interpretation()
+        payload["gates"][0]["after_stage"] = "0"
+        payload["gates"][0]["blocks_stages"] = []
+        findings = self.check(payload)
+        self.assertEqual(codes(findings), ["gate_inside_run"])
+        self.assertIn("stage 1A runs straight after it", findings[0].message)
+
+    def test_a_gate_without_after_stage_may_only_block_a_slice_start(self):
+        payload = good_interpretation()
+        payload["gates"][0]["after_stage"] = None
+        payload["gates"][0]["blocks_stages"] = ["1A"]
+        self.assertEqual(codes(self.check(payload)), ["gate_inside_run"])
+        payload["gates"][0]["blocks_stages"] = ["1B"]
+        self.assertEqual(codes(self.check(payload)), [])
+
+    def test_a_context_block_no_stage_attaches_is_not_coverage(self):
+        payload = good_interpretation()
+        for run in payload["runs"]:
+            for s in run["stages"]:
+                s["context_ids"] = [c for c in s["context_ids"] if c != "principles"]
+        self.assertEqual(codes(self.check(payload)), ["unused_context", "uncovered_source"])
+
+    def test_ids_and_labels_must_be_unique_as_slugs(self):
+        payload = good_interpretation()
+        payload["runs"][1]["id"] = "App"
+        payload["runs"][1]["stages"][0]["label"] = "1a"
+        payload["runs"][1]["stages"][0]["depends_on"] = []
+        payload["gates"][0]["blocks_stages"] = ["1a"]
+        self.assertEqual(codes(self.check(payload)), ["duplicate_id", "duplicate_id"])
+
     def test_a_dependency_on_a_later_stage_blocks(self):
         payload = good_interpretation()
         payload["runs"][0]["stages"][0]["depends_on"] = ["1A"]
@@ -464,6 +495,27 @@ class ApproveTests(_Repo):
         with self.assertRaisesRegex(IntakeError, "--without-amendment"):
             self.approve(result.directory)
         self.assertTrue(self.approve(result.directory, without_amendment=True).created)
+
+    def test_a_repeat_approval_must_match_the_recorded_branch(self):
+        result = self.prepare()
+        self.approve(result.directory)
+        with self.assertRaisesRegex(IntakeError, "already approved for branch 'feature/widgets'"):
+            self.approve(result.directory, expected_branch="feature/other")
+
+    def test_the_amendment_gate_does_not_trust_intake_json(self):
+        payload = good_interpretation()
+        payload["amended_plan"] = PLAN + "\nMore.\n"
+        result = self.prepare(payload, mode="refine")
+        path = result.directory / "intake.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["amendment_proposed"] = False
+        path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaisesRegex(IntakeError, "--without-amendment"):
+            self.approve(result.directory)
+        record["mode"] = "anything"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaisesRegex(IntakeError, "unknown mode"):
+            self.approve(result.directory)
 
     def test_siblings_need_an_explicit_path_and_branch(self):
         payload = good_interpretation()
