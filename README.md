@@ -863,14 +863,20 @@ provider runs the engine refuses unless the manifest's exact bytes (not
 merely an equivalent serialization) and semantic digest are the approved
 ones; the envelope's intake, slice and run key match; it is still in the
 intake it was approved in; `intake.json`, `interpretation.json`,
-`source.md` and the source plan on disk are unchanged since approval; and a
-fresh run uses the approved run key and branch, from the approved
-worktree, at the approved starting commit. The stages executed are parsed
-from the bytes that were verified. The run records source kind
-`intake-manifest` and a digest that covers the approval, and resume,
-acceptance and advancement re-run the same verification (but not the
-starting-commit check, so the run's own accepted commits are normal
-progress). A plain manifest or Markdown plan whose run key or stage ids an
+`source.md` and the source plan on disk are unchanged since approval; the
+run is in the approved primary worktree (same canonical path and git
+directory, so another worktree or clone is refused) on the approved branch;
+and a fresh run uses the approved run key with **every** repository the
+approval recorded -- context and sibling ones included -- still the same
+repository on the same branch at the commit it was approved at. The stages
+executed are parsed from the bytes that were verified. The run records
+source kind `intake-manifest` and a digest that covers the approval;
+resume and `reset-stage` repeat the worktree and branch check, and resume,
+acceptance and advancement re-run the input verification -- but none of
+them compares commits, so the run's own accepted work is normal progress.
+`report.md` is compared at approval and not afterwards: it is the view the
+person approved from, not an execution input, so a later edit is inert
+(making it a protected review artifact is Stage C). A plain manifest or Markdown plan whose run key or stage ids an
 intake minted is refused, so the inner manifest cannot be re-run
 unapproved.
 

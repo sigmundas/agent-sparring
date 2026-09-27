@@ -31,9 +31,15 @@ What that still guarantees:
   interpretation, the source snapshot and the source plan on disk are all
   still what the person approved. The stages it returns are parsed from
   the very bytes it verified.
-- A fresh run of it starts only with the approved run key, branch,
-  repository and starting commit (:meth:`IntakeManifestSource.
-  bind_fresh_run`).
+- It runs only from the approved primary worktree on the approved branch,
+  on start and on every continuation; a fresh run additionally needs the
+  approved run key and every recorded repository at the commit it was
+  approved at (:meth:`IntakeManifestSource.verify_run_context`).
+- ``report.md`` is not rechecked once a slice is approved: it is the view
+  the person approved from (approval compared it), not an input to
+  execution, so editing it afterwards is inert. Making the report itself
+  a protected, re-verifiable review artifact belongs to review-usability
+  work (Stage C of the plan).
 - The run is pinned to the approval: its recorded ``source`` kind is
   :data:`SOURCE_KIND` and its recorded digest covers the approval's bytes,
   so resume, acceptance and advancement -- which re-read the source and
@@ -167,6 +173,12 @@ class IntakeApproval:
     def starting(self) -> Mapping[str, Any]:
         return self.payload["starting_snapshot"]
 
+    @property
+    def at_approval(self) -> Mapping[str, Mapping[str, Any]]:
+        """Every inspected repository as it was when the slice was approved."""
+
+        return self.payload["repositories"]["at_approval"]
+
 
 _APPROVAL_STRINGS = (
     "decision",
@@ -217,6 +229,14 @@ def parse_approval(raw: bytes, path: Path) -> IntakeApproval:
         for k in ("path", "git_common_dir", "branch", "head")
     ):
         raise IntakeApprovalError(f"approval {path} has no valid 'starting_snapshot'")
+    repositories = payload.get("repositories")
+    at_approval = repositories.get("at_approval") if isinstance(repositories, dict) else None
+    if not isinstance(at_approval, dict) or not at_approval or not all(
+        isinstance(seen, dict)
+        and all(isinstance(seen.get(k), str) and seen.get(k) for k in ("path", "git_common_dir", "branch", "head"))
+        for seen in at_approval.values()
+    ):
+        raise IntakeApprovalError(f"approval {path} has no valid 'repositories.at_approval'")
     return IntakeApproval(path=Path(path), raw=raw, payload=payload)
 
 
@@ -262,10 +282,8 @@ class IntakeManifestSource:
     def bind_fresh_run(self, repo_root: Path, *, run_key: str | None, expected_branch: str) -> str:
         """The run key a fresh run of this slice must use, or refuse.
 
-        A fresh run is the only point the approved *starting* repository
-        state is compared: once the run is under way, its own accepted
-        commits move HEAD and the ordinary candidate and branch guards take
-        over.
+        Everything :meth:`verify_run_context` checks for a fresh run, plus
+        the run key itself.
         """
 
         approval = self.approval
@@ -274,32 +292,73 @@ class IntakeManifestSource:
                 f"run slice {approval.field('run_id')!r} was approved as run {approval.run_key}, "
                 f"not {run_key}; run it with --run-key {approval.run_key}"
             )
+        self.verify_run_context(repo_root, expected_branch=expected_branch, fresh=True)
+        return approval.run_key
+
+    def verify_run_context(self, repo_root: Path, *, expected_branch: str, fresh: bool) -> None:
+        """Refuse unless this slice is being run where, and as, it was approved.
+
+        Always: the approved branch, from the approved primary worktree (same
+        canonical path and git directory, so another worktree or clone of
+        the repository is refused), which is on that branch.
+
+        ``fresh`` -- a run that has not started -- additionally requires
+        every repository the approval recorded, context and sibling ones
+        included, to be the same repository on the same branch at the same
+        commit it was approved at. A continuation does not compare commits:
+        the run's own accepted work moves HEAD, and from then on the
+        ordinary candidate and branch guards govern.
+        """
+
+        approval = self.approval
+        run_id = approval.field("run_id")
         if expected_branch != approval.expected_branch:
             raise IntakeApprovalError(
-                f"run slice {approval.field('run_id')!r} was approved for branch "
-                f"{approval.expected_branch!r}, not {expected_branch!r}; a run argument does "
-                "not replace the approved branch"
+                f"run slice {run_id!r} was approved for branch {approval.expected_branch!r}, not "
+                f"{expected_branch!r}; a run argument does not replace the approved branch"
             )
         starting = approval.starting
         try:
             path, common = repository_identity(Path(repo_root))
             branch = current_branch(Path(repo_root))
-            head = resolve_commit(Path(repo_root), "HEAD", label="HEAD")
         except GitContextError as exc:
             raise IntakeApprovalError(f"cannot inspect {repo_root}: {exc}") from exc
         if (path, common) != (starting["path"], starting["git_common_dir"]):
             raise IntakeApprovalError(
-                f"run slice {approval.field('run_id')!r} was approved in {starting['path']} "
-                f"(git directory {starting['git_common_dir']}), not {path} (git directory "
-                f"{common}); run it from the repository that was approved"
+                f"run slice {run_id!r} was approved in {starting['path']} (git directory "
+                f"{starting['git_common_dir']}), not {path} (git directory {common}); run it "
+                "from the repository that was approved"
             )
-        if branch != starting["branch"] or head != starting["head"]:
+        if branch != approval.expected_branch:
             raise IntakeApprovalError(
-                f"{path} moved since approval: approved at {starting['branch']}@"
-                f"{starting['head'][:12]}, now {branch}@{head[:12]}. The approval describes the "
-                "repository as it was; run prepare-plan and approve-plan again for this state"
+                f"{path} is on {branch!r}, but run slice {run_id!r} runs on "
+                f"{approval.expected_branch!r}"
             )
-        return approval.run_key
+        if not fresh:
+            return
+        moved = []
+        for name, seen in sorted(approval.at_approval.items()):
+            try:
+                now_path, now_common = repository_identity(Path(seen["path"]))
+                now_branch = current_branch(Path(seen["path"]))
+                now_head = resolve_commit(Path(seen["path"]), "HEAD", label="HEAD")
+            except GitContextError as exc:
+                moved.append(f"{name}: cannot inspect {seen['path']}: {exc}")
+                continue
+            if (now_path, now_common) != (seen["path"], seen["git_common_dir"]):
+                moved.append(f"{name}: {seen['path']} is now a different repository")
+            elif (now_branch, now_head) != (seen["branch"], seen["head"]):
+                moved.append(
+                    f"{name}: approved at {seen['branch']}@{seen['head'][:12]}, now "
+                    f"{now_branch}@{now_head[:12]}"
+                )
+        if moved:
+            raise IntakeApprovalError(
+                f"repositories moved since run slice {run_id!r} was approved:\n- "
+                + "\n- ".join(moved)
+                + "\nThe approval describes them as they were; run prepare-plan and approve-plan "
+                "again for this state"
+            )
 
 
 def load_intake_manifest(path: Path, raw: bytes | None = None) -> IntakeManifestSource:

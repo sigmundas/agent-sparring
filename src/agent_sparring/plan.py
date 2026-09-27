@@ -1549,6 +1549,15 @@ def resume_plan(
             f"not a {source.kind} one; refusing to resume the same run from a different kind "
             "of input, which would describe different execution content"
         )
+    verify_run_context = getattr(source, "verify_run_context", None)
+    if callable(verify_run_context):
+        # A sealed intake run continues only from the worktree it was
+        # approved in, on its branch. Not against the starting commit: the
+        # run's own accepted work has moved HEAD since.
+        try:
+            verify_run_context(Path(repo_root), expected_branch=expected_branch, fresh=False)
+        except ManifestError as exc:
+            raise PlanError(str(exc)) from exc
     if isinstance(source, MarkdownPlanSource):
         # The stage ids this resume works on are the *recorded run's*, never
         # the ones the document would generate on its own. That is the whole

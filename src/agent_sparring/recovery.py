@@ -89,6 +89,7 @@ from agent_sparring.git_context import (
     is_full_sha,
     resolve_commit,
 )
+from agent_sparring.manifest import ManifestError
 from agent_sparring.plan_model import PlanSource, PlannedStage
 from agent_sparring.stage import (
     STAGES_DIRNAME,
@@ -630,6 +631,13 @@ def reset_stage(
             f"{run_state.expected_branch!r}, not {expected_branch!r}; refusing to reset a "
             "stage of it for a different branch"
         )
+    verify_run_context = getattr(source, "verify_run_context", None)
+    if callable(verify_run_context):
+        # A sealed intake run continues only from its approved worktree.
+        try:
+            verify_run_context(Path(repo_root), expected_branch=expected_branch, fresh=False)
+        except ManifestError as exc:
+            raise RecoveryError(str(exc)) from exc
     index = run_state.current_stage_index
     if not 0 <= index < len(stages):
         raise RecoveryError(

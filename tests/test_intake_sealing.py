@@ -286,7 +286,7 @@ class RepositoryDriftTests(_Sealed):
         (self.repo / "late.txt").write_text("x\n", encoding="utf-8")
         _git(self.repo, "add", "late.txt")
         _git(self.repo, "commit", "-q", "-m", "late")
-        self.refuses_before_providers(approval, "moved since approval")
+        self.refuses_before_providers(approval, "app: approved at feature/widgets@")
 
     def test_another_worktree_of_the_same_repository_refuses(self):
         _, approval = self.prepared_and_approved()
@@ -300,6 +300,62 @@ class RepositoryDriftTests(_Sealed):
             start_plan(
                 load_plan_source(approval.manifest_path, other, manifest=True),
                 other / ".sparring", other, _Forbidden(self), expected_branch=APP_BRANCH,
+            )
+
+    def test_a_context_repository_that_moved_after_approval_refuses_the_fresh_run(self):
+        _, approval = self.prepared_and_approved()
+        (self.web / "later.txt").write_text("x\n", encoding="utf-8")
+        _git(self.web, "add", "later.txt")
+        _git(self.web, "commit", "-q", "-m", "moved after approval")
+        self.refuses_before_providers(approval, "web: approved at feature/web@")
+
+    def test_a_context_repository_on_another_branch_refuses_the_fresh_run(self):
+        _, approval = self.prepared_and_approved()
+        _git(self.web, "checkout", "-q", "-b", "feature/other")
+        self.refuses_before_providers(approval, "now feature/other@")
+
+    def test_a_paused_sealed_run_resumes_only_from_its_approved_worktree(self):
+        _, approval = self.prepared_and_approved()
+        stage = _Committer(self.repo, APP_BRANCH, fail_at=1)
+        with self.assertRaises(PlanRunError):
+            self.start(approval, lambda s: (stage, _SparringAdapter([READY])))
+        state = PlanRunState.load(run_state_path(self.sparring_dir, approval.run_key))
+        self.assertIsNot(state.status, PlanRunStatus.COMPLETE)
+
+        clone = self.root / "app-clone"
+        subprocess.run(
+            ["git", "clone", "-q", "-b", APP_BRANCH, str(self.repo), str(clone)],
+            check=True, capture_output=True,
+        )
+        worktree = self.root / "app-worktree"
+        _git(self.repo, "worktree", "add", "-q", "-b", "feature/widgets-copy", str(worktree))
+        for other in (clone, worktree):
+            with self.subTest(other=other.name):
+                with self.assertRaisesRegex(PlanError, "run it from the repository that was approved"):
+                    resume_plan(
+                        load_plan_source(approval.manifest_path, other, manifest=True),
+                        self.sparring_dir, other, _Forbidden(self), expected_branch=APP_BRANCH,
+                        run_key=approval.run_key,
+                    )
+
+        # The approved worktree still resumes: continuation checks its
+        # identity and branch, not the starting commit.
+        result = resume_plan(
+            self.source(approval), self.sparring_dir, self.repo,
+            lambda s: (_Committer(self.repo, APP_BRANCH), _SparringAdapter([READY] * 2)),
+            expected_branch=APP_BRANCH,
+        )
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+
+    def test_a_paused_sealed_run_does_not_resume_off_its_branch(self):
+        _, approval = self.prepared_and_approved()
+        with self.assertRaises(PlanRunError):
+            self.start(approval, lambda s: (_Committer(self.repo, APP_BRANCH, fail_at=1), _SparringAdapter([])))
+        _git(self.repo, "checkout", "-q", "-b", "feature/detour")
+        with self.assertRaisesRegex(PlanError, "is on 'feature/detour'"):
+            resume_plan(
+                self.source(approval), self.sparring_dir, self.repo, _Forbidden(self),
+                expected_branch=APP_BRANCH,
             )
 
     def test_normal_progress_inside_the_run_is_not_drift(self):
@@ -519,6 +575,21 @@ class CliTests(_Sealed):
         self.assertEqual(code, 1, err)
         self.assertIn("bytes changed after approval", err)
         made.assert_not_called()
+
+    def test_run_plan_refuses_a_moved_context_repository_before_any_provider(self):
+        _, approval = self.prepared_and_approved()
+        (self.web / "later.txt").write_text("x\n", encoding="utf-8")
+        _git(self.web, "add", "later.txt")
+        _git(self.web, "commit", "-q", "-m", "moved after approval")
+        with mock.patch("agent_sparring.cli._build_loop_adapters", side_effect=AssertionError("provider")) as made:
+            code, _, err = self._main(
+                "run-plan", "--manifest", str(approval.manifest_path), "--repo-root", str(self.repo),
+                "--expected-branch", APP_BRANCH, "--run-key", approval.run_key,
+            )
+        self.assertEqual(code, 1, err)
+        self.assertIn("repositories moved since run slice 'app' was approved", err)
+        made.assert_not_called()
+        self.assertFalse(run_state_path(self.sparring_dir, approval.run_key).exists())
 
 
 if __name__ == "__main__":
