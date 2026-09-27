@@ -555,6 +555,18 @@ class ApproveTests(_Repo):
             self.approve(result.directory)
         self.assertFalse((result.directory / "runs").exists())
 
+    def test_faked_requirements_do_not_lift_a_gate_or_an_earlier_slice(self):
+        # The record claims slice web needs nothing; approval still enforces
+        # its gate and its earlier slice from the interpretation itself.
+        result = self.prepare()
+        path = result.directory / "intake.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["approval_requirements"]["web"].update(gates=[], earlier_slices=[], approvable=True)
+        path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(IntakeError, r"waits for gates \[.release.\]"):
+            self.approve(result.directory, run="web", primary_repository="web")
+        self.assertFalse((result.directory / "runs" / "web").exists())
+
     def test_approval_never_reads_the_display_metadata(self):
         # Rewriting the record to claim no blocking finding and nothing to
         # confirm changes nothing: approval recomputes and enforces it all.
