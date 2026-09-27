@@ -119,6 +119,21 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
         purpose="the run's position, expected branch and plan digest",
     ),
     ArtifactOwnership(
+        path="intake/<intake>/",
+        owner="engine",
+        provider_writable=False,
+        lifetime=(
+            "written once by 'sparring prepare-plan' (the intake agent's answer is its "
+            "structured result, recorded by the engine); runs/<run>/ written once by "
+            "'sparring approve-plan'; never rewritten, and read by no managed run"
+        ),
+        purpose=(
+            "a reviewable interpretation of a human plan -- source snapshot, findings, "
+            "run slices, exact briefs, amendment diff -- and, per approved run slice, the "
+            "execution manifest a person passes to 'run-plan --manifest'"
+        ),
+    ),
+    ArtifactOwnership(
         path="stages/<stage>/brief.md",
         owner="engine (a person, for a hand-written stage)",
         provider_writable=False,

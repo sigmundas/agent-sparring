@@ -227,10 +227,11 @@ The commands that touch Git — `handoff`, `run-*`, `freeze-candidate`,
 Track the two configuration files; ignore the per-stage working artifacts:
 
 ```gitignore
-# agent-sparring working artifacts: per-stage files and plan-run position
-# (.sparring/project.toml and .sparring/PROJECT.md stay tracked)
+# agent-sparring working artifacts: per-stage files, plan-run position and
+# plan intake (.sparring/project.toml and .sparring/PROJECT.md stay tracked)
 .sparring/stages/
 .sparring/plans/
+.sparring/intake/
 ```
 
 This is not optional bookkeeping. `freeze-candidate` requires a clean
@@ -250,8 +251,11 @@ sparring check-config
 ```
 
 It prints `stage artifacts git-ignored: yes` / `plan-run state git-ignored:
-yes` and exits non-zero, naming the missing `.gitignore` line, if either is
-visible to git. `run-plan` makes the same check up front and refuses to start
+yes` / `plan intake git-ignored: yes` and exits non-zero, naming the missing
+`.gitignore` line, if any of them is visible to git. (`.sparring/intake/` is
+written only by `prepare-plan`/`approve-plan`, never mid-run, but visible
+intake files make the next freeze refuse the worktree just the same;
+`prepare-plan` refuses to start without it.) `run-plan` makes the same check up front and refuses to start
 otherwise; the check is never skippable.
 
 ## Run a stage
@@ -770,6 +774,70 @@ into the first run's stages
 — see "Whose stage is whose" below. A stage that already exists keeps
 whatever id it was created under; only new stages need the namespace.
 
+#### Preparing a manifest from a human plan: plan intake
+
+A plan that is useful to a person is often not executable as written:
+stages labelled `0`, `1A`, `1B`; constraints that live above the stage
+headings; stages in different repositories; implementation mixed with a
+later production action; dependencies stated in prose. The Markdown parser
+deliberately does not guess at any of that. Plan intake is a pre-execution
+step that does, with a person approving the result:
+
+```sh
+sparring prepare-plan docs/plans/active/foo.md [--mode faithful|refine] \
+    [--context-repository web=../web]
+# review .sparring/intake/<id>/report.md, briefs/, amendment.diff
+sparring approve-plan .sparring/intake/<id> --run <slice> \
+    [--expected-branch B] [--repository web=../web --repository-branch web=B] \
+    [--confirm-prerequisite <gate or earlier slice>] [--without-amendment]
+# prints the exact: sparring run-plan --manifest … --run-key … --expected-branch …
+```
+
+`prepare-plan` runs **one fresh, read-only** agent turn (the sparring role;
+`codex-cli` only, because its read-only sandbox is OS-enforced) that reads
+the whole plan, `PROJECT.md` and the named repositories, and answers in a
+fixed schema: run slices and their ordered stages, reusable context blocks,
+gates, exclusions, findings and a verdict. Nothing is executed or approved,
+and the plan document is never written. The engine then checks the answer
+and writes, under `.sparring/intake/<id>/`: a snapshot of the plan, the
+prompt, the interpretation, one brief per stage, `report.md`, and, in refine
+mode, `amendment.diff`. None of these is in manifest format.
+
+- **Briefs are assembled from the plan's own text.** The agent picks line
+  ranges; the engine renders each brief as the attached context blocks
+  verbatim, then the stage's own text verbatim, then an optional
+  `Intake scoping` note that says it is intake's, may only narrow, make a
+  boundary explicit or defer to a gate, and yields to the plan text. A
+  substantive change goes in refine mode's proposed amendment, which is
+  shown as a diff and never applied.
+- **Source coverage.** Every non-blank line of the plan must be stage text,
+  context, a gate, or an exclusion with a reason. Anything else is a
+  blocking finding, so a plan-wide constraint cannot silently drop out of
+  the briefs.
+- **Run slices.** A manifest runs in one primary repository on one branch;
+  a sibling declaration (see "Cross-repository candidates") pins a coupled
+  candidate but does not move a stage's work. Intake groups stages into
+  slices by primary repository, and a slice is approved and run from its own
+  project.
+- **Gates are boundaries.** The runtime cannot wait for a deployment or a
+  go-ahead between two stages of one run, so a gate that blocks later work
+  must fall between slices — a gate inside a slice is a blocking finding.
+  Approving a slice requires `--confirm-prerequisite` for every gate it
+  waits for and every earlier slice it depends on; the confirmations are
+  recorded in `approval.json`.
+- **Approval** refuses on any blocking finding, a refusal verdict, a plan
+  or interpretation that changed since intake, an unconfirmed prerequisite,
+  a missing branch or sibling path, or an unacknowledged amendment. It
+  writes `runs/<slice>/manifest.json` and `approval.json` once, validated by
+  the engine's own manifest parser; approving again must produce the same
+  manifest.
+
+From there the manifest is an ordinary manifest: digest pinned, briefs
+frozen, no agent able to edit it, every existing gate in force. The
+interpretation is a reviewed file, never workflow state — nothing after
+approval reads it, and the runtime never asks a model which stage is next.
+`prepare-plan` exits 2 when its report has blocking findings.
+
 #### The Markdown convention
 
 Stages are level-2 headings numbered 1..N in document order:
@@ -1177,6 +1245,7 @@ itself, which is an ordinary repository file.
 | `PROJECT.md` | human / repository | no | edited between runs by a person | project context embedded in every prompt |
 | `project.toml` | human / repository | no | edited between runs by a person, by hand or through `sparring set-config` on their behalf | provider, model and effort selection, and engine configuration |
 | `plans/<run>.json` | engine | no | rewritten on every position/status change | the run's position, expected branch, plan digest, recorded push authorization and typed pause |
+| `intake/<intake>/` | engine | no | written once by `prepare-plan` (the intake agent's answer is its structured result); `runs/<slice>/` written once by `approve-plan`; read by no managed run | a reviewable interpretation of a human plan and, per approved slice, the manifest passed to `run-plan --manifest` |
 | `stages/<stage>/brief.md` | engine (a person, for a hand-written stage) | no | generated from the plan section, or hand-written before execution; then immutable | what the stage is reviewed against — the plan section verbatim in a managed run |
 | `stages/<stage>/notes.md` | engine (and a person editing by hand) | no | skeleton at creation, then appended to by section | a human's recorded answer or check results (`## Human evidence`) |
 | `stages/<stage>/handoff.md` | engine | no | regenerated in full by every implementation turn | that turn's claims, git identity and evidence, for the sparrer |

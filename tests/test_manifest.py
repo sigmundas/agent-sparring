@@ -196,7 +196,9 @@ class _ManifestRepoTestCase(unittest.TestCase):
         _run_git(self.repo, "config", "user.email", "test@example.com")
         _run_git(self.repo, "config", "user.name", "Test")
         _run_git(self.repo, "remote", "add", "origin", str(self.remote))
-        (self.repo / ".gitignore").write_text(".sparring/stages/\n.sparring/plans/\n", encoding="utf-8")
+        (self.repo / ".gitignore").write_text(
+            ".sparring/stages/\n.sparring/plans/\n.sparring/intake/\n", encoding="utf-8"
+        )
         _run_git(self.repo, "add", ".")
         _run_git(self.repo, "commit", "-q", "-m", "base")
         _run_git(self.repo, "push", "-q", "-u", "origin", "main")
@@ -672,12 +674,22 @@ class ManifestCliTests(_ManifestRepoTestCase):
         self.assertEqual(code, 0)
         self.assertIn("stage artifacts git-ignored: yes", out)
         self.assertIn("plan-run state git-ignored: yes", out)
+        self.assertIn("plan intake git-ignored: yes", out)
 
         (self.repo / ".gitignore").write_text(".sparring/stages/\n", encoding="utf-8")
         code, out, err = self._main("check-config")
         self.assertEqual(code, 1)
         self.assertIn("plan-run state git-ignored: NO", out)
         self.assertIn(".sparring/plans/", err)
+
+    def test_check_config_refuses_visible_intake_artifacts(self):
+        (self.sparring_dir).mkdir(parents=True, exist_ok=True)
+        (self.sparring_dir / "project.toml").write_text('project = "x"\n', encoding="utf-8")
+        (self.repo / ".gitignore").write_text(".sparring/stages/\n.sparring/plans/\n", encoding="utf-8")
+        code, out, err = self._main("check-config")
+        self.assertEqual(code, 1)
+        self.assertIn("plan intake git-ignored: NO", out)
+        self.assertIn(".sparring/intake/", err)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from agent_sparring.acceptance import (
     freeze_candidate,
 )
 from agent_sparring.agent_config import (
+    AgentConfigError,
     EffectiveAgents,
     ROLES,
     ROLE_SPARRING,
@@ -41,6 +42,14 @@ from agent_sparring.git_context import GitContextError, is_ignored
 from agent_sparring.handoff import generate_handoff
 from agent_sparring.loop import DEFAULT_MAX_SEND_BACK_CYCLES, LoopError, run_unattended_loop
 from agent_sparring.human_gate import HumanGate, HumanGateError
+from agent_sparring.intake import (
+    INTAKE_DIRNAME,
+    MODES as INTAKE_MODES,
+    IntakeError,
+    approve_plan,
+    intake_not_ignored_message,
+    prepare_plan,
+)
 from agent_sparring.manifest import ManifestError
 from agent_sparring.plan import (
     PLANS_DIRNAME,
@@ -332,6 +341,10 @@ def _report_workflow_state_ignored(args: argparse.Namespace, sparring_dir: Path)
     for what, probe in (
         ("stage artifacts", sparring_dir / "stages" / "any-stage" / "state.json"),
         ("plan-run state", sparring_dir / PLANS_DIRNAME / "any-plan.json"),
+        # Written only by prepare-plan/approve-plan, never mid-run, but into
+        # the same worktree: visible intake files make the next freeze
+        # refuse the tree as dirty just the same.
+        ("plan intake", sparring_dir / INTAKE_DIRNAME / "any-intake" / "intake.json"),
     ):
         try:
             probe.resolve().relative_to(repo_root.resolve())
@@ -348,17 +361,21 @@ def _report_workflow_state_ignored(args: argparse.Namespace, sparring_dir: Path)
             problems.append(what)
     if problems:
         print("", file=sys.stderr)
-        print(
-            plan_state_not_ignored_message(
-                repo_root, sparring_dir / PLANS_DIRNAME / "any-plan.json"
+        if "plan-run state" in problems:
+            print(
+                plan_state_not_ignored_message(
+                    repo_root, sparring_dir / PLANS_DIRNAME / "any-plan.json"
+                ),
+                file=sys.stderr,
             )
-            if "plan-run state" in problems
-            else (
+        elif "stage artifacts" in problems:
+            print(
                 f"stage artifacts under {sparring_dir}/stages/ are not ignored by git; add a "
-                f"line '.sparring/stages/' to {repo_root}/.gitignore"
-            ),
-            file=sys.stderr,
-        )
+                f"line '.sparring/stages/' to {repo_root}/.gitignore",
+                file=sys.stderr,
+            )
+        if "plan intake" in problems:
+            print(intake_not_ignored_message(repo_root), file=sys.stderr)
         return 1
     return 0
 
@@ -1405,6 +1422,118 @@ def _add_single_role_model_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _pairs(values: list[str] | None, flag: str) -> dict[str, str]:
+    """``NAME=VALUE`` flags as a mapping; a repeated or malformed name is refused."""
+
+    pairs: dict[str, str] = {}
+    for value in values or []:
+        name, sep, rest = value.partition("=")
+        name, rest = name.strip(), rest.strip()
+        if not sep or not name or not rest:
+            raise IntakeError(f"{flag} expects NAME=VALUE, got {value!r}")
+        if name in pairs:
+            raise IntakeError(f"{flag} names {name!r} twice")
+        pairs[name] = rest
+    return pairs
+
+
+def _project_repository_name(args: argparse.Namespace, sparring_dir: Path, repo_root: Path) -> str:
+    """This project's repository name: --repository-name, else project.toml's
+    ``project``, else the repository directory's name. It is what intake's
+    run slices name as their primary repository."""
+
+    if getattr(args, "repository_name", None):
+        return str(args.repository_name).strip()
+    config = _optional_project_config(sparring_dir)
+    if config is not None and config.project.strip():
+        return config.project.strip()
+    return repo_root.resolve().name
+
+
+def _cmd_prepare_plan(args: argparse.Namespace) -> int:
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        effective = _resolve_agents(args, sparring_dir).sparring
+        if effective.provider != CODEX_PROVIDER_ID:
+            # Intake is a read-only turn, and codex-cli is the provider whose
+            # read-only sandbox is enforced by the OS rather than by a prompt.
+            raise IntakeError(
+                f"plan intake runs on {CODEX_PROVIDER_ID} (an OS-enforced read-only sandbox); "
+                f"the sparring role resolves to {effective.provider!r}"
+            )
+        adapter = CodexCliAdapter(
+            repo_root=repo_root,
+            executable=args.codex_executable,
+            model=effective.model,
+            effort=effective.effort,
+        )
+        project_md = sparring_dir / "PROJECT.md"
+        project_context = project_md.read_text(encoding="utf-8") if project_md.is_file() else None
+        context_repositories = {
+            name: Path(path) for name, path in _pairs(args.context_repository, "--context-repository").items()
+        }
+        result = prepare_plan(
+            Path(args.plan_path),
+            repo_root,
+            sparring_dir,
+            adapter,
+            mode=args.mode,
+            primary_repository=_project_repository_name(args, sparring_dir, repo_root),
+            context_repositories=context_repositories,
+            project_context=project_context,
+            provider={
+                "provider": effective.provider,
+                "model": effective.model,
+                "effort": effective.effort,
+            },
+        )
+    except (IntakeError, ProjectConfigError, AgentConfigError, OSError) as exc:
+        print(f"could not prepare plan: {exc}", file=sys.stderr)
+        return 1
+
+    interpretation = result.interpretation
+    print(f"intake written to {result.directory}", file=sys.stderr)
+    print(f"verdict: {interpretation.verdict}")
+    for run in interpretation.runs:
+        labels = ", ".join(stage.label for stage in run.stages)
+        print(f"run slice {run.id} ({run.primary_repository}): {labels}")
+    blocking = result.blocking
+    print(f"findings: {len(result.findings)} ({len(blocking)} blocking)")
+    print(f"review: {result.directory / 'report.md'}")
+    # Nothing is executable yet either way; a blocking finding only means
+    # approval will refuse, so this is reported as its own exit status.
+    return 2 if blocking else 0
+
+
+def _cmd_approve_plan(args: argparse.Namespace) -> int:
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        approval = approve_plan(
+            Path(args.intake_dir),
+            run_id=args.run,
+            primary_repository=_project_repository_name(args, sparring_dir, repo_root),
+            expected_branch=args.expected_branch,
+            repositories=_pairs(args.repository, "--repository"),
+            repository_branches=_pairs(args.repository_branch, "--repository-branch"),
+            confirmed_prerequisites=args.confirm_prerequisite or (),
+            without_amendment=args.without_amendment,
+        )
+    except (IntakeError, ProjectConfigError, OSError) as exc:
+        print(f"could not approve plan: {exc}", file=sys.stderr)
+        return 1
+
+    verb = "approved" if approval.created else "already approved (identical)"
+    print(f"{verb}: {approval.manifest_path}", file=sys.stderr)
+    print(f"manifest digest: {approval.manifest_digest}", file=sys.stderr)
+    print(
+        f"sparring run-plan --manifest {approval.manifest_path} --run-key {approval.run_key} "
+        f"--repo-root {repo_root} --expected-branch {approval.expected_branch}"
+    )
+    return 0
+
+
 def _add_role_model_arguments(parser: argparse.ArgumentParser) -> None:
     """The per-role model/effort overrides, for every command that configures
     both roles at once (the loop commands and show-config).
@@ -1950,6 +2079,97 @@ def build_parser() -> argparse.ArgumentParser:
         "ids, labels such as 'Stage 3C', exact briefs and the execution order, produced by "
         "a caller that already interpreted the plan document"
     )
+
+    prepare = subparsers.add_parser(
+        "prepare-plan",
+        help=(
+            "read a human plan with one fresh read-only agent turn and write a reviewable "
+            "intake (run slices, stages, exact briefs, gates, findings, an optional amendment "
+            "diff) under .sparring/intake/; executes and approves nothing"
+        ),
+    )
+    prepare.add_argument("plan_path", help="path to the human plan document (never modified)")
+    prepare.add_argument(
+        "--mode",
+        choices=INTAKE_MODES,
+        default=INTAKE_MODES[0],
+        help=(
+            "faithful: interpret the staging as written; refine: the agent may propose "
+            "different stage boundaries and a plan amendment for review (default: faithful)"
+        ),
+    )
+    prepare.add_argument(
+        "--context-repository",
+        action="append",
+        metavar="NAME=PATH",
+        help=(
+            "another repository the plan touches, for the agent to read (never modify) "
+            "and name in run slices; repeatable"
+        ),
+    )
+    prepare.add_argument(
+        "--repository-name",
+        default=None,
+        help="this project's repository name (default: project.toml's project, else the directory name)",
+    )
+    prepare.add_argument("--repo-root", default=None, help=repo_root_help)
+    prepare.add_argument(
+        "--sparring-provider",
+        default=None,
+        help="provider override for the intake turn, which resolves through the sparring role",
+    )
+    prepare.add_argument("--codex-executable", default="codex", help="codex CLI executable to invoke")
+    _add_role_model_arguments(prepare)
+    prepare.set_defaults(func=_cmd_prepare_plan, stage_provider=None)
+
+    approve = subparsers.add_parser(
+        "approve-plan",
+        help=(
+            "approve one reviewed run slice of a prepare-plan intake and write its execution "
+            "manifest; refuses on blocking findings, a changed source plan, or an unconfirmed "
+            "gate or prerequisite run slice"
+        ),
+    )
+    approve.add_argument("intake_dir", help="the .sparring/intake/<id>/ directory prepare-plan wrote")
+    approve.add_argument("--run", required=True, metavar="RUN_ID", help="the run slice to approve")
+    approve.add_argument(
+        "--expected-branch",
+        default=None,
+        help="the branch this slice runs on (required unless the plan states one)",
+    )
+    approve.add_argument(
+        "--repository",
+        action="append",
+        metavar="NAME=PATH",
+        help="path of a sibling repository the slice declares; repeatable",
+    )
+    approve.add_argument(
+        "--repository-branch",
+        action="append",
+        metavar="NAME=BRANCH",
+        help="branch of a sibling repository the slice declares; repeatable",
+    )
+    approve.add_argument(
+        "--confirm-prerequisite",
+        action="append",
+        metavar="ID",
+        help=(
+            "confirm that a gate this slice waits for, or an earlier run slice it depends on, "
+            "is actually satisfied; recorded in approval.json; repeatable"
+        ),
+    )
+    approve.add_argument(
+        "--without-amendment",
+        action="store_true",
+        help="approve the manifest built from the unamended source text although intake proposed an amendment",
+    )
+    approve.add_argument(
+        "--repository-name",
+        default=None,
+        help="this project's repository name (default: project.toml's project, else the directory name)",
+    )
+    approve.add_argument("--repo-root", default=None, help=repo_root_help)
+    approve.set_defaults(func=_cmd_approve_plan)
 
     run_plan = subparsers.add_parser(
         "run-plan",
