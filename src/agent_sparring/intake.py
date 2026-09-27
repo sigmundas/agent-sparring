@@ -872,6 +872,47 @@ def slice_branch(run: RunSlice, repositories: Mapping[str, Any]) -> tuple[str | 
     return inspected, None
 
 
+def approval_requirements(
+    interpretation: Interpretation, repositories: Mapping[str, Any], *, amendment: bool
+) -> dict[str, dict[str, Any]]:
+    """Per run slice, what ``approve-plan`` will ask for, as display metadata.
+
+    The single source for both ``report.md``'s "Next step" and the copy in
+    ``intake.json`` that tools (the VS Code extension) show without parsing
+    the report. It is **not** an input to approval: :func:`approve_plan`
+    recomputes findings, prerequisites, branches and repository identity
+    from the verified intake and enforces them itself, whatever this says.
+
+    ``approvable`` is whether this intake can approve the slice at all
+    (``reason`` says why not); blocking findings are reported separately,
+    because they refuse every slice.
+    """
+
+    out: dict[str, dict[str, Any]] = {}
+    for run in interpretation.runs:
+        gates, earlier = split_prerequisites(interpretation, run.id)
+        branch, problem = slice_branch(run, repositories)
+        out[run.id] = {
+            "approvable": problem is None,
+            "reason": problem,
+            "primary_repository": run.primary_repository,
+            "expected_branch": branch,
+            "siblings": sorted({name for stage in run.stages for name in stage.repositories}),
+            "gates": list(gates),
+            "earlier_slices": list(earlier),
+            "without_amendment": amendment,
+        }
+    return out
+
+
+def findings_summary(findings: Sequence[Finding], verdict: str) -> dict[str, Any]:
+    """How many findings of each severity, and the verdict, as display
+    metadata for ``intake.json``. Approval recomputes the findings itself."""
+
+    counts = {severity: sum(1 for f in findings if f.severity == severity) for severity in SEVERITIES}
+    return {**counts, "verdict": verdict}
+
+
 # -- stage ids and briefs -------------------------------------------------------
 
 
@@ -1147,6 +1188,12 @@ def prepare_plan(
         "provider": dict(provider or {}),
         "provider_session_id": result.session_id,
         "amendment_proposed": amendment is not None,
+        # Display metadata only (see approval_requirements): approval never
+        # reads these two, it recomputes and enforces everything.
+        "findings": findings_summary(findings, interpretation.verdict),
+        "approval_requirements": approval_requirements(
+            interpretation, snapshots, amendment=amendment is not None
+        ),
     }
     report = render_report(
         source,
@@ -1379,21 +1426,22 @@ def render_report(
     if blocking:
         out.append("Resolve the blocking findings (edit the plan, or run intake again), then re-run prepare-plan.")
     else:
+        requirements = approval_requirements(interpretation, repositories, amendment=amendment)
         for run in interpretation.runs:
-            gates, earlier = split_prerequisites(interpretation, run.id)
-            if slice_branch(run, repositories)[1]:
+            needs = requirements[run.id]
+            if not needs["approvable"]:
                 out.append(f"- Run slice `{run.id}` cannot be approved from this intake (see above).")
                 continue
             parts = [f"sparring approve-plan {intake_dir} --run {run.id}"]
-            siblings = sorted({name for stage in run.stages for name in stage.repositories})
-            for name in siblings:
+            for name in needs["siblings"]:
                 parts.append(f"--repository {name}=<path> --repository-branch {name}=<branch>")
-            for gate in gates:
+            for gate in needs["gates"]:
                 parts.append(f"--confirm-prerequisite {gate}")
-            if amendment:
+            if needs["without_amendment"]:
                 parts.append("--without-amendment")
+            earlier = needs["earlier_slices"]
             after = f", once {', '.join('`' + e + '`' for e in earlier)} completed" if earlier else ""
-            confirm = " (confirm each gate only once it is actually satisfied)" if gates else ""
+            confirm = " (confirm each gate only once it is actually satisfied)" if needs["gates"] else ""
             out.append(f"- From the `{run.primary_repository}` project{after}{confirm}: `{' '.join(parts)}`")
     return "\n".join(out).rstrip() + "\n"
 

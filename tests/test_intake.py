@@ -411,6 +411,55 @@ class PrepareTests(_Repo):
         stage0 = (result.directory / "briefs/app/01-0.md").read_text(encoding="utf-8")
         self.assertIn("No stage may touch production", stage0)
 
+    def test_the_record_carries_display_metadata_from_the_report_s_own_source(self):
+        result = self.prepare()
+        record = json.loads((result.directory / "intake.json").read_text(encoding="utf-8"))
+        severities = [f.severity for f in result.findings]
+        self.assertEqual(
+            record["findings"],
+            {
+                "blocking": severities.count("blocking"),
+                "recommendation": severities.count("recommendation"),
+                "info": severities.count("info"),
+                "verdict": "executable_with_recommendations",
+            },
+        )
+        self.assertEqual(
+            record["approval_requirements"],
+            {
+                "app": {
+                    "approvable": True,
+                    "reason": None,
+                    "primary_repository": "app",
+                    "expected_branch": "feature/widgets",
+                    "siblings": [],
+                    "gates": [],
+                    "earlier_slices": [],
+                    "without_amendment": False,
+                },
+                "web": {
+                    "approvable": True,
+                    "reason": None,
+                    "primary_repository": "web",
+                    "expected_branch": "feature/web",
+                    "siblings": [],
+                    "gates": ["release"],
+                    "earlier_slices": ["app"],
+                    "without_amendment": False,
+                },
+            },
+        )
+        report = (result.directory / "report.md").read_text(encoding="utf-8")
+        self.assertIn("--confirm-prerequisite release", report)
+
+    def test_blocking_findings_are_counted_in_the_record(self):
+        payload = good_interpretation()
+        payload["excluded"] = []
+        result = self.prepare(payload)
+        record = json.loads((result.directory / "intake.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["findings"]["blocking"], len(result.blocking))
+        self.assertGreater(record["findings"]["blocking"], 0)
+
     def test_blocking_findings_are_reported_not_refused(self):
         payload = good_interpretation()
         payload["excluded"] = []
@@ -502,6 +551,22 @@ class ApproveTests(_Repo):
         payload = good_interpretation()
         payload["excluded"] = []
         result = self.prepare(payload)
+        with self.assertRaisesRegex(IntakeError, "uncovered_source"):
+            self.approve(result.directory)
+        self.assertFalse((result.directory / "runs").exists())
+
+    def test_approval_never_reads_the_display_metadata(self):
+        # Rewriting the record to claim no blocking finding and nothing to
+        # confirm changes nothing: approval recomputes and enforces it all.
+        payload = good_interpretation()
+        payload["excluded"] = []
+        result = self.prepare(payload)
+        path = result.directory / "intake.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["findings"] = {"blocking": 0, "recommendation": 0, "info": 0, "verdict": "executable_as_written"}
+        for needs in record["approval_requirements"].values():
+            needs.update(gates=[], earlier_slices=[], approvable=True)
+        path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(IntakeError, "uncovered_source"):
             self.approve(result.directory)
         self.assertFalse((result.directory / "runs").exists())
