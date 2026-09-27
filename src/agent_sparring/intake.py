@@ -798,6 +798,8 @@ def render_brief(
     Context blocks first, in source order, each verbatim; then the stage's
     own ranges, verbatim; then the labelled intake note, if any. Line
     numbers are cited so a reviewer can find every excerpt in the plan.
+    The brief's own sections are level-1 headings so that the quoted
+    plan's headings, which are never rewritten, nest beneath them.
     """
 
     blocks = {block.id: block for block in interpretation.context}
@@ -815,7 +817,7 @@ def render_brief(
         f"Primary repository: `{run.primary_repository}`. Sibling repositories: {siblings}.",
     ]
     if attached:
-        out += ["", "## Plan context", ""]
+        out += ["", "# Plan context", ""]
         out.append(
             "Plan-wide text this stage is bound by, quoted verbatim from the source plan."
         )
@@ -825,14 +827,14 @@ def render_brief(
     cited = ", ".join(str(r) for r in stage.source_ranges)
     out += [
         "",
-        "## Stage source",
+        "# Stage source",
         "",
         f"<!-- source plan lines {cited} -->",
         "",
         source.excerpt(stage.source_ranges),
     ]
     if stage.intake_scope:
-        out += ["", "## Intake scoping", "", _SCOPE_PREAMBLE, "", stage.intake_scope.strip()]
+        out += ["", "# Intake scoping", "", _SCOPE_PREAMBLE, "", stage.intake_scope.strip()]
     return "\n".join(out).rstrip() + "\n"
 
 

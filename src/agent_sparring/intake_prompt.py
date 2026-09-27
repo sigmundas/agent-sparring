@@ -87,8 +87,12 @@ plan below.
   mistake to avoid.
 - `runs`: ordered run slices. Each has an id, its `primary_repository` (one
   of the repository names listed below, or a name the plan uses), its
-  `expected_branch` if the plan states one (else null), a rationale, and its
-  ordered `stages`.
+  `expected_branch`, a rationale, and its ordered `stages`. The expected
+  branch is the feature branch this slice's stages commit their candidates
+  to. Give it only if the plan names such a branch; otherwise null, and the
+  person supplies one at approval. A baseline or starting-point branch the
+  plan describes (for example "`main` at `<sha>`") is where work starts
+  from, not where a run commits, and is never the expected branch.
 - Each stage: `label` exactly as the plan labels it (`0`, `1A`, `W3B`, ... --
   labels are display strings; order comes only from the array), `title`,
   `source_ranges` (the stage's own text, including its heading),

@@ -350,10 +350,10 @@ class PrepareTests(_Repo):
         self.assertIn("# Stage brief: web-run-0002-stage-1b-web-repair", brief)
         self.assertIn("- Widget identity never changes.", brief)
         self.assertIn("Repos: web. Repair historical rows once the release is active.", brief)
-        self.assertIn("## Intake scoping", brief)
+        self.assertIn("# Intake scoping", brief)
         self.assertIn("the source plan text governs", brief)
         self.assertLess(brief.index("Widget identity"), brief.index("## Stage 1B"))
-        self.assertLess(brief.index("## Stage 1B"), brief.index("## Intake scoping"))
+        self.assertLess(brief.index("## Stage 1B"), brief.index("# Intake scoping"))
         stage0 = (result.directory / "briefs/app/01-0.md").read_text(encoding="utf-8")
         self.assertIn("No stage may touch production", stage0)
 
