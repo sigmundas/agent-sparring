@@ -122,10 +122,31 @@ class SparringAgentAdapter(Protocol):
         """
 
 
+@runtime_checkable
+class StructuredAgentAdapter(Protocol):
+    """A provider that can run one fresh, read-only, schema-constrained turn.
+
+    Deliberately generic: the caller supplies the schema and owns what the
+    answer means. The adapter contributes only the guarantees it gives every
+    turn -- a read-only sandbox where the provider enforces one, and a final
+    message the provider has validated against ``output_schema``. There is
+    no session parameter: such a turn always starts a new conversation and
+    can never be appended to an existing reviewer thread. Callers still
+    prove read-only with a before/after repository fingerprint rather than
+    trusting the provider alone.
+    """
+
+    def start_structured(
+        self, prompt: str, output_schema: Mapping[str, Any]
+    ) -> SparringAgentResult:
+        """Start a fresh read-only session and return its structured result."""
+
+
 __all__ = [
     "LineSink",
     "ProviderError",
     "Runner",
+    "StructuredAgentAdapter",
     "StageAgentResult",
     "StageAgentAdapter",
     "SparringAgentResult",

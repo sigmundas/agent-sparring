@@ -667,6 +667,28 @@ class CodexCliAdapter:
             )
         return self._invoke(prompt, resume_session_id=session_id, schema=False)
 
+    def start_structured(
+        self, prompt: str, output_schema: Mapping[str, Any]
+    ) -> SparringAgentResult:
+        """A fresh read-only session whose final message obeys ``output_schema``.
+
+        Generic on purpose: the caller owns the schema and everything the
+        answer means (plan intake is the first caller, see
+        :mod:`agent_sparring.intake`), and this adapter only guarantees what
+        it guarantees for every turn -- the hard-coded read-only sandbox and
+        a schema-validated final message. Always a *new* session: there is
+        no ``session_id`` parameter, so a structured turn can never be
+        appended to a reviewer's existing thread.
+
+        ``output_schema`` must be a strict schema in Codex's sense (every
+        property required, ``additionalProperties`` false); Codex refuses a
+        non-strict one, and that refusal surfaces as a :class:`ProviderError`.
+        """
+
+        if not isinstance(output_schema, Mapping) or not output_schema:
+            raise ProviderError("start_structured requires a non-empty JSON schema object")
+        return self._invoke(prompt, resume_session_id=None, schema=output_schema)
+
     # -- internals ----------------------------------------------------
 
     def _build_args(
@@ -717,13 +739,17 @@ class CodexCliAdapter:
         prompt: str,
         resume_session_id: str | None,
         *,
-        schema: bool = True,
+        schema: "bool | Mapping[str, Any]" = True,
     ) -> SparringAgentResult:
+        """``schema``: ``True`` for the verdict schema, ``False`` for none, or
+        a caller-supplied schema object (see :meth:`start_structured`)."""
+
         with tempfile.TemporaryDirectory(prefix="agent-sparring-codex-") as tmp_dir:
             schema_path: Path | None = None
-            if schema:
-                schema_path = Path(tmp_dir) / "verdict_schema.json"
-                schema_path.write_text(json.dumps(VERDICT_SCHEMA), encoding="utf-8")
+            if schema is not False:
+                chosen = VERDICT_SCHEMA if schema is True else dict(schema)
+                schema_path = Path(tmp_dir) / "output_schema.json"
+                schema_path.write_text(json.dumps(chosen), encoding="utf-8")
             output_path = Path(tmp_dir) / "last_message.txt"
 
             args = self._build_args(prompt, resume_session_id, schema_path, output_path)

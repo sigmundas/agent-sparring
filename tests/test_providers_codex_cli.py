@@ -884,3 +884,38 @@ class ConverseArgvTests(unittest.TestCase):
         adapter = CodexCliAdapter(repo_root=Path("."))
         with self.assertRaises(ProviderError):
             adapter.converse("  ", "why?")
+
+
+class StartStructuredTests(unittest.TestCase):
+    """A generic fresh, read-only turn constrained by the caller's schema."""
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+
+    def test_passes_the_callers_schema_in_a_fresh_read_only_session(self):
+        seen = {}
+
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            seen["args"] = list(args)
+            seen["schema"] = json.loads(
+                Path(args[args.index("--output-schema") + 1]).read_text(encoding="utf-8")
+            )
+            Path(args[args.index("-o") + 1]).write_text('{"answer": "x"}', encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args, 0, stdout=json.dumps({"type": "thread.started", "thread_id": "t-9"}) + "\n", stderr=""
+            )
+
+        result = CodexCliAdapter(repo_root=Path("."), runner=runner).start_structured("go", self.SCHEMA)
+        self.assertEqual(seen["schema"], self.SCHEMA)
+        self.assertNotIn("resume", seen["args"])
+        self.assertIn('sandbox_mode="read-only"', " ".join(seen["args"]))
+        self.assertEqual(result.text, '{"answer": "x"}')
+        self.assertEqual(result.session_id, "t-9")
+
+    def test_refuses_an_empty_schema(self):
+        with self.assertRaises(ProviderError):
+            CodexCliAdapter(repo_root=Path(".")).start_structured("go", {})
