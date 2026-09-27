@@ -93,13 +93,15 @@ class PlanSource(Protocol):
 
     Implementations are cheap value objects read from disk at construction
     (:class:`~agent_sparring.plan.MarkdownPlanSource`,
-    :class:`~agent_sparring.manifest.ManifestPlanSource`). ``reload`` re-reads
-    the same file so the runner can prove the execution content has not
-    changed mid-run.
+    :class:`~agent_sparring.manifest.ManifestPlanSource`,
+    :class:`~agent_sparring.intake_approval.IntakeManifestSource`). ``reload``
+    re-reads the same file so the runner can prove the execution content has
+    not changed mid-run.
     """
 
-    #: ``"markdown"`` or ``"manifest"``; recorded in the run state so a run
-    #: cannot silently switch input kinds between start and resume.
+    #: ``"markdown"``, ``"manifest"`` or ``"intake-manifest"``; recorded in the
+    #: run state so a run cannot silently switch input kinds between start and
+    #: resume.
     kind: str
     #: How the plan is named in state and output; for a manifest this is the
     #: human plan document it was built from, so both inputs key the same

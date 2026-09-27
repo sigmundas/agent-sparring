@@ -30,7 +30,8 @@ from agent_sparring.intake import (
     prepare_plan,
     run_prerequisites,
 )
-from agent_sparring.manifest import load_manifest_source
+from agent_sparring.intake_approval import load_intake_manifest
+from agent_sparring.manifest import manifest_digest
 from agent_sparring.providers import SparringAgentResult
 
 PLAN = """\
@@ -307,30 +308,45 @@ class CheckTests(unittest.TestCase):
         self.assertEqual([f.severity for f in ordered], ["blocking", "info"])
 
 
+IGNORE = ".sparring/stages/\n.sparring/plans/\n.sparring/intake/\n"
+
+
+def make_repo(path: Path, branch: str, files: dict | None = None) -> Path:
+    """A committed repository checked out on ``branch``, with the workflow
+    directories ignored."""
+
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.email", "t@example.com")
+    _git(path, "config", "user.name", "T")
+    (path / ".gitignore").write_text(IGNORE, encoding="utf-8")
+    for name, text in (files or {}).items():
+        (path / name).parent.mkdir(parents=True, exist_ok=True)
+        (path / name).write_text(text, encoding="utf-8")
+    _git(path, "add", ".")
+    _git(path, "commit", "-q", "-m", "base")
+    _git(path, "checkout", "-q", "-b", branch)
+    (path / ".sparring").mkdir()
+    return path
+
+
 class _Repo(unittest.TestCase):
-    ignore = ".sparring/stages/\n.sparring/plans/\n.sparring/intake/\n"
+    """``app`` (the preparing project, on the branch the plan names) and a
+    ``web`` context repository, both inspected by intake."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        self.repo = self.root / "app"
-        self.repo.mkdir()
-        _git(self.repo, "init", "-q", "-b", "main")
-        _git(self.repo, "config", "user.email", "t@example.com")
-        _git(self.repo, "config", "user.name", "T")
-        (self.repo / ".gitignore").write_text(self.ignore, encoding="utf-8")
+        self.repo = make_repo(self.root / "app", "feature/widgets", {"docs/plan.md": PLAN})
         self.plan = self.repo / "docs" / "plan.md"
-        self.plan.parent.mkdir()
-        self.plan.write_text(PLAN, encoding="utf-8")
-        _git(self.repo, "add", ".")
-        _git(self.repo, "commit", "-q", "-m", "base")
         self.sparring_dir = self.repo / ".sparring"
-        self.sparring_dir.mkdir()
+        self.web = make_repo(self.root / "web", "feature/web", {"README.md": "web\n"})
+        self.context = {"web": self.web}
 
     def tearDown(self):
         self._tmp.cleanup()
 
-    def prepare(self, payload=None, *, mode="faithful", adapter=None):
+    def prepare(self, payload=None, *, mode="faithful", adapter=None, context=None):
         adapter = adapter or FakeAdapter(payload if payload is not None else good_interpretation())
         keys = iter(["app-run-0001", "web-run-0002", "x-run-0003"])
         return prepare_plan(
@@ -340,6 +356,7 @@ class _Repo(unittest.TestCase):
             adapter,
             mode=mode,
             primary_repository="app",
+            context_repositories=self.context if context is None else context,
             project_context="Project context text.",
             mint_run_key=lambda label: next(keys),
         )
@@ -372,8 +389,14 @@ class PrepareTests(_Repo):
 
         report = (result.directory / "report.md").read_text(encoding="utf-8")
         self.assertIn("Run slice `web` — primary `web`", report)
-        self.assertIn("Must confirm before approval: `app`, `release`", report)
+        self.assertIn("Gates a person confirms at approval: `release`", report)
+        self.assertIn("Earlier run slices that must be approved and complete first: `app`", report)
+        self.assertIn("Expected branch: `feature/web` (checked out when intake inspected it)", report)
         self.assertIn("`release` (production)", report)
+        self.assertNotIn("--confirm-prerequisite app", report)
+        record = json.loads((result.directory / "intake.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(record["repositories"]), ["app", "web"])
+        self.assertEqual(record["repositories"]["web"]["branch"], "feature/web")
 
     def test_briefs_are_verbatim_source_plus_a_labelled_scope(self):
         result = self.prepare()
@@ -425,6 +448,9 @@ class PrepareTests(_Repo):
 class ApproveTests(_Repo):
     def approve(self, directory, run="app", **kwargs):
         kwargs.setdefault("primary_repository", "app")
+        repo = self.repo if kwargs["primary_repository"] == "app" else self.web
+        kwargs.setdefault("repo_root", repo)
+        kwargs.setdefault("sparring_dir", repo / ".sparring")
         return approve_plan(directory, run_id=run, **kwargs)
 
     def test_approves_a_slice_into_a_manifest_the_engine_reads(self):
@@ -432,7 +458,7 @@ class ApproveTests(_Repo):
         approval = self.approve(result.directory)
         self.assertTrue(approval.created)
         self.assertEqual(approval.expected_branch, "feature/widgets")
-        source = load_manifest_source(approval.manifest_path)
+        source = load_intake_manifest(approval.manifest_path)
         stages = source.stages()
         self.assertEqual([s.label for s in stages], ["Stage 0", "Stage 1A"])
         self.assertEqual(stages[0].stage_id, "app-run-0001-stage-0-audit")
@@ -441,7 +467,7 @@ class ApproveTests(_Repo):
             (result.directory / "briefs/app/02-1a.md").read_text(encoding="utf-8"),
         )
         record = json.loads((approval.manifest_path.parent / "approval.json").read_text(encoding="utf-8"))
-        self.assertEqual(record["manifest_digest"], source.digest())
+        self.assertEqual(record["manifest_digest"], manifest_digest(source.manifest))
 
         again = self.approve(result.directory)
         self.assertFalse(again.created)
@@ -449,23 +475,28 @@ class ApproveTests(_Repo):
     def test_a_slice_is_approved_only_from_its_primary_repository(self):
         result = self.prepare()
         with self.assertRaisesRegex(IntakeError, "does not move a stage's work"):
-            self.approve(result.directory, run="web", expected_branch="feature/web")
-
-    def test_gates_and_earlier_slices_must_be_confirmed(self):
-        result = self.prepare()
-        with self.assertRaisesRegex(IntakeError, r"\['app', 'release'\]"):
-            self.approve(result.directory, run="web", primary_repository="web", expected_branch="feature/web")
-        with self.assertRaisesRegex(IntakeError, "names nothing"):
+            self.approve(result.directory, run="web", repo_root=self.repo, sparring_dir=self.sparring_dir)
+        with self.assertRaisesRegex(IntakeError, "is not the repository intake inspected as 'web'"):
             self.approve(
-                result.directory, run="web", primary_repository="web", expected_branch="feature/web",
-                confirmed_prerequisites=["app", "release", "typo"],
+                result.directory, run="web", primary_repository="web", repo_root=self.repo,
+                sparring_dir=self.sparring_dir, confirmed_prerequisites=["release"],
             )
-        approval = self.approve(
-            result.directory, run="web", primary_repository="web", expected_branch="feature/web",
-            confirmed_prerequisites=["app", "release"],
-        )
-        record = json.loads((approval.manifest_path.parent / "approval.json").read_text(encoding="utf-8"))
-        self.assertEqual(record["confirmed_prerequisites"], ["app", "release"])
+
+    def test_gates_are_confirmed_by_id_and_earlier_slices_are_proven(self):
+        result = self.prepare()
+        web = {"run": "web", "primary_repository": "web"}
+        with self.assertRaisesRegex(IntakeError, r"waits for gates \['release'\]"):
+            self.approve(result.directory, **web)
+        with self.assertRaisesRegex(IntakeError, "names no gate"):
+            self.approve(result.directory, confirmed_prerequisites=["release", "typo"], **web)
+        with self.assertRaisesRegex(IntakeError, "not confirmed by name"):
+            self.approve(result.directory, confirmed_prerequisites=["app", "release"], **web)
+        with self.assertRaisesRegex(IntakeError, "earlier run slice 'app' has no valid approval"):
+            self.approve(result.directory, confirmed_prerequisites=["release"], **web)
+        self.approve(result.directory)
+        with self.assertRaisesRegex(IntakeError, "approved but has not been run"):
+            self.approve(result.directory, confirmed_prerequisites=["release"], **web)
+        self.assertFalse((result.directory / "runs" / "web").exists())
 
     def test_blocking_findings_refuse(self):
         payload = good_interpretation()
@@ -496,11 +527,11 @@ class ApproveTests(_Repo):
             self.approve(result.directory)
         self.assertTrue(self.approve(result.directory, without_amendment=True).created)
 
-    def test_a_repeat_approval_must_match_the_recorded_branch(self):
+    def test_an_approval_branch_argument_cannot_replace_the_inspected_branch(self):
         result = self.prepare()
-        self.approve(result.directory)
-        with self.assertRaisesRegex(IntakeError, "already approved for branch 'feature/widgets'"):
+        with self.assertRaisesRegex(IntakeError, "cannot replace it"):
             self.approve(result.directory, expected_branch="feature/other")
+        self.assertEqual(self.approve(result.directory, expected_branch="feature/widgets").expected_branch, "feature/widgets")
 
     def test_the_amendment_gate_does_not_trust_intake_json(self):
         payload = good_interpretation()
@@ -517,25 +548,48 @@ class ApproveTests(_Repo):
         with self.assertRaisesRegex(IntakeError, "unknown mode"):
             self.approve(result.directory)
 
-    def test_siblings_need_an_explicit_path_and_branch(self):
+    def test_siblings_need_an_explicit_path_and_branch_of_an_inspected_repository(self):
+        docs = make_repo(self.root / "docs", "feature/docs")
         payload = good_interpretation()
         payload["runs"][0]["stages"][1]["repositories"] = ["docs"]
-        result = self.prepare(payload)
+        result = self.prepare(payload, context={"web": self.web, "docs": docs})
         with self.assertRaisesRegex(IntakeError, "--repository NAME=PATH"):
             self.approve(result.directory)
+        with self.assertRaisesRegex(IntakeError, "is not the repository intake inspected as 'docs'"):
+            self.approve(
+                result.directory, repositories={"docs": "../web"}, repository_branches={"docs": "feature/docs"}
+            )
         approval = self.approve(
             result.directory,
             repositories={"docs": "../docs"},
             repository_branches={"docs": "feature/docs"},
         )
-        declared = load_manifest_source(approval.manifest_path).stages()[1].repositories
+        declared = load_intake_manifest(approval.manifest_path).stages()[1].repositories
         self.assertEqual([(r.name, r.path, r.branch) for r in declared], [("docs", "../docs", "feature/docs")])
+        with self.assertRaisesRegex(IntakeError, "already approved with a different manifest"):
+            self.approve(
+                result.directory, repositories={"docs": "../docs"}, repository_branches={"docs": "feature/other"}
+            )
 
-    def test_expected_branch_is_required_when_the_plan_states_none(self):
+    def test_a_sibling_that_was_not_inspected_refuses(self):
+        payload = good_interpretation()
+        payload["runs"][0]["stages"][1]["repositories"] = ["docs"]
+        result = self.prepare(payload)
+        with self.assertRaisesRegex(IntakeError, "'docs' was not inspected"):
+            self.approve(result.directory, repositories={"docs": "../docs"}, repository_branches={"docs": "b"})
+
+    def test_the_branch_is_the_inspected_one_when_the_plan_states_none(self):
         payload = good_interpretation()
         payload["runs"][0]["expected_branch"] = None
         result = self.prepare(payload)
-        with self.assertRaisesRegex(IntakeError, "--expected-branch"):
+        self.assertEqual(self.approve(result.directory).expected_branch, "feature/widgets")
+
+    def test_a_plan_branch_that_was_not_checked_out_refuses(self):
+        _git(self.repo, "checkout", "-q", "main")
+        result = self.prepare()
+        report = (result.directory / "report.md").read_text(encoding="utf-8")
+        self.assertIn("cannot be approved", report)
+        with self.assertRaisesRegex(IntakeError, "check out 'feature/widgets' there and run prepare-plan again"):
             self.approve(result.directory)
 
 
@@ -550,7 +604,10 @@ class CliTests(_Repo):
         (self.sparring_dir / "project.toml").write_text('project = "app"\n', encoding="utf-8")
         result = SparringAgentResult(session_id="t-1", text=json.dumps(good_interpretation()), is_error=False)
         with mock.patch("agent_sparring.cli.CodexCliAdapter.start_structured", return_value=result) as call:
-            code, out, err = self._main("prepare-plan", str(self.plan), "--repo-root", str(self.repo))
+            code, out, err = self._main(
+                "prepare-plan", str(self.plan), "--repo-root", str(self.repo),
+                "--context-repository", f"web={self.web}",
+            )
         self.assertEqual(code, 0, err)
         self.assertEqual(call.call_count, 1)
         self.assertIn("run slice web (web): 1B", out)
@@ -559,7 +616,9 @@ class CliTests(_Repo):
         code, out, err = self._main("approve-plan", str(intake_dir), "--run", "app", "--repo-root", str(self.repo))
         self.assertEqual(code, 0, err)
         self.assertIn("sparring run-plan --manifest", out)
+        self.assertIn("--run-key plan-", out)
         self.assertIn("--expected-branch feature/widgets", out)
+        self.assertIn("approval:", err)
 
         code, out, err = self._main("approve-plan", str(intake_dir), "--run", "web", "--repo-root", str(self.repo))
         self.assertEqual(code, 1)

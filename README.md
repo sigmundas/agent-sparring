@@ -776,11 +776,11 @@ whatever id it was created under; only new stages need the namespace.
 
 #### Preparing a manifest from a human plan: plan intake
 
-**Design status (2026-09-27): merge blocked.** The following usage describes
-the implementation at `1e8de40`, not a sealed approval boundary. The
-[integrity revision plan below](#plan-intake-integrity-revision-plan) governs
-the remaining work on `feature/plan-intake` and supersedes conflicting
-integrity claims here and in `intake.py`'s module documentation.
+**Design status (2026-09-27): merge blocked.** Stage A of the
+[integrity revision plan below](#plan-intake-integrity-revision-plan) --
+approval binds execution -- is implemented as a review candidate and is
+described here; Stages B and C (source ownership, gate topology, review
+usability) are not, so their integrity claims do not hold yet.
 
 A plan that is useful to a person is often not executable as written:
 stages labelled `0`, `1A`, `1B`; constraints that live above the stage
@@ -790,12 +790,13 @@ deliberately does not guess at any of that. Plan intake is a pre-execution
 step that does, with a person approving the result:
 
 ```sh
+# check out the branch the slice runs on first
 sparring prepare-plan docs/plans/active/foo.md [--mode faithful|refine] \
     [--context-repository web=../web]
 # review .sparring/intake/<id>/report.md, briefs/, amendment.diff
 sparring approve-plan .sparring/intake/<id> --run <slice> \
-    [--expected-branch B] [--repository web=../web --repository-branch web=B] \
-    [--confirm-prerequisite <gate or earlier slice>] [--without-amendment]
+    [--repository web=../web --repository-branch web=B] \
+    [--confirm-prerequisite <gate>] [--without-amendment]
 # prints the exact: sparring run-plan --manifest … --run-key … --expected-branch …
 ```
 
@@ -831,21 +832,66 @@ mode, `amendment.diff`. None of these is in manifest format.
   must fall between slices: a gate may follow only a slice's last stage, and
   may block only the first stage of a slice. Anything else is a blocking
   finding.
-  Approving a slice requires `--confirm-prerequisite` for every gate it
-  waits for and every earlier slice it depends on; the confirmations are
-  recorded in `approval.json`.
-- **Approval** refuses on any blocking finding, a refusal verdict, a plan
-  or interpretation that changed since intake, an unconfirmed prerequisite,
-  a missing branch or sibling path, or an unacknowledged amendment. It
-  writes `runs/<slice>/manifest.json` and `approval.json` once, validated by
-  the engine's own manifest parser; approving again must produce the same
-  manifest.
+  Approving a slice requires `--confirm-prerequisite <gate id>` for every
+  gate it waits for, recorded in `approval.json`. An earlier slice it
+  depends on is **not** confirmed by name: approval requires that slice's
+  own approval and its sealed run recorded complete with an accepted final
+  candidate, and records that evidence.
+- **Repository snapshots.** Intake records every inspected repository,
+  context-only ones included: canonical worktree path, common git
+  directory, branch, HEAD and dirty paths (from the shared
+  `repo_fingerprint`, so contents, ignored files and modify-then-restore
+  are not attested). A slice runs on the branch its primary repository had
+  checked out; a plan naming another branch refuses until that branch is
+  checked out and the plan prepared again, and `--expected-branch` at
+  approval may only repeat it. Approval refuses if any inspected repository
+  is another repository, on another branch, or at another commit — except a
+  commit an earlier slice of this intake was accepted at. There is no drift
+  override.
+- **Approval** refuses on any blocking finding, a refusal verdict, a plan,
+  snapshot, interpretation or `report.md` that is not what intake produced,
+  an unconfirmed gate, an unproven earlier slice, repository drift, a
+  sibling path that is not the inspected repository, or an unacknowledged
+  amendment. It writes `runs/<slice>/manifest.json` — the ordinary manifest
+  inside an intake envelope — and then creates `approval.json` exactly
+  once. Repeating an identical approval returns it; a conflicting one
+  refuses; neither rewrites it.
 
-From there the manifest is an ordinary manifest: digest pinned, briefs
-frozen, no agent able to edit it, every existing gate in force. The
-interpretation is a reviewed file, never workflow state — nothing after
-approval reads it, and the runtime never asks a model which stage is next.
-`prepare-plan` exits 2 when its report has blocking findings.
+**What `run-plan --manifest` verifies.** An intake envelope runs only with
+the `approval.json` beside it, and before anything is recorded or any
+provider runs the engine refuses unless the manifest's exact bytes (not
+merely an equivalent serialization) and semantic digest are the approved
+ones; the envelope's intake, slice and run key match; it is still in the
+intake it was approved in; `intake.json`, `interpretation.json`,
+`source.md` and the source plan on disk are unchanged since approval; and a
+fresh run uses the approved run key and branch, from the approved
+worktree, at the approved starting commit. The stages executed are parsed
+from the bytes that were verified. The run records source kind
+`intake-manifest` and a digest that covers the approval, and resume,
+acceptance and advancement re-run the same verification (but not the
+starting-commit check, so the run's own accepted commits are normal
+progress). A plain manifest or Markdown plan whose run key or stage ids an
+intake minted is refused, so the inner manifest cannot be re-run
+unapproved.
+
+**Trust model.** Approval is a workflow-integrity guarantee against
+accidental drift, not a security boundary against a managed agent that
+deliberately runs `approve-plan` or rewrites approval files under your
+account — that is out of scope exactly as an agent attacking the engine
+itself is. The approval therefore lives in the git-ignored intake
+directory; no sandbox, key or external store is involved.
+
+**Compatibility.** Hand-authored manifests and Markdown plans are unchanged
+and need no approval. An intake prepared before approvals were sealed
+(`intake.json` version 1) cannot be approved, a version-1 `approval.json`
+authorizes nothing, and its stage ids are refused as a plain run: prepare
+and approve it again. A copy of such a manifest with fresh identities
+cannot be told from a hand-authored one; that is a separate, human-authorized
+plain run. Runs already started from one keep their existing guarantees.
+
+The interpretation is a reviewed file, never workflow state, and the
+runtime never asks a model which stage is next. `prepare-plan` exits 2 when
+its report has blocking findings.
 
 ##### Plan-intake integrity revision plan
 
@@ -853,7 +899,8 @@ This is the in-place revision of the existing plan-intake design, not a
 second feature plan. Inspection found no standalone plan-intake plan in the
 repository: this section and `intake.py`'s module documentation hold its
 design. The unrelated, untracked `docs/plans/backend-selection.md` is outside
-this work. Status: **planned; no integrity revision implemented**. Baseline:
+this work. Status: **Stage A implemented as a review candidate; Stages B and
+C pending**. Baseline:
 `0d7e6f8` → `e99b1d2` → `77fe125` → `20ff521` → `e23af2b` → `1e8de40`.
 The base is `feature/ask-sparrer-dialogue`; that branch **must land first**.
 Keep reusing its public `repo_fingerprint`; do not duplicate it.
@@ -908,7 +955,10 @@ approval of a later slice. Deterministic validation cannot prove the meaning
 of arbitrary prose; unresolved semantics must be visible to the human, not
 silently declared safe by coverage or by another model.
 
-**Stage A — Seal review, approval and execution.** Pending.
+**Stage A — Seal review, approval and execution.** Implemented as a review
+candidate on `feature/plan-intake`, under the trust decision recorded after
+this stage's exit criteria; items 1, 3, 5, 6 and 7 are narrowed by it as
+recorded there.
 
 1. Introduce a small, versioned engine approval store **outside all inspected
    worktrees and provider-writable roots**, using the platform user-state
@@ -1020,6 +1070,51 @@ execution; first-start and continuation checks hold; legitimate progress and
 later-slice snapshot refresh work; legacy behavior remains covered. Implement
 against `intake.py`, CLI, manifest/plan entry points and ownership/state hooks,
 without putting feature semantics in the provider adapter.
+
+*Stage A trust decision (2026-09-27, project owner).* Item 1's provider
+isolation cannot be enforced as built: the Claude stage agent runs as the
+user with the user's own Claude permissions (typically unrestricted shell
+and file writes) and no OS sandbox, and it commits and pushes, so a store
+outside the worktree is as writable to it as the worktree. The owner
+decided that plan intake v1 approval is a **workflow-integrity guarantee
+against accidental drift, not a security boundary** against an agent
+deliberately invoking `approve-plan` or rewriting approval state -- the
+same scope as an agent attacking the engine itself. No Claude sandbox,
+separate OS identity, signing key or external protected store is to be
+added. Under that decision Stage A implements (see "What `run-plan
+--manifest` verifies" above): approval bound to the exact source,
+snapshot, intake record, interpretation and rendered report; an intake
+manifest envelope refused by the plain reader and runnable only through
+its `approval.json`, verified by raw bytes and semantic digest before any
+provider and on resume/accept/advance; the run pinned by source kind and an
+approval-covering digest; intake identities refused as plain runs;
+repository snapshots of every inspected repository, with no drift override
+and no approval-time branch replacement; earlier-slice prerequisites proven
+by that slice's approval and completed sealed run, not by name;
+exclusive, idempotent, never-rewritten approvals; and version-1 intakes and
+approvals refused.
+
+Narrowed or deferred in Stage A, deliberately:
+- *Item 1:* the approval lives in the git-ignored intake directory, not an
+  external store; no provider-isolation proof is claimed.
+- *Item 3:* the human decision is the explicit `approve-plan` command over
+  the exact `report.md` intake rendered (re-rendered and compared); there
+  is no separate interactive review step or engine-issued review identity.
+- *Item 5:* inspected repositories need not be clean; dirty paths are
+  recorded, and branch/HEAD/path identity are what is compared.
+- *Item 6:* no parent-linked successor candidates. The only allowed
+  movement is to a commit an earlier slice of the same intake was accepted
+  at; other drift requires a fresh prepare, which mints new identities, so
+  a later slice whose earlier slice ran under a previous intake cannot yet
+  be approved from the new one.
+- *Item 7:* gates remain confirmed by id (a recorded human attestation);
+  typed gate evidence (actor, candidate, release reference) is Stage C.
+- *Recovery:* approvals are written atomically and exclusively; a missing
+  or corrupt approval fails closed and needs a new approval. There is no
+  backup/restore tooling or append-only decision history beyond the
+  never-rewritten approval file.
+- A managed stage agent that edits the source plan or intake files mid-run
+  stops the run, as editing a Markdown plan's stage sections already does.
 
 **Stage B — Make source ownership and the graph unambiguous.** Pending.
 
@@ -1553,7 +1648,9 @@ itself, which is an ordinary repository file.
 | `PROJECT.md` | human / repository | no | edited between runs by a person | project context embedded in every prompt |
 | `project.toml` | human / repository | no | edited between runs by a person, by hand or through `sparring set-config` on their behalf | provider, model and effort selection, and engine configuration |
 | `plans/<run>.json` | engine | no | rewritten on every position/status change | the run's position, expected branch, plan digest, recorded push authorization and typed pause |
-| `intake/<intake>/` | engine | no | written once by `prepare-plan` (the intake agent's answer is its structured result); `runs/<slice>/` written once by `approve-plan`; read by no managed run | a reviewable interpretation of a human plan and, per approved slice, the manifest passed to `run-plan --manifest` |
+| `intake/<intake>/` | engine | no | written once by `prepare-plan` (the intake agent's answer is its structured result); never rewritten | a reviewable interpretation of a human plan; approval binds its exact bytes, so editing it refuses an approved run |
+| `intake/<intake>/runs/<slice>/` | engine (`approve-plan`, on a person's decision) | no | `manifest.json` replaceable until `approval.json` exists; `approval.json` created once, never rewritten | the intake manifest envelope and the approval `run-plan --manifest` verifies before running it |
+| `intake/registry/<run>.json` | engine (`approve-plan`) | no | written at approval in the project that runs the slice | the run key and stage ids an approved slice owns, so a plain run cannot reuse them |
 | `stages/<stage>/brief.md` | engine (a person, for a hand-written stage) | no | generated from the plan section, or hand-written before execution; then immutable | what the stage is reviewed against — the plan section verbatim in a managed run |
 | `stages/<stage>/notes.md` | engine (and a person editing by hand) | no | skeleton at creation, then appended to by section | a human's recorded answer or check results (`## Human evidence`) |
 | `stages/<stage>/handoff.md` | engine | no | regenerated in full by every implementation turn | that turn's claims, git identity and evidence, for the sparrer |

@@ -99,6 +99,10 @@ from agent_sparring.stage import (
 MANIFEST_VERSION = 1
 
 _TOP_LEVEL_KEYS = frozenset({"version", "plan_label", "source_digest", "stages"})
+#: The top-level key of the envelope plan intake wraps an approved manifest
+#: in (see :mod:`agent_sparring.intake_approval`). Named here only so the
+#: plain reader can refuse one by name instead of as an unknown key.
+INTAKE_ENVELOPE_KEY = "intake_manifest"
 _STAGE_KEYS = frozenset({"stage_id", "label", "title", "brief", "mode", "repositories"})
 _REPOSITORY_KEYS = frozenset({"name", "path", "branch", "candidate_sha"})
 
@@ -124,6 +128,17 @@ def parse_manifest(text: str) -> ExecutionManifest:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ManifestError(f"manifest is not valid JSON: {exc}") from exc
+    if isinstance(payload, Mapping) and INTAKE_ENVELOPE_KEY in payload:
+        raise ManifestError(
+            "this is an intake-approved manifest, which runs only with its approval "
+            "(sparring run-plan --manifest <path>), never as a plain manifest"
+        )
+    return manifest_from_payload(payload)
+
+
+def manifest_from_payload(payload: Any) -> ExecutionManifest:
+    """:func:`parse_manifest` for an already-decoded JSON value."""
+
     if not isinstance(payload, Mapping):
         raise ManifestError("a manifest must be a JSON object")
     _reject_unknown(payload, _TOP_LEVEL_KEYS, "manifest")
@@ -317,11 +332,13 @@ def load_manifest_source(path: Path) -> ManifestPlanSource:
 
 
 __all__ = [
+    "INTAKE_ENVELOPE_KEY",
     "MANIFEST_VERSION",
     "ExecutionManifest",
     "ManifestError",
     "ManifestPlanSource",
     "load_manifest_source",
     "manifest_digest",
+    "manifest_from_payload",
     "parse_manifest",
 ]

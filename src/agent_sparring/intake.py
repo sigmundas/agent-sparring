@@ -26,12 +26,13 @@ Three things stay separate
    check about it, it checks (:func:`check_interpretation`). The
    interpretation is a visible file a person reviews; it is never workflow
    state, and nothing after approval reads it.
-3. **The execution manifest.** The existing contract, unchanged. Only
-   :func:`approve_plan` writes one, and only for a run slice a person
-   explicitly approved. ``run-plan --manifest`` then executes it exactly as
-   it would any other manifest -- digest pinned, briefs frozen, no agent
-   able to edit it, every existing gate in force. The runtime never asks a
-   model what the next stage is.
+3. **The execution manifest.** The existing contract, inside an intake
+   envelope. Only :func:`approve_plan` writes one, and only for a run slice
+   a person explicitly approved, together with the ``approval.json`` that
+   binds it. ``run-plan --manifest`` runs it only through that approval
+   (see :mod:`agent_sparring.intake_approval`), and then exactly as any
+   other manifest -- digest pinned, briefs frozen, every existing gate in
+   force. The runtime never asks a model what the next stage is.
 
 Briefs are assembled, not written
 ---------------------------------
@@ -64,8 +65,12 @@ What the engine enforces
   run, so a gate that blocks later executable work must fall between run
   slices. A gate inside a slice is a blocking finding, never a manifest
   whose order merely implies an unenforced prerequisite. Approving a slice
-  requires the person to confirm, by id, every gate that blocks it and every
-  earlier slice it depends on; the confirmations are recorded.
+  requires the person to confirm, by id, every gate that blocks it; an
+  earlier slice it depends on must instead be approved and its sealed run
+  complete, which approval checks and records.
+- **Repository state.** Every inspected repository is snapshotted at
+  prepare (:func:`repository_snapshot`); approval refuses drift, and a
+  slice runs on the branch intake saw checked out.
 - **Dependency order.** Every ``depends_on`` must point at a stage that runs
   earlier (in an earlier slice, or earlier in the same slice).
 
@@ -78,11 +83,12 @@ reports it. Inside: ``source.md`` (the snapshot), ``prompt.md``,
 ``interpretation.json`` (the agent's answer, verbatim content),
 ``briefs/<run>/<NN>-<label>.md`` (exactly the bytes a manifest will carry),
 ``amendment.diff`` (refine mode, when proposed), ``report.md`` and
-``intake.json`` (the engine's record: digests, run keys, provider). None of
-these is in manifest format, so none can be handed to ``run-plan`` by
-mistake. Approval adds ``runs/<run>/manifest.json`` and
-``runs/<run>/approval.json``, once; approving again must produce the
-identical manifest.
+``intake.json`` (the engine's record: digests, run keys, provider,
+repository snapshots, report digest). None of these is in manifest format,
+so none can be handed to ``run-plan`` by mistake. Approval adds
+``runs/<run>/manifest.json`` and creates ``runs/<run>/approval.json``
+exactly once, plus ``intake/registry/<run key>.json`` in the project that
+runs the slice; approving again must be identical.
 
 Nothing here is specific to any project or plan. A project's plans are
 data.
@@ -100,16 +106,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from agent_sparring.git_context import GitContextError, is_ignored
+from agent_sparring.git_context import GitContextError, is_ignored, repository_identity
+from agent_sparring.intake_approval import (
+    APPROVAL_FILENAME,
+    APPROVAL_VERSION,
+    INTAKE_DIRNAME,
+    MANIFEST_FILENAME,
+    REGISTRY_DIRNAME,
+    RUNS_DIRNAME,
+    SOURCE_KIND as INTAKE_SOURCE_KIND,
+    IntakeApprovalError,
+    envelope_text,
+    load_intake_manifest,
+    read_approval,
+    sha256_bytes,
+    write_atomic,
+    write_exclusive,
+)
 from agent_sparring.intake_prompt import MODE_FAITHFUL, MODE_REFINE, assemble_intake_prompt
 from agent_sparring.manifest import MANIFEST_VERSION, ManifestError, manifest_digest, parse_manifest
-from agent_sparring.plan import new_run_key, plan_key, plan_label
+from agent_sparring.plan import (
+    PlanError,
+    PlanRunState,
+    PlanRunStatus,
+    new_run_key,
+    plan_key,
+    plan_label,
+    run_state_path,
+)
 from agent_sparring.providers import ProviderError, StructuredAgentAdapter
 from agent_sparring.sparring_agent import repo_fingerprint
-from agent_sparring.stage import StageError, StageMode, validate_stage_id
+from agent_sparring.stage import Stage, StageError, StageMode, StageStatus, validate_stage_id
 
-INTAKE_DIRNAME = "intake"
-INTAKE_VERSION = 1
+#: ``intake.json`` version. ``1`` is an unsealed proposal from before
+#: approvals bound execution: recognised, and refused.
+INTAKE_VERSION = 2
 MODES: tuple[str, ...] = (MODE_FAITHFUL, MODE_REFINE)
 
 VERDICT_AS_WRITTEN = "executable_as_written"
@@ -800,6 +831,47 @@ def run_prerequisites(interpretation: Interpretation, run_id: str) -> tuple[str,
     return tuple(sorted(required))
 
 
+def split_prerequisites(interpretation: Interpretation, run_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(gates, earlier run slices)`` of :func:`run_prerequisites`.
+
+    They are satisfied differently: a gate is a person's confirmation, an
+    earlier slice is proven by its own approval and completed run -- never
+    by naming it.
+    """
+
+    slices = {run.id for run in interpretation.runs}
+    required = run_prerequisites(interpretation, run_id)
+    return (
+        tuple(r for r in required if r not in slices),
+        tuple(r for r in required if r in slices),
+    )
+
+
+def slice_branch(run: RunSlice, repositories: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """``(expected branch, None)`` for a run slice, or ``(None, why not)``.
+
+    The branch is the one its primary repository had checked out when intake
+    inspected it. A plan that names a different branch is refused rather
+    than trusted: the interpretation was made against what was inspected,
+    so the intended branch is checked out and the plan prepared again.
+    """
+
+    snapshot = repositories.get(run.primary_repository)
+    if not isinstance(snapshot, Mapping):
+        return None, (
+            f"repository {run.primary_repository!r} was not inspected by this intake; run "
+            f"prepare-plan with --context-repository {run.primary_repository}=<path>"
+        )
+    inspected = str(snapshot.get("branch"))
+    if run.expected_branch and run.expected_branch != inspected:
+        return None, (
+            f"the plan runs slice {run.id!r} on {run.expected_branch!r}, but "
+            f"{run.primary_repository} was on {inspected!r} when intake inspected it; check out "
+            f"{run.expected_branch!r} there and run prepare-plan again"
+        )
+    return inspected, None
+
+
 # -- stage ids and briefs -------------------------------------------------------
 
 
@@ -1000,7 +1072,8 @@ def prepare_plan(
         context_repositories={name: Path(path).resolve() for name, path in context_repositories.items()},
     )
 
-    watched = [repo_root, *context_repositories.values()]
+    named = [(primary_repository, repo_root), *sorted(context_repositories.items())]
+    watched = [Path(path) for _, path in named]
     before = [_fingerprint(path) for path in watched]
     try:
         result = adapter.start_structured(prompt, INTERPRETATION_SCHEMA)
@@ -1019,6 +1092,13 @@ def prepare_plan(
         raise IntakeError(f"cannot re-read plan {plan_path}: {exc}") from exc
     if reread != text:
         raise IntakeError(f"the plan {label} changed during the intake turn; refusing its answer")
+    # Every inspected repository, context-only ones included, as the intake
+    # agent saw it. Approval compares against these, never against whatever
+    # a later argument claims.
+    snapshots = {
+        name: repository_snapshot(path, fingerprint=fingerprint)
+        for (name, path), fingerprint in zip(named, after)
+    }
 
     interpretation = parse_interpretation(result.text)
     findings = all_findings(interpretation, source, mode=mode)
@@ -1068,21 +1148,23 @@ def prepare_plan(
         "provider_session_id": result.session_id,
         "amendment_proposed": amendment is not None,
     }
-    _write(directory / "intake.json", json.dumps(record, indent=2) + "\n")
-    _write(
-        directory / "report.md",
-        render_report(
-            source,
-            interpretation,
-            findings,
-            run_keys=run_keys,
-            briefs=briefs,
-            mode=mode,
-            intake_dir=directory,
-            amendment=amendment is not None,
-            provider=record["provider"],
-        ),
+    report = render_report(
+        source,
+        interpretation,
+        findings,
+        run_keys=run_keys,
+        briefs=briefs,
+        mode=mode,
+        intake_dir=directory,
+        amendment=amendment is not None,
+        provider=record["provider"],
+        repositories=snapshots,
     )
+    record["repositories"] = snapshots
+    record["report_intake_dir"] = str(directory)
+    record["report_digest"] = sha256_text(report)
+    _write(directory / "intake.json", json.dumps(record, indent=2) + "\n")
+    _write(directory / "report.md", report)
     return IntakeResult(directory=directory, interpretation=interpretation, findings=findings, run_keys=run_keys)
 
 
@@ -1091,6 +1173,32 @@ def _fingerprint(path: Path) -> tuple[str, str, tuple[str, ...]]:
         return repo_fingerprint(Path(path))
     except GitContextError as exc:
         raise IntakeError(f"cannot fingerprint repository {path}: {exc}") from exc
+
+
+def repository_snapshot(
+    path: Path, *, fingerprint: tuple[str, str, tuple[str, ...]] | None = None
+) -> dict[str, Any]:
+    """One repository's identity and state: canonical worktree path, common
+    git directory, branch, HEAD and dirty paths.
+
+    Built from the shared :func:`~agent_sparring.sparring_agent.
+    repo_fingerprint`, so it attests what that helper attests and no more:
+    branch, HEAD and which paths are dirty -- not file contents, not ignored
+    material, and not a modify-then-restore in between two observations.
+    """
+
+    branch, head, dirty = fingerprint if fingerprint is not None else _fingerprint(path)
+    try:
+        top, common = repository_identity(Path(path))
+    except GitContextError as exc:
+        raise IntakeError(f"cannot identify repository {path}: {exc}") from exc
+    return {
+        "path": top,
+        "git_common_dir": common,
+        "branch": branch,
+        "head": head,
+        "dirty_paths": list(dirty),
+    }
 
 
 def _render_briefs(
@@ -1134,6 +1242,7 @@ def render_report(
     intake_dir: Path,
     amendment: bool,
     provider: Mapping[str, Any],
+    repositories: Mapping[str, Any],
 ) -> str:
     """``report.md``: everything a person needs to decide on approval."""
 
@@ -1171,14 +1280,19 @@ def render_report(
         "expected branch. Slices are approved and started separately, in order."
     )
     for run in interpretation.runs:
-        prerequisites = run_prerequisites(interpretation, run.id)
+        gates, earlier = split_prerequisites(interpretation, run.id)
+        branch, problem = slice_branch(run, repositories)
         out += [
             "",
             f"### Run slice `{run.id}` — primary `{run.primary_repository}`",
             "",
-            f"- Expected branch: {('`' + run.expected_branch + '`') if run.expected_branch else 'not stated (give --expected-branch at approval)'}",
+            f"- Expected branch: `{branch}` (checked out when intake inspected it)"
+            if branch
+            else f"- Expected branch: **cannot be approved**: {problem}",
             f"- Run key: `{run_keys.get(run.id, '?')}`",
-            f"- Must confirm before approval: {', '.join('`' + p + '`' for p in prerequisites) or 'nothing'}",
+            f"- Gates a person confirms at approval: {', '.join('`' + g + '`' for g in gates) or 'none'}",
+            "- Earlier run slices that must be approved and complete first: "
+            + (', '.join('`' + e + '`' for e in earlier) or 'none'),
         ]
         if run.rationale:
             out.append(f"- Why this slice: {run.rationale}")
@@ -1240,6 +1354,18 @@ def render_report(
         + ("all accounted for." if not uncovered else f"{len(uncovered)} unaccounted range(s) (blocking, see findings).")
     )
 
+    out += ["", "## Repositories inspected", ""]
+    out.append(
+        "Approval refuses if any of these has moved to another branch or commit, except to a "
+        "commit an earlier run slice of this intake was accepted at."
+    )
+    for name, snapshot in sorted(repositories.items()):
+        dirty = snapshot.get("dirty_paths") or []
+        out.append(
+            f"- `{name}`: `{snapshot.get('path')}` on `{snapshot.get('branch')}` at "
+            f"`{str(snapshot.get('head'))[:12]}`" + (f"; {len(dirty)} dirty path(s)" if dirty else "")
+        )
+
     out += ["", "## Proposed amendment", ""]
     out.append(
         "See `amendment.diff`. It is a proposal for the source plan and is not applied; the "
@@ -1254,18 +1380,21 @@ def render_report(
         out.append("Resolve the blocking findings (edit the plan, or run intake again), then re-run prepare-plan.")
     else:
         for run in interpretation.runs:
-            prerequisites = run_prerequisites(interpretation, run.id)
+            gates, earlier = split_prerequisites(interpretation, run.id)
+            if slice_branch(run, repositories)[1]:
+                out.append(f"- Run slice `{run.id}` cannot be approved from this intake (see above).")
+                continue
             parts = [f"sparring approve-plan {intake_dir} --run {run.id}"]
-            if not run.expected_branch:
-                parts.append("--expected-branch <branch>")
             siblings = sorted({name for stage in run.stages for name in stage.repositories})
             for name in siblings:
                 parts.append(f"--repository {name}=<path> --repository-branch {name}=<branch>")
-            for prerequisite in prerequisites:
-                parts.append(f"--confirm-prerequisite {prerequisite}")
+            for gate in gates:
+                parts.append(f"--confirm-prerequisite {gate}")
             if amendment:
                 parts.append("--without-amendment")
-            out.append(f"- From the `{run.primary_repository}` project: `{' '.join(parts)}`")
+            after = f", once {', '.join('`' + e + '`' for e in earlier)} completed" if earlier else ""
+            confirm = " (confirm each gate only once it is actually satisfied)" if gates else ""
+            out.append(f"- From the `{run.primary_repository}` project{after}{confirm}: `{' '.join(parts)}`")
     return "\n".join(out).rstrip() + "\n"
 
 
@@ -1275,6 +1404,7 @@ def render_report(
 @dataclass(frozen=True)
 class Approval:
     manifest_path: Path
+    approval_path: Path
     run_key: str
     expected_branch: str
     manifest_digest: str
@@ -1298,10 +1428,101 @@ def _read_text(path: Path) -> str:
         raise IntakeError(f"cannot read {path}: {exc}") from exc
 
 
+def _read_bytes(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise IntakeError(f"cannot read {path}: {exc}") from exc
+
+
+def _recorded_repositories(record: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    repositories = record.get("repositories")
+    keys = ("path", "git_common_dir", "branch", "head")
+    if not isinstance(repositories, dict) or not all(
+        isinstance(snapshot, dict) and all(isinstance(snapshot.get(k), str) and snapshot.get(k) for k in keys)
+        for snapshot in repositories.values()
+    ):
+        raise IntakeError("intake.json records no valid repository snapshots; run prepare-plan again")
+    return repositories
+
+
+def _same_repository(path: Path, snapshot: Mapping[str, Any]) -> bool:
+    try:
+        return repository_identity(path) == (snapshot["path"], snapshot["git_common_dir"])
+    except GitContextError:
+        return False
+
+
+@dataclass(frozen=True)
+class _CompletedSlice:
+    """What proves an earlier run slice: its approval and its finished run."""
+
+    evidence: dict[str, Any]
+    repository: str
+    final_candidate: str
+
+
+def _completed_slice(intake_dir: Path, run_id: str) -> _CompletedSlice:
+    """Prove that earlier run slice ``run_id`` of this intake was approved and
+    its sealed run completed with an accepted candidate, or refuse."""
+
+    manifest_path = intake_dir / RUNS_DIRNAME / (_slug(run_id) or "run") / MANIFEST_FILENAME
+    try:
+        prior = load_intake_manifest(manifest_path)
+    except IntakeApprovalError as exc:
+        raise IntakeError(
+            f"earlier run slice {run_id!r} has no valid approval ({exc}). It must be approved "
+            "and run to completion before a slice that depends on it is approved"
+        ) from exc
+    approval = prior.approval
+    sparring_dir = Path(str(approval.field("sparring_dir")))
+    state_path = run_state_path(sparring_dir, approval.run_key)
+    if not state_path.is_file():
+        raise IntakeError(
+            f"earlier run slice {run_id!r} is approved but has not been run (no run "
+            f"{approval.run_key} at {state_path}); run and complete it first"
+        )
+    try:
+        state = PlanRunState.load(state_path)
+    except PlanError as exc:
+        raise IntakeError(f"cannot read the run of earlier slice {run_id!r}: {exc}") from exc
+    if (state.run, state.source, state.plan_digest) != (approval.run_key, INTAKE_SOURCE_KIND, prior.digest()):
+        raise IntakeError(
+            f"the run recorded at {state_path} is not the sealed run of earlier slice {run_id!r}"
+        )
+    if state.status is not PlanRunStatus.COMPLETE:
+        raise IntakeError(
+            f"earlier run slice {run_id!r} has not completed (its run {approval.run_key} is "
+            f"{state.status.value} at stage {state.current_stage!r}); approval alone does not "
+            "mean its work happened"
+        )
+    last = prior.stages()[-1]
+    try:
+        stage_state = Stage.resolve(sparring_dir, last.stage_id).read_state()
+    except StageError as exc:
+        raise IntakeError(f"cannot read the final stage of earlier slice {run_id!r}: {exc}") from exc
+    if stage_state.status is not StageStatus.ACCEPTED or not stage_state.candidate_sha:
+        raise IntakeError(f"the final stage of earlier slice {run_id!r} has no accepted candidate")
+    return _CompletedSlice(
+        evidence={
+            "run_id": run_id,
+            "run_key": approval.run_key,
+            "approval_sha256": approval.sha256,
+            "plan_digest": state.plan_digest,
+            "final_stage": last.stage_id,
+            "final_candidate_sha": stage_state.candidate_sha,
+        },
+        repository=str(approval.field("primary_repository")),
+        final_candidate=stage_state.candidate_sha,
+    )
+
+
 def approve_plan(
     intake_dir: Path,
     *,
     run_id: str,
+    repo_root: Path,
+    sparring_dir: Path,
     primary_repository: str,
     expected_branch: str | None = None,
     repositories: Mapping[str, str] | None = None,
@@ -1310,22 +1531,35 @@ def approve_plan(
     without_amendment: bool = False,
     now: Callable[[], datetime] = _utc_now,
 ) -> Approval:
-    """Turn one reviewed run slice into an execution manifest, or refuse.
+    """A person's explicit approval of one reviewed run slice, sealed.
 
-    Every refusal names what to do. The manifest is built from the same
-    source snapshot and interpretation the report was rendered from, with
-    the same deterministic checks, so it holds exactly what the person
-    reviewed. It is then validated with the engine's own manifest parser.
+    Refuses (:class:`IntakeError`, writing nothing) unless the intake is
+    exactly what was reviewed -- source plan, snapshot, interpretation and
+    ``report.md`` -- has no blocking finding, and the slice is approved from
+    its inspected primary repository on the branch intake saw checked out,
+    with every inspected repository where intake saw it (or at a commit an
+    earlier slice of this intake was accepted at), every gate it waits for
+    confirmed by id, and every earlier slice it depends on proven by that
+    slice's own approval and completed run.
 
-    The digests in ``intake.json`` detect accidental or partial edits of the
-    intake directory, not a deliberate rewrite of all of it: the directory
-    is not a trust anchor. What does not depend on it is checked against
-    something that is -- the source plan on disk, and the amendment, which
-    is derived from the interpretation rather than read from the record.
+    Writes ``runs/<run>/manifest.json`` -- an intake envelope around the
+    ordinary manifest -- and then ``approval.json``, which binds the exact
+    manifest bytes, the inputs above, the repository state the run must
+    start from and the prerequisite evidence (see
+    :mod:`agent_sparring.intake_approval`). An approval is created once and
+    never rewritten: repeating an identical one returns it, and a
+    conflicting one refuses.
     """
 
     intake_dir = Path(intake_dir)
+    repo_root = Path(repo_root)
+    record_raw = _read_bytes(intake_dir / "intake.json")
     record = _read_json(intake_dir / "intake.json")
+    if record.get("version") == 1:
+        raise IntakeError(
+            f"{intake_dir} is an unsealed intake prepared before approvals bound execution; it "
+            "cannot be approved. Run prepare-plan again and review the new report"
+        )
     if record.get("version") != INTAKE_VERSION:
         raise IntakeError(f"unsupported intake record version {record.get('version')!r}")
     mode = str(record.get("mode"))
@@ -1377,26 +1611,68 @@ def approve_plan(
             f"approve and run this slice from the {run.primary_repository!r} project"
         )
 
-    required = set(run_prerequisites(interpretation, run_id))
-    confirmed = {value.strip() for value in confirmed_prerequisites if value.strip()}
-    known = {gate.id for gate in interpretation.gates} | set(runs)
-    unknown = sorted(confirmed - known)
-    if unknown:
-        raise IntakeError(f"--confirm-prerequisite names nothing in this intake: {unknown}")
-    irrelevant = sorted(confirmed - required)
-    if irrelevant:
-        raise IntakeError(f"run slice {run_id!r} does not depend on {irrelevant}; confirm only its prerequisites")
-    missing = sorted(required - confirmed)
-    if missing:
+    run_keys = record.get("run_keys") or {}
+    if not isinstance(run_keys, Mapping) or any(
+        not isinstance(run_keys.get(slice_id), str) or not run_keys.get(slice_id) for slice_id in runs
+    ):
+        raise IntakeError("intake.json does not record a run key for every run slice; run prepare-plan again")
+    inspected = _recorded_repositories(record)
+    briefs = _render_briefs(source, interpretation, run_keys)
+
+    # The person reviewed report.md. Approving is only meaningful if it is
+    # the report this intake renders, so a stale or edited one refuses.
+    report_dir = record.get("report_intake_dir")
+    report_text = _read_text(intake_dir / "report.md")
+    rendered = render_report(
+        source,
+        interpretation,
+        findings,
+        run_keys=run_keys,
+        briefs=briefs,
+        mode=mode,
+        intake_dir=Path(str(report_dir)),
+        amendment=amendment_proposed,
+        provider=record.get("provider") or {},
+        repositories=inspected,
+    )
+    if not isinstance(report_dir, str) or rendered != report_text or sha256_text(report_text) != record.get("report_digest"):
         raise IntakeError(
-            f"run slice {run_id!r} is blocked until a person confirms {missing} (gates it waits "
-            "for, or earlier run slices it depends on). The runtime cannot enforce these inside "
-            "a run; confirm each with --confirm-prerequisite once it is actually satisfied"
+            f"{intake_dir / 'report.md'} is not the report this intake renders; what you reviewed "
+            "is not what approval would bind. Run prepare-plan again"
         )
 
-    branch = (expected_branch or "").strip() or run.expected_branch
-    if not branch:
-        raise IntakeError(f"run slice {run_id!r} states no expected branch; pass --expected-branch")
+    gates, earlier = split_prerequisites(interpretation, run_id)
+    confirmed = {value.strip() for value in confirmed_prerequisites if value.strip()}
+    named_slices = sorted(confirmed & set(runs))
+    if named_slices:
+        raise IntakeError(
+            f"--confirm-prerequisite {named_slices}: an earlier run slice is not confirmed by "
+            "name. It is proven by its own approval and completed run, which approval checks"
+        )
+    unknown = sorted(confirmed - {gate.id for gate in interpretation.gates})
+    if unknown:
+        raise IntakeError(f"--confirm-prerequisite names no gate in this intake: {unknown}")
+    irrelevant = sorted(confirmed - set(gates))
+    if irrelevant:
+        raise IntakeError(f"run slice {run_id!r} does not wait for {irrelevant}; confirm only its gates")
+    missing = sorted(set(gates) - confirmed)
+    if missing:
+        raise IntakeError(
+            f"run slice {run_id!r} waits for gates {missing}. The runtime cannot enforce these "
+            "inside a run; confirm each with --confirm-prerequisite once it is actually satisfied"
+        )
+
+    branch, problem = slice_branch(run, inspected)
+    if problem:
+        raise IntakeError(problem)
+    assert branch is not None
+    requested = (expected_branch or "").strip()
+    if requested and requested != branch:
+        raise IntakeError(
+            f"run slice {run_id!r} runs on {branch!r}, the branch intake inspected; "
+            f"--expected-branch {requested!r} cannot replace it. Check out {requested!r} and run "
+            "prepare-plan again"
+        )
 
     repositories = dict(repositories or {})
     repository_branches = dict(repository_branches or {})
@@ -1410,17 +1686,21 @@ def approve_plan(
             f"run slice {run_id!r} declares sibling repositories {missing_repos}; give each a "
             "path and branch with --repository NAME=PATH and --repository-branch NAME=BRANCH"
         )
+    for name in needed:
+        if name not in inspected:
+            raise IntakeError(
+                f"sibling repository {name!r} was not inspected by this intake; run prepare-plan "
+                f"with --context-repository {name}=<path>"
+            )
+        if not _same_repository(repo_root / repositories[name], inspected[name]):
+            raise IntakeError(
+                f"--repository {name}={repositories[name]} is not the repository intake inspected "
+                f"as {name!r} ({inspected[name]['path']})"
+            )
 
-    run_keys = record.get("run_keys") or {}
-    if not isinstance(run_keys, Mapping) or any(
-        not isinstance(run_keys.get(slice_id), str) or not run_keys.get(slice_id) for slice_id in runs
-    ):
-        raise IntakeError("intake.json does not record a run key for every run slice; run prepare-plan again")
     run_key = run_keys[run_id]
-    briefs = _render_briefs(source, interpretation, run_keys)
-    recorded_briefs = record.get("briefs") or {}
-
     stages = []
+    recorded_briefs = record.get("briefs") or {}
     for stage in run.stages:
         stage_id, _, content = briefs[(run.id, stage.label)]
         if recorded_briefs.get(stage_id) != sha256_text(content):
@@ -1454,52 +1734,142 @@ def approve_plan(
         "source_digest": f"sha256:{source.digest}",
         "stages": stages,
     }
-    manifest_text = json.dumps(manifest_payload, indent=2, ensure_ascii=False) + "\n"
     try:
-        manifest = parse_manifest(manifest_text)
+        manifest = parse_manifest(json.dumps(manifest_payload))
     except (ManifestError, StageError) as exc:
         raise IntakeError(f"the approved slice does not form a valid manifest: {exc}") from exc
     digest = manifest_digest(manifest)
+    intake_id = str(record.get("intake_id"))
+    manifest_text = envelope_text(intake_id=intake_id, run_id=run_id, run_key=run_key, manifest=manifest_payload)
 
-    run_dir = intake_dir / "runs" / (_slug(run_id) or "run")
-    manifest_path = run_dir / "manifest.json"
-    if manifest_path.exists():
-        if _read_text(manifest_path) != manifest_text:
+    run_dir = intake_dir / RUNS_DIRNAME / (_slug(run_id) or "run")
+    manifest_path = run_dir / MANIFEST_FILENAME
+    approval_path = run_dir / APPROVAL_FILENAME
+    decision = {
+        "expected_branch": branch,
+        "confirmed_gates": sorted(confirmed),
+        "without_amendment": bool(without_amendment and amendment_proposed),
+    }
+
+    def result(created: bool) -> Approval:
+        return Approval(
+            manifest_path=manifest_path,
+            approval_path=approval_path,
+            run_key=run_key,
+            expected_branch=branch,
+            manifest_digest=digest,
+            created=created,
+        )
+
+    def existing() -> Approval:
+        try:
+            previous = read_approval(approval_path)
+        except IntakeApprovalError as exc:
+            raise IntakeError(f"run slice {run_id!r} has an approval that cannot be used: {exc}") from exc
+        recorded = {key: previous.payload.get(key) for key in decision}
+        if recorded != decision:
+            raise IntakeError(
+                f"run slice {run_id!r} was already approved with {recorded}; an approval is not "
+                f"rewritten, and this one would record {decision}"
+            )
+        on_disk = manifest_path.read_bytes() if manifest_path.is_file() else b""
+        if sha256_bytes(on_disk) != previous.field("manifest_sha256"):
+            raise IntakeError(
+                f"{manifest_path} changed after run slice {run_id!r} was approved; it will not "
+                "run. Run prepare-plan and approve-plan again"
+            )
+        if on_disk != manifest_text.encode("utf-8"):
             raise IntakeError(
                 f"run slice {run_id!r} was already approved with a different manifest "
                 f"({manifest_path}); an approval is not rewritten. Run prepare-plan again"
             )
-        # Branch and confirmations are not in the manifest, so an identical
-        # manifest does not make a repeat approval identical: it must also
-        # agree with what was recorded, or it would print a run-plan command
-        # the approval never covered.
-        previous = _read_json(run_dir / "approval.json")
-        if previous.get("expected_branch") != branch or previous.get("confirmed_prerequisites") != sorted(confirmed):
-            raise IntakeError(
-                f"run slice {run_id!r} was already approved for branch "
-                f"{previous.get('expected_branch')!r} with confirmations "
-                f"{previous.get('confirmed_prerequisites')}; an approval is not rewritten"
-            )
-        return Approval(manifest_path=manifest_path, run_key=run_key, expected_branch=branch, manifest_digest=digest, created=False)
+        return result(created=False)
 
-    run_dir.mkdir(parents=True, exist_ok=True)
-    _write(manifest_path, manifest_text)
+    if approval_path.exists():
+        return existing()
+
+    # A new decision: the repositories must still be where intake saw them.
+    require_intake_ignored(repo_root, sparring_dir)
+    if not _same_repository(repo_root, inspected[primary_repository]):
+        raise IntakeError(
+            f"this project ({repo_root}) is not the repository intake inspected as "
+            f"{primary_repository!r} ({inspected[primary_repository]['path']}); approve from that one"
+        )
+    completed = [_completed_slice(intake_dir, prior) for prior in earlier]
+    advanced: dict[str, set[str]] = {}
+    for prior in completed:
+        advanced.setdefault(prior.repository, set()).add(prior.final_candidate)
+    now_seen: dict[str, dict[str, Any]] = {}
+    drift = []
+    for name, seen in sorted(inspected.items()):
+        present = repository_snapshot(Path(seen["path"]))
+        now_seen[name] = present
+        if (present["path"], present["git_common_dir"]) != (seen["path"], seen["git_common_dir"]):
+            drift.append(f"{name}: {seen['path']} is now a different repository")
+        elif present["branch"] != seen["branch"]:
+            drift.append(f"{name}: branch {seen['branch']!r} is now {present['branch']!r}")
+        elif present["head"] != seen["head"] and present["head"] not in advanced.get(name, set()):
+            drift.append(
+                f"{name}: {seen['branch']} moved from {seen['head'][:12]} to {present['head'][:12]}"
+                + (" (not a commit an earlier slice was accepted at)" if name in advanced else "")
+            )
+    if drift:
+        raise IntakeError(
+            "repositories moved since intake inspected them, so the reviewed interpretation may "
+            "no longer describe them:\n- " + "\n- ".join(drift) + "\nRun prepare-plan again"
+        )
+
+    starting = now_seen[primary_repository]
     approval = {
-        "version": INTAKE_VERSION,
-        "intake_id": record.get("intake_id"),
+        "version": APPROVAL_VERSION,
+        "decision": "approved",
+        "approved_at": now().isoformat(),
+        "intake_id": intake_id,
+        "intake_dir": str(intake_dir.resolve()),
         "run_id": run_id,
         "run_key": run_key,
-        "approved_at": now().isoformat(),
         "primary_repository": primary_repository,
-        "expected_branch": branch,
-        "source_digest": record.get("source_digest"),
-        "interpretation_digest": record.get("interpretation_digest"),
+        "sparring_dir": str(Path(sparring_dir).resolve()),
+        "source": {"path": str(source_path), "label": source.label, "digest": source.digest},
+        "intake_record_sha256": sha256_bytes(record_raw),
+        "interpretation_digest": str(record.get("interpretation_digest")),
+        "report_digest": str(record.get("report_digest")),
+        "manifest_sha256": sha256_bytes(manifest_text.encode("utf-8")),
         "manifest_digest": digest,
-        "confirmed_prerequisites": sorted(confirmed),
-        "without_amendment": bool(without_amendment and amendment_proposed),
+        "stage_ids": [entry["stage_id"] for entry in stages],
+        "starting_snapshot": {
+            key: starting[key] for key in ("path", "git_common_dir", "branch", "head")
+        },
+        "repositories": {"inspected": inspected, "at_approval": now_seen},
+        "prerequisites": {
+            "gates_confirmed": sorted(confirmed),
+            "earlier_slices": [prior.evidence for prior in completed],
+        },
+        **decision,
     }
-    _write(run_dir / "approval.json", json.dumps(approval, indent=2) + "\n")
-    return Approval(manifest_path=manifest_path, run_key=run_key, expected_branch=branch, manifest_digest=digest, created=True)
+    # The manifest may be replaced until an approval exists for it; the
+    # approval is created exactly once, and it is what makes the manifest
+    # runnable. A crash between the two leaves an unapproved manifest that
+    # run-plan refuses and a repeat of this approval completes.
+    write_atomic(manifest_path, manifest_text)
+    registry = intake_root(sparring_dir) / REGISTRY_DIRNAME / f"{run_key}.json"
+    write_atomic(
+        registry,
+        json.dumps(
+            {
+                "run_key": run_key,
+                "intake_dir": str(intake_dir.resolve()),
+                "run_id": run_id,
+                "stage_ids": approval["stage_ids"],
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    if not write_exclusive(approval_path, json.dumps(approval, indent=2) + "\n"):
+        # Another approval won the race; it decides, and this one must agree.
+        return existing()
+    return result(created=True)
 
 
 __all__ = [
@@ -1520,6 +1890,9 @@ __all__ = [
     "parse_interpretation",
     "prepare_plan",
     "render_brief",
+    "repository_snapshot",
     "require_intake_ignored",
     "run_prerequisites",
+    "slice_branch",
+    "split_prerequisites",
 ]

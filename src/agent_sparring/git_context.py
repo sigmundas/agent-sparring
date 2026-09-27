@@ -104,6 +104,24 @@ def resolve_commit(repo_root: Path, rev: str, *, label: str = "revision") -> str
     return sha
 
 
+def repository_identity(repo_root: Path) -> tuple[str, str]:
+    """``(worktree top level, common git directory)``, both resolved.
+
+    The top level says *which worktree* this is; the common directory says
+    which repository it belongs to, and is shared by every linked worktree
+    of one clone. Together they tell a path substitution -- another clone,
+    another worktree, a symlinked alias -- from the repository that was
+    actually inspected.
+    """
+
+    top = _git(repo_root, "rev-parse", "--show-toplevel")
+    common = _git(repo_root, "rev-parse", "--git-common-dir")
+    common_path = Path(common)
+    if not common_path.is_absolute():
+        common_path = Path(repo_root) / common_path
+    return str(Path(top).resolve()), str(common_path.resolve())
+
+
 def is_ignored(repo_root: Path, path: Path) -> bool:
     """Would git ignore ``path`` (which need not exist yet)?
 

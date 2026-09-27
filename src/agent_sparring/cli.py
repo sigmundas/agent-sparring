@@ -1513,6 +1513,8 @@ def _cmd_approve_plan(args: argparse.Namespace) -> int:
         approval = approve_plan(
             Path(args.intake_dir),
             run_id=args.run,
+            repo_root=repo_root,
+            sparring_dir=sparring_dir,
             primary_repository=_project_repository_name(args, sparring_dir, repo_root),
             expected_branch=args.expected_branch,
             repositories=_pairs(args.repository, "--repository"),
@@ -1527,6 +1529,7 @@ def _cmd_approve_plan(args: argparse.Namespace) -> int:
     verb = "approved" if approval.created else "already approved (identical)"
     print(f"{verb}: {approval.manifest_path}", file=sys.stderr)
     print(f"manifest digest: {approval.manifest_digest}", file=sys.stderr)
+    print(f"approval: {approval.approval_path}", file=sys.stderr)
     print(
         f"sparring run-plan --manifest {approval.manifest_path} --run-key {approval.run_key} "
         f"--repo-root {repo_root} --expected-branch {approval.expected_branch}"
@@ -2125,9 +2128,11 @@ def build_parser() -> argparse.ArgumentParser:
     approve = subparsers.add_parser(
         "approve-plan",
         help=(
-            "approve one reviewed run slice of a prepare-plan intake and write its execution "
-            "manifest; refuses on blocking findings, a changed source plan, or an unconfirmed "
-            "gate or prerequisite run slice"
+            "approve one reviewed run slice of a prepare-plan intake and write its sealed "
+            "execution manifest and approval, which run-plan verifies before running anything; "
+            "refuses on blocking findings, a changed plan, interpretation or report, a "
+            "repository that moved since intake, an unconfirmed gate, or an earlier run slice "
+            "that is not approved and complete"
         ),
     )
     approve.add_argument("intake_dir", help="the .sparring/intake/<id>/ directory prepare-plan wrote")
@@ -2135,7 +2140,10 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument(
         "--expected-branch",
         default=None,
-        help="the branch this slice runs on (required unless the plan states one)",
+        help=(
+            "optional check: the branch this slice runs on. It must equal the branch intake "
+            "inspected; to run on another, check it out and run prepare-plan again"
+        ),
     )
     approve.add_argument(
         "--repository",
@@ -2154,8 +2162,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="ID",
         help=(
-            "confirm that a gate this slice waits for, or an earlier run slice it depends on, "
-            "is actually satisfied; recorded in approval.json; repeatable"
+            "confirm, by gate id, that a gate this slice waits for is actually satisfied; "
+            "recorded in approval.json; repeatable. Earlier run slices are not confirmed: "
+            "approval checks their own approval and completed run"
         ),
     )
     approve.add_argument(

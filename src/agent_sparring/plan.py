@@ -190,6 +190,12 @@ from agent_sparring.loop import (
     run_unattended_loop,
 )
 from agent_sparring.manifest import ManifestError, ManifestPlanSource, load_manifest_source
+from agent_sparring.intake_approval import (
+    SOURCE_KIND as INTAKE_SOURCE_KIND,
+    is_envelope,
+    load_intake_manifest,
+    refuse_intake_identities,
+)
 from agent_sparring.plan_model import PlanSource, PlannedStage, digest_planned_stages
 from agent_sparring.push_gate import (
     PushAuthorization,
@@ -829,6 +835,18 @@ def load_plan_source(path: Path, repo_root: Path, *, manifest: bool = False) -> 
 
     if manifest:
         try:
+            raw = Path(path).read_bytes()
+        except OSError as exc:
+            raise PlanError(f"cannot read manifest {path}: {exc}") from exc
+        try:
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                payload = None
+            if is_envelope(payload):
+                # Verified and parsed from these same bytes: what was
+                # checked is what runs.
+                return load_intake_manifest(Path(path), raw)
             return load_manifest_source(Path(path))
         except ManifestError as exc:
             raise PlanError(str(exc)) from exc
@@ -1046,6 +1064,15 @@ def start_plan(
         raise PlanError("expected_branch is required for a plan run")
 
     source = _coerce_source(plan, repo_root)
+    bind_fresh_run = getattr(source, "bind_fresh_run", None)
+    if callable(bind_fresh_run):
+        # An approved intake slice runs as the run it was approved as, from
+        # the repository state it was approved against -- checked here,
+        # before anything is recorded or run.
+        try:
+            run_key = bind_fresh_run(Path(repo_root), run_key=run_key, expected_branch=expected_branch)
+        except ManifestError as exc:
+            raise PlanError(str(exc)) from exc
     label = source.label
     # Open runs are looked for before the run's own identity is minted, so a
     # refusal costs nothing and leaves nothing behind.
@@ -1072,6 +1099,13 @@ def start_plan(
         # run's, not the document's.
         source = source.in_namespace(key)
     stages = source.stages()
+    if source.kind != INTAKE_SOURCE_KIND:
+        try:
+            refuse_intake_identities(
+                sparring_dir, run_key=key, stage_ids=[stage.stage_id for stage in stages]
+            )
+        except ManifestError as exc:
+            raise PlanError(f"refusing a fresh run of {label}: {exc}") from exc
     state_path = run_state_path(sparring_dir, key)
     if state_path.is_file():
         raise PlanError(

@@ -124,13 +124,36 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
         provider_writable=False,
         lifetime=(
             "written once by 'sparring prepare-plan' (the intake agent's answer is its "
-            "structured result, recorded by the engine); runs/<run>/ written once by "
-            "'sparring approve-plan'; never rewritten, and read by no managed run"
+            "structured result, recorded by the engine); never rewritten"
         ),
         purpose=(
             "a reviewable interpretation of a human plan -- source snapshot, findings, "
-            "run slices, exact briefs, amendment diff -- and, per approved run slice, the "
-            "execution manifest a person passes to 'run-plan --manifest'"
+            "run slices, exact briefs, repository snapshots, amendment diff, report; "
+            "approval binds its exact bytes, so editing it refuses an approved run"
+        ),
+    ),
+    ArtifactOwnership(
+        path="intake/<intake>/runs/<run>/",
+        owner="engine ('sparring approve-plan', on a person's explicit decision)",
+        provider_writable=False,
+        lifetime=(
+            "manifest.json may be replaced until approval.json exists; approval.json is "
+            "created exactly once and never rewritten"
+        ),
+        purpose=(
+            "one approved run slice: the intake manifest envelope and the approval that "
+            "binds its exact bytes, inputs, starting repository state and prerequisite "
+            "evidence; 'run-plan --manifest' runs it only through that approval"
+        ),
+    ),
+    ArtifactOwnership(
+        path="intake/registry/<run>.json",
+        owner="engine ('sparring approve-plan')",
+        provider_writable=False,
+        lifetime="written at approval in the project that runs the slice",
+        purpose=(
+            "the run key and stage ids an approved slice owns, so a plain manifest or "
+            "plan reusing them is refused rather than run unapproved"
         ),
     ),
     ArtifactOwnership(
