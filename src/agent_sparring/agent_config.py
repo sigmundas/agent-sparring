@@ -10,13 +10,18 @@ quietly disagree about what the project configured.
 
 Precedence, per role and per field:
 
-    explicit CLI override  >  environment  >  .sparring/project.toml  >  provider default
+    explicit CLI override  >  environment  >  local override  >  .sparring/project.toml  >  provider default
 
 "Provider default" means the engine passes no flag at all and the provider
 CLI does whatever it normally does. The engine never writes a guessed model
 name into that gap, and :func:`resolve_agent_configs` reports the source of
 each value so a UI can say "provider default" honestly instead of inventing
 one.
+
+The local override layer (:mod:`agent_sparring.local_config`) holds model and
+effort for one worktree in its git directory, where no dirty-tree check can see
+it: it is how a cockpit changes the next stage's model or effort while a
+managed run is going, without the edit stopping that run.
 
 The environment layer exists because ``project.toml`` is a tracked file in
 the consuming repository: changing a model there dirties the working tree,
@@ -49,6 +54,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from agent_sparring.config import ProjectConfig, ProjectConfigError
+from agent_sparring.local_config import LocalAgentOverrides
 from agent_sparring.providers import claude_cli, codex_cli
 
 ROLE_STAGE = "stage"
@@ -62,6 +68,7 @@ FIELDS: tuple[str, ...] = ("provider", "model", "effort")
 # output so a UI never has to guess.
 SOURCE_CLI = "cli"
 SOURCE_ENV = "env"
+SOURCE_LOCAL = "local"
 SOURCE_PROJECT = "project"
 SOURCE_ENGINE_DEFAULT = "engine-default"
 SOURCE_PROVIDER_DEFAULT = "provider-default"
@@ -303,9 +310,9 @@ def capability(provider: str) -> ProviderCapability:
 
 
 def _layered(
-    override: str | None, env: str | None, configured: str | None
+    override: str | None, env: str | None, configured: str | None, local: str | None = None
 ) -> tuple[str | None, str | None]:
-    """The most specific value of the three layers, and which one supplied it.
+    """The most specific value of the layers, and which one supplied it.
 
     ``(None, None)`` means no layer set the field, which each caller turns
     into the right kind of default for what it is resolving.
@@ -315,6 +322,8 @@ def _layered(
         return override, SOURCE_CLI
     if env is not None:
         return env, SOURCE_ENV
+    if local is not None:
+        return local, SOURCE_LOCAL
     if configured is not None:
         return configured, SOURCE_PROJECT
     return None, None
@@ -352,8 +361,9 @@ def _resolve_effort(
     override: str | None,
     env: str | None,
     configured: str | None,
+    local: str | None = None,
 ) -> tuple[str | None, str]:
-    value, source = _layered(override, env, configured)
+    value, source = _layered(override, env, configured, local)
     if value is None or source is None:
         return None, SOURCE_PROVIDER_DEFAULT
     # Name the layer the value actually came from, so a rejected level sends
@@ -364,6 +374,7 @@ def _resolve_effort(
     where = {
         SOURCE_CLI: f"the {role} agent effort override",
         SOURCE_ENV: env_var(role, "effort"),
+        SOURCE_LOCAL: f"the local [agents.{role}] effort override",
         SOURCE_PROJECT: f"[agents.{role}] effort",
     }[source]
 
@@ -388,14 +399,16 @@ def _resolve_model(
     override: str | None,
     env: str | None,
     configured: str | None,
+    local: str | None = None,
 ) -> tuple[str | None, str]:
-    value, source = _layered(override, env, configured)
+    value, source = _layered(override, env, configured, local)
     if value is None or source is None:
         return None, SOURCE_PROVIDER_DEFAULT
     if not cap.supports_model:
         where = {
             SOURCE_CLI: f"the {role} agent model override",
             SOURCE_ENV: env_var(role, "model"),
+            SOURCE_LOCAL: f"the local [agents.{role}] model override",
             SOURCE_PROJECT: f"[agents.{role}] model",
         }[source]
         raise AgentConfigError(
@@ -414,6 +427,7 @@ def resolve_role_config(
     overrides: RoleOverrides = RoleOverrides(),
     *,
     environ: Mapping[str, str] | None = None,
+    local: LocalAgentOverrides | None = None,
 ) -> ResolvedAgentConfig:
     """Resolve one role's effective provider/model/effort.
 
@@ -445,11 +459,13 @@ def resolve_role_config(
     cap = capability(provider)
     _require_role(role, cap)
 
+    local_model = local.get(role, "model") if local is not None else None
+    local_effort = local.get(role, "effort") if local is not None else None
     model, model_source = _resolve_model(
-        role, cap, overrides.model, env.model, configured_model
+        role, cap, overrides.model, env.model, configured_model, local_model
     )
     effort, effort_source = _resolve_effort(
-        role, cap, overrides.effort, env.effort, configured_effort
+        role, cap, overrides.effort, env.effort, configured_effort, local_effort
     )
 
     return ResolvedAgentConfig(
@@ -499,12 +515,13 @@ def resolve_agent_configs(
     stage: RoleOverrides = RoleOverrides(),
     sparring: RoleOverrides = RoleOverrides(),
     environ: Mapping[str, str] | None = None,
+    local: LocalAgentOverrides | None = None,
 ) -> EffectiveAgents:
     """Resolve both roles. The single entry point every command goes through."""
 
     return EffectiveAgents(
-        stage=resolve_role_config(ROLE_STAGE, config, stage, environ=environ),
-        sparring=resolve_role_config(ROLE_SPARRING, config, sparring, environ=environ),
+        stage=resolve_role_config(ROLE_STAGE, config, stage, environ=environ, local=local),
+        sparring=resolve_role_config(ROLE_SPARRING, config, sparring, environ=environ, local=local),
     )
 
 
@@ -527,6 +544,7 @@ __all__ = [
     "SOURCE_CLI",
     "SOURCE_ENGINE_DEFAULT",
     "SOURCE_ENV",
+    "SOURCE_LOCAL",
     "SOURCE_PROJECT",
     "SOURCE_PROVIDER_DEFAULT",
     "capability",

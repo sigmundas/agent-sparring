@@ -31,6 +31,12 @@ from agent_sparring.agent_config import (
     resolve_role_config,
 )
 from agent_sparring.config_edit import RoleEdit, apply_role_edit
+from agent_sparring.local_config import (
+    load_local_overrides,
+    local_overrides_path,
+    with_local_edit,
+    write_local_overrides,
+)
 from agent_sparring.config import (
     CONFIG_FILENAME,
     ProjectConfig,
@@ -120,7 +126,7 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
         # The same resolution a run would perform, with no CLI overrides:
         # an effort a provider cannot honour is reported here rather than
         # discovered when a turn is about to start.
-        effective = resolve_agent_configs(config)
+        effective = resolve_agent_configs(config, local=load_local_overrides(sparring_dir))
     except ProjectConfigError as exc:
         print(f"invalid agent configuration: {exc}", file=sys.stderr)
         return 1
@@ -152,7 +158,10 @@ def _describe_agent(resolved: ResolvedAgentConfig) -> str:
 
 
 def _effective_payload(
-    config_path: Path, config: ProjectConfig | None, effective: EffectiveAgents
+    config_path: Path,
+    config: ProjectConfig | None,
+    effective: EffectiveAgents,
+    sparring_dir: Path | None = None,
 ) -> dict[str, object]:
     """The machine-readable effective configuration, in one shape.
 
@@ -167,6 +176,13 @@ def _effective_payload(
         "project": config.project if config is not None else None,
         "error": None,
     }
+    # Where `set-config --local` writes: present only when this project is
+    # inside a git worktree. A UI that sees it may write model/effort there,
+    # which changes no tracked or untracked file of the repository.
+    local_path = local_overrides_path(sparring_dir) if sparring_dir is not None else None
+    if local_path is not None:
+        payload["local_config_path"] = str(local_path)
+        payload["local_config_exists"] = local_path.is_file()
     payload.update(effective.as_dict())
     return payload
 
@@ -191,6 +207,7 @@ def _cmd_show_config(args: argparse.Namespace) -> int:
         config = _optional_project_config(sparring_dir)
         effective = resolve_agent_configs(
             config,
+            local=load_local_overrides(sparring_dir),
             stage=RoleOverrides(
                 provider=args.stage_provider, model=args.stage_model, effort=args.stage_effort
             ),
@@ -219,7 +236,7 @@ def _cmd_show_config(args: argparse.Namespace) -> int:
         return 1
 
     if args.json:
-        json.dump(_effective_payload(config_path, config, effective), sys.stdout, indent=2)
+        json.dump(_effective_payload(config_path, config, effective, sparring_dir), sys.stdout, indent=2)
         print()
         return 0
 
@@ -273,6 +290,8 @@ def _cmd_set_config(args: argparse.Namespace) -> int:
     """
 
     sparring_dir = Path(args.sparring_dir)
+    if args.local:
+        return _set_local_config(args, sparring_dir)
     try:
         edit = RoleEdit(
             provider=args.provider,
@@ -286,7 +305,7 @@ def _cmd_set_config(args: argparse.Namespace) -> int:
         # result: what a caller needs is the effective configuration of the
         # file that now exists, resolved the same way a run will resolve it.
         config = _optional_project_config(sparring_dir)
-        effective = resolve_agent_configs(config)
+        effective = resolve_agent_configs(config, local=load_local_overrides(sparring_dir))
     except ProjectConfigError as exc:
         if args.json:
             json.dump(
@@ -305,7 +324,7 @@ def _cmd_set_config(args: argparse.Namespace) -> int:
         return 1
 
     if args.json:
-        payload = _effective_payload(outcome.path.resolve(), config, effective)
+        payload = _effective_payload(outcome.path.resolve(), config, effective, sparring_dir)
         payload["changed"] = outcome.changed
         payload["created"] = outcome.created
         json.dump(payload, sys.stdout, indent=2)
@@ -317,6 +336,63 @@ def _cmd_set_config(args: argparse.Namespace) -> int:
     elif not outcome.changed:
         print(f"{outcome.path} already said this; nothing written", file=sys.stderr)
     print(f"{outcome.resolved.role} agent: {_describe_agent(outcome.resolved)}")
+    return 0
+
+
+def _set_local_config(args: argparse.Namespace, sparring_dir: Path) -> int:
+    """``set-config --local``: change model/effort in this worktree's local
+    override file (see :mod:`agent_sparring.local_config`), which lives in the
+    git directory and so never dirties the repository.
+
+    Validated before anything is written, by resolving both roles with the
+    edited overrides exactly as the next stage of a run will.
+    """
+
+    config_path = (sparring_dir / CONFIG_FILENAME).resolve()
+    changed = False
+    try:
+        if args.provider is not None:
+            raise ProjectConfigError(
+                "the provider cannot be overridden locally; change it in project.toml "
+                "(set-config without --local)"
+            )
+        edits: list[tuple[str, str | None]] = []
+        if args.model is not None or args.model_default:
+            edits.append(("model", None if args.model_default else args.model))
+        if args.effort is not None or args.effort_default:
+            edits.append(("effort", None if args.effort_default else args.effort))
+        if not edits:
+            raise ProjectConfigError("nothing to change: give --model/--model-default or --effort/--effort-default")
+        overrides = None
+        for field, value in edits:
+            overrides = with_local_edit(sparring_dir, args.role, field, value, base=overrides)
+        assert overrides is not None
+        config = _optional_project_config(sparring_dir)
+        effective = resolve_agent_configs(config, local=overrides)  # refuses before writing
+        changed = write_local_overrides(overrides)
+    except ProjectConfigError as exc:
+        if args.json:
+            json.dump(
+                {"config_path": str(config_path), "config_exists": config_path.is_file(), "changed": False, "error": str(exc)},
+                sys.stdout,
+                indent=2,
+            )
+            print()
+        else:
+            print(f"could not change the {args.role} agent's local override: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        payload = _effective_payload(config_path, config, effective, sparring_dir)
+        payload["changed"] = changed
+        payload["created"] = False
+        json.dump(payload, sys.stdout, indent=2)
+        print()
+        return 0
+    if not changed:
+        print(f"{overrides.path} already said this; nothing written", file=sys.stderr)
+    resolved = effective.stage if args.role == ROLE_STAGE else effective.sparring
+    print(f"{resolved.role} agent: {_describe_agent(resolved)}")
     return 0
 
 
@@ -559,6 +635,7 @@ def _resolve_role(
         role,
         _optional_project_config(sparring_dir),
         RoleOverrides(provider=provider, model=model, effort=effort),
+        local=load_local_overrides(sparring_dir),
     )
 
 
@@ -603,6 +680,7 @@ def _resolve_agents(args: argparse.Namespace, sparring_dir: Path) -> EffectiveAg
 
     return resolve_agent_configs(
         _optional_project_config(sparring_dir),
+        local=load_local_overrides(sparring_dir),
         stage=RoleOverrides(
             provider=args.stage_provider,
             model=args.stage_model,
@@ -1779,6 +1857,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--effort-default",
         action="store_true",
         help="remove the effort override, so the provider's own default applies",
+    )
+    set_config.add_argument(
+        "--local",
+        action="store_true",
+        help=(
+            "write model/effort to this worktree's local override file in the git "
+            "directory instead of project.toml, so the repository is not dirtied and "
+            "a managed run keeps going; it applies from the next planned stage. "
+            "The provider cannot be set locally"
+        ),
     )
     set_config.add_argument(
         "--json",

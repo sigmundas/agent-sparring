@@ -204,6 +204,29 @@ the shape `show-config --json` uses. A change applies to the **next** provider
 turn: it never reconfigures or restarts a turn already running, and it does
 not touch recorded run state or any prompt already captured.
 
+### Changing model or effort during a run: `--local`
+
+`project.toml` is tracked, so editing it while a managed run is going dirties
+the worktree, and the next acceptance refuses because of an edit no candidate
+represents. `--local` writes model and effort to a file in this worktree's
+**git directory** instead:
+
+```sh
+sparring set-config stage --model claude-fable-5-1 --local
+sparring set-config sparring --effort high --local
+sparring set-config sparring --model-default --local   # back to project.toml's value
+```
+
+The file is `<git rev-parse --absolute-git-dir>/agent-sparring/.sparring.toml`.
+`git status` never sees it — it is not tracked, untracked or ignored — and
+each linked worktree has its own. It sits between the environment and
+`project.toml` in the precedence chain (CLI > environment > local >
+`project.toml` > provider default), is validated exactly as the file's values
+are, and applies from the **next planned stage**, because the loop re-reads
+agent configuration before each one. The provider cannot be set locally.
+`show-config --json` names the file as `local_config_path` and reports values
+from it with source `local`; the VS Code cockpit writes here whenever it can.
+
 `PROJECT.md` is prose the workflow never interprets: stack, directory map,
 test and build commands, conventions, product invariants, device/manual
 checks, and — worth the effort — the **current baseline test results**. Verify
