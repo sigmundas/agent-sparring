@@ -278,7 +278,7 @@ class RepositoryDriftTests(_Sealed):
     def test_a_branch_switch_refuses_approval(self):
         intake = self.prepare()
         _git(self.repo, "checkout", "-q", "-b", "feature/elsewhere")
-        with self.assertRaisesRegex(IntakeError, "branch 'feature/widgets' is now 'feature/elsewhere'"):
+        with self.assertRaisesRegex(IntakeError, "runs slice 'app' on 'feature/widgets', but .* is on 'feature/elsewhere'"):
             self.approve(intake.directory)
 
     def test_a_commit_between_approval_and_first_run_refuses(self):

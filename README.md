@@ -876,13 +876,38 @@ mode, `amendment.diff`. None of these is in manifest format.
   context-only ones included: canonical worktree path, common git
   directory, branch, HEAD and dirty paths (from the shared
   `repo_fingerprint`, so contents, ignored files and modify-then-restore
-  are not attested). A slice runs on the branch its primary repository had
-  checked out; a plan naming another branch refuses until that branch is
-  checked out and the plan prepared again, and `--expected-branch` at
-  approval may only repeat it. Approval refuses if any inspected repository
-  is another repository, on another branch, or at another commit — except a
-  commit an earlier slice of this intake was accepted at. There is no drift
-  override.
+  are not attested). Approval refuses if any inspected repository is
+  another repository or at another commit — except a commit an earlier
+  slice of this intake was accepted at — and if a context repository is on
+  another branch (except the branch such an earlier slice ran on). There
+  is no drift override.
+- **The branch is chosen at approval.** A slice runs on the branch its
+  primary repository has checked out when the slice is *approved*, at the
+  inspected (or earlier-accepted) commit, so a later slice does not inherit
+  whatever branch prepare-plan happened to see. A slice with an
+  implementation stage is refused on a protected branch (`main`, `master`),
+  because run-plan's branch guard never runs a stage agent there. A plan
+  naming its own branch still refuses until intake saw it checked out, and
+  `--expected-branch` at approval may only repeat the branch checked out.
+- **`sparring slice-branch <intake> --run <slice> [--json]`** says whether
+  a slice needs a feature branch (`needs_branch`, `action`,
+  `suggested_branch`, and the engine's `problem` sentence), which is what the
+  VS Code extension shows instead of "ready to start". `--create BRANCH`
+  checks out a new branch at the current commit (`git switch -c`, keeping
+  the worktree as it is).
+- **One recovery for an approval sealed on a protected branch** (before
+  approval refused one): `--create BRANCH`, or `--move` onto a feature
+  branch checked out by hand. `approval.json` is not rewritten; the engine
+  writes `runs/<slice>/branch-move.json` once, bound to the approval's exact
+  bytes, and every reader of the approval applies it. It refuses unless the
+  slice runs an implementation agent on the protected branch it was approved
+  on, the worktree is the approved one at the approved commit with no dirty
+  paths beyond those recorded at approval, every other recorded repository
+  is unmoved, no provider turn has happened for any of its stages, and its
+  run (if started) is its sealed run paused before its first stage with no
+  push authorization. The paused run's recorded branch is updated to match,
+  so `resume-plan` continues it on the new branch. It is not a general
+  branch-change: an approval on a branch where it can run is never moved.
 - **Approval** refuses on any blocking finding, a refusal verdict, a plan,
   snapshot, interpretation or `report.md` that is not what intake produced,
   an unconfirmed gate, an unproven earlier slice, repository drift, a

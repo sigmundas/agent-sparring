@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from agent_sparring.branch_guard import is_protected_branch
 from agent_sparring.git_context import (
     GitContextError,
     current_branch,
@@ -83,6 +84,12 @@ INTAKE_DIRNAME = "intake"
 RECORD_FILENAME = "intake.json"
 MANIFEST_FILENAME = "manifest.json"
 APPROVAL_FILENAME = "approval.json"
+#: The engine's record that a slice approved on a protected branch was moved,
+#: before any provider turn, to a feature branch at the same commit (see
+#: :mod:`agent_sparring.intake_branch`). Written once, beside an approval that
+#: is itself never rewritten.
+BRANCH_MOVE_FILENAME = "branch-move.json"
+BRANCH_MOVE_VERSION = 1
 REGISTRY_DIRNAME = "registry"
 RUNS_DIRNAME = "runs"
 
@@ -153,10 +160,18 @@ class IntakeApproval:
     path: Path
     raw: bytes
     payload: Mapping[str, Any]
+    #: A verified :data:`BRANCH_MOVE_FILENAME` record, when the slice was moved.
+    move: Mapping[str, Any] | None = None
 
     @property
     def sha256(self) -> str:
         return sha256_bytes(self.raw)
+
+    @property
+    def approved_branch(self) -> str:
+        """The branch the person approved on, as ``approval.json`` records it."""
+
+        return str(self.payload["expected_branch"])
 
     def field(self, key: str) -> Any:
         return self.payload[key]
@@ -167,17 +182,29 @@ class IntakeApproval:
 
     @property
     def expected_branch(self) -> str:
-        return str(self.payload["expected_branch"])
+        """The branch the slice runs on: the approved one, or the feature
+        branch a recorded move put it on (the same commit either way)."""
+
+        return str(self.move["to_branch"]) if self.move else self.approved_branch
 
     @property
     def starting(self) -> Mapping[str, Any]:
-        return self.payload["starting_snapshot"]
+        starting = self.payload["starting_snapshot"]
+        return {**starting, "branch": self.expected_branch} if self.move else starting
 
     @property
     def at_approval(self) -> Mapping[str, Mapping[str, Any]]:
-        """Every inspected repository as it was when the slice was approved."""
+        """Every inspected repository as it was when the slice was approved
+        (the primary one on the branch a recorded move put it on)."""
 
-        return self.payload["repositories"]["at_approval"]
+        seen = self.payload["repositories"]["at_approval"]
+        if not self.move:
+            return seen
+        primary = str(self.payload["primary_repository"])
+        return {
+            name: ({**snapshot, "branch": self.expected_branch} if name == primary else snapshot)
+            for name, snapshot in seen.items()
+        }
 
 
 _APPROVAL_STRINGS = (
@@ -241,7 +268,45 @@ def parse_approval(raw: bytes, path: Path) -> IntakeApproval:
 
 
 def read_approval(path: Path) -> IntakeApproval:
-    return parse_approval(_read_bytes(path, "approval"), Path(path))
+    approval = parse_approval(_read_bytes(path, "approval"), Path(path))
+    move_path = Path(path).parent / BRANCH_MOVE_FILENAME
+    if not move_path.exists():
+        return approval
+    return IntakeApproval(path=approval.path, raw=approval.raw, payload=approval.payload, move=parse_branch_move(approval, move_path))
+
+
+def parse_branch_move(approval: IntakeApproval, path: Path) -> Mapping[str, Any]:
+    """Verify a branch-move record against the approval it amends, or refuse.
+
+    It must name this approval's exact bytes, move from its approved branch,
+    and keep its starting commit: a move changes which branch the approved
+    commit runs on, never which commit or which repository.
+    """
+
+    try:
+        move = json.loads(_read_bytes(path, "branch move").decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntakeApprovalError(f"branch move {path} is not valid JSON: {exc}") from exc
+    starting = approval.payload["starting_snapshot"]
+    expected = {
+        "version": BRANCH_MOVE_VERSION,
+        "run_id": approval.payload["run_id"],
+        "run_key": approval.payload["run_key"],
+        "approval_sha256": approval.sha256,
+        "from_branch": approval.approved_branch,
+        "head": starting["head"],
+    }
+    if not isinstance(move, dict) or any(move.get(key) != value for key, value in expected.items()):
+        raise IntakeApprovalError(
+            f"branch move {path} does not belong to the approval beside it ({approval.path}); "
+            "the slice will not run"
+        )
+    to_branch = move.get("to_branch")
+    if not isinstance(to_branch, str) or not to_branch or to_branch == approval.approved_branch:
+        raise IntakeApprovalError(f"branch move {path} names no valid 'to_branch'")
+    if is_protected_branch(to_branch):
+        raise IntakeApprovalError(f"branch move {path} moves the slice to protected branch {to_branch!r}")
+    return move
 
 
 # -- the sealed plan source -------------------------------------------------------
@@ -549,6 +614,8 @@ def refuse_intake_identities(sparring_dir: Path, *, run_key: str | None, stage_i
 __all__ = [
     "APPROVAL_FILENAME",
     "APPROVAL_VERSION",
+    "BRANCH_MOVE_FILENAME",
+    "BRANCH_MOVE_VERSION",
     "ENVELOPE_VERSION",
     "INTAKE_DIRNAME",
     "IntakeApproval",
@@ -564,6 +631,7 @@ __all__ = [
     "load_intake_manifest",
     "minted_identities",
     "parse_approval",
+    "parse_branch_move",
     "read_approval",
     "refuse_intake_identities",
     "sha256_bytes",

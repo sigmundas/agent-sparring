@@ -1633,6 +1633,66 @@ def _cmd_prepare_plan(args: argparse.Namespace) -> int:
     return 2 if blocking else 0
 
 
+def _cmd_slice_branch(args: argparse.Namespace) -> int:
+    """Whether an intake slice needs a feature branch; ``--create`` / ``--move`` fix it.
+
+    ``--json`` reports ``{"ok", "status", "created", "moved", "error"}``, where
+    ``status`` is :meth:`~agent_sparring.intake_branch.SliceBranch.as_dict`
+    as it is *after* any action.
+    """
+
+    from agent_sparring.intake_branch import create_slice_branch, move_slice_approval, slice_branch_status
+
+    sparring_dir = Path(args.sparring_dir)
+    created: str | None = None
+    moved: dict[str, object] | None = None
+    error: str | None = None
+    status = None
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        where = {"run_id": args.run, "repo_root": repo_root, "sparring_dir": sparring_dir}
+        move = None
+        if args.create:
+            created, move = create_slice_branch(Path(args.intake_dir), branch=args.create, **where)
+        elif args.move:
+            move = move_slice_approval(Path(args.intake_dir), **where)
+        if move is not None:
+            moved = {
+                "record": str(move.path),
+                "from_branch": move.from_branch,
+                "to_branch": move.to_branch,
+                "created": move.created,
+                "run_state": str(move.run_state) if move.run_state else None,
+            }
+        status = slice_branch_status(Path(args.intake_dir), **where)
+    except (IntakeError, ProjectConfigError, GitContextError, OSError) as exc:
+        error = str(exc)
+    if args.json:
+        json.dump(
+            {"ok": error is None, "status": status.as_dict() if status else None, "created": created, "moved": moved, "error": error},
+            sys.stdout,
+            indent=2,
+        )
+        print()
+        return 0 if error is None else 1
+    if error is not None:
+        print(f"could not {'change' if args.create or args.move else 'check'} the slice's branch: {error}", file=sys.stderr)
+        return 1
+    if created:
+        print(f"checked out new branch {created}", file=sys.stderr)
+    if moved:
+        print(f"moved the approval from {moved['from_branch']} to {moved['to_branch']}: {moved['record']}", file=sys.stderr)
+    assert status is not None
+    if status.blocked:
+        print(f"{status.problem}\nThe engine cannot fix this: {status.blocked}")
+    elif status.action:
+        flag = f"--create {status.suggested_branch}" if status.suggested_branch else "--move"
+        print(f"{status.problem}\nsparring slice-branch {args.intake_dir} --run {args.run} {flag}")
+    else:
+        print(f"{status.stages} runs on {status.approved_branch or status.current_branch}; no branch change is needed")
+    return 0
+
+
 def _cmd_approve_plan(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
     try:
@@ -2290,8 +2350,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-branch",
         default=None,
         help=(
-            "optional check: the branch this slice runs on. It must equal the branch intake "
-            "inspected; to run on another, check it out and run prepare-plan again"
+            "optional check: the branch this slice runs on, which is the branch the repository "
+            "has checked out when it is approved; it must equal that one"
         ),
     )
     approve.add_argument(
@@ -2328,6 +2388,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     approve.add_argument("--repo-root", default=None, help=repo_root_help)
     approve.set_defaults(func=_cmd_approve_plan)
+
+    slice_branch = subparsers.add_parser(
+        "slice-branch",
+        help=(
+            "say whether an intake run slice needs a feature branch before it can run (an "
+            "implementation slice never runs on a protected branch); --create checks one out at "
+            "the current commit, and moves an approval sealed on a protected branch to it"
+        ),
+    )
+    slice_branch.add_argument("intake_dir", help="the .sparring/intake/<id>/ directory prepare-plan wrote")
+    slice_branch.add_argument("--run", required=True, metavar="RUN_ID", help="the run slice")
+    action = slice_branch.add_mutually_exclusive_group()
+    action.add_argument(
+        "--create",
+        default=None,
+        metavar="BRANCH",
+        help="check out new branch BRANCH at the current commit (and move the approval to it)",
+    )
+    action.add_argument(
+        "--move",
+        action="store_true",
+        help=(
+            "move an approval sealed on a protected branch to the feature branch checked out "
+            "now, at the same commit, before any provider turn; recorded beside the approval"
+        ),
+    )
+    slice_branch.add_argument("--repo-root", default=None, help=repo_root_help)
+    slice_branch.add_argument("--json", action="store_true", help="report as JSON")
+    slice_branch.set_defaults(func=_cmd_slice_branch)
 
     run_plan = subparsers.add_parser(
         "run-plan",

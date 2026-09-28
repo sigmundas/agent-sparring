@@ -69,8 +69,18 @@ What the engine enforces
   earlier slice it depends on must instead be approved and its sealed run
   complete, which approval checks and records.
 - **Repository state.** Every inspected repository is snapshotted at
-  prepare (:func:`repository_snapshot`); approval refuses drift, and a
-  slice runs on the branch intake saw checked out.
+  prepare (:func:`repository_snapshot`), and approval refuses drift: a
+  different repository, or a commit that is neither the inspected one nor
+  one an earlier slice of this intake was accepted at.
+- **Branch.** A slice runs on the branch its primary repository has checked
+  out when the slice is *approved*, at the commit intake inspected (or an
+  earlier slice's accepted one) -- so the branch is chosen no later than
+  approval, not inherited from whatever prepare-plan happened to see. A
+  slice with an implementation stage is refused on a protected branch
+  (:func:`~agent_sparring.branch_guard.is_protected_branch`), because
+  run-plan would refuse it there; the person checks out a feature branch at
+  that commit first (``sparring slice-branch --create``). A plan that names
+  its own branch still needs intake to have seen it checked out.
 - **Dependency order.** Every ``depends_on`` must point at a stage that runs
   earlier (in an earlier slice, or earlier in the same slice).
 
@@ -106,7 +116,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from agent_sparring.git_context import GitContextError, is_ignored, repository_identity
+from agent_sparring.branch_guard import is_protected_branch
+from agent_sparring.git_context import GitContextError, current_branch, is_ignored, repository_identity
 from agent_sparring.intake_approval import (
     APPROVAL_FILENAME,
     APPROVAL_VERSION,
@@ -872,6 +883,28 @@ def slice_branch(run: RunSlice, repositories: Mapping[str, Any]) -> tuple[str | 
     return inspected, None
 
 
+def slice_runs_agent(run: RunSlice) -> bool:
+    """Whether any stage of the slice runs an unattended implementation agent,
+    which the branch guard never lets run on a protected branch."""
+
+    return any(stage.mode == StageMode.IMPLEMENTATION.value for stage in run.stages)
+
+
+def slice_stage_names(run: RunSlice) -> str:
+    return ", ".join(f"Stage {stage.label}" for stage in run.stages)
+
+
+def feature_branch_needed(run: RunSlice, repo_root: Path, branch: str) -> str:
+    """Why an implementation slice cannot be approved on ``branch``."""
+
+    return (
+        f"{slice_stage_names(run)} needs a feature branch: it runs an implementation agent, "
+        f"and no stage agent runs unattended on protected branch {branch!r}. Check out a "
+        f"feature branch at this commit in {repo_root} (sparring slice-branch --create "
+        "<branch> does it) and approve again"
+    )
+
+
 def approval_requirements(
     interpretation: Interpretation, repositories: Mapping[str, Any], *, amendment: bool
 ) -> dict[str, dict[str, Any]]:
@@ -1507,6 +1540,8 @@ class _CompletedSlice:
 
     evidence: dict[str, Any]
     repository: str
+    #: The branch that slice ran on, which its accepted work is on.
+    branch: str
     final_candidate: str
 
 
@@ -1561,6 +1596,7 @@ def _completed_slice(intake_dir: Path, run_id: str) -> _CompletedSlice:
             "final_candidate_sha": stage_state.candidate_sha,
         },
         repository=str(approval.field("primary_repository")),
+        branch=approval.expected_branch,
         final_candidate=stage_state.candidate_sha,
     )
 
@@ -1584,8 +1620,9 @@ def approve_plan(
     Refuses (:class:`IntakeError`, writing nothing) unless the intake is
     exactly what was reviewed -- source plan, snapshot, interpretation and
     ``report.md`` -- has no blocking finding, and the slice is approved from
-    its inspected primary repository on the branch intake saw checked out,
-    with every inspected repository where intake saw it (or at a commit an
+    its inspected primary repository -- on the branch it has checked out now,
+    which must not be protected when the slice runs an implementation agent
+    -- with every inspected repository at the commit intake saw (or at one an
     earlier slice of this intake was accepted at), every gate it waits for
     confirmed by id, and every earlier slice it depends on proven by that
     slice's own approval and completed run.
@@ -1710,17 +1747,29 @@ def approve_plan(
             "inside a run; confirm each with --confirm-prerequisite once it is actually satisfied"
         )
 
-    branch, problem = slice_branch(run, inspected)
+    _, problem = slice_branch(run, inspected)
     if problem:
         raise IntakeError(problem)
-    assert branch is not None
+    # The slice runs on the branch checked out now: the branch is chosen at
+    # approval. What intake sealed -- repository and commit -- is checked
+    # below exactly as before.
+    try:
+        branch = current_branch(repo_root)
+    except GitContextError as exc:
+        raise IntakeError(f"cannot read the branch of {repo_root}: {exc}") from exc
+    if run.expected_branch and branch != run.expected_branch:
+        raise IntakeError(
+            f"the plan runs slice {run_id!r} on {run.expected_branch!r}, but {repo_root} is on "
+            f"{branch!r}; check out {run.expected_branch!r} and approve again"
+        )
     requested = (expected_branch or "").strip()
     if requested and requested != branch:
         raise IntakeError(
-            f"run slice {run_id!r} runs on {branch!r}, the branch intake inspected; "
-            f"--expected-branch {requested!r} cannot replace it. Check out {requested!r} and run "
-            "prepare-plan again"
+            f"{repo_root} is on {branch!r}, the branch a slice is approved on; --expected-branch "
+            f"{requested!r} cannot replace it. Check out {requested!r} and approve again"
         )
+    if slice_runs_agent(run) and is_protected_branch(branch):
+        raise IntakeError(feature_branch_needed(run, repo_root, branch))
 
     repositories = dict(repositories or {})
     repository_branches = dict(repository_branches or {})
@@ -1815,6 +1864,8 @@ def approve_plan(
         except IntakeApprovalError as exc:
             raise IntakeError(f"run slice {run_id!r} has an approval that cannot be used: {exc}") from exc
         recorded = {key: previous.payload.get(key) for key in decision}
+        # A recorded branch move is part of the approval's decision.
+        recorded["expected_branch"] = previous.expected_branch
         if recorded != decision:
             raise IntakeError(
                 f"run slice {run_id!r} was already approved with {recorded}; an approval is not "
@@ -1844,21 +1895,27 @@ def approve_plan(
             f"{primary_repository!r} ({inspected[primary_repository]['path']}); approve from that one"
         )
     completed = [_completed_slice(intake_dir, prior) for prior in earlier]
-    advanced: dict[str, set[str]] = {}
+    # Where an earlier slice's accepted work left a repository: its branch
+    # and final candidate. Only that, never an arbitrary later commit.
+    advanced: dict[str, set[tuple[str, str]]] = {}
     for prior in completed:
-        advanced.setdefault(prior.repository, set()).add(prior.final_candidate)
+        advanced.setdefault(prior.repository, set()).add((prior.branch, prior.final_candidate))
     now_seen: dict[str, dict[str, Any]] = {}
     drift = []
     for name, seen in sorted(inspected.items()):
         present = repository_snapshot(Path(seen["path"]))
         now_seen[name] = present
+        accepted = advanced.get(name, set())
+        heads = {seen["head"]} | {head for _, head in accepted}
         if (present["path"], present["git_common_dir"]) != (seen["path"], seen["git_common_dir"]):
             drift.append(f"{name}: {seen['path']} is now a different repository")
-        elif present["branch"] != seen["branch"]:
+        elif name != primary_repository and (present["branch"], present["head"]) not in (
+            {(seen["branch"], head) for head in heads} | accepted
+        ) and present["branch"] != seen["branch"]:
             drift.append(f"{name}: branch {seen['branch']!r} is now {present['branch']!r}")
-        elif present["head"] != seen["head"] and present["head"] not in advanced.get(name, set()):
+        elif present["head"] not in heads:
             drift.append(
-                f"{name}: {seen['branch']} moved from {seen['head'][:12]} to {present['head'][:12]}"
+                f"{name}: {present['branch']} moved from {seen['head'][:12]} to {present['head'][:12]}"
                 + (" (not a commit an earlier slice was accepted at)" if name in advanced else "")
             )
     if drift:
@@ -1941,6 +1998,8 @@ __all__ = [
     "repository_snapshot",
     "require_intake_ignored",
     "run_prerequisites",
+    "feature_branch_needed",
     "slice_branch",
+    "slice_runs_agent",
     "split_prerequisites",
 ]
