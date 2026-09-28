@@ -31,6 +31,7 @@ from agent_sparring.agent_config import (
     resolve_role_config,
 )
 from agent_sparring.config_edit import RoleEdit, apply_role_edit
+from agent_sparring.setup_check import fix_setup, setup_problems
 from agent_sparring.local_config import (
     load_local_overrides,
     local_overrides_path,
@@ -236,13 +237,59 @@ def _cmd_show_config(args: argparse.Namespace) -> int:
         return 1
 
     if args.json:
-        json.dump(_effective_payload(config_path, config, effective, sparring_dir), sys.stdout, indent=2)
+        payload = _effective_payload(config_path, config, effective, sparring_dir)
+        payload.update(_setup_payload(args, sparring_dir))
+        json.dump(payload, sys.stdout, indent=2)
         print()
         return 0
 
     print(f"project.toml: {config_path}{'' if config_path.is_file() else ' (absent)'}")
     for resolved in (effective.stage, effective.sparring):
         print(f"{resolved.role} agent: {_describe_agent(resolved)}")
+    return 0
+
+
+def _setup_payload(args: argparse.Namespace, sparring_dir: Path) -> dict[str, object]:
+    """``setup_problems``: the fixable setup problems, for a UI (see
+    :mod:`agent_sparring.setup_check`). ``setup_error`` instead when they
+    could not be determined -- never an empty list standing in for "unknown".
+    """
+
+    try:
+        repo_root = _resolve_repo_root(argparse.Namespace(repo_root=getattr(args, "repo_root", None)), sparring_dir)
+        return {"setup_problems": [problem.as_dict() for problem in setup_problems(repo_root, sparring_dir)]}
+    except (ProjectConfigError, GitContextError) as exc:
+        return {"setup_error": str(exc)}
+
+
+def _cmd_fix_config(args: argparse.Namespace) -> int:
+    """Repair the fixable setup problems ``show-config`` reports.
+
+    Today that is exactly one kind: workflow-state directories git can see.
+    The missing ``.gitignore`` lines are appended and nothing else changes;
+    committing ``.gitignore`` is left to the person.
+    """
+
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        added = fix_setup(repo_root, sparring_dir)
+    except (ProjectConfigError, GitContextError, OSError) as exc:
+        if args.json:
+            json.dump({"fixed": False, "added": [], "error": str(exc)}, sys.stdout, indent=2)
+            print()
+        else:
+            print(f"could not fix the setup: {exc}", file=sys.stderr)
+        return 1
+    gitignore = repo_root / ".gitignore"
+    if args.json:
+        json.dump({"fixed": True, "added": added, "gitignore": str(gitignore), "error": None}, sys.stdout, indent=2)
+        print()
+        return 0
+    if added:
+        print(f"added {', '.join(added)} to {gitignore}; commit .gitignore to keep it")
+    else:
+        print("nothing to fix: every workflow-state directory is already ignored by git")
     return 0
 
 
@@ -325,6 +372,7 @@ def _cmd_set_config(args: argparse.Namespace) -> int:
 
     if args.json:
         payload = _effective_payload(outcome.path.resolve(), config, effective, sparring_dir)
+        payload.update(_setup_payload(args, sparring_dir))
         payload["changed"] = outcome.changed
         payload["created"] = outcome.created
         json.dump(payload, sys.stdout, indent=2)
@@ -384,6 +432,7 @@ def _set_local_config(args: argparse.Namespace, sparring_dir: Path) -> int:
 
     if args.json:
         payload = _effective_payload(config_path, config, effective, sparring_dir)
+        payload.update(_setup_payload(args, sparring_dir))
         payload["changed"] = changed
         payload["created"] = False
         json.dump(payload, sys.stdout, indent=2)
@@ -1758,6 +1807,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_role_model_arguments(show_config)
     show_config.set_defaults(func=_cmd_show_config)
+
+    fix_config = subparsers.add_parser(
+        "fix-config",
+        help=(
+            "repair the fixable setup problems show-config --json reports: append the "
+            "missing workflow-state lines (.sparring/stages/, plans/, intake/) to the "
+            "repository's .gitignore, and nothing else"
+        ),
+    )
+    fix_config.add_argument("--repo-root", default=None, help="repository root (default: [repo].root, else the parent of --sparring-dir)")
+    fix_config.add_argument("--json", action="store_true", help="report what was added as JSON")
+    fix_config.set_defaults(func=_cmd_fix_config)
 
     usage_parser = subparsers.add_parser(
         "usage",

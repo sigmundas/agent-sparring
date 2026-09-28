@@ -227,6 +227,18 @@ agent configuration before each one. The provider cannot be set locally.
 `show-config --json` names the file as `local_config_path` and reports values
 from it with source `local`; the VS Code cockpit writes here whenever it can.
 
+### Fixable setup problems: `fix-config`
+
+`show-config --json` also reports `setup_problems`: workflow-state directories
+(`.sparring/stages/`, `.sparring/plans/`, `.sparring/intake/`) that git can
+still see. Each entry carries the `.gitignore` line that fixes it and the
+engine's full refusal text; when they cannot be determined the payload has
+`setup_error` instead. `sparring fix-config` appends exactly the missing
+lines to the repository's `.gitignore` — the rest of the file is untouched,
+a second run writes nothing, and a rule elsewhere that still overrides the
+fix is reported as an error. Commit `.gitignore` afterwards; the engine
+never stages or commits it.
+
 `PROJECT.md` is prose the workflow never interprets: stack, directory map,
 test and build commands, conventions, product invariants, device/manual
 checks, and — worth the effort — the **current baseline test results**. Verify

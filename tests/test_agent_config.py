@@ -469,9 +469,13 @@ class ShowConfigTests(unittest.TestCase):
         self._write(FULL_CONFIG)
         _, out, _ = self._main("show-config", "--json")
         payload = json.loads(out)
-        self.assertEqual(
+        # Configuration only. Setup problems (or why they could not be
+        # determined) and a git-only local-override path are also
+        # configuration facts, never environment or credentials.
+        self.assertTrue({"config_path", "config_exists", "project", "error"} <= set(payload))
+        self.assertLessEqual(
             set(payload) - {"stage", "sparring"},
-            {"config_path", "config_exists", "project", "error"},
+            {"config_path", "config_exists", "project", "error", "setup_problems", "setup_error", "local_config_path", "local_config_exists"},
         )
         for role in ("stage", "sparring"):
             self.assertNotIn("env", payload[role])
