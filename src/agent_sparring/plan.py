@@ -165,6 +165,15 @@ from agent_sparring.acceptance import (
     freeze_candidate,
 )
 from agent_sparring.activity import ActivityEmitter
+from agent_sparring.plan_obligations import (
+    PlanObligationError,
+    carry as carry_plan_obligations,
+    incomplete_slices,
+    origin_of,
+    owed as owed_plan_obligations,
+    slice_context,
+    sync as sync_plan_obligations,
+)
 from agent_sparring.deferred_gate import (
     CHECKPOINT_PLAN_COMPLETION,
     DEFERRED_VERIFICATION_REQUIRED,
@@ -466,6 +475,12 @@ class PlanRunState:
     #: deferral existed, which is also the correct reading of "this run owes
     #: nothing".
     deferred_human_checks: tuple[DeferredObligation, ...] = field(default_factory=tuple)
+    #: Gate instances this run handed on to its plan's ledger when its slice
+    #: of an intake ended before the plan did (see
+    #: :mod:`agent_sparring.plan_obligations`): owed by the plan, answered at
+    #: the plan's completion, no longer this run's. Provenance only; omitted
+    #: while empty so every other run's file is unchanged.
+    carried_deferred: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -477,6 +492,10 @@ class PlanRunState:
         payload["deferred_human_checks"] = [
             obligation.to_dict() for obligation in self.deferred_human_checks
         ]
+        if self.carried_deferred:
+            payload["carried_deferred"] = list(self.carried_deferred)
+        else:
+            payload.pop("carried_deferred", None)
         # Omitted rather than written as null, so a run recorded before run
         # instances existed stays exactly the file it was through every
         # resume that rewrites it. Its key is then its file name, which is
@@ -579,6 +598,7 @@ class PlanRunState:
                 deferred_human_checks=tuple(
                     DeferredObligation.from_dict(entry) for entry in raw_deferred
                 ),
+                carried_deferred=tuple(str(entry) for entry in payload.get("carried_deferred") or ()),
             )
         except (PushError, DeferredGateError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -1588,7 +1608,14 @@ def resume_plan(
     # Before anything runs, and before the ordinary evidence path: these
     # answer the run's own checkpoint rather than a stage's review, and a
     # refusal here must stop the resume rather than leave half of it applied.
-    _answer_deferred(state, state_path, sparring_dir, deferred_results, report=report)
+    _answer_deferred(
+        state,
+        state_path,
+        sparring_dir,
+        deferred_results,
+        report=report,
+        context=slice_context(source) if deferred_results else None,
+    )
 
     sparrer_first = False
     if evidence is not None and evidence.strip():
@@ -1845,6 +1872,7 @@ def _answer_deferred(
     answers: tuple[DeferredAnswer, ...],
     *,
     report: Reporter,
+    context: Any = None,
 ) -> None:
     """Record a person's results for the deferred checks the run is stopped
     on, or refuse.
@@ -1895,7 +1923,12 @@ def _answer_deferred(
                 CheckResult(check_id=check.id, outcome=answer.outcome, note=answer.note)
             )
         )
-        stage = Stage.resolve(sparring_dir, obligation.stage_id)
+        # An obligation carried from an earlier slice was raised by a stage
+        # of that slice's run, possibly in another repository: its notes.md
+        # is where the answer is written.
+        carried = origin_of(context, obligation.instance_id)
+        origin_dir = Path(carried.origin_sparring_dir) if carried is not None else sparring_dir
+        stage = Stage.resolve(origin_dir, obligation.stage_id)
         if stage.exists():
             record_human_evidence(stage, _deferred_evidence_line(obligation, check, answer))
         report(
@@ -1903,6 +1936,8 @@ def _answer_deferred(
             f"instance {obligation.instance_id} (raised by {obligation.stage_id})"
         )
     state.save(state_path)
+    if context is not None:
+        sync_plan_obligations(context, state.deferred_human_checks, run=_RunOwner.of(state).key)
 
 
 def _locate_deferred_check(
@@ -2667,6 +2702,92 @@ def _loop_routings(result: "LoopResult | None") -> tuple[RoutingResult, ...]:
     return tuple(cycle.routing for cycle in result.cycles) or (result.routing,)
 
 
+def _carry_to_plan(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    context: Any,
+    sparring_dir: Path,
+    pending_slices: tuple[str, ...],
+    *,
+    report: Reporter,
+) -> None:
+    """Hand this slice's unresolved obligations to the plan's ledger.
+
+    Only obligations owed by plan completion move; one a reviewer promoted
+    is due now and has already stopped the run before this point. Nothing is
+    answered, waived or marked: the entries leave this run's ledger with
+    their results and gate instances intact, and the plan's end asks for
+    them.
+    """
+
+    carried = tuple(
+        entry
+        for entry in state.unresolved_deferred
+        if entry.checkpoint == CHECKPOINT_PLAN_COMPLETION and not entry.promoted
+    )
+    if not carried:
+        return
+    try:
+        carry_plan_obligations(
+            context, carried, origin_run=_RunOwner.of(state).key, origin_sparring_dir=sparring_dir
+        )
+    except (PlanObligationError, OSError) as exc:
+        raise PlanError(
+            f"could not carry {len(carried)} deferred check(s) to the plan ledger at "
+            f"{context.ledger_path}: {exc}. The run stays where it is; nothing was carried"
+        ) from exc
+    ids = {entry.instance_id for entry in carried}
+    state.deferred_human_checks = tuple(
+        entry for entry in state.deferred_human_checks if entry.instance_id not in ids
+    )
+    state.carried_deferred = state.carried_deferred + tuple(
+        entry.instance_id for entry in carried if entry.instance_id not in state.carried_deferred
+    )
+    state.awaiting = None
+    state.save(state_path)
+    for entry in carried:
+        activity.emit(
+            "plan.deferred_carried",
+            summary=f"{entry.gate.title} carried to plan completion (owed after {', '.join(pending_slices)})",
+        )
+        report(
+            f"deferred check {entry.gate.title!r} (raised by {entry.stage_id}, gate instance "
+            f"{entry.instance_id}) is owed by the whole plan, not this run slice: carried to "
+            f"{context.ledger_path}; it will be asked for when the plan's last slice "
+            f"completes (still to complete: {', '.join(pending_slices)})"
+        )
+
+
+def _claim_from_plan(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    context: Any,
+    *,
+    report: Reporter,
+) -> None:
+    """At the plan's end, bring every carried, unresolved obligation into this
+    run's ledger (same gate instance, same results), so the completion
+    checkpoint below covers the whole plan."""
+
+    try:
+        carried = owed_plan_obligations(context)
+    except PlanObligationError as exc:
+        raise PlanError(f"cannot read the plan's deferred checks: {exc}") from exc
+    claimed = [entry for entry in carried if state.record_deferred(entry.obligation)]
+    if not claimed:
+        return
+    state.save(state_path)
+    for entry in claimed:
+        activity.emit("plan.deferred_claimed", summary=f"{entry.obligation.gate.title} (raised by {entry.origin_slice})")
+        report(
+            f"deferred check {entry.obligation.gate.title!r} raised by run slice "
+            f"{entry.origin_slice} ({entry.obligation.stage_id}) is due now: this is the plan's "
+            f"last slice"
+        )
+
+
 def _stop_for_deferred(
     state: PlanRunState,
     state_path: Path,
@@ -3245,6 +3366,19 @@ def _drive(
             )
 
         if state.current_stage_index + 1 >= total:
+            # The run's last stage is finished. For a slice of an intake that
+            # is not the plan's end: obligations owed by plan completion are
+            # the plan's, not this slice's, so they are carried to the plan
+            # ledger and this slice completes. For the slice that is the
+            # plan's end, every carried obligation is claimed here, so the
+            # checkpoint below covers the whole plan.
+            slice_ctx = slice_context(source)
+            if slice_ctx is not None:
+                pending_slices = incomplete_slices(slice_ctx)
+                if pending_slices:
+                    _carry_to_plan(state, state_path, activity, slice_ctx, sparring_dir, pending_slices, report=report)
+                else:
+                    _claim_from_plan(state, state_path, activity, slice_ctx, report=report)
             # NON-NEGOTIABLE: every executable stage is finished, and the
             # plan still may not report completion while a person owes it
             # verification. The run stops instead, with one checkpoint
@@ -3269,6 +3403,10 @@ def _drive(
             state.awaiting = None
             state.status = PlanRunStatus.COMPLETE
             state.save(state_path)
+            if slice_ctx is not None:
+                # The plan's end: what this run claimed is answered, and the
+                # plan ledger says so, with the run that answered it.
+                sync_plan_obligations(slice_ctx, state.deferred_human_checks, run=_RunOwner.of(state).key)
             activity.emit("plan.completed", summary=f"{total} stage(s) accepted")
             report(f"plan {state.plan}: complete; {total} stage(s) accepted")
             return PlanRunResult(

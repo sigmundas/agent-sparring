@@ -631,6 +631,33 @@ shown what the run already owes, and may decide that a later stage now depends
 on one of those answers; naming its gate instance in `promote_deferred` stops
 the run for it before the next stage, under the same asking.
 
+#### A check owed by a plan that runs as intake slices
+
+An intake runs one plan as several managed runs — its run slices, often in
+different repositories. "Before plan completion" then means before the
+*plan* completes, not before the slice that raised the check does. So when a
+slice reaches its last stage while other slices of its intake are not yet
+complete, its unanswered deferred checks are **carried** to the plan's
+ledger, unanswered and unwaived, and the slice completes; later slices can be
+approved and run. The ledger lives with the intake, in the repository the
+intake was prepared in:
+
+```text
+.sparring/intake/obligations/<plan key>.json
+```
+
+It is keyed by the plan document, so an intake prepared again for the same
+plan still finds it. Whichever slice turns out to be the last one to
+complete **claims** every carried check at its end and stops for them there,
+exactly as a one-run plan stops at its end — the plan cannot complete while
+any is owed. "Complete" is the same proof approval uses for an earlier slice:
+its sealed run recorded complete with an accepted final candidate. An answer
+is written into the `notes.md` of the stage that raised the check, in that
+stage's own repository, and the ledger records which run answered it. Can't
+test resolves nothing here either. A slice that an earlier engine stopped at
+its own end for such a check is recovered by resuming it: it completes
+without re-running anything and carries the check on.
+
 ### Repairing a check that failed
 
 Only a `pass` settles an obligation, and the run loop skips accepted stages.
