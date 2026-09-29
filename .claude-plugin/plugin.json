@@ -1,0 +1,12 @@
+{
+  "name": "agent-sparring",
+  "displayName": "Agent Sparring",
+  "version": "0.1.0",
+  "description": "Set up a repository for agent-sparring, turn a discussion into a staged plan, and run it with an implementation agent and an independent reviewer. Requires the `sparring` CLI from this repository.",
+  "author": {
+    "name": "Sigmund Ås"
+  },
+  "repository": "https://github.com/sigmundas/agent-sparring",
+  "license": "MIT",
+  "keywords": ["agent-sparring", "code-review", "staged-plans", "claude-code", "codex"]
+}

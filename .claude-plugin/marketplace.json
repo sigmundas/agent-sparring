@@ -1,0 +1,15 @@
+{
+  "name": "agent-sparring",
+  "description": "The agent-sparring engine's own Claude Code skills.",
+  "owner": {
+    "name": "Sigmund Ås"
+  },
+  "plugins": [
+    {
+      "name": "agent-sparring",
+      "source": "./",
+      "description": "Skills that drive the agent-sparring engine: setup, plan authoring and plan runs.",
+      "version": "0.1.0"
+    }
+  ]
+}
