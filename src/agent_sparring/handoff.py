@@ -6,9 +6,7 @@ changed files, working-tree status, test evidence, and any open/deferred
 checks or previous unresolved sparring findings available to the sparrer.
 The thin form (default) never embeds a diff; the self-contained form adds
 one for a sparrer without repository access. Shape only (not code) is drawn
-from the Sporely V1 web review packet at
-``/Users/sigmundas/Documents/Code/sporely/.sparring/handoff.py`` — that file
-is deeply Sporely/multi-repo/transcript-specific and is not ported here.
+from an earlier project-specific review packet, which is not ported here.
 """
 
 from __future__ import annotations

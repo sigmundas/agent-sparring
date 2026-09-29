@@ -1528,6 +1528,54 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
     return 0
 
 
+def _cmd_check_plan(args: argparse.Namespace) -> int:
+    """Validate a plan input exactly as ``run-plan`` would read it, and stop.
+
+    Nothing is recorded, approved or run: no run state, no stage directory,
+    no provider. Stage ids are left out on purpose -- a run assigns them
+    from its own key when it starts.
+    """
+
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        source = load_plan_source(Path(args.plan_path), repo_root, manifest=args.manifest)
+        stages = source.stages()
+    except (PlanError, ProjectConfigError, OSError) as exc:
+        if args.json:
+            json.dump({"valid": False, "error": str(exc)}, sys.stdout, indent=2)
+            print()
+        else:
+            print(f"plan is not runnable: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        payload = {
+            "valid": True,
+            "kind": source.kind,
+            "label": source.label,
+            "stages": [
+                {
+                    "position": stage.position,
+                    "label": stage.label,
+                    "title": stage.title,
+                    "mode": stage.mode.value,
+                    "repositories": [repository.name for repository in stage.repositories],
+                }
+                for stage in stages
+            ],
+            "error": None,
+        }
+        json.dump(payload, sys.stdout, indent=2)
+        print()
+        return 0
+    print(f"{source.label}: {len(stages)} stage(s), read as {source.kind}")
+    for stage in stages:
+        suffix = " (review only)" if stage.review_only else ""
+        print(f"  {stage.display}{suffix}")
+    print("nothing was run or approved")
+    return 0
+
+
 def _cmd_run_plan(args: argparse.Namespace) -> int:
     return _run_plan_command(args, resume=False)
 
@@ -2596,6 +2644,23 @@ def build_parser() -> argparse.ArgumentParser:
     slice_branch.add_argument("--repo-root", default=None, help=repo_root_help)
     slice_branch.add_argument("--json", action="store_true", help="report as JSON")
     slice_branch.set_defaults(func=_cmd_slice_branch)
+
+    check_plan = subparsers.add_parser(
+        "check-plan",
+        help=(
+            "validate a Markdown plan or --manifest exactly as run-plan would read it, "
+            "and list its stages; records, approves and runs nothing"
+        ),
+    )
+    check_plan.add_argument("plan_path", help="path to a reviewed Markdown plan, or a manifest with --manifest")
+    check_plan.add_argument(
+        "--manifest",
+        action="store_true",
+        help="read plan_path as an execution manifest (JSON), including an approved intake manifest",
+    )
+    check_plan.add_argument("--repo-root", default=None, help=repo_root_help)
+    check_plan.add_argument("--json", action="store_true", help="report as JSON")
+    check_plan.set_defaults(func=_cmd_check_plan)
 
     run_plan = subparsers.add_parser(
         "run-plan",

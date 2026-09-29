@@ -828,3 +828,67 @@ class CliInterruptionTests(unittest.TestCase):
 
         parser.parse_args = parse  # type: ignore[method-assign]
         return parser
+
+
+class CliCheckPlanTests(unittest.TestCase):
+    """check-plan reads a plan the way run-plan would, and writes nothing."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name) / "repo"
+        self.repo.mkdir(parents=True)
+        _run_git(self.repo, "init", "-q", "-b", "main")
+        self.sparring_dir = self.repo / ".sparring"
+
+    def _check(self, *argv: str) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["--sparring-dir", str(self.sparring_dir), "check-plan", *argv])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_lists_stages_of_a_valid_plan_and_records_nothing(self):
+        plan = self.repo / "plan.md"
+        plan.write_text(
+            "# Plan\n\n## Stage 1 — Foundation\nBuild it.\n\n## Stage 2 — Polish\nShip it.\n",
+            encoding="utf-8",
+        )
+        code, out, _ = self._check(str(plan), "--json")
+        self.assertEqual(code, 0)
+        report = json.loads(out)
+        self.assertTrue(report["valid"])
+        self.assertEqual(report["kind"], "markdown")
+        self.assertEqual([s["title"] for s in report["stages"]], ["Foundation", "Polish"])
+        self.assertEqual([s["mode"] for s in report["stages"]], ["implementation"] * 2)
+        self.assertNotIn("stage_id", report["stages"][0])
+        self.assertFalse(self.sparring_dir.exists())
+
+    def test_refuses_a_numbering_gap_with_the_parser_message(self):
+        plan = self.repo / "plan.md"
+        plan.write_text("## Stage 1 — A\nx\n\n## Stage 3 — B\ny\n", encoding="utf-8")
+        code, _, err = self._check(str(plan))
+        self.assertEqual(code, 1)
+        self.assertIn("stage numbering must be 1..N", err)
+        self.assertFalse(self.sparring_dir.exists())
+
+    def test_reads_a_manifest_with_non_numeric_labels(self):
+        manifest = self.repo / "manifest.json"
+        brief = "# Stage brief\n\nDo it.\n"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "plan_label": "docs/plan.md",
+                    "source_digest": "sha256:abc",
+                    "stages": [
+                        {"stage_id": "stage-3c-schema", "label": "Stage 3C", "title": "Schema", "brief": brief},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, out, _ = self._check(str(manifest), "--manifest", "--json")
+        self.assertEqual(code, 0, out)
+        report = json.loads(out)
+        self.assertEqual(report["kind"], "manifest")
+        self.assertEqual(report["stages"][0]["label"], "Stage 3C")
