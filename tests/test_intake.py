@@ -29,6 +29,7 @@ from agent_sparring.intake import (
     parse_interpretation,
     prepare_plan,
     run_prerequisites,
+    stage_contracts,
 )
 from agent_sparring.intake_approval import load_intake_manifest
 from agent_sparring.manifest import manifest_digest
@@ -308,6 +309,59 @@ class CheckTests(unittest.TestCase):
         self.assertEqual([f.severity for f in ordered], ["blocking", "info"])
 
 
+RUN_KEYS = {"app": "app-run-0001", "web": "web-run-0002"}
+
+
+def _contracts_by_label(payload) -> dict:
+    interpretation = parse_interpretation(json.dumps(payload))
+    source = SourcePlan(label="docs/plan.md", text=PLAN)
+    contracts = stage_contracts(source, interpretation, RUN_KEYS)
+    return {c["plan_stage_label"]: c for c in contracts.values()}
+
+
+class StageContractTests(unittest.TestCase):
+    """``contract_digest`` hashes a stage's own cited source text only:
+    never ``depends_on``, never another stage's text, never metadata."""
+
+    def test_an_unchanged_stage_has_the_same_digest_across_calls(self):
+        first = _contracts_by_label(good_interpretation())
+        second = _contracts_by_label(good_interpretation())
+        self.assertEqual(first["1A"]["contract_digest"], second["1A"]["contract_digest"])
+
+    def test_inserting_a_later_stage_does_not_change_earlier_digests(self):
+        before = _contracts_by_label(good_interpretation())
+        payload = good_interpretation()
+        payload["runs"][0]["stages"].append(
+            stage("extra", "Extra", "## References", "docs/widgets.md")
+        )
+        after = _contracts_by_label(payload)
+        self.assertEqual(before["0"]["contract_digest"], after["0"]["contract_digest"])
+        self.assertEqual(before["1A"]["contract_digest"], after["1A"]["contract_digest"])
+        self.assertIn("extra", after)
+
+    def test_changing_a_stage_s_own_depends_on_does_not_change_its_digest(self):
+        before = _contracts_by_label(good_interpretation())
+        payload = good_interpretation()
+        payload["runs"][0]["stages"][1]["depends_on"] = []
+        after = _contracts_by_label(payload)
+        self.assertEqual(before["1A"]["contract_digest"], after["1A"]["contract_digest"])
+
+    def test_changing_another_stage_s_depends_on_does_not_touch_this_one(self):
+        before = _contracts_by_label(good_interpretation())
+        payload = good_interpretation()
+        payload["runs"][1]["stages"][0]["depends_on"] = ["0"]  # 1B now (also) depends on 0
+        after = _contracts_by_label(payload)
+        self.assertEqual(before["0"]["contract_digest"], after["0"]["contract_digest"])
+        self.assertEqual(before["1A"]["contract_digest"], after["1A"]["contract_digest"])
+
+    def test_changing_the_stage_s_own_source_text_changes_its_digest(self):
+        before = _contracts_by_label(good_interpretation())
+        payload = good_interpretation()
+        payload["runs"][0]["stages"][1]["source_ranges"] = [lines("## Stage 1A")]
+        after = _contracts_by_label(payload)
+        self.assertNotEqual(before["1A"]["contract_digest"], after["1A"]["contract_digest"])
+
+
 IGNORE = ".sparring/stages/\n.sparring/plans/\n.sparring/intake/\n"
 
 
@@ -537,6 +591,40 @@ class CompletionMarkerTests(_Repo):
             primary_repository="app",
         )
         self.assertTrue(approval.created)
+
+
+class LineageTests(_Repo):
+    """A new intake links the plan's already-finished intakes and traces a
+    recurring stage label back to where it was first seen."""
+
+    def test_a_second_intake_records_previous_intakes_and_traces_a_recurring_label(self):
+        first = self.prepare()
+        first_record = json.loads((first.directory / "intake.json").read_text(encoding="utf-8"))
+        self.assertEqual(first_record["previous_intakes"], [])
+        self.assertEqual(first_record["stage_lineage"], {})
+
+        second = self.prepare()
+        second_record = json.loads((second.directory / "intake.json").read_text(encoding="utf-8"))
+        self.assertEqual(second_record["previous_intakes"], [first_record["intake_id"]])
+
+        first_stage_0_id = next(
+            sid for sid, c in first_record["stages"].items() if c["plan_stage_label"] == "0"
+        )
+        second_stage_0_id = next(
+            sid for sid, c in second_record["stages"].items() if c["plan_stage_label"] == "0"
+        )
+        self.assertEqual(
+            second_record["stage_lineage"][second_stage_0_id],
+            {
+                "label": "0",
+                "first_seen": {
+                    "intake_id": first_record["intake_id"],
+                    "run_id": "app",
+                    "stage_id": first_stage_0_id,
+                    "contract_digest": first_record["stages"][first_stage_0_id]["contract_digest"],
+                },
+            },
+        )
 
 
 class ApproveTests(_Repo):

@@ -1208,6 +1208,15 @@ def prepare_plan(
     if duplicate_ids:
         raise IntakeError(f"derived stage ids collide: {duplicate_ids}; labels must slug uniquely")
 
+    # Lineage: every already-finished intake of this same plan, oldest
+    # first, and where each of this intake's stages, by its own
+    # plan_stage_label, was first seen among them (see stage_lineage). Both
+    # are purely structural here; carry-forward (what may execute) is built
+    # on top of this, not decided by it.
+    priors = previous_finished_intakes(sparring_dir, label)
+    contracts = stage_contracts(source, interpretation, run_keys)
+    lineage = stage_lineage(contracts, priors)
+
     stamp = now().strftime("%Y%m%dT%H%M%SZ")
     intake_id = f"{plan_key(label)}-{stamp}-{mode}-{uuid.uuid4().hex[:4]}"
     directory = intake_root(sparring_dir) / intake_id
@@ -1244,6 +1253,9 @@ def prepare_plan(
         "context_repositories": {name: str(Path(p).resolve()) for name, p in sorted(context_repositories.items())},
         "run_keys": run_keys,
         "briefs": brief_digests,
+        "previous_intakes": [prior.intake_id for prior in priors],
+        "stages": contracts,
+        "stage_lineage": lineage,
         "provider": dict(provider or {}),
         "provider_session_id": result.session_id,
         "amendment_proposed": amendment is not None,
@@ -1305,6 +1317,127 @@ def completion_marker_problem(intake_dir: Path, record: Mapping[str, Any]) -> st
         f"{intake_dir} has no {marker_name} -- prepare_plan did not finish (it was likely "
         "interrupted). This intake cannot be approved; run prepare-plan again"
     )
+
+
+@dataclass(frozen=True)
+class _PriorIntake:
+    intake_id: str
+    directory: Path
+    record: Mapping[str, Any]
+
+
+def previous_finished_intakes(sparring_dir: Path, label: str) -> list[_PriorIntake]:
+    """Every already-finished intake of the same plan (by :func:`plan_key`)
+    recorded under ``sparring_dir``, oldest first.
+
+    An intake with no completion marker, or one whose marker is missing (see
+    :func:`completion_marker_problem`), was never reviewed and contributes no
+    lineage. A directory that is not a readable intake at all -- foreign or
+    corrupt state under ``intake/`` -- is skipped rather than failing the
+    scan: this is best-effort discovery, not a claim about that directory.
+    """
+
+    root = intake_root(sparring_dir)
+    if not root.is_dir():
+        return []
+    key = plan_key(label)
+    found: list[_PriorIntake] = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.name == REGISTRY_DIRNAME:
+            continue
+        record_path = entry / "intake.json"
+        if not record_path.is_file():
+            continue
+        try:
+            record = _read_json(record_path)
+        except IntakeError:
+            continue
+        if plan_key(str(record.get("plan_label", ""))) != key:
+            continue
+        if completion_marker_problem(entry, record) is not None:
+            continue
+        found.append(_PriorIntake(intake_id=str(record.get("intake_id") or entry.name), directory=entry, record=record))
+    found.sort(key=lambda prior: str(prior.record.get("created_at", "")))
+    return found
+
+
+def _normalize_contract_text(text: str) -> str:
+    """Whitespace-only normalization for :func:`stage_contracts`: trailing
+    space on a line and leading/trailing blank lines never change a stage's
+    contract, but no other difference is smoothed over."""
+
+    return "\n".join(line.rstrip() for line in text.splitlines()).strip()
+
+
+def stage_contracts(
+    source: SourcePlan, interpretation: Interpretation, run_keys: Mapping[str, str]
+) -> dict[str, dict[str, str]]:
+    """Each stage's stable identity: ``{stage_id: {plan_stage_label, run_id,
+    contract_digest}}``.
+
+    ``contract_digest`` hashes only the plan's own text for that stage
+    (``stage.source_ranges``, whitespace-normalized) -- never attached
+    context blocks, never ``depends_on``, never any other stage's text. A
+    stage's dependencies are not part of its contract: inserting a stage
+    elsewhere, or changing what a stage depends on, does not move its
+    digest, by construction, because this never reads ``depends_on`` at
+    all. Only a change to the stage's own cited source text does.
+    """
+
+    contracts: dict[str, dict[str, str]] = {}
+    for run in interpretation.runs:
+        for stage in run.stages:
+            stage_id = stage_id_for(run_keys[run.id], stage)
+            text = _normalize_contract_text(source.excerpt(stage.source_ranges))
+            contracts[stage_id] = {
+                "plan_stage_label": stage.label,
+                "run_id": run.id,
+                "contract_digest": sha256_text(text),
+            }
+    return contracts
+
+
+def stage_lineage(
+    contracts: Mapping[str, Mapping[str, str]], priors: Sequence[_PriorIntake]
+) -> dict[str, dict[str, Any]]:
+    """For each of this intake's stages whose ``plan_stage_label`` also
+    named a stage in an earlier finished intake of the same plan, where that
+    label was first seen: ``{stage_id: {label, first_seen: {intake_id,
+    run_id, stage_id, contract_digest}}}``.
+
+    Purely structural traceability by label, computed from ``priors`` in
+    the order given (oldest first) so "first seen" is truly the earliest
+    occurrence. It says nothing about whether that earlier stage was ever
+    approved or completed, or whether its contract still matches -- that is
+    carry-forward's job, built on top of this.
+    """
+
+    by_label: dict[str, tuple[str, Mapping[str, Any]]] = {}
+    for prior in priors:
+        for prior_stage_id, prior_stage in (prior.record.get("stages") or {}).items():
+            label = prior_stage.get("plan_stage_label")
+            if not isinstance(label, str) or label in by_label:
+                continue
+            by_label[label] = (
+                prior.intake_id,
+                {
+                    "run_id": prior_stage.get("run_id"),
+                    "stage_id": prior_stage_id,
+                    "contract_digest": prior_stage.get("contract_digest"),
+                },
+            )
+    lineage: dict[str, dict[str, Any]] = {}
+    for stage_id, contract in contracts.items():
+        label = contract["plan_stage_label"]
+        seen = by_label.get(label)
+        if seen is None:
+            continue
+        intake_id, prior_stage = seen
+        lineage[stage_id] = {
+            "label": label,
+            "first_seen": {"intake_id": intake_id, **prior_stage},
+        }
+    return lineage
 
 
 def _fingerprint(path: Path) -> tuple[str, str, tuple[str, ...]]:
