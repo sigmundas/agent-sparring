@@ -109,7 +109,10 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
             "edited between runs by a person, by hand or through "
             "'sparring set-config' on their behalf"
         ),
-        purpose="provider, model and effort selection, and engine configuration",
+        purpose=(
+            "provider selection and engine configuration (model and effort are "
+            "the person's own preferences, outside the repository)"
+        ),
     ),
     ArtifactOwnership(
         path="plans/<run>.json",
