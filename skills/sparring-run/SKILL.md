@@ -27,13 +27,18 @@ Run `sparring check-config`. If it fails, run `sparring show-config --json`.
 For `setup_problems` of kind `not-ignored` (missing `.gitignore` lines) or
 `obsolete-agent-setting` (old `model`/`effort` keys in `project.toml`),
 offer `sparring fix-config`, which repairs exactly those and nothing else.
+While obsolete keys remain, the engine refuses to start any run.
 Then remind the person that the changed files must be committed. Removing
 obsolete keys doesn't choose a model for them. For anything else, relay the
 engine's message and point to `/agent-sparring:sparring-setup`.
 
 Show which model and effort each role will use (`show-config`). They come
 from the person's own preferences, or the provider's default. Don't change
-them as part of starting a run.
+them as part of starting a run. A stage keeps the configuration it started
+with until it ends, so a preference changed during a run applies from the
+next stage. Don't pass `--stage-model` or similar flags to a resume to force
+a change: the engine refuses an override that contradicts the stage's
+recorded configuration.
 
 ## 2. Branch and worktree
 

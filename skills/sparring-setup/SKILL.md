@@ -41,8 +41,9 @@ Check each of these and report all failures together:
   - `kind: "not-ignored"`: a workflow-state directory git can see. The fix
     appends that `.gitignore` line.
   - `kind: "obsolete-agent-setting"`: `project.toml` still sets a `model` or
-    `effort`, which the engine no longer reads. The fix removes the key. It
-    does **not** choose a preference for the person.
+    `effort`, which the engine no longer reads. No run can start until it is
+    removed. The fix removes the key. It does **not** choose a preference for
+    the person.
   - any other kind: show the engine's `message` verbatim. Don't invent a fix.
 - Report the providers and where each model/effort comes from (`user`
   means the person's own preference; `provider-default` means none is set).
