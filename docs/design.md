@@ -339,8 +339,9 @@ how one path ends up quietly ignoring it.
 A `project.toml` written before this split still parses: `model`/`effort`
 under `[agents.<role>]` are read only so they can be reported as obsolete
 (`show-config --json`'s `setup_problems`, kind `obsolete-agent-setting`) and
-removed by `fix-config`. They are never resolved — a stale value left behind
-is diagnosed, not silently honoured.
+removed by `fix-config`. They are never resolved, and while one is present
+every command that would start a provider turn refuses: a stale value is
+neither silently honoured nor silently ignored.
 
 The environment layer exists for a one-off: trying a different model in one
 shell without changing the saved preference. The `SPARRING_<ROLE>_<FIELD>`
@@ -388,9 +389,11 @@ injection with a schema, and it would let a project reach past the
 invariants an adapter exists to hold (the sparrer's read-only sandbox, most
 of all).
 
-Resolution happens when a turn is launched and is re-read per stage, so
-editing `project.toml` affects the next turn and cannot reconfigure or
-restart one in flight. Provider session resume is untouched by any of this:
+Resolution happens before a stage's first provider turn and is then pinned
+for the whole stage in its `state.json` (`agents`): SEND_BACK cycles,
+resumes in a new process and the finalization turn reuse it, so a changed
+preference applies from the next stage and can never reconfigure a stage, or
+a provider session, already under way. Provider session resume is untouched by any of this:
 the session id is the provider's own, recorded in stage state, and never
 carried on an adapter object.
 

@@ -445,6 +445,11 @@ def validate_preference(role: str, provider: str, field: str, value: str) -> Non
         _check_effort(role, cap, value, SOURCE_USER)
     elif field == "model":
         _check_model(role, cap, SOURCE_USER)
+        if value.strip().startswith("-"):
+            raise AgentConfigError(
+                f"{value!r} is not a model id: a saved model must not begin with '-', which a "
+                f"provider command line would read as an option"
+            )
         if provider == claude_cli.PROVIDER_ID and value.strip().lower() in claude_cli.MODEL_ALIASES:
             exact = ", ".join(model for model, _ in claude_cli.KNOWN_MODELS)
             raise AgentConfigError(

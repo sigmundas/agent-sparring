@@ -230,6 +230,42 @@ def _optional_str_field(payload: dict[str, Any], key: str) -> str | None:
     return value
 
 
+@dataclass(frozen=True)
+class PinnedAgent:
+    """What one role runs with for the whole of one stage.
+
+    Written once, immediately before the stage's first provider turn, and
+    read back by every later turn of the same stage -- SEND_BACK cycles,
+    resumes in a new process, the finalization turn -- so a preference
+    changed while the stage is under way applies from the *next* stage and
+    never switches the model under an existing provider session.
+    """
+
+    provider: str
+    model: str | None
+    model_source: str
+    effort: str | None
+    effort_source: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: Any, *, where: str) -> "PinnedAgent":
+        if not isinstance(payload, dict):
+            raise StageError(f"state.json field {where!r} must be an object")
+        provider = _optional_str_field(payload, "provider")
+        if not provider:
+            raise StageError(f"state.json field '{where}.provider' is required")
+        return cls(
+            provider=provider,
+            model=_optional_str_field(payload, "model"),
+            model_source=_optional_str_field(payload, "model_source") or "unknown",
+            effort=_optional_str_field(payload, "effort"),
+            effort_source=_optional_str_field(payload, "effort_source") or "unknown",
+        )
+
+
 @dataclass
 class StageState:
     """The smallest machine state needed by later stages.
@@ -284,9 +320,18 @@ class StageState:
     # an error -- every state.json on disk today reads back as unowned, and
     # stays byte-identical until a run claims it.
     run: str | None = None
+    # The agent configuration this stage runs with from its first provider
+    # turn to its last, as ``{"stage": PinnedAgent, "sparring": PinnedAgent}``
+    # (see :class:`PinnedAgent`). ``None`` until the first turn, and absent
+    # from state.json then, so existing files stay byte-identical.
+    agents: dict[str, PinnedAgent] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        if self.agents is None:
+            payload.pop("agents", None)
+        else:
+            payload["agents"] = {role: pin.to_dict() for role, pin in self.agents.items()}
         payload["status"] = self.status.value
         if self.repositories:
             payload["repositories"] = [repo.to_dict() for repo in self.repositories]
@@ -324,7 +369,18 @@ class StageState:
             mode = StageMode.from_str(raw_mode)
         else:
             raise StageError("state.json field 'mode' must be a string or null")
+        raw_agents = payload.get("agents")
+        if raw_agents is None:
+            agents: dict[str, PinnedAgent] | None = None
+        elif isinstance(raw_agents, dict):
+            agents = {
+                str(role): PinnedAgent.from_dict(entry, where=f"agents.{role}")
+                for role, entry in raw_agents.items()
+            }
+        else:
+            raise StageError("state.json field 'agents' must be an object or null")
         return cls(
+            agents=agents,
             status=status,
             implementation_session_id=_optional_str_field(
                 payload, "implementation_session_id"

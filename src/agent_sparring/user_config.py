@@ -31,9 +31,9 @@ file, and atomic. The schema is closed: an unknown role, a provider id that is
 not a plain name, or a key other than ``model``/``effort`` is a load error, not
 silently ignored.
 
-Live-run semantics are the loop's own: a managed run re-resolves agent
-configuration immediately before each planned stage, so a change applies from
-the next stage and never to a provider process already running.
+A change applies from the next stage: each stage pins the configuration it
+resolved before its first provider turn and keeps it to the end (see
+:class:`agent_sparring.stage.PinnedAgent`).
 """
 
 from __future__ import annotations

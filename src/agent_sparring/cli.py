@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from agent_sparring.activity import ActivityLog
@@ -27,6 +28,8 @@ from agent_sparring.agent_config import (
     ROLE_STAGE,
     ResolvedAgentConfig,
     RoleOverrides,
+    SOURCE_CLI,
+    SOURCE_ENV,
     resolve_agent_configs,
     resolve_role_config,
     validate_preference,
@@ -92,7 +95,7 @@ from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.sparring_prompt import build_sparring_prompt
 from agent_sparring.dialogue import DialogueError, resolve_check, run_dialogue_turn
 from agent_sparring.dialogue_prompt import assemble_dialogue_prompt
-from agent_sparring.stage import Stage, StageError, StageMode
+from agent_sparring.stage import PinnedAgent, Stage, StageError, StageMode
 from agent_sparring.usage import collect_stage_usage, render_report
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 from agent_sparring.stage_prompt import build_stage_prompt
@@ -142,8 +145,8 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
 
 def _warn_obsolete_settings(config: ProjectConfig | None) -> bool:
     """Say, on stderr, that project.toml still sets model/effort the engine no
-    longer reads. True when it does. Never fatal to a run: the keys are
-    ignored, and the person's own preferences apply."""
+    longer reads. True when it does. Commands that start a provider turn
+    refuse outright instead (:func:`_refuse_obsolete_settings`)."""
 
     if config is None or not config.obsolete_agent_settings:
         return False
@@ -781,8 +784,13 @@ def _emit_resolved(
 
 
 def _resolve_agents(args: argparse.Namespace, sparring_dir: Path) -> EffectiveAgents:
-    """Both roles, from the shared loop flags (see :func:`_add_loop_arguments`)."""
+    """Both roles, from the shared loop flags (see :func:`_add_loop_arguments`).
 
+    Every caller starts provider turns, so obsolete project settings refuse
+    here (:func:`_refuse_obsolete_settings`).
+    """
+
+    _refuse_obsolete_settings(sparring_dir)
     return resolve_agent_configs(
         _optional_project_config(sparring_dir),
         stage=RoleOverrides(
@@ -795,6 +803,95 @@ def _resolve_agents(args: argparse.Namespace, sparring_dir: Path) -> EffectiveAg
             model=args.sparring_model,
             effort=args.sparring_effort,
         ),
+    )
+
+
+def _refuse_obsolete_settings(sparring_dir: Path) -> None:
+    """Refuse to start a provider turn while project.toml still sets model/effort.
+
+    Those keys no longer take effect (model and effort are the person's own
+    preferences). Running anyway would use a different model than the file
+    appears to choose, so every command that starts a provider turn stops
+    here, before any run state is written or any provider starts, and names
+    the engine-owned fix.
+    """
+
+    config = _optional_project_config(sparring_dir)
+    if config is None or not config.obsolete_agent_settings:
+        return
+    names = ", ".join(
+        f"[agents.{setting.role}] {setting.field} = {setting.value!r}"
+        for setting in config.obsolete_agent_settings
+    )
+    raise AgentConfigError(
+        f"project.toml still sets {names}, which no longer takes effect: model and effort are your "
+        f"own preferences now, shared by every project. The engine will not start a provider turn "
+        f"while the file appears to choose a model it would not use. Run 'sparring fix-config' to "
+        f"remove the obsolete keys, then choose your preferences with 'sparring set-config' (the "
+        f"removed values are not carried over)"
+    )
+
+
+def _pin_of(resolved: ResolvedAgentConfig) -> PinnedAgent:
+    return PinnedAgent(
+        provider=resolved.provider,
+        model=resolved.model,
+        model_source=resolved.model_source,
+        effort=resolved.effort,
+        effort_source=resolved.effort_source,
+    )
+
+
+def _apply_pin(resolved: ResolvedAgentConfig, pin: PinnedAgent) -> ResolvedAgentConfig:
+    """This stage's recorded configuration for one role, or a refusal.
+
+    A preference changed since the stage started is simply not used here: it
+    applies from the next stage. An explicit command-line or environment
+    override that asks for something else mid-stage is refused rather than
+    ignored, because it is a request the person made for this invocation.
+    """
+
+    if resolved.provider != pin.provider:
+        raise AgentConfigError(
+            f"this stage started with {pin.provider} as its {resolved.role} agent and runs with it "
+            f"to the end; the provider now resolves to {resolved.provider}. A provider change "
+            f"applies from the next stage"
+        )
+    for field, pinned in (("model", pin.model), ("effort", pin.effort)):
+        value = getattr(resolved, field)
+        source = getattr(resolved, f"{field}_source")
+        if source in (SOURCE_CLI, SOURCE_ENV) and value != pinned:
+            raise AgentConfigError(
+                f"this stage runs its {resolved.role} agent with {field} "
+                f"{pinned if pinned is not None else 'provider default'!s} from its first turn to its "
+                f"last; the {source} override asks for {value!r}. A {field} change applies from the "
+                f"next stage: drop the override to continue this one"
+            )
+    return replace(
+        resolved,
+        model=pin.model,
+        model_source=pin.model_source,
+        effort=pin.effort,
+        effort_source=pin.effort_source,
+    )
+
+
+def _stage_agents(stage: Stage, fresh: EffectiveAgents, *, record: bool = True) -> EffectiveAgents:
+    """The configuration ``stage`` runs with: pinned at its first provider
+    turn (``record``) and reused by every later one (see
+    :class:`agent_sparring.stage.PinnedAgent`)."""
+
+    state = stage.read_state()
+    pins = dict(state.agents or {})
+    missing = [resolved for resolved in (fresh.stage, fresh.sparring) if resolved.role not in pins]
+    if missing and record:
+        for resolved in missing:
+            pins[resolved.role] = _pin_of(resolved)
+        state.agents = pins
+        stage.write_state(state)
+    return EffectiveAgents(
+        stage=_apply_pin(fresh.stage, pins[ROLE_STAGE]) if ROLE_STAGE in pins else fresh.stage,
+        sparring=_apply_pin(fresh.sparring, pins[ROLE_SPARRING]) if ROLE_SPARRING in pins else fresh.sparring,
     )
 
 
@@ -839,13 +936,14 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
         # Resolved here, at launch, from the project.toml on disk right now:
         # a later edit changes the NEXT turn, never this one (see the
         # live-run semantics note on _build_loop_adapters).
-        effective = _resolve_role(
-            ROLE_STAGE,
-            sparring_dir,
-            provider=args.provider,
-            model=args.model,
-            effort=args.effort,
-        )
+        _refuse_obsolete_settings(sparring_dir)
+        effective = _stage_agents(
+            stage,
+            resolve_agent_configs(
+                _optional_project_config(sparring_dir),
+                stage=RoleOverrides(provider=args.provider, model=args.model, effort=args.effort),
+            ),
+        ).stage
         _emit_resolved(stage.activity_log(), effective)
         adapter = ClaudeCliAdapter(
             repo_root=repo_root,
@@ -903,13 +1001,15 @@ def _cmd_ask(args: argparse.Namespace) -> int:
             )
             return 0
 
-        effective = _resolve_role(
-            ROLE_SPARRING,
-            sparring_dir,
-            provider=args.provider,
-            model=args.model,
-            effort=args.effort,
-        )
+        _refuse_obsolete_settings(sparring_dir)
+        effective = _stage_agents(
+            stage,
+            resolve_agent_configs(
+                _optional_project_config(sparring_dir),
+                sparring=RoleOverrides(provider=args.provider, model=args.model, effort=args.effort),
+            ),
+            record=False,
+        ).sparring
         _emit_resolved(stage.activity_log(), effective)
         adapter = CodexCliAdapter(
             repo_root=repo_root,
@@ -976,13 +1076,14 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
             print(prompt)
             return 0
 
-        effective = _resolve_role(
-            ROLE_SPARRING,
-            sparring_dir,
-            provider=args.provider,
-            model=args.model,
-            effort=args.effort,
-        )
+        _refuse_obsolete_settings(sparring_dir)
+        effective = _stage_agents(
+            stage,
+            resolve_agent_configs(
+                _optional_project_config(sparring_dir),
+                sparring=RoleOverrides(provider=args.provider, model=args.model, effort=args.effort),
+            ),
+        ).sparring
         # No --sandbox override is exposed here: CodexCliAdapter has no
         # sandbox field or extra_args passthrough at all -- read-only is
         # hard-coded (see providers/codex_cli.py), so there is no
@@ -1029,7 +1130,6 @@ def _require_loop_providers(args: argparse.Namespace, sparring_dir: Path) -> Non
     run starts rather than partway through it.
     """
 
-    _warn_obsolete_settings(_optional_project_config(sparring_dir))
     _resolve_agents(args, sparring_dir)
 
 
@@ -1039,6 +1139,7 @@ def _build_loop_adapters(
     repo_root: Path,
     *,
     activity_log: ActivityLog | None = None,
+    stage: Stage | None = None,
 ) -> tuple[ClaudeCliAdapter, CodexCliAdapter]:
     """The stage and sparring adapters for run-loop / run-plan / resume-plan,
     from the shared provider flags (see :func:`_add_loop_arguments`).
@@ -1058,6 +1159,10 @@ def _build_loop_adapters(
     """
 
     effective = _resolve_agents(args, sparring_dir)
+    if stage is not None:
+        # One configuration for the whole stage: pinned before its first
+        # turn, reused by every later turn and every later process.
+        effective = _stage_agents(stage, effective)
     _emit_resolved(activity_log, effective.stage)
     _emit_resolved(activity_log, effective.sparring)
     stage_adapter = ClaudeCliAdapter(
@@ -1101,7 +1206,7 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
         # Both adapters append to this stage's activity.jsonl (see
         # agent_sparring.activity): observational only, never read back.
         stage_adapter, sparring_adapter = _build_loop_adapters(
-            args, sparring_dir, repo_root, activity_log=stage.activity_log()
+            args, sparring_dir, repo_root, activity_log=stage.activity_log(), stage=stage
         )
 
         loop_result = run_unattended_loop(
@@ -1368,7 +1473,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
 
         def make_adapters(stage: Stage) -> tuple[ClaudeCliAdapter, CodexCliAdapter]:
             return _build_loop_adapters(
-                args, sparring_dir, repo_root, activity_log=stage.activity_log()
+                args, sparring_dir, repo_root, activity_log=stage.activity_log(), stage=stage
             )
 
         def report(message: str) -> None:
@@ -2016,8 +2121,8 @@ def build_parser() -> argparse.ArgumentParser:
             "written. Everything is validated before anything is written, writes "
             "are atomic, and a request that matches what is stored writes nothing. "
             "Clearing a preference means the provider's own default applies. A "
-            "change applies from the next provider turn a run configures (the next "
-            "stage of a managed run); it never reconfigures a turn already running."
+            "change applies from the next stage: a stage keeps the configuration it "
+            "started with until it ends."
         ),
     )
     set_config.add_argument(

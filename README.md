@@ -121,11 +121,17 @@ model / effort:  explicit CLI flag  >  SPARRING_* environment  >  your saved pre
 `--sparring-model` / `--sparring-effort`. The independent reviewer is the
 sparring role, so it uses your sparring preference.
 
-Configuration is resolved when a provider turn is launched, and re-read for
-each stage of a plan run. Changing your preference therefore affects the
-*next* turn; it never reconfigures or restarts a provider process already
-running, and it does not disturb session resume — the session id belongs to
-the provider and is recorded in stage state, not on an adapter object.
+**A stage keeps one configuration from its first turn to its last.** Before
+a stage's first provider turn the engine records what each role resolved to
+(provider, model, effort and where each came from) in the stage's
+`state.json`, under `agents`. Every later turn of that stage reuses it:
+SEND_BACK cycles, a `resume-plan` in a new process, the finalization turn. A
+preference changed while a stage is under way therefore **applies from the
+next stage**, and never switches the model under an existing provider
+session. A command-line or environment override that contradicts the
+recorded value mid-stage is refused, not ignored; drop it to continue the
+stage, or let it take effect on the next one. Resetting a stage starts it
+fresh, configuration included.
 
 To see what a turn would actually run with, and where each value came from:
 
@@ -249,9 +255,12 @@ that git can still see, each carrying the `.gitignore` line that fixes it and
 the engine's full refusal text — when they cannot be determined the payload
 has `setup_error` instead. And, kind `obsolete-agent-setting`: a `model` or
 `effort` key still sitting under `[agents.<role>]` in `project.toml` from
-before this feature — parsed, reported, and **never resolved**; `check-config`
-warns about it on stderr and exits non-zero so a stale value is never
-mistaken for the one actually in effect.
+before this feature — parsed, reported, and **never resolved**. It blocks
+work: `check-config` reports it and exits non-zero, and every command that
+would start a provider turn (`run-plan`, `resume-plan`, `run-loop`,
+`run-stage`, `run-sparring`, `ask`, `prepare-plan`) refuses before any run
+state is written or any provider starts — running anyway would use a
+different model than the file appears to choose.
 
 `sparring fix-config` repairs both kinds in one pass: it appends exactly the
 missing lines to the repository's `.gitignore`, and removes exactly the

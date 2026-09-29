@@ -355,7 +355,7 @@ class SetConfigCommandTests(_ConfigDirTestCase):
         self.assertIn("sparring", out)
         # The two properties a person most needs to know before running it.
         self.assertIn("atomic", out)
-        self.assertIn("next provider turn", out)
+        self.assertIn("next stage", out)
 
     def test_the_role_is_a_closed_choice(self):
         code, _, err = self.cli("set-config", "reviewer", "--model", "claude-opus-5-5")
