@@ -40,21 +40,25 @@ class ProjectConfig:
     sparring_agent_provider: str | None = None
     default_sparring_mode: str | None = None
     stage_self_check: bool = False
-    # Optional per-role provider turn settings. ``None`` means the field was
-    # not configured, which is not the same as a default: the engine then
-    # passes no flag and the provider CLI does whatever it normally does.
-    # Whether a given value is meaningful for the resolved provider is not
-    # decided here -- the effective provider may come from a command-line
-    # override -- but by agent_config.resolve_role_config.
-    stage_agent_model: str | None = None
-    stage_agent_effort: str | None = None
-    sparring_agent_model: str | None = None
-    sparring_agent_effort: str | None = None
+    # ``model``/``effort`` under ``[agents.<role>]`` from before they became
+    # user preferences (see :mod:`agent_sparring.user_config`). Parsed only so
+    # they can be reported as a setup problem and removed by ``fix-config``;
+    # nothing resolves a provider turn from them.
+    obsolete_agent_settings: tuple["ObsoleteAgentSetting", ...] = ()
 
     def command(self, name: str) -> str | None:
         """Return a configured project command by name, if any."""
 
         return self.commands.get(name)
+
+
+@dataclass(frozen=True)
+class ObsoleteAgentSetting:
+    """One project-level ``model``/``effort`` key that no longer takes effect."""
+
+    role: str
+    field: str
+    value: str
 
 
 def _require_str(table: Mapping[str, Any], key: str, *, where: str) -> str:
@@ -98,6 +102,11 @@ def _optional_table(
         raise ProjectConfigError(f"{where} field '{key}' must be a table")
     return value
 
+
+# Keys an [agents.<role>] table may still contain but that no longer take
+# effect: model and effort are user preferences now. Accepted by the parser so
+# the engine can diagnose and remove them, rather than refuse to load the file.
+OBSOLETE_AGENT_KEYS: tuple[str, ...] = ("model", "effort")
 
 # The complete schema of an [agents.<role>] table. Kept closed on purpose:
 # a misspelled key here (``efort``, ``reasoning``) would otherwise be
@@ -157,10 +166,12 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
     _reject_unknown_agent_keys(sparring_agents, where=sparring_where)
     stage_provider = _optional_str(stage_agents, "provider", where=stage_where)
     sparring_provider = _optional_str(sparring_agents, "provider", where=sparring_where)
-    stage_model = _optional_str(stage_agents, "model", where=stage_where)
-    stage_effort = _optional_str(stage_agents, "effort", where=stage_where)
-    sparring_model = _optional_str(sparring_agents, "model", where=sparring_where)
-    sparring_effort = _optional_str(sparring_agents, "effort", where=sparring_where)
+    obsolete = tuple(
+        ObsoleteAgentSetting(role=role, field=key, value=str(role_table[key]))
+        for role, role_table in (("stage", stage_agents), ("sparring", sparring_agents))
+        for key in OBSOLETE_AGENT_KEYS
+        if key in role_table
+    )
 
     sparring_table = _optional_table(table, "sparring", where=source)
     default_mode = _optional_str(
@@ -178,10 +189,7 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
         sparring_agent_provider=sparring_provider,
         default_sparring_mode=default_mode,
         stage_self_check=self_check if self_check is not None else False,
-        stage_agent_model=stage_model,
-        stage_agent_effort=stage_effort,
-        sparring_agent_model=sparring_model,
-        sparring_agent_effort=sparring_effort,
+        obsolete_agent_settings=obsolete,
     )
 
 

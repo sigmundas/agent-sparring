@@ -5,7 +5,15 @@ therefore check the resolver directly, check the argv each adapter builds
 from a resolved value, and then check that the orchestration commands
 (run-stage, run-sparring, run-loop, run-plan, resume-plan and the
 independent-review stage) all end up with what that resolver produced --
-rather than trusting that each command remembered to consult project.toml.
+rather than trusting that each command remembered to consult project.toml or
+the user's preferences.
+
+Provider is a project decision (``project.toml``); model and effort are the
+person's own preference, shared by every project and keyed by role and
+provider (:mod:`agent_sparring.user_config`). project.toml may still carry
+old ``model``/``effort`` keys under ``[agents.<role>]`` -- they are parsed
+only as obsolete settings (see ``tests/test_setup_check.py`` for their
+diagnosis and removal) and never resolved.
 """
 
 import argparse
@@ -34,6 +42,7 @@ from agent_sparring.providers import ProviderError
 from agent_sparring.providers.claude_cli import ClaudeCliAdapter
 from agent_sparring.providers.codex_cli import CodexCliAdapter
 from agent_sparring.stage import StageMode
+from agent_sparring.user_config import RolePreference, UserPreferences, update_user_preferences, user_config_path
 from test_independent_review import REVIEW_STAGE, _ReviewRepoTestCase
 from test_plan import (  # the shared scripted adapters, verdicts and repo fixture
     NEEDS_YOU,
@@ -54,6 +63,8 @@ provider = "claude-cli"
 provider = "codex-cli"
 """
 
+# Still legal to have around (a file written before model/effort became a
+# user preference): parsed as obsolete settings, never resolved.
 FULL_CONFIG = """\
 project = "demo"
 
@@ -68,6 +79,38 @@ model = "gpt-5.6-terra"
 effort = "xhigh"
 """
 
+# The same model/effort FULL_CONFIG used to carry as project settings, as a
+# resolver-level user preference object -- for tests of resolve_role_config
+# and resolve_agent_configs directly (no disk, no CLI).
+PREFERRED = UserPreferences(
+    path=Path("unused"),
+    entries={
+        (ROLE_STAGE, "claude-cli"): RolePreference(model="opus", effort="high"),
+        (ROLE_SPARRING, "codex-cli"): RolePreference(model="gpt-5.6-terra", effort="xhigh"),
+    },
+)
+
+
+def _write_preferences(
+    *, stage_model=None, stage_effort=None, sparring_model=None, sparring_effort=None
+) -> None:
+    """Write this test process's isolated user preference file (see
+    ``tests/conftest.py``) for the roles' only implemented provider.
+    ``project.toml`` no longer carries model/effort at all."""
+
+    def edit(current: UserPreferences) -> UserPreferences:
+        if stage_model is not None:
+            current = current.with_edit(ROLE_STAGE, "claude-cli", "model", stage_model)
+        if stage_effort is not None:
+            current = current.with_edit(ROLE_STAGE, "claude-cli", "effort", stage_effort)
+        if sparring_model is not None:
+            current = current.with_edit(ROLE_SPARRING, "codex-cli", "model", sparring_model)
+        if sparring_effort is not None:
+            current = current.with_edit(ROLE_SPARRING, "codex-cli", "effort", sparring_effort)
+        return current
+
+    update_user_preferences(user_config_path(), edit)
+
 
 def _fake_completed(stdout: str) -> "subprocess.CompletedProcess[str]":
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
@@ -78,31 +121,24 @@ class ProjectConfigParsingTests(unittest.TestCase):
         config = parse_project_config(LEGACY_CONFIG)
         self.assertEqual(config.stage_agent_provider, "claude-cli")
         self.assertEqual(config.sparring_agent_provider, "codex-cli")
-        # Absent is absent -- not a fabricated default.
-        self.assertIsNone(config.stage_agent_model)
-        self.assertIsNone(config.stage_agent_effort)
-        self.assertIsNone(config.sparring_agent_model)
-        self.assertIsNone(config.sparring_agent_effort)
+        # Absent is absent: no obsolete setting is invented when there is none.
+        self.assertEqual(config.obsolete_agent_settings, ())
 
-    def test_model_and_effort_are_read_per_role(self):
+    def test_model_and_effort_are_read_as_obsolete_settings_never_active_fields(self):
+        # project.toml no longer carries execution model/effort: these keys
+        # are parsed only so 'sparring fix-config' can remove them, never so
+        # a run can resolve them.
         config = parse_project_config(FULL_CONFIG)
-        self.assertEqual(config.stage_agent_model, "opus")
-        self.assertEqual(config.stage_agent_effort, "high")
-        self.assertEqual(config.sparring_agent_model, "gpt-5.6-terra")
-        self.assertEqual(config.sparring_agent_effort, "xhigh")
-
-    def test_a_non_string_model_names_the_table_and_the_field(self):
-        with self.assertRaises(ProjectConfigError) as ctx:
-            parse_project_config('project = "d"\n\n[agents.stage]\nmodel = 7\n')
-        message = str(ctx.exception)
-        self.assertIn("[agents.stage]", message)
-        self.assertIn("'model'", message)
-
-    def test_an_empty_effort_string_is_rejected_rather_than_treated_as_unset(self):
-        with self.assertRaises(ProjectConfigError) as ctx:
-            parse_project_config('project = "d"\n\n[agents.sparring]\neffort = ""\n')
-        self.assertIn("[agents.sparring]", str(ctx.exception))
-        self.assertIn("'effort'", str(ctx.exception))
+        by_role_field = {(s.role, s.field): s.value for s in config.obsolete_agent_settings}
+        self.assertEqual(
+            by_role_field,
+            {
+                ("stage", "model"): "opus",
+                ("stage", "effort"): "high",
+                ("sparring", "model"): "gpt-5.6-terra",
+                ("sparring", "effort"): "xhigh",
+            },
+        )
 
     def test_a_misspelled_field_is_reported_rather_than_silently_ignored(self):
         # Silently ignoring "efort" would buy a full-price turn at an effort
@@ -135,18 +171,20 @@ class ResolutionTests(unittest.TestCase):
             self.assertEqual(resolved.model_source, "provider-default")
             self.assertEqual(resolved.effort_source, "provider-default")
 
-    def test_project_values_are_used_and_reported_as_coming_from_the_project(self):
-        effective = resolve_agent_configs(parse_project_config(FULL_CONFIG))
+    def test_user_preference_values_are_used_and_reported_as_coming_from_the_user(self):
+        effective = resolve_agent_configs(parse_project_config(LEGACY_CONFIG), preferences=PREFERRED)
         self.assertEqual(effective.stage.model, "opus")
         self.assertEqual(effective.stage.effort, "high")
-        self.assertEqual(effective.stage.model_source, "project")
+        self.assertEqual(effective.stage.model_source, "user")
+        self.assertEqual(effective.stage.effort_source, "user")
         self.assertEqual(effective.sparring.model, "gpt-5.6-terra")
         self.assertEqual(effective.sparring.effort, "xhigh")
 
-    def test_a_cli_override_beats_the_project_value(self):
+    def test_a_cli_override_beats_the_user_preference(self):
         effective = resolve_agent_configs(
-            parse_project_config(FULL_CONFIG),
+            parse_project_config(LEGACY_CONFIG),
             stage=RoleOverrides(model="sonnet", effort="low"),
+            preferences=PREFERRED,
         )
         self.assertEqual(effective.stage.model, "sonnet")
         self.assertEqual(effective.stage.model_source, "cli")
@@ -157,11 +195,14 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(effective.sparring.effort, "xhigh")
 
     def test_the_two_roles_are_independent(self):
-        config = parse_project_config(
-            'project = "d"\n\n[agents.stage]\nmodel = "opus"\n\n'
-            '[agents.sparring]\neffort = "max"\n'
+        preferences = UserPreferences(
+            path=Path("unused"),
+            entries={
+                (ROLE_STAGE, "claude-cli"): RolePreference(model="opus"),
+                (ROLE_SPARRING, "codex-cli"): RolePreference(effort="max"),
+            },
         )
-        effective = resolve_agent_configs(config)
+        effective = resolve_agent_configs(parse_project_config(LEGACY_CONFIG), preferences=preferences)
         self.assertEqual(effective.stage.model, "opus")
         self.assertIsNone(effective.stage.effort)
         self.assertIsNone(effective.sparring.model)
@@ -170,33 +211,47 @@ class ResolutionTests(unittest.TestCase):
     def test_an_effort_the_provider_does_not_accept_is_a_config_error(self):
         # "ultra" is a real Codex level and not a Claude one; the engine
         # must not quietly translate it into the nearest Claude level.
-        config = parse_project_config(
-            'project = "d"\n\n[agents.stage]\nprovider = "claude-cli"\neffort = "ultra"\n'
+        preferences = UserPreferences(
+            path=Path("unused"), entries={(ROLE_STAGE, "claude-cli"): RolePreference(effort="ultra")}
         )
+        config = parse_project_config('project = "d"\n\n[agents.stage]\nprovider = "claude-cli"\n')
         with self.assertRaises(AgentConfigError) as ctx:
-            resolve_role_config(ROLE_STAGE, config)
+            resolve_role_config(ROLE_STAGE, config, preferences=preferences)
         message = str(ctx.exception)
-        self.assertIn("[agents.stage] effort", message)
+        self.assertIn("your stage agent effort preference for claude-cli", message)
         self.assertIn("'ultra'", message)
         self.assertIn("claude-cli", message)
         self.assertIn("low, medium, high, xhigh, max", message)
 
     def test_the_same_level_is_accepted_for_the_provider_that_has_it(self):
-        config = parse_project_config(
-            'project = "d"\n\n[agents.sparring]\nprovider = "codex-cli"\neffort = "ultra"\n'
+        preferences = UserPreferences(
+            path=Path("unused"), entries={(ROLE_SPARRING, "codex-cli"): RolePreference(effort="ultra")}
         )
-        self.assertEqual(resolve_role_config(ROLE_SPARRING, config).effort, "ultra")
+        config = parse_project_config('project = "d"\n\n[agents.sparring]\nprovider = "codex-cli"\n')
+        self.assertEqual(
+            resolve_role_config(ROLE_SPARRING, config, preferences=preferences).effort, "ultra"
+        )
 
     def test_effort_is_validated_against_the_effective_provider_not_the_configured_one(self):
-        # project.toml pins codex-cli + "ultra"; a command line that switches
-        # the provider must be judged against the provider that will run.
-        config = parse_project_config(
-            'project = "d"\n\n[agents.sparring]\nprovider = "codex-cli"\neffort = "ultra"\n'
-        )
+        # A CLI override can switch the provider mid-resolution; the effort
+        # -- however it arrived -- must be judged against the provider that
+        # will actually run, not the one project.toml names.
+        config = parse_project_config('project = "d"\n\n[agents.sparring]\nprovider = "codex-cli"\n')
         with self.assertRaises(AgentConfigError):
             resolve_role_config(
-                ROLE_SPARRING, config, RoleOverrides(provider="claude-cli")
+                ROLE_SPARRING, config, RoleOverrides(provider="claude-cli", effort="ultra")
             )
+
+    def test_a_preference_saved_for_one_provider_is_never_applied_after_a_provider_switch(self):
+        # The whole point of keying preferences by (role, provider): moving
+        # the sparring role to a hypothetical provider must not inherit
+        # codex-cli's own stored effort.
+        config = parse_project_config('project = "d"\n\n[agents.sparring]\nprovider = "codex-cli"\n')
+        resolved = resolve_role_config(
+            ROLE_SPARRING, config, RoleOverrides(provider="codex-cli"), preferences=PREFERRED
+        )
+        self.assertEqual(resolved.effort, "xhigh")
+        self.assertEqual(resolved.effort_source, "user")
 
     def test_a_provider_that_cannot_serve_the_role_is_refused(self):
         with self.assertRaises(AgentConfigError) as ctx:
@@ -355,7 +410,10 @@ class LoopAdapterFactoryTests(unittest.TestCase):
         (self.sparring_dir / "project.toml").write_text(content, encoding="utf-8")
 
     def test_project_config_reaches_both_adapters_on_the_right_role(self):
-        self._write(FULL_CONFIG)
+        self._write(LEGACY_CONFIG)
+        _write_preferences(
+            stage_model="opus", stage_effort="high", sparring_model="gpt-5.6-terra", sparring_effort="xhigh"
+        )
         stage_adapter, sparring_adapter = _build_loop_adapters(
             self._args(), self.sparring_dir, self.repo
         )
@@ -364,8 +422,11 @@ class LoopAdapterFactoryTests(unittest.TestCase):
         self.assertEqual(sparring_adapter.model, "gpt-5.6-terra")
         self.assertEqual(sparring_adapter.effort, "xhigh")
 
-    def test_cli_overrides_beat_the_project_per_role(self):
-        self._write(FULL_CONFIG)
+    def test_cli_overrides_beat_the_user_preference_per_role(self):
+        self._write(LEGACY_CONFIG)
+        _write_preferences(
+            stage_model="opus", stage_effort="high", sparring_model="gpt-5.6-terra", sparring_effort="xhigh"
+        )
         stage_adapter, sparring_adapter = _build_loop_adapters(
             self._args(stage_model="sonnet", sparring_effort="minimal"),
             self.sparring_dir,
@@ -386,9 +447,8 @@ class LoopAdapterFactoryTests(unittest.TestCase):
             self.assertIsNone(adapter.effort)
 
     def test_an_unsupported_effort_stops_the_run_before_an_adapter_exists(self):
-        self._write(
-            'project = "d"\n\n[agents.stage]\nprovider = "claude-cli"\neffort = "ultra"\n'
-        )
+        self._write(LEGACY_CONFIG)
+        _write_preferences(stage_effort="ultra")
         with self.assertRaises(AgentConfigError):
             _build_loop_adapters(self._args(), self.sparring_dir, self.repo)
 
@@ -396,9 +456,10 @@ class LoopAdapterFactoryTests(unittest.TestCase):
         # Live-run semantics: nothing caches the resolved configuration for
         # the lifetime of a run, and nothing reaches into an adapter that
         # already exists.
-        self._write(FULL_CONFIG)
+        self._write(LEGACY_CONFIG)
+        _write_preferences(stage_model="opus")
         first, _ = _build_loop_adapters(self._args(), self.sparring_dir, self.repo)
-        self._write(FULL_CONFIG.replace('model = "opus"', 'model = "sonnet"'))
+        _write_preferences(stage_model="sonnet")
         second, _ = _build_loop_adapters(self._args(), self.sparring_dir, self.repo)
         self.assertEqual(first.model, "opus", "the adapter already built is unchanged")
         self.assertEqual(second.model, "sonnet")
@@ -422,7 +483,10 @@ class ShowConfigTests(unittest.TestCase):
         (self.sparring_dir / "project.toml").write_text(content, encoding="utf-8")
 
     def test_json_reports_the_resolved_values_and_where_each_came_from(self):
-        self._write(FULL_CONFIG)
+        self._write(LEGACY_CONFIG)
+        _write_preferences(
+            stage_model="opus", stage_effort="high", sparring_model="gpt-5.6-terra", sparring_effort="xhigh"
+        )
         code, out, err = self._main("show-config", "--json", "--stage-model", "sonnet")
         self.assertEqual(code, 0, err)
         payload = json.loads(out)
@@ -431,9 +495,9 @@ class ShowConfigTests(unittest.TestCase):
         self.assertEqual(payload["stage"]["model"], "sonnet")
         self.assertEqual(payload["stage"]["model_source"], "cli")
         self.assertEqual(payload["stage"]["effort"], "high")
-        self.assertEqual(payload["stage"]["effort_source"], "project")
+        self.assertEqual(payload["stage"]["effort_source"], "user")
         self.assertEqual(payload["sparring"]["provider_display_name"], "Codex")
-        self.assertEqual(payload["sparring"]["model_source"], "project")
+        self.assertEqual(payload["sparring"]["model_source"], "user")
         self.assertTrue(payload["config_exists"])
         self.assertTrue(Path(payload["config_path"]).is_absolute())
         self.assertIsNone(payload["error"])
@@ -458,7 +522,8 @@ class ShowConfigTests(unittest.TestCase):
         self.assertEqual(payload["stage"]["provider_source"], "engine-default")
 
     def test_an_invalid_configuration_exits_nonzero_with_a_json_error(self):
-        self._write('project = "d"\n\n[agents.stage]\neffort = "ultra"\n')
+        self._write(LEGACY_CONFIG)
+        _write_preferences(stage_effort="ultra")
         code, out, _ = self._main("show-config", "--json")
         self.assertEqual(code, 1)
         payload = json.loads(out)
@@ -466,33 +531,47 @@ class ShowConfigTests(unittest.TestCase):
         self.assertNotIn("stage", payload, "no resolved config is invented for a broken file")
 
     def test_it_reports_no_environment_or_secret_material(self):
-        self._write(FULL_CONFIG)
+        self._write(LEGACY_CONFIG)
+        _write_preferences(
+            stage_model="opus", stage_effort="high", sparring_model="gpt-5.6-terra", sparring_effort="xhigh"
+        )
         _, out, _ = self._main("show-config", "--json")
         payload = json.loads(out)
         # Configuration only. Setup problems (or why they could not be
-        # determined) and a git-only local-override path are also
-        # configuration facts, never environment or credentials.
+        # determined) and the user-preference file's own path/existence are
+        # also configuration facts, never environment or credentials.
         self.assertTrue({"config_path", "config_exists", "project", "error"} <= set(payload))
         self.assertLessEqual(
             set(payload) - {"stage", "sparring"},
-            {"config_path", "config_exists", "project", "error", "setup_problems", "setup_error", "local_config_path", "local_config_exists"},
+            {
+                "config_path",
+                "config_exists",
+                "project",
+                "error",
+                "setup_problems",
+                "setup_error",
+                "user_config_path",
+                "user_config_exists",
+            },
         )
         for role in ("stage", "sparring"):
             self.assertNotIn("env", payload[role])
             self.assertNotIn("executable", payload[role])
 
     def test_check_config_reports_the_effective_agents_too(self):
-        self._write(FULL_CONFIG)
+        self._write(LEGACY_CONFIG)
+        _write_preferences(stage_model="opus", stage_effort="high")
         code, out, _ = self._main("check-config", "--repo-root", str(self.repo))
         # The repo is not a git repository here, so the workflow-state probe
         # is the only thing that can fail; the agent lines must still print.
         self.assertIn("stage agent: claude-cli (project)", out)
-        self.assertIn("model 'opus' (project)", out)
-        self.assertIn("effort 'high' (project)", out)
+        self.assertIn("model 'opus' (user)", out)
+        self.assertIn("effort 'high' (user)", out)
         del code
 
     def test_check_config_fails_on_an_effort_the_provider_cannot_honour(self):
-        self._write('project = "d"\n\n[agents.stage]\neffort = "ultra"\n')
+        self._write(LEGACY_CONFIG)
+        _write_preferences(stage_effort="ultra")
         code, _, err = self._main("check-config", "--repo-root", str(self.repo))
         self.assertEqual(code, 1)
         self.assertIn("invalid agent configuration", err)
@@ -527,10 +606,7 @@ class InitConfigTests(unittest.TestCase):
         config = parse_project_config(
             (self.sparring_dir / "project.toml").read_text(encoding="utf-8")
         )
-        self.assertIsNone(config.stage_agent_model)
-        self.assertIsNone(config.stage_agent_effort)
-        self.assertIsNone(config.sparring_agent_model)
-        self.assertIsNone(config.sparring_agent_effort)
+        self.assertEqual(config.obsolete_agent_settings, ())
 
     def test_it_refuses_to_overwrite_an_existing_file(self):
         self.sparring_dir.mkdir(parents=True)
@@ -595,7 +671,8 @@ class _Refusing:
 
 
 class SingleRoleCommandResolutionTests(unittest.TestCase):
-    """run-stage and run-sparring read the same project.toml the loop does."""
+    """run-stage and run-sparring read the same project.toml and the same
+    user preferences the loop does."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -617,7 +694,10 @@ class SingleRoleCommandResolutionTests(unittest.TestCase):
         )
         self.sparring_dir = self.repo / ".sparring"
         self._main("new-stage", "stage-1")
-        (self.sparring_dir / "project.toml").write_text(FULL_CONFIG, encoding="utf-8")
+        (self.sparring_dir / "project.toml").write_text(LEGACY_CONFIG, encoding="utf-8")
+        _write_preferences(
+            stage_model="opus", stage_effort="high", sparring_model="gpt-5.6-terra", sparring_effort="xhigh"
+        )
 
     def _main(self, *argv: str) -> int:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -632,7 +712,7 @@ class SingleRoleCommandResolutionTests(unittest.TestCase):
             self._main(*argv)
         return recorder
 
-    def test_run_stage_uses_the_project_stage_model_and_effort(self):
+    def test_run_stage_uses_the_user_stage_model_and_effort(self):
         recorder = self._run(
             "run-stage", "stage-1", "--repo-root", str(self.repo),
             "--expected-branch", "feature/x",
@@ -648,7 +728,7 @@ class SingleRoleCommandResolutionTests(unittest.TestCase):
         self.assertEqual(recorder.stage_kwargs[0]["model"], "sonnet")
         self.assertEqual(recorder.stage_kwargs[0]["effort"], "max")
 
-    def test_run_sparring_uses_the_project_sparring_model_and_effort(self):
+    def test_run_sparring_uses_the_user_sparring_model_and_effort(self):
         recorder = self._run(
             "run-sparring", "stage-1", "--repo-root", str(self.repo),
             "--expected-branch", "feature/x",
@@ -657,10 +737,7 @@ class SingleRoleCommandResolutionTests(unittest.TestCase):
         self.assertEqual(recorder.sparring_kwargs[0]["effort"], "xhigh")
 
     def test_run_stage_refuses_an_unsupported_effort_without_building_an_adapter(self):
-        (self.sparring_dir / "project.toml").write_text(
-            'project = "d"\n\n[agents.stage]\nprovider = "claude-cli"\neffort = "ultra"\n',
-            encoding="utf-8",
-        )
+        _write_preferences(stage_effort="ultra")
         recorder = RecordingAdapters(_Refusing(), _Refusing())
         err = io.StringIO()
         with recorder.patched(), contextlib.redirect_stdout(io.StringIO()), (
@@ -683,10 +760,13 @@ class PlanCommandResolutionTests(_PlanRepoTestCase):
     def setUp(self):
         super().setUp()
         self.sparring_dir.mkdir(exist_ok=True)
-        (self.sparring_dir / "project.toml").write_text(FULL_CONFIG, encoding="utf-8")
+        (self.sparring_dir / "project.toml").write_text(LEGACY_CONFIG, encoding="utf-8")
         _run_git(self.repo, "add", ".sparring/project.toml")
         _run_git(self.repo, "commit", "-q", "-m", "project config")
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        _write_preferences(
+            stage_model="opus", stage_effort="high", sparring_model="gpt-5.6-terra", sparring_effort="xhigh"
+        )
 
     def _main(self, recorder: RecordingAdapters, *argv: str) -> tuple[int, str]:
         err = io.StringIO()
@@ -699,7 +779,7 @@ class PlanCommandResolutionTests(_PlanRepoTestCase):
     def _recorder(self, verdicts) -> RecordingAdapters:
         return RecordingAdapters(_StageAdapter(self.repo), _SparringAdapter(verdicts))
 
-    def test_run_plan_gives_each_role_its_own_project_configuration(self):
+    def test_run_plan_gives_each_role_its_own_configuration(self):
         recorder = self._recorder([NEEDS_YOU])
         code, err = self._main(
             recorder, "run-plan", str(self.plan_path), "--repo-root", str(self.repo),
@@ -744,10 +824,7 @@ class PlanCommandResolutionTests(_PlanRepoTestCase):
         self.assertTrue(all(kw["effort"] == "minimal" for kw in recorder.sparring_kwargs))
 
     def test_an_unsupported_effort_stops_run_plan_before_any_stage_state_exists(self):
-        (self.sparring_dir / "project.toml").write_text(
-            'project = "d"\n\n[agents.sparring]\nprovider = "codex-cli"\neffort = "turbo"\n',
-            encoding="utf-8",
-        )
+        _write_preferences(sparring_effort="turbo")
         recorder = self._recorder([READY])
         code, err = self._main(
             recorder, "run-plan", str(self.plan_path), "--repo-root", str(self.repo),
@@ -766,12 +843,13 @@ class IndependentReviewResolutionTests(_ReviewRepoTestCase):
     def setUp(self):
         super().setUp()
         self.sparring_dir.mkdir(exist_ok=True)
-        (self.sparring_dir / "project.toml").write_text(FULL_CONFIG, encoding="utf-8")
+        (self.sparring_dir / "project.toml").write_text(LEGACY_CONFIG, encoding="utf-8")
         _run_git(self.repo, "add", ".sparring/project.toml")
         _run_git(self.repo, "commit", "-q", "-m", "project config")
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        _write_preferences(sparring_model="gpt-5.6-terra", sparring_effort="xhigh")
 
-    def test_the_reviewer_is_configured_from_agents_sparring(self):
+    def test_the_reviewer_is_configured_from_the_sparring_role(self):
         recorder = RecordingAdapters(
             _StageAdapter(self.repo, commit=True), _SparringAdapter([READY, READY])
         )
@@ -791,8 +869,8 @@ class IndependentReviewResolutionTests(_ReviewRepoTestCase):
             self.stage(REVIEW_STAGE).read_state().mode, StageMode.INDEPENDENT_REVIEW
         )
         # Two adapter pairs were built (one per stage); every sparring one --
-        # including the review stage's reviewer -- carries the sparring role's
-        # configuration, and none of them carries the stage agent's.
+        # including the review stage's reviewer -- carries the sparring
+        # role's configuration, and none of them carries the stage agent's.
         self.assertEqual(len(recorder.sparring_kwargs), 2)
         for kwargs in recorder.sparring_kwargs:
             self.assertEqual(kwargs["model"], "gpt-5.6-terra")

@@ -35,26 +35,23 @@ project = "{project}"
 # Repository root, relative to this file's project (the parent of .sparring).
 root = "."
 
+# Which provider runs each role is a project decision. Model and effort are
+# your own preferences, shared by every project: set them with
+#   sparring set-config stage --model <exact model id> --effort <level>
+# (or from the VS Code cockpit), never here.
 [agents.stage]
 provider = "{stage_provider}"
-# Optional. Omit either line to use the provider's own default; the engine
-# then passes no flag at all and does not guess what the default is.
-# model = ""
-# effort = ""  # {stage_provider} accepts: {stage_efforts}
 
 [agents.sparring]
 provider = "{sparring_provider}"
-# model = ""
-# effort = ""  # {sparring_provider} accepts: {sparring_efforts}
 """
 
 
 def render_project_config(project: str) -> str:
     """The minimal valid project.toml for a new project.
 
-    The effort vocabularies are taken from the provider capability table
-    rather than retyped, so the comments cannot claim a level the adapter
-    would refuse.
+    The providers are the engine's defaults, taken from the capability
+    table rather than retyped.
     """
 
     stage = PROVIDER_CAPABILITIES[DEFAULT_PROVIDERS[ROLE_STAGE]]
@@ -62,9 +59,7 @@ def render_project_config(project: str) -> str:
     return PROJECT_CONFIG_TEMPLATE.format(
         project=project,
         stage_provider=stage.provider_id,
-        stage_efforts=", ".join(stage.effort_levels),
         sparring_provider=sparring.provider_id,
-        sparring_efforts=", ".join(sparring.effort_levels),
     )
 
 

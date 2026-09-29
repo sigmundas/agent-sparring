@@ -8,9 +8,17 @@ path -- ``run-stage``, ``run-sparring``, ``run-loop``, ``run-plan``,
 builds its adapters from :func:`resolve_agent_configs`, so none of them can
 quietly disagree about what the project configured.
 
-Precedence, per role and per field:
+Precedence. The provider is a project decision:
 
-    explicit CLI override  >  environment  >  local override  >  .sparring/project.toml  >  provider default
+    explicit CLI override  >  environment  >  .sparring/project.toml  >  engine default
+
+Model and effort are the person's own preferences, shared by every project
+and keyed by role *and* the provider just resolved:
+
+    explicit CLI override  >  environment  >  user preference  >  provider default
+
+There is no project-level model or effort any more: such keys in
+``project.toml`` are reported as obsolete setup problems and never used.
 
 "Provider default" means the engine passes no flag at all and the provider
 CLI does whatever it normally does. The engine never writes a guessed model
@@ -18,20 +26,16 @@ name into that gap, and :func:`resolve_agent_configs` reports the source of
 each value so a UI can say "provider default" honestly instead of inventing
 one.
 
-The local override layer (:mod:`agent_sparring.local_config`) holds model and
-effort for one worktree in its git directory, where no dirty-tree check can see
-it: it is how a cockpit changes the next stage's model or effort while a
-managed run is going, without the edit stopping that run.
+The user preference layer (:mod:`agent_sparring.user_config`) lives outside
+every repository, so choosing a model never dirties a working tree, and it
+is keyed by provider, so a preference for one provider is never applied to
+another. A preference changed while a managed run is going applies from the
+next stage: the loop re-resolves before each one.
 
-The environment layer exists because ``project.toml`` is a tracked file in
-the consuming repository: changing a model there dirties the working tree,
-and :mod:`agent_sparring.finalization` then treats that edit as candidate
-content. Trying a different model for one run should not require staging and
-committing a configuration change, so the same three fields can be set as
-environment variables, which leave no trace in the repository. It sits below
-the command line (an explicit flag is still the most specific thing a person
-can say) and above ``project.toml`` (a shell-local choice overrides the
-committed project default, which is the entire point). The variables are
+The environment layer is for a one-off: trying a different model for one run
+in one shell, without changing the saved preference. It sits below the
+command line (an explicit flag is still the most specific thing a person can
+say) and above the saved preference. The variables are
 listed in :data:`ENV_VARS` and validated exactly as the file's values are --
 an unsupported effort level or an unimplemented provider is the same
 configuration error whichever layer supplied it.
@@ -54,7 +58,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from agent_sparring.config import ProjectConfig, ProjectConfigError
-from agent_sparring.local_config import LocalAgentOverrides
+from agent_sparring.user_config import UserPreferences, load_user_preferences
 from agent_sparring.providers import claude_cli, codex_cli
 
 ROLE_STAGE = "stage"
@@ -68,8 +72,8 @@ FIELDS: tuple[str, ...] = ("provider", "model", "effort")
 # output so a UI never has to guess.
 SOURCE_CLI = "cli"
 SOURCE_ENV = "env"
-SOURCE_LOCAL = "local"
 SOURCE_PROJECT = "project"
+SOURCE_USER = "user"
 SOURCE_ENGINE_DEFAULT = "engine-default"
 SOURCE_PROVIDER_DEFAULT = "provider-default"
 
@@ -310,29 +314,29 @@ def capability(provider: str) -> ProviderCapability:
 
 
 def _layered(
-    override: str | None, env: str | None, configured: str | None, local: str | None = None
+    override: str | None, env: str | None, stored: str | None, stored_source: str
 ) -> tuple[str | None, str | None]:
     """The most specific value of the layers, and which one supplied it.
 
-    ``(None, None)`` means no layer set the field, which each caller turns
-    into the right kind of default for what it is resolving.
+    ``stored`` is the persistent layer for the field -- ``project.toml`` for a
+    provider, the user preference for model and effort -- named by
+    ``stored_source``. ``(None, None)`` means no layer set the field, which
+    each caller turns into the right kind of default.
     """
 
     if override is not None:
         return override, SOURCE_CLI
     if env is not None:
         return env, SOURCE_ENV
-    if local is not None:
-        return local, SOURCE_LOCAL
-    if configured is not None:
-        return configured, SOURCE_PROJECT
+    if stored is not None:
+        return stored, stored_source
     return None, None
 
 
 def _resolve_provider(
     role: str, override: str | None, env: str | None, configured: str | None
 ) -> tuple[str, str]:
-    value, source = _layered(override or None, env or None, configured or None)
+    value, source = _layered(override or None, env or None, configured or None, SOURCE_PROJECT)
     if value is None or source is None:
         return DEFAULT_PROVIDERS[role], SOURCE_ENGINE_DEFAULT
     return value, source
@@ -355,29 +359,21 @@ def _require_role(role: str, cap: ProviderCapability) -> None:
     )
 
 
-def _resolve_effort(
-    role: str,
-    cap: ProviderCapability,
-    override: str | None,
-    env: str | None,
-    configured: str | None,
-    local: str | None = None,
-) -> tuple[str | None, str]:
-    value, source = _layered(override, env, configured, local)
-    if value is None or source is None:
-        return None, SOURCE_PROVIDER_DEFAULT
-    # Name the layer the value actually came from, so a rejected level sends
-    # the reader to the right place to change it. The CLI flag is spelled
-    # --effort by run-stage/run-sparring and --stage-effort /
-    # --sparring-effort by the loop commands, so name the role rather than
-    # one command's flag.
-    where = {
-        SOURCE_CLI: f"the {role} agent effort override",
-        SOURCE_ENV: env_var(role, "effort"),
-        SOURCE_LOCAL: f"the local [agents.{role}] effort override",
-        SOURCE_PROJECT: f"[agents.{role}] effort",
+def _where(role: str, cap: ProviderCapability, field: str, source: str) -> str:
+    """Name the layer a value came from, so a refusal sends the reader to the
+    right place to change it. The CLI flag is spelled --effort by run-stage and
+    --stage-effort / --sparring-effort by the loop commands, so name the role
+    rather than one command's flag."""
+
+    return {
+        SOURCE_CLI: f"the {role} agent {field} override",
+        SOURCE_ENV: env_var(role, field),
+        SOURCE_USER: f"your {role} agent {field} preference for {cap.provider_id}",
     }[source]
 
+
+def _check_effort(role: str, cap: ProviderCapability, value: str, source: str) -> None:
+    where = _where(role, cap, "effort", source)
     if not cap.supports_effort:
         raise AgentConfigError(
             f"{where} is not supported by provider {cap.provider_id!r}: that provider "
@@ -390,6 +386,30 @@ def _resolve_effort(
             f"{where} value {value!r} is not supported by provider "
             f"{cap.provider_id!r}; supported levels: {supported}"
         )
+
+
+def _check_model(role: str, cap: ProviderCapability, source: str) -> None:
+    if not cap.supports_model:
+        raise AgentConfigError(
+            f"{_where(role, cap, 'model', source)} is not supported by provider "
+            f"{cap.provider_id!r}: that provider does not accept a model selection"
+        )
+    # Model names are deliberately not enumerated: both installed CLIs accept
+    # free-form model names and gain new ones without an engine release. The
+    # provider remains the authority on which names exist.
+
+
+def _resolve_effort(
+    role: str,
+    cap: ProviderCapability,
+    override: str | None,
+    env: str | None,
+    preferred: str | None,
+) -> tuple[str | None, str]:
+    value, source = _layered(override, env, preferred, SOURCE_USER)
+    if value is None or source is None:
+        return None, SOURCE_PROVIDER_DEFAULT
+    _check_effort(role, cap, value, source)
     return value, source
 
 
@@ -398,27 +418,41 @@ def _resolve_model(
     cap: ProviderCapability,
     override: str | None,
     env: str | None,
-    configured: str | None,
-    local: str | None = None,
+    preferred: str | None,
 ) -> tuple[str | None, str]:
-    value, source = _layered(override, env, configured, local)
+    value, source = _layered(override, env, preferred, SOURCE_USER)
     if value is None or source is None:
         return None, SOURCE_PROVIDER_DEFAULT
-    if not cap.supports_model:
-        where = {
-            SOURCE_CLI: f"the {role} agent model override",
-            SOURCE_ENV: env_var(role, "model"),
-            SOURCE_LOCAL: f"the local [agents.{role}] model override",
-            SOURCE_PROJECT: f"[agents.{role}] model",
-        }[source]
-        raise AgentConfigError(
-            f"{where} is not supported by provider {cap.provider_id!r}: that provider "
-            f"does not accept a model selection"
-        )
-    # Model names are deliberately not enumerated: both installed CLIs accept
-    # free-form model names/aliases and gain new ones without an engine
-    # release. The provider remains the authority on which names exist.
+    _check_model(role, cap, source)
     return value, source
+
+
+def validate_preference(role: str, provider: str, field: str, value: str) -> None:
+    """Refuse a user preference no provider turn could run with, before it is saved.
+
+    The same checks a run applies to a resolved value, plus one only a saved
+    preference needs: a provider alias that means "the latest of a family"
+    (``opus``) is refused, because a preference is shown as the exact model
+    it names and an alias would silently change underneath it. A one-off
+    command-line or environment override may still use one.
+    """
+
+    if role not in ROLES:
+        raise AgentConfigError(f"unknown agent role {role!r}; known roles: {', '.join(ROLES)}")
+    cap = capability(provider)
+    _require_role(role, cap)
+    if field == "effort":
+        _check_effort(role, cap, value, SOURCE_USER)
+    elif field == "model":
+        _check_model(role, cap, SOURCE_USER)
+        if provider == claude_cli.PROVIDER_ID and value.strip().lower() in claude_cli.MODEL_ALIASES:
+            exact = ", ".join(model for model, _ in claude_cli.KNOWN_MODELS)
+            raise AgentConfigError(
+                f"{value!r} is an alias for whichever {cap.display_name} model is latest, not an "
+                f"exact model; save an exact model id instead (for example {exact})"
+            )
+    else:
+        raise AgentConfigError(f"{field!r} is not a user preference; only model and effort are")
 
 
 def resolve_role_config(
@@ -427,14 +461,16 @@ def resolve_role_config(
     overrides: RoleOverrides = RoleOverrides(),
     *,
     environ: Mapping[str, str] | None = None,
-    local: LocalAgentOverrides | None = None,
+    preferences: UserPreferences | None = None,
 ) -> ResolvedAgentConfig:
     """Resolve one role's effective provider/model/effort.
 
     ``config`` may be ``None`` when the project has no ``project.toml`` at
-    all; the command line, the environment and the engine defaults then
-    supply everything. ``environ`` defaults to the real process environment
-    and exists so tests can supply one without mutating it.
+    all; the command line, the environment, the user preferences and the
+    engine defaults then supply everything. ``environ`` defaults to the real
+    process environment and ``preferences`` to the user preference file
+    (:func:`~agent_sparring.user_config.load_user_preferences`); both exist so
+    tests can supply their own.
     """
 
     if role not in ROLES:
@@ -442,16 +478,11 @@ def resolve_role_config(
 
     env = read_role_env(role, environ)
 
-    configured_provider = configured_model = configured_effort = None
+    configured_provider = None
     if config is not None:
-        if role == ROLE_STAGE:
-            configured_provider = config.stage_agent_provider
-            configured_model = config.stage_agent_model
-            configured_effort = config.stage_agent_effort
-        else:
-            configured_provider = config.sparring_agent_provider
-            configured_model = config.sparring_agent_model
-            configured_effort = config.sparring_agent_effort
+        configured_provider = (
+            config.stage_agent_provider if role == ROLE_STAGE else config.sparring_agent_provider
+        )
 
     provider, provider_source = _resolve_provider(
         role, overrides.provider, env.provider, configured_provider
@@ -459,14 +490,13 @@ def resolve_role_config(
     cap = capability(provider)
     _require_role(role, cap)
 
-    local_model = local.get(role, "model") if local is not None else None
-    local_effort = local.get(role, "effort") if local is not None else None
-    model, model_source = _resolve_model(
-        role, cap, overrides.model, env.model, configured_model, local_model
-    )
-    effort, effort_source = _resolve_effort(
-        role, cap, overrides.effort, env.effort, configured_effort, local_effort
-    )
+    if preferences is None:
+        preferences = load_user_preferences()
+    # Keyed by the provider just resolved: a preference saved for another
+    # provider is never applied to this one.
+    preferred = preferences.for_role(role, provider)
+    model, model_source = _resolve_model(role, cap, overrides.model, env.model, preferred.model)
+    effort, effort_source = _resolve_effort(role, cap, overrides.effort, env.effort, preferred.effort)
 
     return ResolvedAgentConfig(
         role=role,
@@ -515,13 +545,20 @@ def resolve_agent_configs(
     stage: RoleOverrides = RoleOverrides(),
     sparring: RoleOverrides = RoleOverrides(),
     environ: Mapping[str, str] | None = None,
-    local: LocalAgentOverrides | None = None,
+    preferences: UserPreferences | None = None,
 ) -> EffectiveAgents:
-    """Resolve both roles. The single entry point every command goes through."""
+    """Resolve both roles. The single entry point every command goes through.
 
+    The preference file is read once, so both roles see the same snapshot.
+    """
+
+    if preferences is None:
+        preferences = load_user_preferences()
     return EffectiveAgents(
-        stage=resolve_role_config(ROLE_STAGE, config, stage, environ=environ, local=local),
-        sparring=resolve_role_config(ROLE_SPARRING, config, sparring, environ=environ, local=local),
+        stage=resolve_role_config(ROLE_STAGE, config, stage, environ=environ, preferences=preferences),
+        sparring=resolve_role_config(
+            ROLE_SPARRING, config, sparring, environ=environ, preferences=preferences
+        ),
     )
 
 
@@ -544,13 +581,14 @@ __all__ = [
     "SOURCE_CLI",
     "SOURCE_ENGINE_DEFAULT",
     "SOURCE_ENV",
-    "SOURCE_LOCAL",
     "SOURCE_PROJECT",
     "SOURCE_PROVIDER_DEFAULT",
+    "SOURCE_USER",
     "capability",
     "env_var",
     "providers_for_role",
     "read_role_env",
     "resolve_agent_configs",
     "resolve_role_config",
+    "validate_preference",
 ]

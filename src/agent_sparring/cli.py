@@ -29,15 +29,16 @@ from agent_sparring.agent_config import (
     RoleOverrides,
     resolve_agent_configs,
     resolve_role_config,
+    validate_preference,
 )
 from agent_sparring.config_edit import RoleEdit, apply_role_edit
 from agent_sparring.setup_check import fix_setup, setup_problems
-from agent_sparring.local_config import (
-    load_local_overrides,
-    local_overrides_path,
-    with_local_edit,
-    write_local_overrides,
+from agent_sparring.user_config import (
+    load_user_preferences,
+    update_user_preferences,
+    user_config_path,
 )
+from agent_sparring.model_choices import model_choices
 from agent_sparring.config import (
     CONFIG_FILENAME,
     ProjectConfig,
@@ -127,13 +128,33 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
         # The same resolution a run would perform, with no CLI overrides:
         # an effort a provider cannot honour is reported here rather than
         # discovered when a turn is about to start.
-        effective = resolve_agent_configs(config, local=load_local_overrides(sparring_dir))
+        effective = resolve_agent_configs(config)
     except ProjectConfigError as exc:
         print(f"invalid agent configuration: {exc}", file=sys.stderr)
         return 1
+    print(f"user preferences: {user_config_path()}")
     for resolved in (effective.stage, effective.sparring):
         print(f"{resolved.role} agent: {_describe_agent(resolved)}")
-    return _report_workflow_state_ignored(args, sparring_dir)
+    obsolete = _warn_obsolete_settings(config)
+    ignored = _report_workflow_state_ignored(args, sparring_dir)
+    return 1 if obsolete else ignored
+
+
+def _warn_obsolete_settings(config: ProjectConfig | None) -> bool:
+    """Say, on stderr, that project.toml still sets model/effort the engine no
+    longer reads. True when it does. Never fatal to a run: the keys are
+    ignored, and the person's own preferences apply."""
+
+    if config is None or not config.obsolete_agent_settings:
+        return False
+    for setting in config.obsolete_agent_settings:
+        print(
+            f"obsolete: project.toml [agents.{setting.role}] {setting.field} = {setting.value!r} "
+            f"is ignored; model and effort are your own preferences now",
+            file=sys.stderr,
+        )
+    print("remove them with: sparring fix-config", file=sys.stderr)
+    return True
 
 
 def _describe_agent(resolved: ResolvedAgentConfig) -> str:
@@ -177,13 +198,12 @@ def _effective_payload(
         "project": config.project if config is not None else None,
         "error": None,
     }
-    # Where `set-config --local` writes: present only when this project is
-    # inside a git worktree. A UI that sees it may write model/effort there,
-    # which changes no tracked or untracked file of the repository.
-    local_path = local_overrides_path(sparring_dir) if sparring_dir is not None else None
-    if local_path is not None:
-        payload["local_config_path"] = str(local_path)
-        payload["local_config_exists"] = local_path.is_file()
+    # Where model and effort preferences live: one file for this person,
+    # outside every repository (see agent_sparring.user_config). A UI writes
+    # it through set-config, never directly.
+    user_path = user_config_path()
+    payload["user_config_path"] = str(user_path)
+    payload["user_config_exists"] = user_path.is_file()
     payload.update(effective.as_dict())
     return payload
 
@@ -208,7 +228,6 @@ def _cmd_show_config(args: argparse.Namespace) -> int:
         config = _optional_project_config(sparring_dir)
         effective = resolve_agent_configs(
             config,
-            local=load_local_overrides(sparring_dir),
             stage=RoleOverrides(
                 provider=args.stage_provider, model=args.stage_model, effort=args.stage_effort
             ),
@@ -249,6 +268,50 @@ def _cmd_show_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_model_choices(args: argparse.Namespace) -> int:
+    """The models a UI may offer for each role's provider here, and where the
+    list came from (see :mod:`agent_sparring.model_choices`). A suggestion
+    list, never a validation boundary: ``custom_allowed`` is always true.
+
+    Separate from ``show-config`` because the Codex catalog is a provider
+    subprocess, which a configuration refresh must not pay for every time.
+    """
+
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        effective = resolve_agent_configs(_optional_project_config(sparring_dir))
+        roles = [effective.stage, effective.sparring]
+        if args.role:
+            roles = [resolved for resolved in roles if resolved.role == args.role]
+        report = [
+            model_choices(
+                resolved.role,
+                args.provider or resolved.provider,
+                codex_executable=args.codex_executable,
+            ).as_dict()
+            for resolved in roles
+        ]
+    except ProjectConfigError as exc:
+        if args.json:
+            json.dump({"roles": [], "error": str(exc)}, sys.stdout, indent=2)
+            print()
+        else:
+            print(f"invalid configuration: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        json.dump({"roles": report, "error": None}, sys.stdout, indent=2)
+        print()
+        return 0
+    for entry in report:
+        print(f"{entry['role']} agent ({entry['provider']}), from {entry['source']}:")
+        for choice in entry["choices"]:
+            print(f"  {choice['model']}")
+        if entry["error"]:
+            print(f"  (no list: {entry['error']})")
+        print("  any other exact model id is accepted too")
+    return 0
+
+
 def _setup_payload(args: argparse.Namespace, sparring_dir: Path) -> dict[str, object]:
     """``setup_problems``: the fixable setup problems, for a UI (see
     :mod:`agent_sparring.setup_check`). ``setup_error`` instead when they
@@ -265,31 +328,50 @@ def _setup_payload(args: argparse.Namespace, sparring_dir: Path) -> dict[str, ob
 def _cmd_fix_config(args: argparse.Namespace) -> int:
     """Repair the fixable setup problems ``show-config`` reports.
 
-    Today that is exactly one kind: workflow-state directories git can see.
-    The missing ``.gitignore`` lines are appended and nothing else changes;
-    committing ``.gitignore`` is left to the person.
+    Two kinds (see :mod:`agent_sparring.setup_check`): obsolete model/effort
+    keys are removed from ``project.toml``, and the missing ``.gitignore``
+    lines for workflow-state directories are appended. Nothing else changes,
+    no preference is chosen for the person, and committing is left to them.
     """
 
     sparring_dir = Path(args.sparring_dir)
     try:
         repo_root = _resolve_repo_root(args, sparring_dir)
-        added = fix_setup(repo_root, sparring_dir)
+        fix = fix_setup(repo_root, sparring_dir)
     except (ProjectConfigError, GitContextError, OSError) as exc:
         if args.json:
-            json.dump({"fixed": False, "added": [], "error": str(exc)}, sys.stdout, indent=2)
+            json.dump({"fixed": False, "added": [], "removed": [], "error": str(exc)}, sys.stdout, indent=2)
             print()
         else:
             print(f"could not fix the setup: {exc}", file=sys.stderr)
         return 1
     gitignore = repo_root / ".gitignore"
+    removed = [{"role": r.role, "field": r.field, "value": r.value} for r in fix.removed]
     if args.json:
-        json.dump({"fixed": True, "added": added, "gitignore": str(gitignore), "error": None}, sys.stdout, indent=2)
+        json.dump(
+            {
+                "fixed": True,
+                "added": fix.added,
+                "gitignore": str(gitignore),
+                "removed": removed,
+                "config_path": str(fix.config_path),
+                "error": None,
+            },
+            sys.stdout,
+            indent=2,
+        )
         print()
         return 0
-    if added:
-        print(f"added {', '.join(added)} to {gitignore}; commit .gitignore to keep it")
-    else:
-        print("nothing to fix: every workflow-state directory is already ignored by git")
+    if fix.removed:
+        names = ", ".join(f"[agents.{r.role}] {r.field}" for r in fix.removed)
+        print(
+            f"removed obsolete {names} from {fix.config_path}; commit it to keep it. Your model/effort "
+            f"preferences were not changed: choose them with 'sparring set-config'"
+        )
+    if fix.added:
+        print(f"added {', '.join(fix.added)} to {gitignore}; commit .gitignore to keep it")
+    if not fix.removed and not fix.added:
+        print("nothing to fix: no obsolete settings, and every workflow-state directory is already ignored by git")
     return 0
 
 
@@ -322,43 +404,74 @@ def _cmd_init_config(args: argparse.Namespace) -> int:
 
 
 def _cmd_set_config(args: argparse.Namespace) -> int:
-    """Change one role's provider/model/effort in the project's project.toml.
+    """Change one role's provider (project) or model/effort (user preference).
 
     The typed counterpart to :func:`_cmd_show_config`: the engine owns
-    parsing, validation, mutation and effective resolution, so a UI can
-    offer controls without learning to write TOML and without acquiring a
-    second opinion about what a value means. The role is a fixed choice and
-    the fields are a closed set -- there is no way to spell an arbitrary key,
-    an arbitrary value or a command fragment through this command.
+    parsing, validation, mutation and effective resolution, so a UI can offer
+    controls without learning to write TOML and without acquiring a second
+    opinion about what a value means. The role is a fixed choice and the
+    fields are a closed set.
 
-    The write itself is :mod:`agent_sparring.config_edit`'s: validated
-    before anything reaches the disk, atomic when it does, and a no-op when
-    the file already says what was asked for.
+    Two destinations, because they are two different decisions:
+
+    - ``--provider`` is the project's, and is written to ``project.toml``
+      (:mod:`agent_sparring.config_edit`).
+    - ``--model``/``--effort`` (and their ``-default`` clears) are the
+      person's, shared by every project, and are written to the user
+      preference file (:mod:`agent_sparring.user_config`) under this role and
+      the provider in effect for it -- or ``--for-provider``. They never touch
+      a repository.
+
+    Everything is validated before anything is written; a request that
+    matches what is stored already writes nothing.
     """
 
     sparring_dir = Path(args.sparring_dir)
-    if args.local:
-        return _set_local_config(args, sparring_dir)
+    config_path = (sparring_dir / CONFIG_FILENAME).resolve()
+    pref_edits: list[tuple[str, str | None]] = []
+    if args.model is not None or args.model_default:
+        pref_edits.append(("model", None if args.model_default else args.model))
+    if args.effort is not None or args.effort_default:
+        pref_edits.append(("effort", None if args.effort_default else args.effort))
+    outcome = None
+    preference_changed = False
     try:
-        edit = RoleEdit(
-            provider=args.provider,
-            model=args.model,
-            clear_model=args.model_default,
-            effort=args.effort,
-            clear_effort=args.effort_default,
-        )
-        outcome = apply_role_edit(sparring_dir, args.role, edit)
-        # Deliberately re-read from disk rather than reporting the in-memory
-        # result: what a caller needs is the effective configuration of the
-        # file that now exists, resolved the same way a run will resolve it.
+        if args.provider is None and not pref_edits:
+            raise ProjectConfigError(
+                "nothing to change: give --provider (project), or --model/--model-default "
+                "or --effort/--effort-default (your preference)"
+            )
+        if args.provider is not None and args.for_provider is not None:
+            raise ProjectConfigError("--for-provider names the preference scope; do not combine it with --provider")
+        # Validate the preference edit before anything is written, including a
+        # provider change in the same invocation: the preference then belongs to
+        # the new provider.
+        provider = args.for_provider or args.provider
+        if pref_edits:
+            provider = provider or _resolve_role(args.role, sparring_dir).provider
+            for field, value in pref_edits:
+                if value is not None:
+                    validate_preference(args.role, provider, field, value.strip())
+        if args.provider is not None:
+            outcome = apply_role_edit(sparring_dir, args.role, RoleEdit(provider=args.provider))
+        if pref_edits:
+
+            def edit(current):
+                for field, value in pref_edits:
+                    current = current.with_edit(args.role, provider, field, value)
+                return current
+
+            _, preference_changed = update_user_preferences(user_config_path(), edit)
+        # Re-read what is now stored, resolved the way a run will resolve it.
         config = _optional_project_config(sparring_dir)
-        effective = resolve_agent_configs(config, local=load_local_overrides(sparring_dir))
+        effective = resolve_agent_configs(config)
     except ProjectConfigError as exc:
         if args.json:
             json.dump(
                 {
-                    "config_path": str((sparring_dir / CONFIG_FILENAME).resolve()),
-                    "config_exists": (sparring_dir / CONFIG_FILENAME).is_file(),
+                    "config_path": str(config_path),
+                    "config_exists": config_path.is_file(),
+                    "user_config_path": str(user_config_path()),
                     "changed": False,
                     "error": str(exc),
                 },
@@ -370,76 +483,20 @@ def _cmd_set_config(args: argparse.Namespace) -> int:
             print(f"could not change the {args.role} agent configuration: {exc}", file=sys.stderr)
         return 1
 
-    if args.json:
-        payload = _effective_payload(outcome.path.resolve(), config, effective, sparring_dir)
-        payload.update(_setup_payload(args, sparring_dir))
-        payload["changed"] = outcome.changed
-        payload["created"] = outcome.created
-        json.dump(payload, sys.stdout, indent=2)
-        print()
-        return 0
-
-    if outcome.created:
-        print(f"created {outcome.path}", file=sys.stderr)
-    elif not outcome.changed:
-        print(f"{outcome.path} already said this; nothing written", file=sys.stderr)
-    print(f"{outcome.resolved.role} agent: {_describe_agent(outcome.resolved)}")
-    return 0
-
-
-def _set_local_config(args: argparse.Namespace, sparring_dir: Path) -> int:
-    """``set-config --local``: change model/effort in this worktree's local
-    override file (see :mod:`agent_sparring.local_config`), which lives in the
-    git directory and so never dirties the repository.
-
-    Validated before anything is written, by resolving both roles with the
-    edited overrides exactly as the next stage of a run will.
-    """
-
-    config_path = (sparring_dir / CONFIG_FILENAME).resolve()
-    changed = False
-    try:
-        if args.provider is not None:
-            raise ProjectConfigError(
-                "the provider cannot be overridden locally; change it in project.toml "
-                "(set-config without --local)"
-            )
-        edits: list[tuple[str, str | None]] = []
-        if args.model is not None or args.model_default:
-            edits.append(("model", None if args.model_default else args.model))
-        if args.effort is not None or args.effort_default:
-            edits.append(("effort", None if args.effort_default else args.effort))
-        if not edits:
-            raise ProjectConfigError("nothing to change: give --model/--model-default or --effort/--effort-default")
-        overrides = None
-        for field, value in edits:
-            overrides = with_local_edit(sparring_dir, args.role, field, value, base=overrides)
-        assert overrides is not None
-        config = _optional_project_config(sparring_dir)
-        effective = resolve_agent_configs(config, local=overrides)  # refuses before writing
-        changed = write_local_overrides(overrides)
-    except ProjectConfigError as exc:
-        if args.json:
-            json.dump(
-                {"config_path": str(config_path), "config_exists": config_path.is_file(), "changed": False, "error": str(exc)},
-                sys.stdout,
-                indent=2,
-            )
-            print()
-        else:
-            print(f"could not change the {args.role} agent's local override: {exc}", file=sys.stderr)
-        return 1
-
+    changed = preference_changed or (outcome is not None and outcome.changed)
     if args.json:
         payload = _effective_payload(config_path, config, effective, sparring_dir)
         payload.update(_setup_payload(args, sparring_dir))
         payload["changed"] = changed
-        payload["created"] = False
+        payload["created"] = outcome.created if outcome is not None else False
         json.dump(payload, sys.stdout, indent=2)
         print()
         return 0
+
+    if outcome is not None and outcome.created:
+        print(f"created {outcome.path}", file=sys.stderr)
     if not changed:
-        print(f"{overrides.path} already said this; nothing written", file=sys.stderr)
+        print("already set; nothing written", file=sys.stderr)
     resolved = effective.stage if args.role == ROLE_STAGE else effective.sparring
     print(f"{resolved.role} agent: {_describe_agent(resolved)}")
     return 0
@@ -684,7 +741,6 @@ def _resolve_role(
         role,
         _optional_project_config(sparring_dir),
         RoleOverrides(provider=provider, model=model, effort=effort),
-        local=load_local_overrides(sparring_dir),
     )
 
 
@@ -729,7 +785,6 @@ def _resolve_agents(args: argparse.Namespace, sparring_dir: Path) -> EffectiveAg
 
     return resolve_agent_configs(
         _optional_project_config(sparring_dir),
-        local=load_local_overrides(sparring_dir),
         stage=RoleOverrides(
             provider=args.stage_provider,
             model=args.stage_model,
@@ -974,6 +1029,7 @@ def _require_loop_providers(args: argparse.Namespace, sparring_dir: Path) -> Non
     run starts rather than partway through it.
     """
 
+    _warn_obsolete_settings(_optional_project_config(sparring_dir))
     _resolve_agents(args, sparring_dir)
 
 
@@ -993,9 +1049,9 @@ def _build_loop_adapters(
     adapters that emit no provider telemetry.
 
     Live-run semantics: this is called once per planned stage, immediately
-    before that stage's turns, and it re-reads ``project.toml`` every time.
-    Editing the file therefore affects the next stage's turns and leaves
-    any provider process already running untouched -- the engine never
+    before that stage's turns, and it re-reads ``project.toml`` and the user
+    preferences every time. Changing either therefore affects the next
+    stage's turns and leaves any provider process already running untouched -- the engine never
     reconfigures or restarts a turn in flight. Provider session resume is
     unaffected: the session id is the provider's, recorded in stage state,
     and does not live on an adapter object.
@@ -1534,8 +1590,8 @@ def _add_single_role_model_arguments(parser: argparse.ArgumentParser) -> None:
         "--model",
         default=None,
         help=(
-            "model override for the provider (default: project.toml's model for "
-            "this role, else the provider's own default)"
+            "model override for the provider (default: your saved preference for "
+            "this role and the resolved provider, else the provider's own default)"
         ),
     )
     parser.add_argument(
@@ -1543,8 +1599,8 @@ def _add_single_role_model_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "reasoning/effort level, validated against the resolved provider "
-            "(default: project.toml's effort for this role, else the provider's "
-            "own default)"
+            "(default: your saved preference for it, else the provider's own "
+            "default)"
         ),
     )
 
@@ -1729,24 +1785,26 @@ def _add_role_model_arguments(parser: argparse.ArgumentParser) -> None:
     both roles at once (the loop commands and show-config).
 
     Precedence for each of them is the same and lives in one place (see
-    :mod:`agent_sparring.agent_config`): this flag, then project.toml's
-    ``[agents.<role>]``, then the provider's own default.
+    :mod:`agent_sparring.agent_config`): this flag, then the
+    ``SPARRING_<ROLE>_<FIELD>`` environment variable, then your own saved
+    preference for the resolved provider (``sparring set-config``), then the
+    provider's own default. project.toml no longer carries model or effort.
     """
 
     parser.add_argument(
         "--stage-model",
         default=None,
         help=(
-            "model override for the stage agent (default: project.toml's "
-            "[agents.stage].model, else the provider's own default)"
+            "model override for the stage agent (default: your saved preference "
+            "for the resolved provider, else the provider's own default)"
         ),
     )
     parser.add_argument(
         "--sparring-model",
         default=None,
         help=(
-            "model override for the sparring agent (default: project.toml's "
-            "[agents.sparring].model, else the provider's own default)"
+            "model override for the sparring agent (default: your saved preference "
+            "for the resolved provider, else the provider's own default)"
         ),
     )
     parser.add_argument(
@@ -1754,8 +1812,8 @@ def _add_role_model_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "reasoning/effort level for the stage agent, validated against the "
-            "resolved provider (default: project.toml's [agents.stage].effort, "
-            "else the provider's own default)"
+            "resolved provider (default: your saved preference for it, else the "
+            "provider's own default)"
         ),
     )
     parser.add_argument(
@@ -1763,8 +1821,8 @@ def _add_role_model_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "reasoning/effort level for the sparring agent, validated against the "
-            "resolved provider (default: project.toml's [agents.sparring].effort, "
-            "else the provider's own default)"
+            "resolved provider (default: your saved preference for it, else the "
+            "provider's own default)"
         ),
     )
 
@@ -1868,12 +1926,29 @@ def build_parser() -> argparse.ArgumentParser:
     _add_role_model_arguments(show_config)
     show_config.set_defaults(func=_cmd_show_config)
 
+    choices_parser = subparsers.add_parser(
+        "model-choices",
+        help=(
+            "list the models to offer for each role's provider (Codex from its own "
+            "catalog; Claude from the engine's known exact ids) -- suggestions, not a "
+            "closed list"
+        ),
+    )
+    choices_parser.add_argument("--role", choices=list(ROLES), default=None, help="only this role")
+    choices_parser.add_argument(
+        "--provider", default=None, help="list for this provider instead of the one in effect (needs --role)"
+    )
+    choices_parser.add_argument("--codex-executable", default="codex", help="codex CLI executable to ask")
+    choices_parser.add_argument("--json", action="store_true", help="report as JSON")
+    choices_parser.set_defaults(func=_cmd_model_choices)
+
     fix_config = subparsers.add_parser(
         "fix-config",
         help=(
-            "repair the fixable setup problems show-config --json reports: append the "
-            "missing workflow-state lines (.sparring/stages/, plans/, intake/) to the "
-            "repository's .gitignore, and nothing else"
+            "repair the fixable setup problems show-config --json reports: remove "
+            "obsolete model/effort keys from project.toml (without choosing any "
+            "preference for you), and append the missing workflow-state lines "
+            "(.sparring/stages/, plans/, intake/) to the repository's .gitignore; nothing else"
         ),
     )
     fix_config.add_argument("--repo-root", default=None, help="repository root (default: [repo].root, else the parent of --sparring-dir)")
@@ -1928,21 +2003,21 @@ def build_parser() -> argparse.ArgumentParser:
     set_config = subparsers.add_parser(
         "set-config",
         help=(
-            "change one role's provider/model/effort in project.toml, validated "
-            "the way a run would resolve it (the only engine command that writes "
-            "that file)"
+            "change one role's provider (in project.toml) or your model/effort "
+            "preference (in your user config, shared by every project), validated "
+            "the way a run would resolve it"
         ),
         description=(
-            "Set or clear the provider, model and effort of one agent role in "
-            "the project's .sparring/project.toml. Only these fields of only "
-            "these roles can be written: there is no arbitrary key/value "
-            "setting. The edit is validated before anything is written, the "
-            "write is atomic, comments and unrelated settings are preserved, "
-            "and a request that matches the file already writes nothing. "
-            "Clearing an override means the provider's own default applies "
-            "again -- the engine then passes no flag and does not guess what "
-            "that default is. A change applies to the next provider turn; it "
-            "never reconfigures a turn already running."
+            "Set a role's provider for this project, or set or clear your own model "
+            "and effort preference for that role and provider. The provider is "
+            "written to .sparring/project.toml; model and effort are written to "
+            "your user configuration (see show-config for its path), keyed by role "
+            "and provider, and never to a repository. Only these fields can be "
+            "written. Everything is validated before anything is written, writes "
+            "are atomic, and a request that matches what is stored writes nothing. "
+            "Clearing a preference means the provider's own default applies. A "
+            "change applies from the next provider turn a run configures (the next "
+            "stage of a managed run); it never reconfigures a turn already running."
         ),
     )
     set_config.add_argument(
@@ -1953,40 +2028,39 @@ def build_parser() -> argparse.ArgumentParser:
     set_config.add_argument(
         "--provider",
         default=None,
-        help=(
-            "provider for this role, validated against the providers implemented "
-            "for it. A model or effort already configured that the new provider "
-            "cannot honour is reported, never silently dropped"
-        ),
+        help="this project's provider for the role, validated against the providers implemented for it",
     )
     model_choice = set_config.add_mutually_exclusive_group()
     model_choice.add_argument(
-        "--model", default=None, help="set this role's model (free-form; the provider knows its own names)"
+        "--model",
+        default=None,
+        help=(
+            "your preferred exact model for this role and provider (the provider knows "
+            "its own names; see model-choices). Aliases such as 'opus' are refused"
+        ),
     )
     model_choice.add_argument(
         "--model-default",
         action="store_true",
-        help="remove the model override, so the provider's own default applies",
+        help="clear your model preference, so the provider's own default applies",
     )
     effort_choice = set_config.add_mutually_exclusive_group()
     effort_choice.add_argument(
         "--effort",
         default=None,
-        help="set this role's reasoning/effort level (must be one the resolved provider accepts)",
+        help="your preferred reasoning/effort level (must be one the provider accepts)",
     )
     effort_choice.add_argument(
         "--effort-default",
         action="store_true",
-        help="remove the effort override, so the provider's own default applies",
+        help="clear your effort preference, so the provider's own default applies",
     )
     set_config.add_argument(
-        "--local",
-        action="store_true",
+        "--for-provider",
+        default=None,
         help=(
-            "write model/effort to this worktree's local override file in the git "
-            "directory instead of project.toml, so the repository is not dirtied and "
-            "a managed run keeps going; it applies from the next planned stage. "
-            "The provider cannot be set locally"
+            "which provider's preference to change (default: the provider in effect for "
+            "the role here). Needed outside a project, or to prepare another provider"
         ),
     )
     set_config.add_argument(

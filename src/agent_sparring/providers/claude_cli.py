@@ -63,6 +63,25 @@ DISPLAY_NAME = "Claude"
 # it through (see ClaudeCliAdapter.__post_init__).
 EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
+# The CLI cannot list the models it accepts: ``--model`` takes "an alias for
+# the latest model (e.g. 'fable', 'opus', or 'sonnet') or a model's full
+# name", and there is no command that enumerates either. So the engine knows
+# a few exact ids as *suggestions* -- never as a validation boundary: any other
+# exact id is still accepted and the provider stays the authority on it.
+KNOWN_MODELS: tuple[tuple[str, str], ...] = (
+    ("claude-opus-5-5", "Claude Opus 5.5"),
+    ("claude-fable-5-1", "Claude Fable 5.1"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+    ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+)
+
+# Names the CLI resolves to "the latest" of a family. Fine for a one-off
+# command-line or environment override; refused as a saved preference, where
+# it would read as an exact model while silently changing underneath.
+MODEL_ALIASES: frozenset[str] = frozenset(
+    {"default", "best", "fable", "opus", "sonnet", "haiku", "opusplan", "opus[1m]", "sonnet[1m]"}
+)
+
 # Tool names whose ``input.file_path`` (or ``notebook_path``) names a file
 # the agent is changing. Only the path is ever recorded -- never
 # old/new strings, content, or any other input field.

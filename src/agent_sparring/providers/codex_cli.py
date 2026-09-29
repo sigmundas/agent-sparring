@@ -128,6 +128,75 @@ EFFORT_LEVELS: tuple[str, ...] = (
     "ultra",
 )
 
+# Model names are not an engine enumeration either. Codex publishes its own
+# catalog through "codex debug models" (JSON, the same data as its model
+# cache); :func:`list_models` reads the entries it marks for listing.
+MODEL_LIST_TIMEOUT_SECONDS = 15
+
+
+@dataclass(frozen=True)
+class CatalogModel:
+    """One model as Codex's own catalog lists it."""
+
+    model: str
+    display_name: str | None
+    effort_levels: tuple[str, ...]
+    default_effort: str | None
+
+
+def list_models(executable: str = "codex") -> tuple[CatalogModel, ...]:
+    """The models Codex lists, in its own priority order.
+
+    Raises :class:`ProviderError` when the catalog cannot be read; the caller
+    reports that as "no catalog" rather than an empty list of models.
+    """
+
+    try:
+        completed = subprocess.run(
+            [executable, "debug", "models"],
+            capture_output=True,
+            text=True,
+            timeout=MODEL_LIST_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ProviderError(f"could not run '{executable} debug models': {exc}") from exc
+    if completed.returncode != 0:
+        raise ProviderError(f"'{executable} debug models' exited with code {completed.returncode}")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"'{executable} debug models' did not print JSON: {exc}") from exc
+    entries = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        raise ProviderError(f"'{executable} debug models' printed no model list")
+    models: list[tuple[int, CatalogModel]] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or entry.get("visibility", "list") != "list":
+            continue
+        slug = entry.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        levels = tuple(
+            level["effort"]
+            for level in entry.get("supported_reasoning_levels") or ()
+            if isinstance(level, dict) and isinstance(level.get("effort"), str)
+        )
+        priority = entry.get("priority")
+        models.append(
+            (
+                priority if isinstance(priority, int) else 10_000 + index,
+                CatalogModel(
+                    model=slug,
+                    display_name=_str_or_none(entry.get("display_name")),
+                    effort_levels=levels,
+                    default_effort=_str_or_none(entry.get("default_reasoning_level")),
+                ),
+            )
+        )
+    return tuple(model for _, model in sorted(models, key=lambda item: item[0]))
+
+
 # Verified live (see module docstring): "codex exec resume" rejects the
 # top-level --sandbox flag outright, and without any override does not
 # inherit the original session's read-only sandbox either -- a real write

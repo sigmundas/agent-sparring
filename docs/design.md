@@ -320,35 +320,46 @@ pass/fail gate. Independent sparring still runs afterward regardless.
 
 ### Model and effort: one resolution, honest per provider
 
-`[agents.<role>]` also carries optional `model` and `effort`. Resolution for
-every role and every field lives in exactly one module,
-`agent_sparring/agent_config.py`, and every orchestration path — `run-stage`,
-`run-sparring`, `run-loop`, `run-plan`, `resume-plan`, the independent-review
-stage and the finalization turn — builds its adapters from it. The
-alternative, each command consulting the config for itself, is how one path
-ends up quietly ignoring it.
+`[agents.<role>]` carries only `provider`: which adapter a role runs, a
+project decision. Model and effort are not project settings — they are the
+*person's* own preference, shared by every project and kept in one
+engine-owned file outside every repository
+(`agent_sparring/user_config.py`), keyed by role *and* the provider just
+resolved so a preference saved for one provider is never applied to
+another. Resolution for every role and every field lives in exactly one
+module, `agent_sparring/agent_config.py`, and every orchestration path —
+`run-stage`, `run-sparring`, `run-loop`, `run-plan`, `resume-plan`, the
+independent-review stage and the finalization turn — builds its adapters
+from it. The alternative, each command consulting the config for itself, is
+how one path ends up quietly ignoring it.
 
-    explicit CLI override  >  SPARRING_* environment  >  .sparring/project.toml  >  provider default
+    provider:        explicit CLI override  >  SPARRING_* environment  >  .sparring/project.toml  >  engine default
+    model / effort:  explicit CLI override  >  SPARRING_* environment  >  user preference          >  provider default
 
-The environment layer is there because `project.toml` is a tracked file in
-the consuming repository. Changing a model in it dirties the working tree,
-and finalization treats a dirty path that is not a stage artifact as
-candidate content — so trying a different model for one run would otherwise
-mean staging and committing a configuration change along with the work. The
-`SPARRING_<ROLE>_<FIELD>` variables set the same three fields and leave
-nothing behind in the repository. They sit below the command line, because an
-explicit flag is still the most specific thing a person can say, and above
-the file, because a shell-local choice overriding the committed project
-default is the entire point. Being applied inside the one resolver means
-every orchestration path honours them without any of them knowing they
-exist.
+A `project.toml` written before this split still parses: `model`/`effort`
+under `[agents.<role>]` are read only so they can be reported as obsolete
+(`show-config --json`'s `setup_problems`, kind `obsolete-agent-setting`) and
+removed by `fix-config`. They are never resolved — a stale value left behind
+is diagnosed, not silently honoured.
 
-Leaving nothing behind is also the layer's one real cost: after the fact,
-nothing in the repository says which model ran. That is why every run records
-an `agents.resolved` event per role in the stage's activity log, carrying
-each value *and the layer that supplied it*, and why the variables are
-validated rather than quietly ignored — a set-but-empty variable is an error,
-because someone who exported the name meant to select something.
+The environment layer exists for a one-off: trying a different model in one
+shell without changing the saved preference. The `SPARRING_<ROLE>_<FIELD>`
+variables set the provider, model or effort and leave nothing behind
+anywhere. They sit below the command line, because an explicit flag is
+still the most specific thing a person can say, and above the persistent
+layer (`project.toml` for the provider, the user preference for model and
+effort), because a shell-local choice overriding the saved one is the entire
+point. Being applied inside the one resolver means every orchestration path
+honours them without any of them knowing they exist.
+
+The user preference file, like the environment, leaves nothing behind in the
+repository: after the fact, nothing there says which model ran. That is why
+every run records an `agents.resolved` event per role in the stage's
+activity log, carrying each value *and the layer that supplied it*, and why
+both the environment and the preference file are validated rather than
+quietly ignored — a set-but-empty environment variable is an error, because
+someone who exported the name meant to select something, and a preference is
+validated by `sparring set-config` before it is ever written.
 
 "Provider default" is a real state, not a missing answer: the engine passes
 no flag and reports the value as unset with source `provider-default`. It

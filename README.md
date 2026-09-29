@@ -55,25 +55,25 @@ keep a copy of the schema.
 
 ### Choosing a model and an effort level
 
-Each role may also pin the model and the reasoning/effort level its provider
-runs at:
+Which **provider** runs a role is the project's decision, in `project.toml`
+(above). Which **model** that provider uses, and how hard it thinks, is
+*your* decision, and it is not a project setting: it is your own preference,
+shared by every project, kept in one file outside every repository so
+choosing a model while working in one repo is still the choice the moment
+you switch to another that uses the same provider for the same role:
 
-```toml
-[agents.stage]
-provider = "claude-cli"
-model = "opus"
-effort = "high"
+```sh
+sparring set-config stage --model claude-opus-5-5 --effort high
+sparring set-config sparring --model gpt-5.6-terra --effort xhigh
 
-[agents.sparring]
-provider = "codex-cli"
-model = "gpt-5.6-terra"
-effort = "xhigh"
+sparring set-config stage --model-default     # drop the preference; use the provider's
+sparring set-config stage --effort-default    # own default again
 ```
 
 Both fields are optional, and **leaving one out is not the same as writing a
-default into it**. An omitted `model` or `effort` means the engine passes no
-flag at all and the provider CLI does whatever it normally does; the engine
-never guesses which model that turns out to be.
+default into it**. No preference means the engine passes no flag at all and
+the provider CLI does whatever it normally does; the engine never guesses
+which model that turns out to be.
 
 `effort` is deliberately not a single engine-wide vocabulary. Each provider
 is validated against what its own CLI accepts:
@@ -88,25 +88,44 @@ before any provider process starts, rather than something translated into
 "the nearest equivalent". This matters concretely for `claude-cli`: given an
 unknown `--effort`, the CLI *warns and runs the turn anyway* at its default
 effort, so a typo would otherwise buy a full-price turn at a level nobody
-chose. Model names are not enumerated — both CLIs accept free-form names and
-aliases, and gain new ones without an engine release.
+chose. `sparring set-config` refuses it before writing anything.
+
+Model names are not enumerated as a validation boundary — both CLIs accept
+free-form names and gain new ones without an engine release — but
+`sparring model-choices` offers a suggestion list per role (Codex's own
+catalog for `codex-cli`; a short list of exact ids the engine happens to know
+for `claude-cli`), never a closed one:
+
+```sh
+sparring model-choices                 # every role
+sparring model-choices --role stage    # just this role
+sparring model-choices --json
+```
+
+A saved preference must be an exact model id, not an alias — `set-config`
+refuses `opus`, `sonnet`, `fable` and the like as something *saved*, because
+a preference is shown as the exact model it names and an alias would
+silently change underneath it. A one-off CLI or environment override may
+still use an alias; only what gets written down is held to the stricter
+rule.
 
 Every command takes overrides, and the precedence is the same everywhere:
 
 ```text
-explicit CLI flag  >  SPARRING_* environment  >  .sparring/project.toml  >  the provider's own default
+provider:        explicit CLI flag  >  SPARRING_* environment  >  .sparring/project.toml  >  the engine's own default
+model / effort:  explicit CLI flag  >  SPARRING_* environment  >  your saved preference    >  the provider's own default
 ```
 
 `run-stage` and `run-sparring` take `--model` / `--effort`; `run-loop`,
 `run-plan` and `resume-plan` take `--stage-model` / `--stage-effort` and
 `--sparring-model` / `--sparring-effort`. The independent reviewer is the
-sparring role, so it uses `[agents.sparring]`.
+sparring role, so it uses your sparring preference.
 
 Configuration is resolved when a provider turn is launched, and re-read for
-each stage of a plan run. Editing `project.toml` therefore affects the *next*
-turn; it never reconfigures or restarts a provider process already running,
-and it does not disturb session resume — the session id belongs to the
-provider and is recorded in stage state, not on an adapter object.
+each stage of a plan run. Changing your preference therefore affects the
+*next* turn; it never reconfigures or restarts a provider process already
+running, and it does not disturb session resume — the session id belongs to
+the provider and is recorded in stage state, not on an adapter object.
 
 To see what a turn would actually run with, and where each value came from:
 
@@ -116,25 +135,39 @@ sparring show-config --json     # the same answer, machine-readable
 ```
 
 The JSON form reports `provider`, `model`, `effort` and a `*_source` for each
-(`cli`, `env`, `project`, `engine-default` or `provider-default`) per role,
-plus the path of the `project.toml` it read. It reports only the resolved
-values — it never enumerates the environment and never prints a credential. This is how the VS Code extension shows
-the effective configuration, so that "this provider plus this file plus an
-omitted model means X" is answered in one place. Each role also reports
+(`cli`, `env`, `project`, `user`, `engine-default` or `provider-default`) per
+role, plus the path of the `project.toml` it read and the path of your
+preference file (`user_config_path`, with `user_config_exists`). It reports
+only the resolved values — it never enumerates the environment and never
+prints a credential. This is how the VS Code extension shows the effective
+configuration, so that "this provider plus your preference plus an omitted
+effort means X" is answered in one place. Each role also reports
 `provider_choices`: every provider implemented for that role, with its own
 effort vocabulary, so a UI can offer the real choice without keeping a list
 of providers that goes stale.
 
-### Trying a different model without touching the repository
+Your preference file lives at:
 
-`project.toml` is tracked in your repository. That is right for the project's
-agreed configuration, but it makes a one-off experiment awkward: editing the
-file dirties the working tree, and finalization treats any dirty path that is
-not a stage artifact as candidate content, so a model change ends up staged
-and committed alongside the work it was only supposed to observe.
+```text
+$SPARRING_USER_CONFIG                                (when set: the file itself)
+$XDG_CONFIG_HOME/agent-sparring/config.toml           (when XDG_CONFIG_HOME is set)
+%APPDATA%\agent-sparring\config.toml                  (Windows)
+~/.config/agent-sparring/config.toml                  (macOS, Linux)
+```
 
-Set the same three fields in the environment instead. They leave no trace in
-the repository:
+both `show-config` and `check-config` print the path in effect. It is never
+inside a repository, so a change here never dirties a working tree and
+`git status` never sees it. Writes are validated before anything reaches
+disk and are atomic; a request that matches what is already stored writes
+nothing, and clearing the last preference for a role/provider removes the
+file. Nothing outside `sparring set-config` (or a UI that shells out to it)
+ever writes to it.
+
+### Trying a different model without touching anything saved
+
+For a one-off — try a different model for one run, without changing the
+preference you actually want saved — set the same three fields in the
+environment instead:
 
 ```sh
 export SPARRING_SPARRING_MODEL=gpt-6-astra    # just this shell
@@ -145,14 +178,18 @@ The names are mechanical — `SPARRING_` plus the role plus the field, upper
 case — for the two roles `STAGE` and `SPARRING` and the three fields
 `PROVIDER`, `MODEL` and `EFFORT`. (Yes, the sparring role's variables read
 `SPARRING_SPARRING_*`.) Per role and per field, so setting a model leaves the
-project's effort alone.
+effort alone. `PROVIDER` overrides the project's `project.toml`; `MODEL` and
+`EFFORT` override your saved preference — neither ever touches the file it
+overrides.
 
-They are validated exactly as the file's values are: an effort level the
-resolved provider does not accept, or a provider not implemented for that
-role, is a configuration error raised before any provider process starts, and
-the message names the variable that set it. A variable that is present but
-empty is an error too, rather than a silent fall back to the file — unset it
-to stop overriding.
+They are validated exactly as a saved value is: an effort level the resolved
+provider does not accept, or a provider not implemented for that role, is a
+configuration error raised before any provider process starts, and the
+message names the variable that set it. A variable that is present but empty
+is an error too, rather than a silent fall back — unset it to stop
+overriding. Unlike a saved preference, an environment override *may* use a
+Claude alias such as `opus` — the stricter "exact id only" rule applies to
+what gets written down, not to a one-off.
 
 Because an environment override leaves nothing behind, the stage's own
 `activity.jsonl` is the only record that it happened. Every run writes an
@@ -162,82 +199,69 @@ resolved and which layer supplied each. `sparring usage` reads it back — see
 
 ### Changing the file itself
 
-For the times something else needs to change `project.toml` — the VS Code
-cockpit's inline selectors, a script — there is one typed command:
+For the times something else needs to change `project.toml`'s provider — the
+VS Code cockpit's inline selectors, a script — there is one typed command,
+the same `set-config` used for your model/effort preference above:
 
 ```sh
-sparring set-config stage --model opus --effort high
-sparring set-config sparring --model gpt-5.6-terra --effort xhigh
-
-sparring set-config stage --model-default     # drop the override; use the provider's
-sparring set-config stage --effort-default    # own default again
+sparring set-config stage --provider claude-cli
 ```
 
-The role is `stage` or `sparring` and the fields are `--provider`, `--model`
-and `--effort`. There is deliberately **no** way to set an arbitrary key to an
-arbitrary value: nothing here can reach `[repo].root`, add a key the parser
-would later reject, or smuggle a fragment into a provider's argv.
+`--provider` is the only field this command writes to `project.toml`; there
+is deliberately **no** way to set an arbitrary key to an arbitrary value —
+nothing here can reach `[repo].root`, add a key the parser would later
+reject, or smuggle a fragment into a provider's argv. `--model` / `--effort`
+(and their `-default` clears) go to your preference file instead, under the
+role and the provider in effect for it — or `--for-provider`, when you want
+to prepare a preference for a provider you are not using yet, or you are
+running outside any project at all.
 
-What it guarantees:
+What it guarantees, for both destinations:
 
 - the edit is validated the way a run resolves it — an effort the provider
-  does not accept, a provider not implemented for the role — *before* anything
-  is written, so a rejected change leaves the file exactly as it was;
-- a file that is already malformed is refused, not replaced: a broken file is
-  someone's work in progress, and overwriting it is not a repair;
-- comments, key order and every unrelated setting survive; only the line asked
-  about changes;
-- the write is atomic, so a reader sees the whole old file or the whole new
-  one and a failure part-way leaves the original intact;
-- a request the file already satisfies writes nothing at all, which makes a
-  repeated or double-clicked change harmless;
+  does not accept, an unsaveable Claude alias, a provider not implemented for
+  the role, an unknown `--for-provider` — *before* anything is written, so a
+  rejected change leaves every file exactly as it was;
+- a `project.toml` that is already malformed is refused, not replaced: a
+  broken file is someone's work in progress, and overwriting it is not a
+  repair;
+- comments, key order and every unrelated setting in `project.toml` survive;
+  only the line asked about changes;
+- both writes are atomic, so a reader sees the whole old file or the whole
+  new one and a failure part-way leaves the original intact;
+- a request a file already satisfies writes nothing at all, which makes a
+  repeated or double-clicked change harmless — and clearing the last
+  preference for a role/provider removes your preference file's entry
+  entirely (and the file itself, if nothing else is left in it);
 - a project with no `project.toml` gets the same template `init-config`
-  writes, and then the change.
-
-Nothing is ever silently discarded. If changing a role's provider would leave
-an effort already in the file unusable, the command says so and stops rather
-than resetting it for you — set the provider and the effort together in one
-invocation if that is what you meant.
+  writes, and then the provider change.
 
 `set-config --json` reports the resulting effective configuration in exactly
-the shape `show-config --json` uses. A change applies to the **next** provider
-turn: it never reconfigures or restarts a turn already running, and it does
-not touch recorded run state or any prompt already captured.
-
-### Changing model or effort during a run: `--local`
-
-`project.toml` is tracked, so editing it while a managed run is going dirties
-the worktree, and the next acceptance refuses because of an edit no candidate
-represents. `--local` writes model and effort to a file in this worktree's
-**git directory** instead:
-
-```sh
-sparring set-config stage --model claude-fable-5-1 --local
-sparring set-config sparring --effort high --local
-sparring set-config sparring --model-default --local   # back to project.toml's value
-```
-
-The file is `<git rev-parse --absolute-git-dir>/agent-sparring/.sparring.toml`.
-`git status` never sees it — it is not tracked, untracked or ignored — and
-each linked worktree has its own. It sits between the environment and
-`project.toml` in the precedence chain (CLI > environment > local >
-`project.toml` > provider default), is validated exactly as the file's values
-are, and applies from the **next planned stage**, because the loop re-reads
-agent configuration before each one. The provider cannot be set locally.
-`show-config --json` names the file as `local_config_path` and reports values
-from it with source `local`; the VS Code cockpit writes here whenever it can.
+the shape `show-config --json` uses. A change applies to the **next**
+provider turn: it never reconfigures or restarts a turn already running, and
+it does not touch recorded run state or any prompt already captured.
 
 ### Fixable setup problems: `fix-config`
 
-`show-config --json` also reports `setup_problems`: workflow-state directories
-(`.sparring/stages/`, `.sparring/plans/`, `.sparring/intake/`) that git can
-still see. Each entry carries the `.gitignore` line that fixes it and the
-engine's full refusal text; when they cannot be determined the payload has
-`setup_error` instead. `sparring fix-config` appends exactly the missing
-lines to the repository's `.gitignore` — the rest of the file is untouched,
-a second run writes nothing, and a rule elsewhere that still overrides the
-fix is reported as an error. Commit `.gitignore` afterwards; the engine
-never stages or commits it.
+`show-config --json` also reports `setup_problems`, two kinds. Workflow-state
+directories (`.sparring/stages/`, `.sparring/plans/`, `.sparring/intake/`)
+that git can still see, each carrying the `.gitignore` line that fixes it and
+the engine's full refusal text — when they cannot be determined the payload
+has `setup_error` instead. And, kind `obsolete-agent-setting`: a `model` or
+`effort` key still sitting under `[agents.<role>]` in `project.toml` from
+before this feature — parsed, reported, and **never resolved**; `check-config`
+warns about it on stderr and exits non-zero so a stale value is never
+mistaken for the one actually in effect.
+
+`sparring fix-config` repairs both kinds in one pass: it appends exactly the
+missing lines to the repository's `.gitignore`, and removes exactly the
+obsolete `model`/`effort` keys from `project.toml` — nothing else in either
+file changes, a second run writes nothing, and a rule elsewhere that still
+overrides the `.gitignore` fix is reported as an error. It does **not** copy
+the removed values into your preferences; which repository's old value
+should win is your choice, not a deterministic repair — set it afterwards
+with `sparring set-config`. Commit `.gitignore` and `project.toml` afterwards;
+the engine never stages or commits either.
 
 `PROJECT.md` is prose the workflow never interprets: stack, directory map,
 test and build commands, conventions, product invariants, device/manual

@@ -1,13 +1,19 @@
 """The environment layer of provider/model/effort resolution.
 
-``project.toml`` is a tracked file in the consuming repository, so changing a
-model there dirties the working tree and finalization treats the edit as
-candidate content. The environment layer exists so a person can try a
-different model for one run without staging and committing a configuration
-change. These tests pin the three things that makes it safe to rely on:
-where it sits in the precedence chain, that it is validated exactly as the
-file is, and that every orchestration path sees it -- because it is applied
-inside the single resolver they all already go through.
+``project.toml`` is a tracked file in the consuming repository, so a
+provider choice there dirties the working tree and finalization treats the
+edit as candidate content. Model and effort are not project settings any
+more -- they are the person's own preference
+(:mod:`agent_sparring.user_config`), shared by every project -- but the
+precedence chain is the same shape for every layer: an environment override
+lets a person try something different for one run without writing anything
+down, sits below the command line and above whichever persistent layer is
+in play (``project.toml`` for the provider, the user preference for model
+and effort), and is validated exactly as that persistent layer is. These
+tests pin the three things that make it safe to rely on: where it sits in
+the precedence chain, that it is validated exactly as a stored value is, and
+that every orchestration path sees it -- because it is applied inside the
+single resolver they all already go through.
 """
 
 import argparse
@@ -32,6 +38,7 @@ from agent_sparring.agent_config import (
     SOURCE_ENV,
     SOURCE_PROJECT,
     SOURCE_PROVIDER_DEFAULT,
+    SOURCE_USER,
     AgentConfigError,
     RoleOverrides,
     env_var,
@@ -40,21 +47,29 @@ from agent_sparring.agent_config import (
     resolve_role_config,
 )
 from agent_sparring.config import parse_project_config
+from agent_sparring.user_config import RolePreference, UserPreferences, update_user_preferences, user_config_path
 
+# Providers are still a project decision.
 CONFIGURED = parse_project_config(
     """
 project = "demo"
 
 [agents.stage]
 provider = "claude-cli"
-model = "opus"
-effort = "medium"
 
 [agents.sparring]
 provider = "codex-cli"
-model = "gpt-5.6-sol"
-effort = "medium"
 """
+)
+
+# The persistent layer for model/effort now: the person's own preference,
+# keyed by role and provider, never read from project.toml.
+PREFERRED = UserPreferences(
+    path=Path("unused"),
+    entries={
+        ("stage", "claude-cli"): RolePreference(model="opus", effort="medium"),
+        ("sparring", "codex-cli"): RolePreference(model="gpt-5.6-sol", effort="medium"),
+    },
 )
 
 
@@ -71,15 +86,28 @@ class EnvVarNamesTest(unittest.TestCase):
             ROLE_SPARRING,
             CONFIGURED,
             environ={"SPARRING_SPARRING_MODLE": "gpt-6-astra"},
+            preferences=PREFERRED,
         )
         self.assertEqual(resolved.model, "gpt-5.6-sol")
-        self.assertEqual(resolved.model_source, SOURCE_PROJECT)
+        self.assertEqual(resolved.model_source, SOURCE_USER)
 
 
 class PrecedenceTest(unittest.TestCase):
-    def test_env_overrides_project(self):
+    def test_env_overrides_project_for_the_provider(self):
         resolved = resolve_role_config(
-            ROLE_SPARRING, CONFIGURED, environ={"SPARRING_SPARRING_MODEL": "gpt-6-astra"}
+            ROLE_SPARRING,
+            CONFIGURED,
+            environ={"SPARRING_SPARRING_PROVIDER": "codex-cli"},
+        )
+        self.assertEqual(resolved.provider, "codex-cli")
+        self.assertEqual(resolved.provider_source, SOURCE_ENV)
+
+    def test_env_overrides_the_user_preference(self):
+        resolved = resolve_role_config(
+            ROLE_SPARRING,
+            CONFIGURED,
+            environ={"SPARRING_SPARRING_MODEL": "gpt-6-astra"},
+            preferences=PREFERRED,
         )
         self.assertEqual(resolved.model, "gpt-6-astra")
         self.assertEqual(resolved.model_source, SOURCE_ENV)
@@ -90,27 +118,32 @@ class PrecedenceTest(unittest.TestCase):
             CONFIGURED,
             RoleOverrides(model="from-flag"),
             environ={"SPARRING_SPARRING_MODEL": "gpt-6-astra"},
+            preferences=PREFERRED,
         )
         self.assertEqual(resolved.model, "from-flag")
         self.assertEqual(resolved.model_source, SOURCE_CLI)
 
     def test_fields_are_independent(self):
-        # Setting the model must not disturb the effort the project configured.
+        # Setting the model must not disturb the effort the preference set,
+        # nor the provider project.toml configured.
         resolved = resolve_role_config(
-            ROLE_SPARRING, CONFIGURED, environ={"SPARRING_SPARRING_MODEL": "gpt-6-astra"}
+            ROLE_SPARRING,
+            CONFIGURED,
+            environ={"SPARRING_SPARRING_MODEL": "gpt-6-astra"},
+            preferences=PREFERRED,
         )
-        self.assertEqual((resolved.effort, resolved.effort_source), ("medium", SOURCE_PROJECT))
+        self.assertEqual((resolved.effort, resolved.effort_source), ("medium", SOURCE_USER))
         self.assertEqual(
             (resolved.provider, resolved.provider_source), ("codex-cli", SOURCE_PROJECT)
         )
 
     def test_roles_are_independent(self):
         effective = resolve_agent_configs(
-            CONFIGURED, environ={"SPARRING_SPARRING_MODEL": "gpt-6-astra"}
+            CONFIGURED, environ={"SPARRING_SPARRING_MODEL": "gpt-6-astra"}, preferences=PREFERRED
         )
         self.assertEqual(effective.sparring.model, "gpt-6-astra")
         self.assertEqual(effective.stage.model, "opus")
-        self.assertEqual(effective.stage.model_source, SOURCE_PROJECT)
+        self.assertEqual(effective.stage.model_source, SOURCE_USER)
 
     def test_env_applies_without_any_project_file(self):
         resolved = resolve_role_config(
@@ -196,15 +229,19 @@ class ProcessEnvironmentTest(unittest.TestCase):
 
     def test_os_environ_is_the_default_source(self):
         with mock.patch.dict(os.environ, {"SPARRING_SPARRING_MODEL": "gpt-6-astra"}):
-            resolved = resolve_role_config(ROLE_SPARRING, CONFIGURED)
+            resolved = resolve_role_config(ROLE_SPARRING, CONFIGURED, preferences=PREFERRED)
         self.assertEqual(resolved.model, "gpt-6-astra")
         self.assertEqual(resolved.model_source, SOURCE_ENV)
 
-    def test_a_clean_environment_falls_back_to_the_project(self):
+    def test_a_clean_environment_falls_back_to_the_user_preference(self):
+        # Preferences are passed explicitly (not left to load from disk):
+        # os.environ is cleared entirely here, including the test's own
+        # SPARRING_USER_CONFIG isolation, so relying on the default loader
+        # would risk reading the developer's real preference file.
         with mock.patch.dict(os.environ, {}, clear=True):
-            resolved = resolve_role_config(ROLE_SPARRING, CONFIGURED)
+            resolved = resolve_role_config(ROLE_SPARRING, CONFIGURED, preferences=PREFERRED)
         self.assertEqual(resolved.model, "gpt-5.6-sol")
-        self.assertEqual(resolved.model_source, SOURCE_PROJECT)
+        self.assertEqual(resolved.model_source, SOURCE_USER)
 
 
 class AdapterAndTelemetryTest(unittest.TestCase):
@@ -212,8 +249,8 @@ class AdapterAndTelemetryTest(unittest.TestCase):
 
     An environment override is only useful if it reaches the provider
     process, and it is only safe if the run says so afterwards -- unlike a
-    ``project.toml`` edit, it leaves no trace in the repository, so the
-    stage's own activity log is the only record that it happened.
+    preference file edit, it leaves no trace anywhere, so the stage's own
+    activity log is the only record that it happened.
     """
 
     def setUp(self):
@@ -229,13 +266,19 @@ project = "demo"
 
 [agents.stage]
 provider = "claude-cli"
-model = "opus"
 
 [agents.sparring]
 provider = "codex-cli"
-model = "gpt-5.6-sol"
 """,
             encoding="utf-8",
+        )
+        # The persistent layer for model now lives in the user's own
+        # preference file, not in project.toml.
+        update_user_preferences(
+            user_config_path(),
+            lambda current: current.with_edit(
+                "stage", "claude-cli", "model", "opus"
+            ).with_edit("sparring", "codex-cli", "model", "gpt-5.6-sol"),
         )
 
     def _args(self):
@@ -273,7 +316,7 @@ model = "gpt-5.6-sol"
         # came from, so the log distinguishes the two.
         stage = usage.roles[ROLE_STAGE]
         self.assertEqual(stage.requested_model, "opus")
-        self.assertEqual(stage.model_source, SOURCE_PROJECT)
+        self.assertEqual(stage.model_source, SOURCE_USER)
 
     def test_a_provider_default_is_recorded_as_such_not_as_missing(self):
         log = ActivityLog(path=self.stage_dir / "activity.jsonl")

@@ -10,8 +10,10 @@ Three properties make that safe enough to be worth having:
 
 *Typed, not generic.* There is no "set an arbitrary TOML key to an arbitrary
 value" operation. The role is one of :data:`~agent_sparring.agent_config.ROLES`
-and the fields are ``provider``, ``model`` and ``effort`` -- the same closed
-schema :mod:`agent_sparring.config` parses. A caller cannot reach
+and the one editable field is ``provider``. Model and effort are not project
+settings (they are user preferences, :mod:`agent_sparring.user_config`); the
+only thing this module does with them is remove obsolete copies
+(:func:`remove_obsolete_agent_settings`). A caller cannot reach
 ``[repo].root``, cannot add a key the parser would later reject, and cannot
 express anything that ends up in a provider's argv beyond what the adapters
 already validate.
@@ -31,10 +33,6 @@ changes the line it was asked to change. An edit that would produce the bytes
 already on disk writes nothing at all, which also makes a duplicate request
 -- a double-clicked control, a repeated command -- harmless.
 
-Nothing here silently discards a value. Changing a role's provider to one
-that cannot honour the model or effort already configured is an error naming
-both, not a quiet reset: the caller can then decide, and set the provider and
-the effort together in one invocation if that is what they meant.
 """
 
 from __future__ import annotations
@@ -42,7 +40,7 @@ from __future__ import annotations
 import contextlib
 import os
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import MutableMapping
 
@@ -58,58 +56,30 @@ from agent_sparring.agent_config import (
 )
 from agent_sparring.config import (
     CONFIG_FILENAME,
+    ObsoleteAgentSetting,
     ProjectConfig,
     ProjectConfigError,
     parse_project_config,
 )
 from agent_sparring.templates import render_project_config
 
-# The fields of an [agents.<role>] table this module may write. Deliberately
-# the same closed set config.py parses, named here so the two cannot drift
-# without a test noticing.
-EDITABLE_FIELDS: tuple[str, ...] = ("provider", "model", "effort")
+# The fields of an [agents.<role>] table this module may write.
+EDITABLE_FIELDS: tuple[str, ...] = ("provider",)
 
 
 @dataclass(frozen=True)
 class RoleEdit:
-    """One requested change to one role.
-
-    Each field is three-valued. ``None`` means "leave it alone"; a string
-    means "set it to this"; the matching ``clear_*`` flag means "remove the
-    project override, so the provider's own default applies again".
-
-    Setting and clearing the same field is a contradiction and is refused
-    rather than resolved in some order the caller did not choose.
-    """
+    """One requested change to one role's project configuration: its provider."""
 
     provider: str | None = None
-    model: str | None = None
-    clear_model: bool = False
-    effort: str | None = None
-    clear_effort: bool = False
 
     def __post_init__(self) -> None:
-        if self.model is not None and self.clear_model:
-            raise AgentConfigError("cannot set a model and clear the model override at once")
-        if self.effort is not None and self.clear_effort:
-            raise AgentConfigError("cannot set an effort and clear the effort override at once")
-        for name in ("provider", "model", "effort"):
-            value = getattr(self, name)
-            if value is not None and not value.strip():
-                # An empty string is how a UI most plausibly expresses "use
-                # the default", and writing `model = ""` would produce a file
-                # config.py then refuses to parse. Say which operation was
-                # meant instead of guessing.
-                raise AgentConfigError(
-                    f"{name} cannot be empty; to use the provider's own default, clear the "
-                    f"override instead of setting it to an empty value"
-                )
+        if self.provider is not None and not self.provider.strip():
+            raise AgentConfigError("provider cannot be empty")
 
     @property
     def is_empty(self) -> bool:
-        return not (
-            self.provider or self.model or self.clear_model or self.effort or self.clear_effort
-        )
+        return not self.provider
 
 
 @dataclass(frozen=True)
@@ -183,14 +153,6 @@ def _apply(table: MutableMapping[str, object], edit: RoleEdit) -> None:
 
     if edit.provider is not None:
         table["provider"] = edit.provider
-    if edit.model is not None:
-        table["model"] = edit.model
-    elif edit.clear_model:
-        table.pop("model", None)
-    if edit.effort is not None:
-        table["effort"] = edit.effort
-    elif edit.clear_effort:
-        table.pop("effort", None)
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -229,38 +191,6 @@ def _atomic_write(path: Path, text: str) -> None:
         raise ProjectConfigError(f"could not write {path}: {exc}") from exc
 
 
-def _explain(
-    exc: AgentConfigError, role: str, edit: RoleEdit, config: ProjectConfig
-) -> AgentConfigError:
-    """The refusal, with a sentence about what to do when a provider change
-    is what made an otherwise-fine setting unusable.
-
-    Distinguishing the two cases is worth the extra resolution: "that
-    provider does not do this role" and "that provider cannot honour the
-    effort already in your file" call for completely different responses,
-    and only the second one is fixed by a combined edit. The question is
-    asked of the engine rather than guessed at from the message text.
-    """
-
-    if edit.provider is None:
-        return exc
-    without_overrides = replace(
-        config,
-        **{f"{role}_agent_model": None, f"{role}_agent_effort": None},
-    )
-    try:
-        resolve_role_config(role, without_overrides)
-    except AgentConfigError:
-        # The new provider is unusable for this role no matter what else the
-        # file says; the original message already explains that exactly.
-        return exc
-    return AgentConfigError(
-        f"{exc}. Changing the {role} agent's provider to {edit.provider!r} would leave a value "
-        f"already in project.toml unusable, and set-config will not discard it for you: set the "
-        f"provider and that value together, or clear the override, in a single invocation"
-    )
-
-
 def apply_role_edit(sparring_dir: Path, role: str, edit: RoleEdit) -> EditOutcome:
     """Apply ``edit`` to ``role`` in ``sparring_dir``'s ``project.toml``.
 
@@ -275,8 +205,8 @@ def apply_role_edit(sparring_dir: Path, role: str, edit: RoleEdit) -> EditOutcom
         raise AgentConfigError(f"unknown agent role {role!r}; known roles: {', '.join(ROLES)}")
     if edit.is_empty:
         raise AgentConfigError(
-            f"nothing to change for the {role} agent; name at least one of "
-            f"{', '.join(EDITABLE_FIELDS)} to set, or an override to clear"
+            f"nothing to change in project.toml for the {role} agent; the only project "
+            f"setting is its provider"
         )
 
     path = sparring_dir / CONFIG_FILENAME
@@ -298,10 +228,7 @@ def apply_role_edit(sparring_dir: Path, role: str, edit: RoleEdit) -> EditOutcom
     # this role, an effort that provider has no concept of or does not
     # accept -- is refused here, with the file still untouched.
     config = parse_project_config(candidate, source=str(path))
-    try:
-        resolved = resolve_role_config(role, config)
-    except AgentConfigError as exc:
-        raise _explain(exc, role, edit, config) from exc
+    resolved = resolve_role_config(role, config)
 
     if not created and candidate == original:
         # Already exactly this. Writing identical bytes would only churn the
@@ -312,9 +239,40 @@ def apply_role_edit(sparring_dir: Path, role: str, edit: RoleEdit) -> EditOutcom
     return EditOutcome(path=path, changed=True, created=created, resolved=resolved)
 
 
+def remove_obsolete_agent_settings(sparring_dir: Path) -> tuple[Path, list[ObsoleteAgentSetting]]:
+    """Remove ``model``/``effort`` from every ``[agents.<role>]`` table.
+
+    Surgical like every other edit here: the provider, every other table,
+    comments and formatting are kept, and an ``[agents.<role>]`` table left
+    empty is kept too (it is the person's structure, not the engine's). The
+    removed values are returned so they can be reported; they are never
+    copied into the user's preferences -- which repository's old values should
+    win is not something the engine can decide. Idempotent: with nothing to
+    remove, nothing is written.
+    """
+
+    path = sparring_dir / CONFIG_FILENAME
+    if not path.is_file():
+        return path, []
+    document, original, _ = _document(path, sparring_dir.resolve().parent.name)
+    config = parse_project_config(original, source=str(path))
+    if not config.obsolete_agent_settings:
+        return path, []
+    agents = document.get("agents")
+    for setting in config.obsolete_agent_settings:
+        agents[setting.role].pop(setting.field, None)  # type: ignore[index,union-attr]
+    candidate = tomlkit.dumps(document)
+    remaining = parse_project_config(candidate, source=str(path))
+    if remaining.obsolete_agent_settings:  # pragma: no cover - defensive
+        raise ProjectConfigError(f"could not remove obsolete agent settings from {path}")
+    _atomic_write(path, candidate)
+    return path, list(config.obsolete_agent_settings)
+
+
 __all__ = [
     "EDITABLE_FIELDS",
     "EditOutcome",
     "RoleEdit",
     "apply_role_edit",
+    "remove_obsolete_agent_settings",
 ]
