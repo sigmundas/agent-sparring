@@ -154,6 +154,15 @@ from agent_sparring.stage import Stage, StageError, StageMode, StageStatus, vali
 INTAKE_VERSION = 2
 MODES: tuple[str, ...] = (MODE_FAITHFUL, MODE_REFINE)
 
+#: Name of the file that proves a ``prepare_plan`` turn finished. Written as
+#: the very last step of a successful prepare; an intake whose ``intake.json``
+#: names this key (every intake from this version on) is usable only once it
+#: exists. An interrupted prepare -- killed after ``intake.json`` was written
+#: but before the marker -- leaves a directory that looks complete but is not;
+#: the marker is what tells the difference. Legacy intakes recorded before
+#: this key existed have no marker to check and remain usable as before.
+COMPLETION_MARKER_FILENAME = "prepared.json"
+
 VERDICT_AS_WRITTEN = "executable_as_written"
 VERDICT_WITH_RECOMMENDATIONS = "executable_with_recommendations"
 VERDICT_CANNOT_INTERPRET = "cannot_interpret_faithfully"
@@ -1224,6 +1233,7 @@ def prepare_plan(
     record = {
         "version": INTAKE_VERSION,
         "intake_id": intake_id,
+        "completion_marker": COMPLETION_MARKER_FILENAME,
         "mode": mode,
         "created_at": now().isoformat(),
         "plan_label": label,
@@ -1261,7 +1271,40 @@ def prepare_plan(
     record["report_digest"] = sha256_text(report)
     _write(directory / "intake.json", json.dumps(record, indent=2) + "\n")
     _write(directory / "report.md", report)
+    # The very last write of a successful prepare. Its presence is what
+    # distinguishes a finished intake from one interrupted after intake.json
+    # was written; approval refuses one without it (see completion_marker).
+    marker = {
+        "intake_id": intake_id,
+        "prepared_at": now().isoformat(),
+        "verdict": interpretation.verdict,
+    }
+    write_atomic(directory / COMPLETION_MARKER_FILENAME, json.dumps(marker, indent=2) + "\n")
     return IntakeResult(directory=directory, interpretation=interpretation, findings=findings, run_keys=run_keys)
+
+
+def completion_marker_problem(intake_dir: Path, record: Mapping[str, Any]) -> str | None:
+    """``None`` if this intake is usable, else why it is not.
+
+    An intake whose ``intake.json`` names a ``completion_marker`` is usable
+    only once that file exists in ``intake_dir``: its absence means
+    ``prepare_plan`` was interrupted after writing ``intake.json`` but before
+    finishing, so ``report.md`` may not be what a finished intake would have
+    produced. A legacy intake with no ``completion_marker`` key predates this
+    check and is unaffected by it.
+    """
+
+    marker_name = record.get("completion_marker")
+    if not marker_name:
+        return None
+    if not isinstance(marker_name, str):
+        raise IntakeError(f"{intake_dir / 'intake.json'} names a non-string completion_marker")
+    if (intake_dir / marker_name).is_file():
+        return None
+    return (
+        f"{intake_dir} has no {marker_name} -- prepare_plan did not finish (it was likely "
+        "interrupted). This intake cannot be approved; run prepare-plan again"
+    )
 
 
 def _fingerprint(path: Path) -> tuple[str, str, tuple[str, ...]]:
@@ -1664,6 +1707,9 @@ def approve_plan(
         )
     if record.get("version") != INTAKE_VERSION:
         raise IntakeError(f"unsupported intake record version {record.get('version')!r}")
+    marker_problem = completion_marker_problem(intake_dir, record)
+    if marker_problem:
+        raise IntakeError(marker_problem)
     mode = str(record.get("mode"))
     if mode not in MODES:
         raise IntakeError(f"intake.json records an unknown mode {mode!r}; run prepare-plan again")

@@ -375,6 +375,7 @@ class PrepareTests(_Repo):
                 "briefs/web/01-1b.md",
                 "intake.json",
                 "interpretation.json",
+                "prepared.json",
                 "prompt.md",
                 "report.md",
                 "source.md",
@@ -492,6 +493,50 @@ class PrepareTests(_Repo):
         with self.assertRaisesRegex(IntakeError, r"\.sparring/intake/"):
             self.prepare(adapter=adapter)
         self.assertEqual(adapter.calls, [])
+
+    def test_a_successful_prepare_writes_the_completion_marker_last(self):
+        result = self.prepare()
+        record = json.loads((result.directory / "intake.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["completion_marker"], "prepared.json")
+        marker = json.loads((result.directory / "prepared.json").read_text(encoding="utf-8"))
+        self.assertEqual(marker["intake_id"], record["intake_id"])
+        self.assertEqual(marker["verdict"], "executable_with_recommendations")
+        self.assertIn("prepared_at", marker)
+
+
+class CompletionMarkerTests(_Repo):
+    """An intake naming a completion marker is usable only once it exists;
+    an intake with no ``completion_marker`` key (legacy) is unaffected."""
+
+    def test_an_intake_interrupted_before_the_marker_cannot_be_approved(self):
+        result = self.prepare()
+        (result.directory / "prepared.json").unlink()
+        with self.assertRaisesRegex(IntakeError, "prepare_plan did not finish"):
+            approve_plan(
+                result.directory, run_id="app", repo_root=self.repo, sparring_dir=self.sparring_dir,
+                primary_repository="app",
+            )
+
+    def test_a_finished_intake_approves_normally(self):
+        result = self.prepare()
+        approval = approve_plan(
+            result.directory, run_id="app", repo_root=self.repo, sparring_dir=self.sparring_dir,
+            primary_repository="app",
+        )
+        self.assertTrue(approval.created)
+
+    def test_a_legacy_intake_with_no_completion_marker_key_still_approves(self):
+        result = self.prepare()
+        record_path = result.directory / "intake.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        del record["completion_marker"]
+        record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        (result.directory / "prepared.json").unlink()
+        approval = approve_plan(
+            result.directory, run_id="app", repo_root=self.repo, sparring_dir=self.sparring_dir,
+            primary_repository="app",
+        )
+        self.assertTrue(approval.created)
 
 
 class ApproveTests(_Repo):

@@ -903,7 +903,11 @@ gates, exclusions, findings and a verdict. Nothing is executed or approved,
 and the plan document is never written. The engine then checks the answer
 and writes, under `.sparring/intake/<id>/`: a snapshot of the plan, the
 prompt, the interpretation, one brief per stage, `report.md`, and, in refine
-mode, `amendment.diff`. None of these is in manifest format.
+mode, `amendment.diff`. None of these is in manifest format. The very last
+write is `prepared.json` (named by `intake.json`'s `completion_marker` key):
+an intake interrupted after `intake.json` was written but before this file
+looks complete but is not, and `approve-plan` refuses it until `prepare-plan`
+is run again.
 
 - **Briefs are assembled from the plan's own text.** The agent picks line
   ranges; the engine renders each brief as the attached context blocks
