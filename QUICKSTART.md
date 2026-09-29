@@ -28,10 +28,22 @@ Claude Code, run `/plugin marketplace add sigmundas/agent-sparring`, then
 on (or run `/agent-sparring:sparring-setup`):
 
 ```sh
-sparring init-config     # writes .sparring/project.toml
+sparring init-config     # writes .sparring/project.toml (which provider runs each role)
 sparring fix-config      # adds .sparring/stages/, plans/, intake/ to .gitignore
 sparring check-config    # must say "git-ignored: yes" three times
 ```
+
+Optional: choose your models. Model and effort are your own preferences.
+They're shared by every repository and never stored in `project.toml`:
+
+```sh
+sparring model-choices
+sparring set-config stage --model claude-opus-5-5 --effort medium
+sparring set-config sparring --model gpt-6-astra
+```
+
+Without a preference, each provider uses its own default. The VS Code
+Overview edits the same preferences.
 
 **5. Write `.sparring/PROJECT.md`.** This is prose every agent reads: stack,
 directory map, test and build commands, conventions, and the current baseline

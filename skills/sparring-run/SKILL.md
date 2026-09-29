@@ -24,10 +24,16 @@ only after the person confirms in step 4.
 ## 1. Setup
 
 Run `sparring check-config`. If it fails, run `sparring show-config --json`.
-For `setup_problems` of kind `not-ignored`, offer `sparring fix-config`
-(it only appends `.gitignore` lines), then remind the person that
-`.gitignore` must be committed. For anything else, relay the engine's message
-and point to `/agent-sparring:sparring-setup`.
+For `setup_problems` of kind `not-ignored` (missing `.gitignore` lines) or
+`obsolete-agent-setting` (old `model`/`effort` keys in `project.toml`),
+offer `sparring fix-config`, which repairs exactly those and nothing else.
+Then remind the person that the changed files must be committed. Removing
+obsolete keys doesn't choose a model for them. For anything else, relay the
+engine's message and point to `/agent-sparring:sparring-setup`.
+
+Show which model and effort each role will use (`show-config`). They come
+from the person's own preferences, or the provider's default. Don't change
+them as part of starting a run.
 
 ## 2. Branch and worktree
 
