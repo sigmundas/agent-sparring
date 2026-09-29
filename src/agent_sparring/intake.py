@@ -1924,10 +1924,25 @@ def approve_plan(
             indirect.append(_completed_slice(intake_dir, prior))
         except IntakeError:
             continue
+    # Nor is a slice that runs *beside* this one -- both after a common
+    # prerequisite, as Stage 5 and Stage 3P after Stage 2. Completed and
+    # accepted, it moved its repository just as legitimately, and approving
+    # the other must not read that as drift. It is proven by _completed_slice
+    # exactly as an ancestor is, and its final candidate is the only commit it
+    # explains; it is recorded apart, because it is not a prerequisite.
+    related = {run_id, *earlier, *slice_ancestors(interpretation, run_id)}
+    parallel = []
+    for run in interpretation.runs:
+        if run.id in related:
+            continue
+        try:
+            parallel.append(_completed_slice(intake_dir, run.id))
+        except IntakeError:
+            continue
     # Where an earlier slice's accepted work left a repository: its branch
     # and final candidate. Only that, never an arbitrary later commit.
     advanced: dict[str, set[tuple[str, str]]] = {}
-    for prior in (*completed, *indirect):
+    for prior in (*completed, *indirect, *parallel):
         advanced.setdefault(prior.repository, set()).add((prior.branch, prior.final_candidate))
     now_seen: dict[str, dict[str, Any]] = {}
     drift = []
@@ -1979,6 +1994,7 @@ def approve_plan(
             "gates_confirmed": sorted(confirmed),
             "earlier_slices": [prior.evidence for prior in completed],
             "indirect_slices": [prior.evidence for prior in indirect],
+            "parallel_slices": [prior.evidence for prior in parallel],
         },
         **decision,
     }

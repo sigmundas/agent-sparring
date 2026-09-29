@@ -75,6 +75,16 @@ def chain_interpretation() -> dict:
     }
 
 
+def parallel_interpretation() -> dict:
+    """A1 -> B1 and A1 -> A2: B1 (web) runs beside A2 (app), as Stage 5 beside Stage 3P."""
+
+    payload = chain_interpretation()
+    for run in payload["runs"]:
+        if run["id"] == "a2":
+            run["stages"][0]["depends_on"] = ["A1"]
+    return payload
+
+
 class TransitiveAncestryTests(_Sealed):
     def setUp(self):
         super().setUp()
@@ -205,3 +215,22 @@ class TransitiveAncestryTests(_Sealed):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_a_completed_parallel_slices_candidate_is_not_drift(self):
+        intake = self.prepare(parallel_interpretation())
+        heads = self.complete(intake, "a1", "b1")
+        self.assertEqual(_head(self.web), heads["b1"])
+        approval = self.approve_slice(intake, "a2")
+        self.assertTrue(approval.created)
+        prerequisites = self.record(approval)["prerequisites"]
+        self.assertEqual([e["run_id"] for e in prerequisites["earlier_slices"]], ["a1"])
+        self.assertEqual(prerequisites["indirect_slices"], [], "B1 is not a prerequisite of A2")
+        (parallel,) = prerequisites["parallel_slices"]
+        self.assertEqual((parallel["run_id"], parallel["final_candidate_sha"]), ("b1", heads["b1"]))
+
+    def test_a_commit_after_a_parallel_slices_candidate_still_refuses(self):
+        intake = self.prepare(parallel_interpretation())
+        self.complete(intake, "a1", "b1")
+        self.commit_on(self.web, "unreviewed.txt")
+        with self.assertRaisesRegex(IntakeError, "web: .*not a commit an earlier slice was accepted at"):
+            self.approve_slice(intake, "a2")
