@@ -842,6 +842,22 @@ def run_prerequisites(interpretation: Interpretation, run_id: str) -> tuple[str,
     return tuple(sorted(required))
 
 
+def slice_ancestors(interpretation: Interpretation, run_id: str) -> tuple[str, ...]:
+    """Every earlier run slice ``run_id`` depends on, directly or through
+    another slice: the transitive closure of the slices in
+    :func:`run_prerequisites`, excluding ``run_id`` itself. Sorted."""
+
+    slices = {run.id for run in interpretation.runs}
+    found: set[str] = set()
+    pending = [run_id]
+    while pending:
+        for prior in run_prerequisites(interpretation, pending.pop()):
+            if prior in slices and prior != run_id and prior not in found:
+                found.add(prior)
+                pending.append(prior)
+    return tuple(sorted(found))
+
+
 def split_prerequisites(interpretation: Interpretation, run_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """``(gates, earlier run slices)`` of :func:`run_prerequisites`.
 
@@ -1623,7 +1639,8 @@ def approve_plan(
     its inspected primary repository -- on the branch it has checked out now,
     which must not be protected when the slice runs an implementation agent
     -- with every inspected repository at the commit intake saw (or at one an
-    earlier slice of this intake was accepted at), every gate it waits for
+    earlier slice it depends on, directly or transitively, was accepted
+    at), every gate it waits for
     confirmed by id, and every earlier slice it depends on proven by that
     slice's own approval and completed run.
 
@@ -1895,10 +1912,22 @@ def approve_plan(
             f"{primary_repository!r} ({inspected[primary_repository]['path']}); approve from that one"
         )
     completed = [_completed_slice(intake_dir, prior) for prior in earlier]
+    # A slice this one depends on only through another slice (A1 -> B1 ->
+    # A2) moved its repository just as legitimately. It is not required
+    # here -- the direct prerequisite's own approval required it -- so one
+    # that is not proven complete and accepted simply does not count.
+    indirect = []
+    for prior in slice_ancestors(interpretation, run_id):
+        if prior in earlier:
+            continue
+        try:
+            indirect.append(_completed_slice(intake_dir, prior))
+        except IntakeError:
+            continue
     # Where an earlier slice's accepted work left a repository: its branch
     # and final candidate. Only that, never an arbitrary later commit.
     advanced: dict[str, set[tuple[str, str]]] = {}
-    for prior in completed:
+    for prior in (*completed, *indirect):
         advanced.setdefault(prior.repository, set()).add((prior.branch, prior.final_candidate))
     now_seen: dict[str, dict[str, Any]] = {}
     drift = []
@@ -1949,6 +1978,7 @@ def approve_plan(
         "prerequisites": {
             "gates_confirmed": sorted(confirmed),
             "earlier_slices": [prior.evidence for prior in completed],
+            "indirect_slices": [prior.evidence for prior in indirect],
         },
         **decision,
     }

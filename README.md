@@ -877,10 +877,13 @@ mode, `amendment.diff`. None of these is in manifest format.
   directory, branch, HEAD and dirty paths (from the shared
   `repo_fingerprint`, so contents, ignored files and modify-then-restore
   are not attested). Approval refuses if any inspected repository is
-  another repository or at another commit — except a commit an earlier
-  slice of this intake was accepted at — and if a context repository is on
-  another branch (except the branch such an earlier slice ran on). There
-  is no drift override.
+  another repository or at another commit — except the exact final
+  candidate of a slice of this intake that the approved slice depends on,
+  directly or through other slices (for `A1 → B1 → A2`, A2 accepts A1's
+  candidate), proven complete and accepted — and if a context repository is
+  on another branch (except the branch such a slice ran on). The approval
+  records the direct prerequisites under `earlier_slices` and the indirect
+  ones it counted under `indirect_slices`. There is no drift override.
 - **The branch is chosen at approval.** A slice runs on the branch its
   primary repository has checked out when the slice is *approved*, at the
   inspected (or earlier-accepted) commit, so a later slice does not inherit
