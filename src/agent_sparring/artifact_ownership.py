@@ -5,7 +5,7 @@ module is the production declaration of that: :data:`ARTIFACTS` is what the
 tests are written against, and :func:`ownership_section` is the single source
 of the sentence the providers are told it in -- so a stage prompt and a
 sparring prompt cannot drift into describing different contracts. The
-README's ownership table is the corresponding human-readable summary. It is
+ownership table in docs/reference.md is the corresponding human-readable summary. It is
 hand-written, nothing renders or checks it against this module, so keeping
 the two consistent is a manual step when either changes.
 
@@ -86,8 +86,8 @@ SOURCE_PLAN = ArtifactOwnership(
 )
 
 #: Every artifact a managed run reads or writes, in the order a reader meets
-#: them. The README's ownership table summarises this tuple for a reader and
-#: is maintained by hand; it is not generated from it.
+#: them. The ownership table in docs/reference.md summarises this tuple for a
+#: reader and is maintained by hand; it is not generated from it.
 ARTIFACTS: tuple[ArtifactOwnership, ...] = (
     SOURCE_PLAN,
     ArtifactOwnership(

@@ -11,12 +11,13 @@ they are not implicitly injected into consuming projects.
   identify the requested base/candidate and inspect diff stat, names, then
   targeted diffs, including staged/untracked work when reviewing a working tree.
 - Search symbols with scoped `rg -n`, then read bounded definition/caller ranges.
-  Narrow truncated output. Do not dump `cli.py`, `plan.py`, the README, design
-  history, logs, or complete stage directories for general orientation.
-- Read the relevant README heading for user-facing behavior; read only the
-  corresponding `docs/design.md` section for architectural intent. Code/tests
-  establish current behavior; report discrepancies instead of treating stale
-  prose as proof.
+  Narrow truncated output. Do not dump `cli.py`, `plan.py`, the `docs/`
+  reference pages, design history, logs, or complete stage directories for
+  general orientation.
+- Read the relevant `docs/` page heading (index: `docs/README.md`) for
+  user-facing behavior; read only the corresponding `docs/design.md` section
+  for architectural intent. Code/tests establish current behavior; report
+  discrepancies instead of treating stale prose as proof.
 - Read additional repository instructions before crossing into a named sibling.
   Do not search the parent workspace or sibling worktrees speculatively.
 - Reuse findings within a session. Delegate only bounded independent questions

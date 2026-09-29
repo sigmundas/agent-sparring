@@ -201,7 +201,7 @@ experience shows that this is necessary.
 
 #### The human may talk to the sparrer, and that costs some independence
 
-`sparring ask` (see "Asking the reviewer" in the README, and
+`sparring ask` (see "Asking the reviewer" in [docs/stages.md](stages.md), and
 `agent_sparring/dialogue.py`) lets a person put questions to the sparrer in
 its own thread and get prose back. It exists because a `NEEDS_YOU` gate was
 able to demand judgement while withholding the material to exercise it: the
