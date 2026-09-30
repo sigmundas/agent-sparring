@@ -10,7 +10,8 @@ Stage-B slot/stage declaration:
   (:mod:`agent_sparring.migration_history`) -- what a target actually has
   applied, as of when someone last ran ``sparring record-migration-history``;
 - the deferred-migration registry, if configured
-  (:mod:`agent_sparring.migration_registry`).
+  (:mod:`agent_sparring.migration_registry`), read from git at the same ref
+  as the branch's migration files.
 
 This module never renames, edits, writes, or runs anything. Its output
 (:class:`MigrationReport`) is a classification of each version plus a list of
@@ -49,7 +50,7 @@ from agent_sparring.migration_history import (
 from agent_sparring.migration_registry import (
     DeferredRegistry,
     DeferredRegistryError,
-    load_deferred_registry,
+    parse_deferred_registry,
     sha256_hex,
 )
 
@@ -243,13 +244,13 @@ def _list_versions(repo_root: Path, ref: str, directory: str, adapter) -> _RefLi
     filesystem and never from a Stage-B slot/stage declaration, so an
     uncommitted or declared-but-absent file can never be counted."""
 
-    result = _run_git(repo_root, "ls-tree", "-r", "--name-only", ref, "--", directory)
+    top = posixpath.normpath(directory)
+    result = _run_git(repo_root, "ls-tree", "-r", "--name-only", ref, "--", top)
     if result.returncode != 0:
         raise MigrationStatusError(
-            f"git ls-tree {ref} -- {directory} failed in {repo_root}: "
+            f"git ls-tree {ref} -- {top} failed in {repo_root}: "
             f"{result.stderr.strip() or 'unknown error'}"
         )
-    top = posixpath.normpath(directory)
     by_version: dict[str, list[str]] = {}
     unrecognised: list[str] = []
     for line in sorted(result.stdout.splitlines()):
@@ -368,12 +369,22 @@ def _unrecognised_problems(listings: dict[str, _RefListing], directory: str) -> 
     return problems
 
 
-def _load_registry(repo_root: Path, migrations: MigrationsConfig) -> DeferredRegistry | None:
+def _load_registry(repo_root: Path, migrations: MigrationsConfig, ref: str) -> DeferredRegistry | None:
+    """The deferred registry as committed at ``ref`` -- the same ref the
+    branch's migration files are read from, so an uncommitted edit in the
+    working tree can never turn a stale migration into a deferred one."""
+
     if not migrations.deferred_registry:
         return None
-    path = Path(repo_root) / migrations.deferred_registry
+    path = posixpath.normpath(migrations.deferred_registry)
     try:
-        return load_deferred_registry(path)
+        content = _show(repo_root, ref, path)
+    except MigrationStatusError as exc:
+        raise MigrationStatusError(f"could not read deferred registry {path} at {ref}: {exc}") from exc
+    try:
+        return parse_deferred_registry(content.decode("utf-8"), source=f"{ref}:{path}")
+    except UnicodeDecodeError as exc:
+        raise MigrationStatusError(f"deferred registry {ref}:{path} is not UTF-8 text: {exc}") from exc
     except DeferredRegistryError as exc:
         raise MigrationStatusError(f"could not read deferred registry: {exc}") from exc
 
@@ -409,7 +420,7 @@ def classify(
     duplicate_versions = {problem.version for problem in duplicate_problems}
     file_problems = duplicate_problems + _unrecognised_problems(listings, migrations.directory)
 
-    registry = _load_registry(repo_root, migrations)
+    registry = _load_registry(repo_root, migrations, branch_ref)
     deferred_by_version = registry.by_version() if registry else {}
     for entry in deferred_by_version.values():
         # The registry pins a file as well as a version; an entry whose own

@@ -13,9 +13,10 @@ paths, tests, or rules. Everything here is generic.
 
 from __future__ import annotations
 
+import posixpath
 import tomllib
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 
 CONFIG_FILENAME = "project.toml"
@@ -187,6 +188,26 @@ _MIGRATIONS_KEYS: frozenset[str] = frozenset(
 MIGRATIONS_ADAPTERS: frozenset[str] = frozenset({"supabase"})
 
 
+def _require_repo_relative(value: str, key: str, *, where: str) -> str:
+    """Refuse a path that is absolute or that escapes the repository.
+
+    ``[migrations]`` paths are read from git trees relative to the
+    repository root; an absolute path or a ``..`` that climbs out of it
+    could only ever point somewhere this engine must not read.
+    """
+
+    if PurePosixPath(value).is_absolute() or PureWindowsPath(value).anchor:
+        raise ProjectConfigError(
+            f"{where} field '{key}' must be relative to the repository root, got {value!r}"
+        )
+    normalized = posixpath.normpath(value.replace("\\", "/"))
+    if normalized == ".." or normalized.startswith("../"):
+        raise ProjectConfigError(
+            f"{where} field '{key}' must stay inside the repository, got {value!r}"
+        )
+    return value
+
+
 def _parse_migrations(table: Mapping[str, Any], *, source: str) -> MigrationsConfig | None:
     if "migrations" not in table:
         return None
@@ -207,11 +228,15 @@ def _parse_migrations(table: Mapping[str, Any], *, source: str) -> MigrationsCon
         raise ProjectConfigError(
             f"{where} field 'adapter' must be one of {sorted(MIGRATIONS_ADAPTERS)}, got {adapter!r}"
         )
-    directory = _require_str(raw, "directory", where=where)
+    directory = _require_repo_relative(
+        _require_str(raw, "directory", where=where), "directory", where=where
+    )
     main_ref = _require_str(raw, "main_ref", where=where)
     target = _optional_str(raw, "target", where=where) or "production"
     target_ref = _optional_str(raw, "target_ref", where=where)
     deferred_registry = _optional_str(raw, "deferred_registry", where=where)
+    if deferred_registry is not None:
+        _require_repo_relative(deferred_registry, "deferred_registry", where=where)
     max_age = _optional_int(raw, "max_observation_age_minutes", where=where, default=60)
     if max_age <= 0:
         raise ProjectConfigError(

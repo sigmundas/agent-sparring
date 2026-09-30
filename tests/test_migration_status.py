@@ -441,6 +441,71 @@ class MigrationStatusFixtureTests(unittest.TestCase):
             self._status(report, DEFERRED_VERSION).classification, CLASS_DEFERRED_TAMPERED
         )
 
+    # Finding 5: the registry comes from the same ref as the migrations.
+    def _registry_deferring(self, *entries: tuple[str, str, str]) -> str:
+        return json.dumps(
+            {
+                "deferredMigrations": [
+                    {"version": v, "file": f, "sha256": hashlib.sha256(c.encode()).hexdigest(), "reason": "r"}
+                    for v, f, c in entries
+                ]
+            }
+        )
+
+    def test_uncommitted_registry_entry_does_not_turn_stale_into_deferred(self):
+        # The working tree's registry gains an entry that is never committed.
+        _write(
+            self.repo,
+            "supabase/deploy-exceptions.json",
+            self._registry_deferring(
+                (DEFERRED_VERSION, DEFERRED_FILE, DEFERRED_CONTENT),
+                (PENDING_ONE_VERSION, PENDING_ONE, "select 'pending one';\n"),
+            ),
+        )
+        report = self._classify(SNAPSHOT_B, branch_ref="feature")
+        self.assertEqual(
+            self._status(report, PENDING_ONE_VERSION).classification, CLASS_MIGRATION_ORDER_STALE
+        )
+        self.assertEqual(self._status(report, DEFERRED_VERSION).classification, CLASS_DEFERRED)
+
+    def test_registry_is_read_at_the_branch_ref_not_the_checked_out_tree(self):
+        self._commit_on(
+            "defers-pending",
+            {
+                "supabase/deploy-exceptions.json": self._registry_deferring(
+                    (DEFERRED_VERSION, DEFERRED_FILE, DEFERRED_CONTENT),
+                    (PENDING_ONE_VERSION, PENDING_ONE, "select 'pending one';\n"),
+                )
+            },
+        )
+        _run_git(self.repo, "checkout", "-q", "feature")
+        report = self._classify(SNAPSHOT_B, branch_ref="defers-pending")
+        self.assertEqual(self._status(report, PENDING_ONE_VERSION).classification, CLASS_DEFERRED)
+        # And the checked-out branch (whose registry lacks it) still says stale.
+        report = self._classify(SNAPSHOT_B, branch_ref="feature")
+        self.assertEqual(
+            self._status(report, PENDING_ONE_VERSION).classification, CLASS_MIGRATION_ORDER_STALE
+        )
+
+    def test_non_normalized_directory_and_registry_paths_still_resolve(self):
+        self.config = _config(
+            directory="supabase/./migrations",
+            deferred_registry="supabase/x/../deploy-exceptions.json",
+        )
+        report = self._classify(SNAPSHOT_B)
+        self.assertEqual(self._status(report, DEFERRED_VERSION).classification, CLASS_DEFERRED)
+        self.assertEqual(
+            self._status(report, PENDING_ONE_VERSION).classification, CLASS_MIGRATION_ORDER_STALE
+        )
+        self.assertEqual(report.file_problems, ())
+
+    def test_registry_missing_at_the_ref_is_a_status_error(self):
+        _run_git(self.repo, "checkout", "-q", "-b", "no-registry", "feature")
+        _run_git(self.repo, "rm", "-q", "supabase/deploy-exceptions.json")
+        _run_git(self.repo, "commit", "-q", "-m", "drop registry")
+        with self.assertRaisesRegex(MigrationStatusError, "deferred registry"):
+            self._classify(SNAPSHOT_A, branch_ref="no-registry")
+
     def test_migration_repair_never_appears_in_rendered_report(self):
         for snapshot in (None, SNAPSHOT_A, SNAPSHOT_B):
             report = self._classify(snapshot)

@@ -183,6 +183,35 @@ class MigrationsConfigTests(unittest.TestCase):
         with self.assertRaises(ProjectConfigError):
             parse_project_config(self.VALID + "max_observation_age_minutes = 0\n")
 
+    # Finding 5: both paths are repository-relative and must stay inside it.
+    def _with_paths(self, directory: str, registry: str | None = None) -> str:
+        text = (
+            'project = "x"\n\n[migrations]\nadapter = "supabase"\n'
+            f"directory = {directory!r}\nmain_ref = \"origin/main\"\n"
+        )
+        if registry is not None:
+            text += f"deferred_registry = {registry!r}\n"
+        return text
+
+    def test_directory_outside_the_repository_is_refused(self):
+        for directory in ("/etc/migrations", "../elsewhere", "supabase/../../x", "..", "C:\\migrations"):
+            with self.subTest(directory=directory):
+                with self.assertRaisesRegex(ProjectConfigError, "directory"):
+                    parse_project_config(self._with_paths(directory))
+
+    def test_deferred_registry_outside_the_repository_is_refused(self):
+        for registry in ("/tmp/deploy-exceptions.json", "../deploy-exceptions.json", "a/../../b.json"):
+            with self.subTest(registry=registry):
+                with self.assertRaisesRegex(ProjectConfigError, "deferred_registry"):
+                    parse_project_config(self._with_paths("supabase/migrations", registry))
+
+    def test_repository_relative_paths_are_accepted(self):
+        config = parse_project_config(
+            self._with_paths("supabase/./migrations", "supabase/x/../deploy-exceptions.json")
+        )
+        self.assertEqual(config.migrations.directory, "supabase/./migrations")
+        self.assertEqual(config.migrations.deferred_registry, "supabase/x/../deploy-exceptions.json")
+
     def test_migrations_not_a_table_fails(self):
         with self.assertRaises(ProjectConfigError):
             parse_project_config('project = "x"\nmigrations = "nope"\n')
