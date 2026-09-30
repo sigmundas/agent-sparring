@@ -42,13 +42,15 @@ an intake interrupted after `intake.json` was written but before this file
 looks complete but is not, and `approve-plan` refuses it until `prepare-plan`
 is run again.
 
-- **Briefs are assembled from the plan's own text.** The agent picks line
-  ranges; the engine renders each brief as the attached context blocks
-  verbatim, then the stage's own text verbatim, then an optional
-  `Intake scoping` note that says it is intake's, may only narrow, make a
-  boundary explicit or defer to a gate, and yields to the plan text. A
-  substantive change goes in refine mode's proposed amendment, which is
-  shown as a diff and never applied.
+- **Briefs are assembled from the plan's own text.** The engine renders each
+  brief with a `## Goal` paragraph first, from the stage's own structured
+  `rationale` (or its `title` when the agent gave no rationale) — intake's
+  understanding of the stage, never a heuristic re-read of the quoted text
+  below it — then the attached context blocks verbatim, then the stage's own
+  text verbatim, then an optional `Intake scoping` note that says it is
+  intake's, may only narrow, make a boundary explicit or defer to a gate, and
+  yields to the plan text. A substantive change goes in refine mode's
+  proposed amendment, which is shown as a diff and never applied.
 - **Source coverage.** Every non-blank line of the plan (horizontal rules
   aside) must be stage text, context that at least one stage attaches, a
   gate, or an exclusion with a reason. Anything else is a

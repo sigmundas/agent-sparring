@@ -1013,6 +1013,12 @@ def render_brief(
     The brief's own sections are level-1 headings so that the quoted
     plan's section headings, which are never rewritten, nest beneath them
     (a quoted level-1 document title sits beside them).
+
+    A ``## Goal`` paragraph comes first, from intake's own structured
+    understanding of the stage (its rationale, or its title when intake
+    gave no rationale) -- never invented by re-reading the quoted source
+    text. A client presenting this brief can show that paragraph verbatim
+    instead of guessing at one from the plan-context boilerplate below.
     """
 
     blocks = {block.id: block for block in interpretation.context}
@@ -1020,6 +1026,7 @@ def render_brief(
     attached.sort(key=lambda block: min((r.start for r in block.ranges), default=0))
 
     siblings = ", ".join(f"`{name}`" for name in stage.repositories) or "none"
+    goal_text = stage.rationale.strip() if stage.rationale and stage.rationale.strip() else stage.title.strip()
     out = [
         f"# Stage brief: {stage_id}",
         "",
@@ -1028,6 +1035,10 @@ def render_brief(
         "other stages are separate.",
         "",
         f"Primary repository: `{run.primary_repository}`. Sibling repositories: {siblings}.",
+        "",
+        "## Goal",
+        "",
+        goal_text,
     ]
     if attached:
         out += ["", "# Plan context", ""]

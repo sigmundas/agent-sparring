@@ -466,6 +466,31 @@ class PrepareTests(_Repo):
         stage0 = (result.directory / "briefs/app/01-0.md").read_text(encoding="utf-8")
         self.assertIn("No stage may touch production", stage0)
 
+    def test_briefs_state_an_explicit_goal_from_structured_stage_information(self):
+        """A ``## Goal`` paragraph comes from intake's own stage fields --
+        never invented by re-reading the quoted plan text -- so a client can
+        show it without falling back to boilerplate."""
+
+        payload = copy.deepcopy(good_interpretation())
+        payload["runs"][1]["stages"][0]["rationale"] = (
+            "Repair the historical widget rows once the production release has activated."
+        )
+        result = self.prepare(payload=payload)
+
+        web_brief = (result.directory / "briefs/web/01-1b.md").read_text(encoding="utf-8")
+        self.assertIn("## Goal", web_brief)
+        self.assertIn(
+            "Repair the historical widget rows once the production release has activated.",
+            web_brief,
+        )
+        self.assertLess(web_brief.index("## Goal"), web_brief.index("# Plan context"))
+        self.assertLess(web_brief.index("## Goal"), web_brief.index("## Stage 1B"))
+
+        # Stage 0's rationale is left blank in the fixture: the Goal falls
+        # back to the stage's own structured title, not an invented summary.
+        stage0 = (result.directory / "briefs/app/01-0.md").read_text(encoding="utf-8")
+        self.assertIn("## Goal\n\nAudit", stage0)
+
     def test_the_record_carries_display_metadata_from_the_report_s_own_source(self):
         result = self.prepare()
         record = json.loads((result.directory / "intake.json").read_text(encoding="utf-8"))
