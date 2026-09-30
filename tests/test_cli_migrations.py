@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import subprocess
 import tempfile
@@ -106,7 +108,7 @@ class RecordAndCheckMigrationsEndToEndTests(unittest.TestCase):
         (self.sparring_dir / "project.toml").write_text(MIGRATIONS_TOML, encoding="utf-8")
         self.listing_path = Path(self._tmp.name) / "listing.txt"
 
-    def _record(self, listing: str) -> int:
+    def _record(self, listing: str, observed_at: str | None = None) -> int:
         self.listing_path.write_text(listing, encoding="utf-8")
         return main(
             [
@@ -116,11 +118,57 @@ class RecordAndCheckMigrationsEndToEndTests(unittest.TestCase):
                 "--file",
                 str(self.listing_path),
                 "--observed-at",
-                now_observed_at(),
+                observed_at or now_observed_at(),
                 "--repo-root",
                 str(self.repo),
             ]
         )
+
+    def _check_json(self) -> tuple[int, dict]:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            exit_code = main(
+                [
+                    "--sparring-dir",
+                    str(self.sparring_dir),
+                    "check-migrations",
+                    "--json",
+                    "--repo-root",
+                    str(self.repo),
+                ]
+            )
+        return exit_code, json.loads(buf.getvalue())
+
+    def _history_dir(self) -> Path:
+        return self.repo / ".git" / "agent-sparring" / "migrations" / "history"
+
+    def test_record_refuses_observed_at_without_timezone(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self._record(VALID_LISTING, observed_at="2026-10-01T10:00:00"), 1)
+        self.assertIn("timezone", err.getvalue())
+        self.assertFalse(self._history_dir().exists())
+
+    def test_check_migrations_reports_a_stored_naive_snapshot_without_a_traceback(self):
+        # A file written before this validation existed (or edited by hand).
+        self._history_dir().mkdir(parents=True)
+        (self._history_dir() / "20261001T100000Z-000000000000.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "adapter": "supabase",
+                    "target_ref": None,
+                    "observed_at": "2026-10-01T10:00:00",
+                    "source": "recorded",
+                    "raw_sha256": "0" * 64,
+                    "applied": ["20260925160000"],
+                    "head": "20260925160000",
+                }
+            ),
+            encoding="utf-8",
+        )
+        exit_code, payload = self._check_json()
+        self.assertEqual(exit_code, 1)
+        self.assertIn("timezone", payload["error"])
 
     def test_record_then_clean_check_migrations_exits_zero(self):
         self.assertEqual(self._record(VALID_LISTING), 0)

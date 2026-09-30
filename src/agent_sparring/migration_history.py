@@ -78,11 +78,24 @@ def now_observed_at() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _parse_observed_at(value: str) -> datetime:
+def parse_observed_at(value: str) -> datetime:
+    """Parse an ``observed_at`` timestamp, requiring an explicit timezone.
+
+    A timestamp without one (``2026-10-01T10:00:00``) is refused: it names
+    no single moment, and comparing it with the current (aware) time is
+    exactly what ``check-migrations`` has to do to compute a snapshot's age.
+    """
+
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
         raise MigrationHistoryError(f"observed_at {value!r} is not a valid ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise MigrationHistoryError(
+            f"observed_at {value!r} has no timezone; give one explicitly "
+            "(e.g. '2026-10-01T10:00:00Z' or '2026-10-01T12:00:00+02:00')"
+        )
+    return parsed
 
 
 def snapshot_from_dict(payload: Mapping[str, Any], *, source: str) -> HistorySnapshot:
@@ -102,7 +115,10 @@ def snapshot_from_dict(payload: Mapping[str, Any], *, source: str) -> HistorySna
     observed_at = payload.get("observed_at")
     if not isinstance(observed_at, str) or not observed_at:
         raise MigrationHistoryError(f"{source} field 'observed_at' must be a non-empty string")
-    _parse_observed_at(observed_at)
+    try:
+        parse_observed_at(observed_at)
+    except MigrationHistoryError as exc:
+        raise MigrationHistoryError(f"{source} field 'observed_at': {exc}") from exc
     raw_sha256 = payload.get("raw_sha256")
     if not isinstance(raw_sha256, str) or not raw_sha256:
         raise MigrationHistoryError(f"{source} field 'raw_sha256' must be a non-empty string")
@@ -194,7 +210,7 @@ def record_history_snapshot(
         raise MigrationHistoryError(f"could not parse the captured migration history: {exc}") from exc
 
     observed = observed_at or now_observed_at()
-    observed_dt = _parse_observed_at(observed)  # validates the caller-supplied timestamp too
+    observed_dt = parse_observed_at(observed)  # validates the caller-supplied timestamp too
     head = max(applied, key=adapter.order_key) if applied else None
     raw_sha256 = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
 
@@ -224,7 +240,9 @@ def latest_snapshot(repo_root: Path) -> HistorySnapshot | None:
     "No usable git common dir" is reported as "no snapshot" here (there is
     nowhere one could be), rather than raised -- a read-only report should
     say ``production_history_unknown``, not refuse to run, for a repository
-    that simply has not been configured for this yet.
+    that simply has not been configured for this yet. A snapshot file that
+    exists but cannot be read or validated raises
+    :class:`MigrationHistoryError` naming it.
     """
 
     try:
@@ -237,15 +255,22 @@ def latest_snapshot(repo_root: Path) -> HistorySnapshot | None:
     best: HistorySnapshot | None = None
     best_dt: datetime | None = None
     for path in sorted(directory.glob("*.json")):
+        # A snapshot this module itself wrote always parses. One that does
+        # not (damaged, hand-edited, or written before a validation existed)
+        # is refused by name rather than skipped: skipping it could silently
+        # fall back to an older observation, and "which snapshot is latest"
+        # cannot be answered while one of them cannot be read.
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            snapshot = snapshot_from_dict(payload, source=str(path))
-        except (OSError, json.JSONDecodeError, MigrationHistoryError):
-            # A snapshot this module itself wrote should always parse; a file
-            # that does not is skipped rather than crashing a read-only
-            # report over one damaged observation.
-            continue
-        observed_dt = _parse_observed_at(snapshot.observed_at)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise MigrationHistoryError(
+                f"history snapshot {path} could not be read ({exc}); fix or remove it"
+            ) from exc
+        try:
+            snapshot = snapshot_from_dict(payload, source=f"history snapshot {path}")
+        except MigrationHistoryError as exc:
+            raise MigrationHistoryError(f"{exc}; fix or remove it") from exc
+        observed_dt = parse_observed_at(snapshot.observed_at)
         if best_dt is None or observed_dt > best_dt:
             best, best_dt = snapshot, observed_dt
     return best
@@ -259,6 +284,7 @@ __all__ = [
     "history_dir",
     "latest_snapshot",
     "now_observed_at",
+    "parse_observed_at",
     "record_history_snapshot",
     "snapshot_from_dict",
 ]

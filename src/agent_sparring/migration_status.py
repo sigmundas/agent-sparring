@@ -36,7 +36,12 @@ from typing import Any, Union
 
 from agent_sparring.config import MigrationsConfig
 from agent_sparring.migration_adapters import get_adapter
-from agent_sparring.migration_history import HistorySnapshot, latest_snapshot
+from agent_sparring.migration_history import (
+    HistorySnapshot,
+    MigrationHistoryError,
+    latest_snapshot,
+    parse_observed_at,
+)
 from agent_sparring.migration_registry import (
     DeferredRegistry,
     DeferredRegistryError,
@@ -264,7 +269,10 @@ def classify(
 
     adapter = get_adapter(migrations.adapter)
     if snapshot is None:
-        snapshot = latest_snapshot(repo_root)
+        try:
+            snapshot = latest_snapshot(repo_root)
+        except MigrationHistoryError as exc:
+            raise MigrationStatusError(str(exc)) from exc
 
     branch_versions = _list_versions(repo_root, branch_ref, migrations.directory, adapter)
     main_versions = _list_versions(repo_root, migrations.main_ref, migrations.directory, adapter)
@@ -337,7 +345,10 @@ def classify(
     stale_snapshot = False
     if snapshot is not None:
         moment = now or datetime.now(timezone.utc)
-        observed_dt = datetime.fromisoformat(snapshot.observed_at.replace("Z", "+00:00"))
+        try:
+            observed_dt = parse_observed_at(snapshot.observed_at)
+        except MigrationHistoryError as exc:
+            raise MigrationStatusError(f"the latest history snapshot is unusable: {exc}") from exc
         age_minutes = (moment - observed_dt).total_seconds() / 60.0
         stale_snapshot = age_minutes > migrations.max_observation_age_minutes
 

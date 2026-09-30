@@ -29,6 +29,7 @@ from agent_sparring.migration_status import (
     CLASS_MIGRATION_ORDER_STALE,
     CLASS_REMOTE_ONLY,
     CLASS_UNAPPLIED,
+    MigrationStatusError,
     ReconciliationProposal,
     RetimestampProposal,
     classify,
@@ -284,6 +285,11 @@ class MigrationStatusFixtureTests(unittest.TestCase):
         recent = _snapshot(APPLIED_VERSIONS, HEAD_A, "2026-09-30T18:50:00Z")
         report = classify(self.repo, self.config, branch_ref="feature", snapshot=recent, now=NOW)
         self.assertFalse(report.stale_snapshot)
+
+    def test_naive_snapshot_timestamp_is_a_clean_status_error(self):
+        naive = _snapshot(APPLIED_VERSIONS, HEAD_A, "2026-09-30T18:50:00")
+        with self.assertRaisesRegex(MigrationStatusError, "timezone"):
+            self._classify(naive)
 
     def test_migration_repair_never_appears_in_rendered_report(self):
         for snapshot in (None, SNAPSHOT_A, SNAPSHOT_B):

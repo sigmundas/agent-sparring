@@ -1,3 +1,4 @@
+import json
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from agent_sparring.migration_history import (
     history_dir,
     latest_snapshot,
     record_history_snapshot,
+    snapshot_from_dict,
 )
 
 VALID_LISTING = (
@@ -126,6 +128,86 @@ class RecordHistorySnapshotTests(unittest.TestCase):
         snapshot = latest_snapshot(worktree)
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.head, "20260925160000")
+
+
+def _store_raw_snapshot(repo: Path, name: str, payload) -> Path:
+    """Write a snapshot file by hand, bypassing record_history_snapshot's
+    validation -- the shape an older/damaged/hand-edited file could have."""
+
+    directory = history_dir(repo)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    text = payload if isinstance(payload, str) else json.dumps(payload)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _snapshot_payload(observed_at: str, head: str = "20260925160000") -> dict:
+    return {
+        "version": 1,
+        "adapter": "supabase",
+        "target_ref": None,
+        "observed_at": observed_at,
+        "source": "recorded",
+        "raw_sha256": "0" * 64,
+        "applied": [head],
+        "head": head,
+    }
+
+
+class ObservedAtTimezoneTests(unittest.TestCase):
+    """Finding 1: a timestamp without a timezone must never reach the
+    naive-minus-aware subtraction in check-migrations."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name) / "repo"
+        _init_repo(self.repo)
+
+    def test_record_refuses_observed_at_without_timezone(self):
+        with self.assertRaisesRegex(MigrationHistoryError, "timezone"):
+            record_history_snapshot(
+                self.repo,
+                adapter_id="supabase",
+                raw_text=VALID_LISTING,
+                target_ref=None,
+                observed_at="2026-10-01T10:00:00",
+            )
+        self.assertFalse(history_dir(self.repo).exists())
+
+    def test_record_accepts_explicit_offset(self):
+        snapshot, _ = record_history_snapshot(
+            self.repo,
+            adapter_id="supabase",
+            raw_text=VALID_LISTING,
+            target_ref=None,
+            observed_at="2026-09-30T14:00:00+02:00",
+        )
+        self.assertEqual(snapshot.observed_at, "2026-09-30T14:00:00+02:00")
+
+    def test_snapshot_from_dict_refuses_naive_observed_at(self):
+        with self.assertRaisesRegex(MigrationHistoryError, "timezone"):
+            snapshot_from_dict(_snapshot_payload("2026-10-01T10:00:00"), source="x.json")
+
+    def test_latest_snapshot_reports_a_stored_naive_snapshot_cleanly(self):
+        path = _store_raw_snapshot(self.repo, "a.json", _snapshot_payload("2026-10-01T10:00:00"))
+        with self.assertRaises(MigrationHistoryError) as ctx:
+            latest_snapshot(self.repo)
+        self.assertIn(str(path), str(ctx.exception))
+        self.assertIn("timezone", str(ctx.exception))
+
+    def test_latest_snapshot_with_two_naive_snapshots_is_a_clean_error(self):
+        _store_raw_snapshot(self.repo, "a.json", _snapshot_payload("2026-09-30T10:00:00"))
+        _store_raw_snapshot(self.repo, "b.json", _snapshot_payload("2026-09-30T11:00:00"))
+        with self.assertRaises(MigrationHistoryError):
+            latest_snapshot(self.repo)
+
+    def test_latest_snapshot_reports_a_malformed_snapshot_cleanly(self):
+        path = _store_raw_snapshot(self.repo, "broken.json", "{not json")
+        with self.assertRaises(MigrationHistoryError) as ctx:
+            latest_snapshot(self.repo)
+        self.assertIn(str(path), str(ctx.exception))
 
 
 if __name__ == "__main__":
