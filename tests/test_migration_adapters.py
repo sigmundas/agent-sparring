@@ -40,8 +40,23 @@ class SupabaseAdapterVersionOfTests(unittest.TestCase):
     def test_rejects_non_migration_file(self):
         self.assertIsNone(self.adapter.version_of("README.md"))
 
-    def test_rejects_short_timestamp(self):
-        self.assertIsNone(self.adapter.version_of("2026091516_add_widgets.sql"))
+    # The Supabase CLI accepts any all-digit version prefix: its
+    # migrateFilePattern is ^([0-9]+)_(.*)\.sql$ (pkg/migration/file.go).
+    def test_accepts_any_all_digit_prefix_like_the_supabase_cli(self):
+        self.assertEqual(self.adapter.version_of("2026091516_add_widgets.sql"), "2026091516")
+        self.assertEqual(self.adapter.version_of("1_init.sql"), "1")
+        self.assertEqual(self.adapter.version_of("123_.sql"), "123")
+
+    def test_rejects_names_the_supabase_cli_would_skip(self):
+        for name in (
+            "20260925160000-add_widgets.sql",
+            "v20260925160000_add_widgets.sql",
+            "20260925160000.sql",
+            "_add_widgets.sql",
+            "\u0661\u0662_arabic_indic_digits.sql",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(self.adapter.version_of(name))
 
     def test_rejects_wrong_extension(self):
         self.assertIsNone(self.adapter.version_of("20260925160000_add_widgets.txt"))
@@ -55,6 +70,13 @@ class SupabaseAdapterOrderKeyTests(unittest.TestCase):
             sorted(versions, key=adapter.order_key),
             ["20260913120000", "20260925160000", "20260930181742"],
         )
+
+
+    def test_mixed_width_versions_sort_as_strings_like_the_supabase_cli(self):
+        # db push orders local files by name (fs.ReadDir) and remote versions
+        # by a text ORDER BY, comparing them as strings (FindPendingMigrations).
+        adapter = SupabaseMigrationAdapter()
+        self.assertEqual(sorted(["9", "10", "20260913120000"], key=adapter.order_key), ["10", "20260913120000", "9"])
 
 
 class SupabaseAdapterParseHistoryTests(unittest.TestCase):
@@ -75,6 +97,15 @@ class SupabaseAdapterParseHistoryTests(unittest.TestCase):
             "        20260913120000 | 20260913120000 | 2026-09-13 12:00:00\n"
         )
         self.assertEqual(self.adapter.parse_history(text), ["20260913120000"])
+
+    def test_short_versions_are_accepted_in_history_cells(self):
+        text = (
+            "        Local          | Remote         | Time (UTC)\n"
+            "  ----------------------|----------------|---------------------\n"
+            "        1              | 1              | 1\n"
+            "        20260913120000 | 20260913120000 | 2026-09-13 12:00:00\n"
+        )
+        self.assertEqual(self.adapter.parse_history(text), ["1", "20260913120000"])
 
     def test_no_header_raises(self):
         with self.assertRaises(MigrationAdapterError):

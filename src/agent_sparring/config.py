@@ -74,7 +74,7 @@ class MigrationsConfig:
     Stage A is detection only: nothing here names a command to run, and
     ``adapter`` is deliberately a closed set of *parsers* (currently just
     ``"supabase"``, for its ``migration list`` table format and
-    ``<14 digits>_name.sql`` naming), never a live probe. There is
+    ``<digits>_name.sql`` naming), never a live probe. There is
     intentionally no ``probe``/command field to invoke a CLI or a database --
     such a key is rejected by the closed schema below like any other unknown
     field, exactly so it cannot be added by accident later without this

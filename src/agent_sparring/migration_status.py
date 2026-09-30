@@ -19,15 +19,18 @@ this engine would execute. In particular, nothing here ever suggests
 ``migration repair``; a version once seen in a recorded snapshot's applied
 list is permanently treated as immutable history.
 
-Version ordering assumes Supabase's own convention (a 14-digit timestamp
-that also sorts correctly as a decimal integer), which is the only adapter
-this stage supports (see :mod:`agent_sparring.migration_adapters`). A future
-adapter with a different version shape would need its own retiming strategy;
-this module does not try to anticipate one.
+Versions are ordered by the adapter's ``order_key`` (for Supabase, the
+version string itself, as the Supabase CLI orders them -- see
+:mod:`agent_sparring.migration_adapters`). Retimestamp proposals are 14-digit
+UTC timestamps, the form ``supabase migration new`` writes, which is the
+only adapter this stage supports. A future adapter with a different version
+shape would need its own retiming strategy; this module does not try to
+anticipate one.
 """
 
 from __future__ import annotations
 
+import posixpath
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -66,6 +69,7 @@ PROPOSAL_RETIMESTAMP = "propose_retimestamp"
 PROPOSAL_RECONCILIATION = "propose_reconciliation_stage"
 
 PROBLEM_DUPLICATE_VERSION = "duplicate_version"
+PROBLEM_UNRECOGNISED_FILE = "unrecognised_migration_file"
 
 
 class MigrationStatusError(ValueError):
@@ -228,6 +232,9 @@ class _RefListing:
     versions: dict[str, str]
     #: ``{version: (path, ...)}`` for every version more than one file claims.
     duplicates: dict[str, tuple[str, ...]]
+    #: Files in the directory the adapter does not recognise as migrations
+    #: (a bad name, or a file in a subdirectory the migration tool never reads).
+    unrecognised: tuple[str, ...]
 
 
 def _list_versions(repo_root: Path, ref: str, directory: str, adapter) -> _RefListing:
@@ -242,19 +249,26 @@ def _list_versions(repo_root: Path, ref: str, directory: str, adapter) -> _RefLi
             f"git ls-tree {ref} -- {directory} failed in {repo_root}: "
             f"{result.stderr.strip() or 'unknown error'}"
         )
+    top = posixpath.normpath(directory)
     by_version: dict[str, list[str]] = {}
+    unrecognised: list[str] = []
     for line in sorted(result.stdout.splitlines()):
         line = line.strip()
         if not line:
             continue
-        version = adapter.version_of(line)
+        # Only direct children count: a migration tool reads the directory
+        # itself, not its subdirectories (the Supabase CLI skips them).
+        version = adapter.version_of(line) if posixpath.dirname(line) == top else None
         if version:
             by_version.setdefault(version, []).append(line)
+        else:
+            unrecognised.append(line)
     return _RefListing(
         versions={version: paths[0] for version, paths in by_version.items()},
         duplicates={
             version: tuple(paths) for version, paths in by_version.items() if len(paths) > 1
         },
+        unrecognised=tuple(unrecognised),
     )
 
 
@@ -322,6 +336,38 @@ def _references(repo_root: Path, ref: str, version: str, exclude_path: str | Non
     return tuple(sorted(paths))
 
 
+def _unrecognised_problems(listings: dict[str, _RefListing], directory: str) -> list[FileProblem]:
+    """One :class:`FileProblem` per file in the migrations directory (in any
+    of ``listings``) that is not a recognised migration. A ``.sql`` file is
+    blocking -- it looks like a migration the tool will never apply -- while
+    anything else (a README, a ``.gitkeep``) is reported without blocking."""
+
+    refs_by_path: dict[str, list[str]] = {}
+    for ref, listing in listings.items():
+        for path in listing.unrecognised:
+            refs_by_path.setdefault(path, []).append(ref)
+    top = posixpath.normpath(directory)
+    problems: list[FileProblem] = []
+    for path in sorted(refs_by_path):
+        blocking = path.endswith(".sql")
+        if posixpath.dirname(path) != top:
+            why = "is in a subdirectory, which the migration tool does not read"
+        elif blocking:
+            why = "does not match the migration file naming, so the migration tool will skip it"
+        else:
+            why = "is not a migration file"
+        problems.append(
+            FileProblem(
+                kind=PROBLEM_UNRECOGNISED_FILE,
+                paths=(path,),
+                refs=tuple(refs_by_path[path]),
+                message=f"unrecognised migration file: {path} {why}",
+                blocking=blocking,
+            )
+        )
+    return problems
+
+
 def _load_registry(repo_root: Path, migrations: MigrationsConfig) -> DeferredRegistry | None:
     if not migrations.deferred_registry:
         return None
@@ -358,11 +404,22 @@ def classify(
     branch_versions = branch_listing.versions
     main_versions = main_listing.versions
     all_versions = set(branch_versions) | set(main_versions)
-    file_problems = _duplicate_problems({branch_ref: branch_listing, migrations.main_ref: main_listing})
-    duplicate_versions = {problem.version for problem in file_problems}
+    listings = {branch_ref: branch_listing, migrations.main_ref: main_listing}
+    duplicate_problems = _duplicate_problems(listings)
+    duplicate_versions = {problem.version for problem in duplicate_problems}
+    file_problems = duplicate_problems + _unrecognised_problems(listings, migrations.directory)
 
     registry = _load_registry(repo_root, migrations)
     deferred_by_version = registry.by_version() if registry else {}
+    for entry in deferred_by_version.values():
+        # The registry pins a file as well as a version; an entry whose own
+        # file name encodes some other version cannot be trusted either way.
+        file_version = adapter.version_of(Path(entry.file).name)
+        if file_version != entry.version:
+            raise MigrationStatusError(
+                f"deferred registry entry for version {entry.version} names file "
+                f"{entry.file!r}, which {'encodes version ' + file_version if file_version else 'is not a migration file name'}"
+            )
 
     applied_set = set(snapshot.applied) if snapshot else set()
     remote_head = snapshot.head if snapshot else None
@@ -390,9 +447,14 @@ def classify(
             entry = deferred_by_version[version]
             content_ref = branch_ref if version in branch_versions else migrations.main_ref
             content = _show(repo_root, content_ref, path) if path else b""
-            classification = (
-                CLASS_DEFERRED if path and sha256_hex(content) == entry.sha256 else CLASS_DEFERRED_TAMPERED
+            # Deferred only if the committed file is exactly the pinned one:
+            # same name and same content hash.
+            pinned = (
+                path is not None
+                and Path(path).name == Path(entry.file).name
+                and sha256_hex(content) == entry.sha256
             )
+            classification = CLASS_DEFERRED if pinned else CLASS_DEFERRED_TAMPERED
         elif remote_head is not None and adapter.order_key(version) < adapter.order_key(remote_head):
             classification = CLASS_MIGRATION_ORDER_STALE
             stale_versions.append(version)
@@ -537,6 +599,7 @@ __all__ = [
     "CLASS_UNAPPLIED",
     "FLAG_APPLIED_MODIFIED",
     "PROBLEM_DUPLICATE_VERSION",
+    "PROBLEM_UNRECOGNISED_FILE",
     "PROPOSAL_RECONCILIATION",
     "PROPOSAL_RETIMESTAMP",
     "FileProblem",

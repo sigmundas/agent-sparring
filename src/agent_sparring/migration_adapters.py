@@ -41,7 +41,8 @@ class MigrationAdapter(Protocol):
     def version_of(self, path: str) -> str | None:
         """The migration version a file name encodes, or ``None`` if this
         adapter does not recognise ``path`` as a migration file at all (e.g.
-        a stray ``README.md`` sitting in the migrations directory)."""
+        a stray ``README.md`` sitting in the migrations directory). The
+        status engine reports every such file rather than dropping it."""
 
     def order_key(self, version: str):
         """A key such that ``sorted(versions, key=adapter.order_key)`` is
@@ -68,17 +69,29 @@ class MigrationAdapter(Protocol):
 # malformed input.
 _HEADER_RE = re.compile(r"^\s*Local\s*\|\s*Remote\s*\|")
 _SEPARATOR_RE = re.compile(r"^\s*-+\s*\|")
-_VERSION_CELL_RE = re.compile(r"^\d{14}$")
-_FILENAME_RE = re.compile(r"^(\d{14})_.+\.sql$")
+# The Supabase CLI's own rule (``migrateFilePattern`` in the CLI's
+# ``pkg/migration/file.go``): any all-ASCII-digit version, an underscore, any
+# name (even empty), ``.sql``. ``supabase migration new`` always writes a
+# 14-digit UTC timestamp, but the CLI applies whatever matches this, so
+# anything narrower here would silently ignore a file the CLI deploys.
+_VERSION_CELL_RE = re.compile(r"^[0-9]+$")
+_FILENAME_RE = re.compile(r"^([0-9]+)_(.*)\.sql$")
 
 
 class SupabaseMigrationAdapter:
     """Parses Supabase CLI migration-file names and ``migration list`` output.
 
-    Versions are the 14-digit timestamp prefix Supabase's own migration file
-    naming uses (``<14 digits>_name.sql``); as fixed-width decimal strings
-    they already sort correctly as plain strings, so :meth:`order_key`
-    returns the version unchanged.
+    A version is the all-digit prefix of ``<digits>_name.sql`` -- normally a
+    14-digit UTC timestamp, but the CLI accepts any digit string.
+    :meth:`order_key` is the version itself, compared as a plain string,
+    because that is the order ``supabase db push`` uses: local files in file
+    name order, remote versions from a text ``ORDER BY version``, compared
+    with string comparison when deciding what is pending or out of order.
+    For same-width timestamps this is also numeric order.
+
+    One CLI rule is not mirrored: the CLI skips a *first* file named
+    ``<14 digits>_init.sql`` older than ``20211209000000`` (a deprecated
+    layout from old CLI versions); this adapter counts it as a migration.
     """
 
     id = "supabase"

@@ -31,6 +31,7 @@ from agent_sparring.migration_status import (
     CLASS_REMOTE_ONLY,
     CLASS_UNAPPLIED,
     PROBLEM_DUPLICATE_VERSION,
+    PROBLEM_UNRECOGNISED_FILE,
     MigrationStatusError,
     ReconciliationProposal,
     RetimestampProposal,
@@ -355,6 +356,90 @@ class MigrationStatusFixtureTests(unittest.TestCase):
             self._status(report, DEFERRED_VERSION).classification, CLASS_DUPLICATE_VERSION
         )
         self.assertTrue(report.has_findings())
+
+    # Finding 4: files the adapter cannot parse are reported, never dropped.
+    def test_unrecognised_files_in_the_migrations_directory_are_reported(self):
+        self._commit_on(
+            "odd-files",
+            {
+                "supabase/migrations/README.md": "notes\n",
+                "supabase/migrations/20260929140000-dash.sql": "select 1;\n",
+                "supabase/migrations/nested/20260929150000_nested.sql": "select 2;\n",
+            },
+        )
+        report = self._classify(SNAPSHOT_A, branch_ref="odd-files")
+        problems = {
+            p.paths[0]: p for p in report.file_problems if p.kind == PROBLEM_UNRECOGNISED_FILE
+        }
+        self.assertEqual(
+            set(problems),
+            {
+                "supabase/migrations/README.md",
+                "supabase/migrations/20260929140000-dash.sql",
+                "supabase/migrations/nested/20260929150000_nested.sql",
+            },
+        )
+        # A .sql file the migration tool would skip never deploys: blocking.
+        self.assertTrue(problems["supabase/migrations/20260929140000-dash.sql"].blocking)
+        self.assertTrue(problems["supabase/migrations/nested/20260929150000_nested.sql"].blocking)
+        # A non-SQL file is reported but does not block a clean result.
+        self.assertFalse(problems["supabase/migrations/README.md"].blocking)
+        self.assertEqual(problems["supabase/migrations/README.md"].refs, ("odd-files",))
+        self.assertTrue(report.has_findings())
+        self.assertNotIn("20260929150000", {v.version for v in report.versions})
+        text = render_report(report)
+        self.assertIn("20260929140000-dash.sql", text)
+        self.assertIn("README.md", text)
+
+    def test_a_non_sql_file_alone_is_reported_without_blocking(self):
+        self._commit_on("readme-only", {"supabase/migrations/README.md": "notes\n"})
+        recent = _snapshot(APPLIED_VERSIONS, HEAD_A, "2026-09-30T18:50:00Z")
+        report = self._classify(recent, branch_ref="readme-only")
+        self.assertEqual(len(report.file_problems), 1)
+        self.assertFalse(report.has_findings())
+        self.assertIn("README.md", render_report(report))
+
+    def test_short_version_file_is_classified_not_dropped(self):
+        self._commit_on("short", {"supabase/migrations/1_early.sql": "select 1;\n"})
+        report = self._classify(SNAPSHOT_A, branch_ref="short")
+        # "1" sorts before the head as a string, exactly as the CLI orders it.
+        self.assertEqual(self._status(report, "1").classification, CLASS_MIGRATION_ORDER_STALE)
+
+    def test_registry_entry_whose_file_encodes_another_version_is_refused(self):
+        registry = json.dumps(
+            {
+                "deferredMigrations": [
+                    {
+                        "version": DEFERRED_VERSION,
+                        "file": "20260914090001_wrong.sql",
+                        "sha256": hashlib.sha256(DEFERRED_CONTENT.encode()).hexdigest(),
+                        "reason": "r",
+                    }
+                ]
+            }
+        )
+        self._commit_on("bad-registry", {"supabase/deploy-exceptions.json": registry})
+        with self.assertRaisesRegex(MigrationStatusError, "20260914090001_wrong.sql"):
+            self._classify(SNAPSHOT_A, branch_ref="bad-registry")
+
+    def test_registry_entry_naming_a_different_file_for_its_version_is_tampered(self):
+        registry = json.dumps(
+            {
+                "deferredMigrations": [
+                    {
+                        "version": DEFERRED_VERSION,
+                        "file": f"{DEFERRED_VERSION}_some_other_name.sql",
+                        "sha256": hashlib.sha256(DEFERRED_CONTENT.encode()).hexdigest(),
+                        "reason": "r",
+                    }
+                ]
+            }
+        )
+        self._commit_on("renamed-registry", {"supabase/deploy-exceptions.json": registry})
+        report = self._classify(SNAPSHOT_A, branch_ref="renamed-registry")
+        self.assertEqual(
+            self._status(report, DEFERRED_VERSION).classification, CLASS_DEFERRED_TAMPERED
+        )
 
     def test_migration_repair_never_appears_in_rendered_report(self):
         for snapshot in (None, SNAPSHOT_A, SNAPSHOT_B):
