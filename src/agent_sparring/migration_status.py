@@ -58,11 +58,14 @@ CLASS_DEFERRED = "deferred"
 CLASS_DEFERRED_TAMPERED = "deferred_tampered"
 CLASS_MIGRATION_ORDER_STALE = "migration_order_stale"
 CLASS_REMOTE_ONLY = "remote_only"
+CLASS_DUPLICATE_VERSION = "duplicate_version"
 
 FLAG_APPLIED_MODIFIED = "applied_migration_modified"
 
 PROPOSAL_RETIMESTAMP = "propose_retimestamp"
 PROPOSAL_RECONCILIATION = "propose_reconciliation_stage"
+
+PROBLEM_DUPLICATE_VERSION = "duplicate_version"
 
 
 class MigrationStatusError(ValueError):
@@ -130,6 +133,30 @@ Proposal = Union[RetimestampProposal, ReconciliationProposal]
 
 
 @dataclass(frozen=True)
+class FileProblem:
+    """A problem with the migration files themselves, found while listing
+    them -- reported as its own finding rather than resolved by guessing
+    (e.g. two files claiming one version: neither is silently preferred)."""
+
+    kind: str
+    paths: tuple[str, ...]
+    refs: tuple[str, ...]
+    message: str
+    version: str | None = None
+    blocking: bool = True
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "version": self.version,
+            "paths": list(self.paths),
+            "refs": list(self.refs),
+            "message": self.message,
+            "blocking": self.blocking,
+        }
+
+
+@dataclass(frozen=True)
 class MigrationReport:
     """A full read-only migration-order report."""
 
@@ -144,6 +171,7 @@ class MigrationReport:
     remote_history_not_reconciled: bool
     versions: tuple[VersionStatus, ...]
     proposals: tuple[Proposal, ...]
+    file_problems: tuple[FileProblem, ...] = ()
     version: int = REPORT_VERSION
 
     def by_classification(self, classification: str) -> tuple[str, ...]:
@@ -153,8 +181,15 @@ class MigrationReport:
         """Whether this report says anything other than "everything is
         fine": used to choose ``check-migrations``'s exit code."""
 
-        noteworthy = {CLASS_MIGRATION_ORDER_STALE, CLASS_DEFERRED_TAMPERED, CLASS_REMOTE_ONLY}
+        noteworthy = {
+            CLASS_MIGRATION_ORDER_STALE,
+            CLASS_DEFERRED_TAMPERED,
+            CLASS_REMOTE_ONLY,
+            CLASS_DUPLICATE_VERSION,
+        }
         if any(v.classification in noteworthy for v in self.versions):
+            return True
+        if any(problem.blocking for problem in self.file_problems):
             return True
         if any(FLAG_APPLIED_MODIFIED in v.flags for v in self.versions):
             return True
@@ -174,6 +209,7 @@ class MigrationReport:
             "remote_history_not_reconciled": self.remote_history_not_reconciled,
             "versions": [v.as_dict() for v in self.versions],
             "proposals": [p.as_dict() for p in self.proposals],
+            "file_problems": [p.as_dict() for p in self.file_problems],
         }
 
 
@@ -183,11 +219,22 @@ def _run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _list_versions(repo_root: Path, ref: str, directory: str, adapter) -> dict[str, str]:
-    """``{version: path}`` for every migration file ``adapter`` recognises in
-    ``directory`` at ``ref``, read straight from git's tree -- never from the
-    working-tree filesystem and never from a Stage-B slot/stage declaration,
-    so an uncommitted or declared-but-absent file can never be counted."""
+@dataclass(frozen=True)
+class _RefListing:
+    """The migration files found in one ref's migrations directory."""
+
+    #: ``{version: path}``. A version claimed by more than one file maps to
+    #: the first of them here only so it is still counted; see ``duplicates``.
+    versions: dict[str, str]
+    #: ``{version: (path, ...)}`` for every version more than one file claims.
+    duplicates: dict[str, tuple[str, ...]]
+
+
+def _list_versions(repo_root: Path, ref: str, directory: str, adapter) -> _RefListing:
+    """Every migration file ``adapter`` recognises in ``directory`` at
+    ``ref``, read straight from git's tree -- never from the working-tree
+    filesystem and never from a Stage-B slot/stage declaration, so an
+    uncommitted or declared-but-absent file can never be counted."""
 
     result = _run_git(repo_root, "ls-tree", "-r", "--name-only", ref, "--", directory)
     if result.returncode != 0:
@@ -195,15 +242,45 @@ def _list_versions(repo_root: Path, ref: str, directory: str, adapter) -> dict[s
             f"git ls-tree {ref} -- {directory} failed in {repo_root}: "
             f"{result.stderr.strip() or 'unknown error'}"
         )
-    versions: dict[str, str] = {}
-    for line in result.stdout.splitlines():
+    by_version: dict[str, list[str]] = {}
+    for line in sorted(result.stdout.splitlines()):
         line = line.strip()
         if not line:
             continue
         version = adapter.version_of(line)
         if version:
-            versions[version] = line
-    return versions
+            by_version.setdefault(version, []).append(line)
+    return _RefListing(
+        versions={version: paths[0] for version, paths in by_version.items()},
+        duplicates={
+            version: tuple(paths) for version, paths in by_version.items() if len(paths) > 1
+        },
+    )
+
+
+def _duplicate_problems(listings: dict[str, _RefListing]) -> list[FileProblem]:
+    """One :class:`FileProblem` per version that more than one file claims,
+    in any of ``listings`` (``{ref: listing}``), naming every such file."""
+
+    paths_by_version: dict[str, set[str]] = {}
+    refs_by_version: dict[str, list[str]] = {}
+    for ref, listing in listings.items():
+        for version, paths in listing.duplicates.items():
+            paths_by_version.setdefault(version, set()).update(paths)
+            refs_by_version.setdefault(version, []).append(ref)
+    return [
+        FileProblem(
+            kind=PROBLEM_DUPLICATE_VERSION,
+            version=version,
+            paths=tuple(sorted(paths_by_version[version])),
+            refs=tuple(refs_by_version[version]),
+            message=(
+                f"{len(paths_by_version[version])} migration files share version {version}; "
+                "the migration tool cannot apply both, and this report will not pick one"
+            ),
+        )
+        for version in sorted(paths_by_version)
+    ]
 
 
 def _show(repo_root: Path, ref: str, path: str) -> bytes:
@@ -276,9 +353,13 @@ def classify(
         except MigrationHistoryError as exc:
             raise MigrationStatusError(str(exc)) from exc
 
-    branch_versions = _list_versions(repo_root, branch_ref, migrations.directory, adapter)
-    main_versions = _list_versions(repo_root, migrations.main_ref, migrations.directory, adapter)
+    branch_listing = _list_versions(repo_root, branch_ref, migrations.directory, adapter)
+    main_listing = _list_versions(repo_root, migrations.main_ref, migrations.directory, adapter)
+    branch_versions = branch_listing.versions
+    main_versions = main_listing.versions
     all_versions = set(branch_versions) | set(main_versions)
+    file_problems = _duplicate_problems({branch_ref: branch_listing, migrations.main_ref: main_listing})
+    duplicate_versions = {problem.version for problem in file_problems}
 
     registry = _load_registry(repo_root, migrations)
     deferred_by_version = registry.by_version() if registry else {}
@@ -292,7 +373,13 @@ def classify(
     for version in sorted(all_versions, key=adapter.order_key):
         path = branch_versions.get(version) or main_versions.get(version)
         flags: list[str] = []
-        if version in applied_set:
+        if version in duplicate_versions:
+            # Which file is "the" migration is ambiguous, so nothing that
+            # depends on its content (tamper hash, modified-applied check,
+            # a retimestamp proposal) is computed against either one.
+            classification = CLASS_DUPLICATE_VERSION
+            path = None
+        elif version in applied_set:
             classification = CLASS_APPLIED
             if version in branch_versions and version in main_versions:
                 branch_content = _show(repo_root, branch_ref, branch_versions[version])
@@ -369,6 +456,7 @@ def classify(
         remote_history_not_reconciled=bool(remote_only_versions),
         versions=tuple(statuses),
         proposals=tuple(proposals),
+        file_problems=tuple(file_problems),
     )
 
 
@@ -413,6 +501,10 @@ def render_report(report: MigrationReport) -> str:
             f"on the main branch: {', '.join(modified)}"
         )
 
+    for problem in report.file_problems:
+        prefix = "" if problem.blocking else "Note: "
+        lines.append(f"{prefix}{problem.message}: {', '.join(problem.paths)}")
+
     remote_only = report.by_classification(CLASS_REMOTE_ONLY)
     if remote_only:
         lines.append(
@@ -439,12 +531,15 @@ __all__ = [
     "CLASS_APPLIED",
     "CLASS_DEFERRED",
     "CLASS_DEFERRED_TAMPERED",
+    "CLASS_DUPLICATE_VERSION",
     "CLASS_MIGRATION_ORDER_STALE",
     "CLASS_REMOTE_ONLY",
     "CLASS_UNAPPLIED",
     "FLAG_APPLIED_MODIFIED",
+    "PROBLEM_DUPLICATE_VERSION",
     "PROPOSAL_RECONCILIATION",
     "PROPOSAL_RETIMESTAMP",
+    "FileProblem",
     "MigrationReport",
     "MigrationStatusError",
     "ReconciliationProposal",

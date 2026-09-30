@@ -26,9 +26,11 @@ from agent_sparring.migration_status import (
     CLASS_APPLIED,
     CLASS_DEFERRED,
     CLASS_DEFERRED_TAMPERED,
+    CLASS_DUPLICATE_VERSION,
     CLASS_MIGRATION_ORDER_STALE,
     CLASS_REMOTE_ONLY,
     CLASS_UNAPPLIED,
+    PROBLEM_DUPLICATE_VERSION,
     MigrationStatusError,
     ReconciliationProposal,
     RetimestampProposal,
@@ -301,6 +303,58 @@ class MigrationStatusFixtureTests(unittest.TestCase):
         report = self._classify(slightly_ahead)
         self.assertEqual(report.snapshot_age_minutes, 0.0)
         self.assertFalse(report.stale_snapshot)
+
+    def _commit_on(self, branch: str, files: dict[str, str]) -> None:
+        _run_git(self.repo, "checkout", "-q", "-b", branch, "feature")
+        for rel_path, content in files.items():
+            _write(self.repo, rel_path, content)
+        _run_git(self.repo, "add", "-A")
+        _run_git(self.repo, "commit", "-q", "-m", f"commit on {branch}")
+
+    # Finding 3: two files with one version must not collapse into one.
+    def test_two_files_with_one_version_are_reported_not_collapsed(self):
+        self._commit_on(
+            "dup",
+            {
+                "supabase/migrations/20260920000000_m.sql": "select 'm';\n",
+                "supabase/migrations/20260920000000_dup.sql": "select 'dup';\n",
+            },
+        )
+        report = self._classify(SNAPSHOT_A, branch_ref="dup")
+        status = self._status(report, "20260920000000")
+        self.assertEqual(status.classification, CLASS_DUPLICATE_VERSION)
+        problems = [p for p in report.file_problems if p.kind == PROBLEM_DUPLICATE_VERSION]
+        self.assertEqual(len(problems), 1)
+        self.assertEqual(problems[0].version, "20260920000000")
+        self.assertEqual(
+            problems[0].paths,
+            (
+                "supabase/migrations/20260920000000_dup.sql",
+                "supabase/migrations/20260920000000_m.sql",
+            ),
+        )
+        self.assertTrue(problems[0].blocking)
+        # Not silently retimed as if it were one ordinary stale migration.
+        self.assertFalse(
+            any(
+                isinstance(p, RetimestampProposal) and p.old_version == "20260920000000"
+                for p in report.proposals
+            )
+        )
+        self.assertTrue(report.has_findings())
+        self.assertIn("20260920000000", render_report(report))
+        self.assertEqual(report.as_dict()["file_problems"][0]["kind"], PROBLEM_DUPLICATE_VERSION)
+
+    def test_duplicate_of_a_deferred_version_is_not_hash_checked_against_either(self):
+        self._commit_on(
+            "dup-deferred",
+            {f"supabase/migrations/{DEFERRED_VERSION}_other.sql": "select 'other';\n"},
+        )
+        report = self._classify(SNAPSHOT_A, branch_ref="dup-deferred")
+        self.assertEqual(
+            self._status(report, DEFERRED_VERSION).classification, CLASS_DUPLICATE_VERSION
+        )
+        self.assertTrue(report.has_findings())
 
     def test_migration_repair_never_appears_in_rendered_report(self):
         for snapshot in (None, SNAPSHOT_A, SNAPSHOT_B):
