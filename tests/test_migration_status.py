@@ -291,6 +291,17 @@ class MigrationStatusFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(MigrationStatusError, "timezone"):
             self._classify(naive)
 
+    def test_future_snapshot_beyond_clock_skew_is_a_status_error(self):
+        future = _snapshot(APPLIED_VERSIONS, HEAD_A, "2099-01-01T00:00:00Z")
+        with self.assertRaisesRegex(MigrationStatusError, "future"):
+            self._classify(future)
+
+    def test_snapshot_within_clock_skew_never_reports_a_negative_age(self):
+        slightly_ahead = _snapshot(APPLIED_VERSIONS, HEAD_A, "2026-09-30T19:02:00Z")
+        report = self._classify(slightly_ahead)
+        self.assertEqual(report.snapshot_age_minutes, 0.0)
+        self.assertFalse(report.stale_snapshot)
+
     def test_migration_repair_never_appears_in_rendered_report(self):
         for snapshot in (None, SNAPSHOT_A, SNAPSHOT_B):
             report = self._classify(snapshot)

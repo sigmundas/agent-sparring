@@ -148,6 +148,33 @@ class RecordAndCheckMigrationsEndToEndTests(unittest.TestCase):
         self.assertIn("timezone", err.getvalue())
         self.assertFalse(self._history_dir().exists())
 
+    def test_record_refuses_a_future_observed_at(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self._record(VALID_LISTING, observed_at="2099-01-01T00:00:00Z"), 1)
+        self.assertIn("future", err.getvalue())
+        self.assertFalse(self._history_dir().exists())
+
+    def test_check_migrations_reports_a_stored_future_snapshot(self):
+        self.assertEqual(self._record(VALID_LISTING), 0)
+        (self._history_dir() / "20990101T000000Z-000000000000.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "adapter": "supabase",
+                    "target_ref": None,
+                    "observed_at": "2099-01-01T00:00:00Z",
+                    "source": "recorded",
+                    "raw_sha256": "0" * 64,
+                    "applied": ["20260925160000"],
+                    "head": "20260925160000",
+                }
+            ),
+            encoding="utf-8",
+        )
+        exit_code, payload = self._check_json()
+        self.assertEqual(exit_code, 1)
+        self.assertIn("future", payload["error"])
+
     def test_check_migrations_reports_a_stored_naive_snapshot_without_a_traceback(self):
         # A file written before this validation existed (or edited by hand).
         self._history_dir().mkdir(parents=True)

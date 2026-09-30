@@ -2,11 +2,13 @@ import json
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import conftest_path  # noqa: F401
 
 from agent_sparring.migration_history import (
+    CLOCK_SKEW_TOLERANCE,
     MigrationHistoryError,
     history_dir,
     latest_snapshot,
@@ -208,6 +210,56 @@ class ObservedAtTimezoneTests(unittest.TestCase):
         with self.assertRaises(MigrationHistoryError) as ctx:
             latest_snapshot(self.repo)
         self.assertIn(str(path), str(ctx.exception))
+
+
+class FutureObservedAtTests(unittest.TestCase):
+    """Finding 2: a future observed_at would win latest-snapshot selection
+    forever and give a negative age that never goes stale."""
+
+    NOW = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name) / "repo"
+        _init_repo(self.repo)
+
+    def _record(self, observed_at: str, listing: str = VALID_LISTING):
+        return record_history_snapshot(
+            self.repo,
+            adapter_id="supabase",
+            raw_text=listing,
+            target_ref=None,
+            observed_at=observed_at,
+            now=self.NOW,
+        )
+
+    def test_record_refuses_a_far_future_observed_at(self):
+        with self.assertRaisesRegex(MigrationHistoryError, "future"):
+            self._record("2099-01-01T00:00:00Z")
+        self.assertFalse(history_dir(self.repo).exists())
+
+    def test_record_refuses_just_past_the_clock_skew_tolerance(self):
+        beyond = self.NOW + CLOCK_SKEW_TOLERANCE + timedelta(seconds=1)
+        with self.assertRaisesRegex(MigrationHistoryError, "future"):
+            self._record(beyond.isoformat())
+
+    def test_record_accepts_small_clock_skew(self):
+        within = self.NOW + CLOCK_SKEW_TOLERANCE
+        snapshot, _ = self._record(within.isoformat())
+        self.assertEqual(snapshot.observed_at, within.isoformat())
+
+    def test_a_stored_future_snapshot_is_reported_not_trusted(self):
+        # Written before this validation existed: it would otherwise win
+        # selection forever and hide every later recording.
+        path = _store_raw_snapshot(
+            self.repo, "future.json", _snapshot_payload("2099-01-01T00:00:00Z", head="20990101000000")
+        )
+        self._record("2026-10-01T11:59:00Z")
+        with self.assertRaises(MigrationHistoryError) as ctx:
+            latest_snapshot(self.repo, now=self.NOW)
+        self.assertIn(str(path), str(ctx.exception))
+        self.assertIn("future", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -2238,7 +2238,10 @@ def build_parser() -> argparse.ArgumentParser:
     record_migration_history.add_argument(
         "--observed-at",
         default=None,
-        help="ISO-8601 timestamp for when --file was captured (default: now, UTC)",
+        help=(
+            "ISO-8601 timestamp, with a timezone, for when --file was captured "
+            "(default: now, UTC); refused if it lies more than a few minutes in the future"
+        ),
     )
     record_migration_history.add_argument("--repo-root", default=None, help="repository root (default: [repo].root, else the parent of --sparring-dir)")
     record_migration_history.add_argument("--json", action="store_true", help="report what was recorded as JSON")

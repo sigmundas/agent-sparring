@@ -24,7 +24,7 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -35,6 +35,13 @@ HISTORY_VERSION = 1
 SOURCE_RECORDED = "recorded"
 
 HISTORY_SUBDIR = Path("agent-sparring") / "migrations" / "history"
+
+#: How far an ``observed_at`` may lie ahead of this machine's clock and still
+#: be accepted -- room for a capture taken on another machine whose clock
+#: runs slightly fast, and nothing more. A snapshot further in the future
+#: would win latest-snapshot selection over every later recording and have
+#: a negative age that never goes stale, so it is refused.
+CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
 
 _SNAPSHOT_KEYS = frozenset(
     {"version", "adapter", "target_ref", "observed_at", "source", "raw_sha256", "applied", "head"}
@@ -96,6 +103,19 @@ def parse_observed_at(value: str) -> datetime:
             "(e.g. '2026-10-01T10:00:00Z' or '2026-10-01T12:00:00+02:00')"
         )
     return parsed
+
+
+def check_not_future(observed_dt: datetime, *, now: datetime, what: str) -> None:
+    """Refuse an observation more than :data:`CLOCK_SKEW_TOLERANCE` ahead of
+    ``now``."""
+
+    if observed_dt > now + CLOCK_SKEW_TOLERANCE:
+        tolerance = int(CLOCK_SKEW_TOLERANCE.total_seconds() // 60)
+        raise MigrationHistoryError(
+            f"{what} is in the future (observed_at {observed_dt.isoformat()} is after "
+            f"now, {now.isoformat(timespec='seconds')}, by more than the {tolerance}-minute "
+            "clock-skew tolerance)"
+        )
 
 
 def snapshot_from_dict(payload: Mapping[str, Any], *, source: str) -> HistorySnapshot:
@@ -194,11 +214,13 @@ def record_history_snapshot(
     raw_text: str,
     target_ref: str | None,
     observed_at: str | None = None,
+    now: datetime | None = None,
 ) -> tuple[HistorySnapshot, Path]:
     """Parse ``raw_text`` with the named adapter and write a new snapshot file.
 
     Raises :class:`MigrationHistoryError` if ``raw_text`` is not parseable by
-    that adapter, or if there is nowhere to record it (see
+    that adapter, if ``observed_at`` has no timezone or lies in the future
+    beyond :data:`CLOCK_SKEW_TOLERANCE`, or if there is nowhere to record it (see
     :func:`_git_common_dir`). Record, don't interpret: this never compares the
     result against any other snapshot or declares anything stale.
     """
@@ -211,6 +233,9 @@ def record_history_snapshot(
 
     observed = observed_at or now_observed_at()
     observed_dt = parse_observed_at(observed)  # validates the caller-supplied timestamp too
+    check_not_future(
+        observed_dt, now=now or datetime.now(timezone.utc), what="the migration history observation"
+    )
     head = max(applied, key=adapter.order_key) if applied else None
     raw_sha256 = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
 
@@ -234,7 +259,7 @@ def record_history_snapshot(
     return snapshot, path
 
 
-def latest_snapshot(repo_root: Path) -> HistorySnapshot | None:
+def latest_snapshot(repo_root: Path, *, now: datetime | None = None) -> HistorySnapshot | None:
     """The most recently observed snapshot, or ``None`` if none is recorded.
 
     "No usable git common dir" is reported as "no snapshot" here (there is
@@ -242,8 +267,12 @@ def latest_snapshot(repo_root: Path) -> HistorySnapshot | None:
     say ``production_history_unknown``, not refuse to run, for a repository
     that simply has not been configured for this yet. A snapshot file that
     exists but cannot be read or validated raises
-    :class:`MigrationHistoryError` naming it.
+    :class:`MigrationHistoryError` naming it -- including one observed in
+    the future beyond :data:`CLOCK_SKEW_TOLERANCE`, which would otherwise be
+    selected over every later recording forever.
     """
+
+    moment = now or datetime.now(timezone.utc)
 
     try:
         directory = history_dir(repo_root)
@@ -271,16 +300,22 @@ def latest_snapshot(repo_root: Path) -> HistorySnapshot | None:
         except MigrationHistoryError as exc:
             raise MigrationHistoryError(f"{exc}; fix or remove it") from exc
         observed_dt = parse_observed_at(snapshot.observed_at)
+        try:
+            check_not_future(observed_dt, now=moment, what=f"history snapshot {path}")
+        except MigrationHistoryError as exc:
+            raise MigrationHistoryError(f"{exc}; fix or remove it") from exc
         if best_dt is None or observed_dt > best_dt:
             best, best_dt = snapshot, observed_dt
     return best
 
 
 __all__ = [
+    "CLOCK_SKEW_TOLERANCE",
     "HISTORY_VERSION",
     "SOURCE_RECORDED",
     "HistorySnapshot",
     "MigrationHistoryError",
+    "check_not_future",
     "history_dir",
     "latest_snapshot",
     "now_observed_at",

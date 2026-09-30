@@ -39,6 +39,7 @@ from agent_sparring.migration_adapters import get_adapter
 from agent_sparring.migration_history import (
     HistorySnapshot,
     MigrationHistoryError,
+    check_not_future,
     latest_snapshot,
     parse_observed_at,
 )
@@ -268,9 +269,10 @@ def classify(
     reading the latest recorded snapshot; nothing is written."""
 
     adapter = get_adapter(migrations.adapter)
+    moment = now or datetime.now(timezone.utc)
     if snapshot is None:
         try:
-            snapshot = latest_snapshot(repo_root)
+            snapshot = latest_snapshot(repo_root, now=moment)
         except MigrationHistoryError as exc:
             raise MigrationStatusError(str(exc)) from exc
 
@@ -344,12 +346,15 @@ def classify(
     age_minutes: float | None = None
     stale_snapshot = False
     if snapshot is not None:
-        moment = now or datetime.now(timezone.utc)
         try:
             observed_dt = parse_observed_at(snapshot.observed_at)
+            check_not_future(observed_dt, now=moment, what="the latest history snapshot")
         except MigrationHistoryError as exc:
             raise MigrationStatusError(f"the latest history snapshot is unusable: {exc}") from exc
-        age_minutes = (moment - observed_dt).total_seconds() / 60.0
+        # Never negative: anything further ahead than the clock-skew
+        # tolerance was refused just above, and an observation within it is
+        # treated as taken "now" rather than reported with a negative age.
+        age_minutes = max(0.0, (moment - observed_dt).total_seconds() / 60.0)
         stale_snapshot = age_minutes > migrations.max_observation_age_minutes
 
     return MigrationReport(
