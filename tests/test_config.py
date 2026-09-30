@@ -97,6 +97,96 @@ class ParseProjectConfigTests(unittest.TestCase):
         with self.assertRaises(ProjectConfigError):
             parse_project_config('project = "x"\n\n[stage]\nself_check = "yes"\n')
 
+    def test_unknown_top_level_table_is_ignored(self):
+        # Older-engine tolerance: today, parse_project_config only ever looks
+        # at the top-level keys it recognises (project/repo/commands/agents/
+        # sparring/stage/migrations). Any other top-level table -- including
+        # one from a future engine version this one has never heard of -- is
+        # simply never read, not rejected. This is a load-bearing property
+        # for forward compatibility across engine versions sharing one
+        # project.toml, so it is pinned here rather than left implicit.
+        config = parse_project_config(
+            'project = "x"\n\n[totally_unknown_future_table]\nfoo = 1\nbar = "baz"\n'
+        )
+        self.assertEqual(config.project, "x")
+        self.assertIsNone(config.migrations)
+
+
+class MigrationsConfigTests(unittest.TestCase):
+    VALID = (
+        'project = "x"\n\n'
+        "[migrations]\n"
+        'adapter = "supabase"\n'
+        'directory = "supabase/migrations"\n'
+        'main_ref = "origin/main"\n'
+    )
+
+    def test_absent_migrations_table_is_none_and_changes_nothing_else(self):
+        # When [migrations] is absent, behaviour must be byte-identical to a
+        # config parsed before this table existed at all.
+        config = parse_project_config(MINIMAL_TOML)
+        self.assertIsNone(config.migrations)
+        baseline = parse_project_config(MINIMAL_TOML)
+        self.assertEqual(config, baseline)
+
+    def test_minimal_migrations_table_uses_defaults(self):
+        config = parse_project_config(self.VALID)
+        self.assertIsNotNone(config.migrations)
+        m = config.migrations
+        self.assertEqual(m.adapter, "supabase")
+        self.assertEqual(m.directory, "supabase/migrations")
+        self.assertEqual(m.main_ref, "origin/main")
+        self.assertEqual(m.target, "production")
+        self.assertIsNone(m.target_ref)
+        self.assertIsNone(m.deferred_registry)
+        self.assertEqual(m.max_observation_age_minutes, 60)
+
+    def test_full_migrations_table_is_parsed(self):
+        toml = self.VALID + (
+            'target = "staging"\n'
+            'target_ref = "origin/staging"\n'
+            'deferred_registry = "supabase/deploy-exceptions.json"\n'
+            "max_observation_age_minutes = 30\n"
+        )
+        m = parse_project_config(toml).migrations
+        self.assertEqual(m.target, "staging")
+        self.assertEqual(m.target_ref, "origin/staging")
+        self.assertEqual(m.deferred_registry, "supabase/deploy-exceptions.json")
+        self.assertEqual(m.max_observation_age_minutes, 30)
+
+    def test_missing_required_field_fails(self):
+        with self.assertRaises(ProjectConfigError):
+            parse_project_config(
+                'project = "x"\n\n[migrations]\nadapter = "supabase"\ndirectory = "d"\n'
+            )
+
+    def test_unknown_adapter_fails(self):
+        with self.assertRaises(ProjectConfigError):
+            parse_project_config(
+                'project = "x"\n\n[migrations]\nadapter = "flyway"\ndirectory = "d"\nmain_ref = "origin/main"\n'
+            )
+
+    def test_probe_key_is_rejected_as_a_config_error(self):
+        # Stage A must never run a live probe. A `probe` key is rejected
+        # outright by the closed schema below, the same as any other
+        # misspelled/invented field -- it is never merely ignored, and it is
+        # certainly never executed.
+        with self.assertRaises(ProjectConfigError) as ctx:
+            parse_project_config(self.VALID + 'probe = "supabase migration list"\n')
+        self.assertIn("probe", str(ctx.exception))
+
+    def test_unknown_field_fails_closed(self):
+        with self.assertRaises(ProjectConfigError):
+            parse_project_config(self.VALID + 'unexpected = "value"\n')
+
+    def test_non_positive_max_observation_age_fails(self):
+        with self.assertRaises(ProjectConfigError):
+            parse_project_config(self.VALID + "max_observation_age_minutes = 0\n")
+
+    def test_migrations_not_a_table_fails(self):
+        with self.assertRaises(ProjectConfigError):
+            parse_project_config('project = "x"\nmigrations = "nope"\n')
+
 
 class LoadProjectConfigFilesystemTests(unittest.TestCase):
     def test_load_project_config_from_directory(self):
