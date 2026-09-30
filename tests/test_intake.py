@@ -10,6 +10,7 @@ import contextlib
 import copy
 import io
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +21,7 @@ import conftest_path  # noqa: F401
 
 from agent_sparring.cli import main
 from agent_sparring.intake import (
+    BRIEF_FORMAT_VERSION,
     INTERPRETATION_SCHEMA,
     IntakeError,
     SourcePlan,
@@ -29,6 +31,7 @@ from agent_sparring.intake import (
     parse_interpretation,
     prepare_plan,
     run_prerequisites,
+    sha256_text,
     stage_contracts,
 )
 from agent_sparring.intake_approval import load_intake_manifest
@@ -826,6 +829,81 @@ class ApproveTests(_Repo):
         self.assertIn("cannot be approved", report)
         with self.assertRaisesRegex(IntakeError, "check out 'feature/widgets' there and run prepare-plan again"):
             self.approve(result.directory)
+
+
+class BriefFormatCompatTests(_Repo):
+    """A legacy intake recorded no ``brief_format_version`` at all -- it was
+    prepared before ``render_brief`` gained the ``## Goal`` paragraph.
+    Approval re-renders each brief in whichever form its own intake
+    recorded, so a legacy intake still approves and a new one still gets
+    its Goal; a genuinely edited brief is refused either way."""
+
+    def approve(self, directory, run="app", **kwargs):
+        kwargs.setdefault("primary_repository", "app")
+        kwargs.setdefault("repo_root", self.repo)
+        kwargs.setdefault("sparring_dir", self.sparring_dir)
+        return approve_plan(directory, run_id=run, **kwargs)
+
+    def _make_legacy(self, result):
+        """Downgrade a freshly prepared intake to look like one prepared
+        before ``brief_format_version`` existed: the key is absent from
+        ``intake.json``, and every brief file has its ``## Goal`` paragraph
+        stripped -- the only difference ``render_brief(include_goal=False)``
+        makes -- with its recorded digest recomputed to match."""
+
+        record_path = result.directory / "intake.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        del record["brief_format_version"]
+        for brief_path in (result.directory / "briefs").rglob("*.md"):
+            content = brief_path.read_text(encoding="utf-8")
+            digest = sha256_text(content)
+            stage_id = next(sid for sid, d in record["briefs"].items() if d == digest)
+            legacy_content = re.sub(r"\n\n## Goal\n\n.*?\n\n(?=# )", "\n\n", content, count=1, flags=re.S)
+            self.assertNotEqual(legacy_content, content, "fixture did not contain a ## Goal paragraph to strip")
+            brief_path.write_text(legacy_content, encoding="utf-8")
+            record["briefs"][stage_id] = sha256_text(legacy_content)
+        record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+    def test_a_legacy_intake_with_no_brief_format_version_still_approves(self):
+        result = self.prepare()
+        self._make_legacy(result)
+        approval = self.approve(result.directory)
+        self.assertTrue(approval.created)
+        brief = load_intake_manifest(approval.manifest_path).stages()[0].brief
+        self.assertNotIn("## Goal", brief)
+
+    def test_a_newly_prepared_intake_includes_goal_and_approves(self):
+        result = self.prepare()
+        record = json.loads((result.directory / "intake.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["brief_format_version"], BRIEF_FORMAT_VERSION)
+        approval = self.approve(result.directory)
+        self.assertTrue(approval.created)
+        brief = load_intake_manifest(approval.manifest_path).stages()[0].brief
+        self.assertIn("## Goal", brief)
+
+    def _corrupt_one_brief_digest(self, result):
+        """Record a wrong digest for one stage's brief, simulating a brief
+        that no longer renders to what intake recorded (approval re-renders
+        from source.md/interpretation.json rather than trusting the on-disk
+        briefs/*.md files, so the tamper belongs in intake.json)."""
+
+        record_path = result.directory / "intake.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        stage_id = next(iter(record["briefs"]))
+        record["briefs"][stage_id] = "0" * 64
+        record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+    def test_a_tampered_brief_is_refused_in_either_format(self):
+        new_format = self.prepare()
+        self._corrupt_one_brief_digest(new_format)
+        with self.assertRaisesRegex(IntakeError, "no longer renders to what intake recorded"):
+            self.approve(new_format.directory)
+
+        legacy = self.prepare()
+        self._make_legacy(legacy)
+        self._corrupt_one_brief_digest(legacy)
+        with self.assertRaisesRegex(IntakeError, "no longer renders to what intake recorded"):
+            self.approve(legacy.directory)
 
 
 class CliTests(_Repo):

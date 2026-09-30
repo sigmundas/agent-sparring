@@ -154,6 +154,16 @@ from agent_sparring.stage import Stage, StageError, StageMode, StageStatus, vali
 INTAKE_VERSION = 2
 MODES: tuple[str, ...] = (MODE_FAITHFUL, MODE_REFINE)
 
+#: ``render_brief``'s output format, recorded in ``intake.json`` as
+#: ``brief_format_version`` by every intake prepared from this version on.
+#: ``2`` adds the ``## Goal`` paragraph; an intake recording no value at all
+#: was prepared before that field existed and rendered the ``1`` form (no
+#: Goal). Approval re-renders each brief in whichever form its own intake
+#: recorded, so a legacy intake's on-disk briefs -- reviewed and digested
+#: before the Goal paragraph existed -- still match and still approve; only
+#: a brief that no longer renders to what its own intake recorded is refused.
+BRIEF_FORMAT_VERSION = 2
+
 #: Name of the file that proves a ``prepare_plan`` turn finished. Written as
 #: the very last step of a successful prepare; an intake whose ``intake.json``
 #: names this key (every intake from this version on) is usable only once it
@@ -1004,6 +1014,7 @@ def render_brief(
     *,
     stage_id: str,
     position: int,
+    include_goal: bool = True,
 ) -> str:
     """The exact ``brief.md`` for one stage, assembled from source text.
 
@@ -1014,11 +1025,14 @@ def render_brief(
     plan's section headings, which are never rewritten, nest beneath them
     (a quoted level-1 document title sits beside them).
 
-    A ``## Goal`` paragraph comes first, from intake's own structured
-    understanding of the stage (its rationale, or its title when intake
-    gave no rationale) -- never invented by re-reading the quoted source
-    text. A client presenting this brief can show that paragraph verbatim
-    instead of guessing at one from the plan-context boilerplate below.
+    When ``include_goal`` (the default), a ``## Goal`` paragraph comes first,
+    from intake's own structured understanding of the stage (its rationale,
+    or its title when intake gave no rationale) -- never invented by
+    re-reading the quoted source text. A client presenting this brief can
+    show that paragraph verbatim instead of guessing at one from the
+    plan-context boilerplate below. ``include_goal=False`` reproduces the
+    ``1`` brief format (see ``BRIEF_FORMAT_VERSION``), byte for byte, so a
+    legacy intake's recorded digests still match at approval.
     """
 
     blocks = {block.id: block for block in interpretation.context}
@@ -1026,7 +1040,6 @@ def render_brief(
     attached.sort(key=lambda block: min((r.start for r in block.ranges), default=0))
 
     siblings = ", ".join(f"`{name}`" for name in stage.repositories) or "none"
-    goal_text = stage.rationale.strip() if stage.rationale and stage.rationale.strip() else stage.title.strip()
     out = [
         f"# Stage brief: {stage_id}",
         "",
@@ -1035,11 +1048,10 @@ def render_brief(
         "other stages are separate.",
         "",
         f"Primary repository: `{run.primary_repository}`. Sibling repositories: {siblings}.",
-        "",
-        "## Goal",
-        "",
-        goal_text,
     ]
+    if include_goal:
+        goal_text = stage.rationale.strip() if stage.rationale and stage.rationale.strip() else stage.title.strip()
+        out += ["", "## Goal", "", goal_text]
     if attached:
         out += ["", "# Plan context", ""]
         out.append(
@@ -1253,6 +1265,7 @@ def prepare_plan(
     record = {
         "version": INTAKE_VERSION,
         "intake_id": intake_id,
+        "brief_format_version": BRIEF_FORMAT_VERSION,
         "completion_marker": COMPLETION_MARKER_FILENAME,
         "mode": mode,
         "created_at": now().isoformat(),
@@ -1485,7 +1498,11 @@ def repository_snapshot(
 
 
 def _render_briefs(
-    source: SourcePlan, interpretation: Interpretation, run_keys: Mapping[str, str]
+    source: SourcePlan,
+    interpretation: Interpretation,
+    run_keys: Mapping[str, str],
+    *,
+    include_goal: bool = True,
 ) -> dict[tuple[str, str], tuple[str, str, str]]:
     """``{(run id, label): (stage id, relative path, content)}``."""
 
@@ -1493,7 +1510,15 @@ def _render_briefs(
     for run in interpretation.runs:
         for index, stage in enumerate(run.stages, start=1):
             stage_id = stage_id_for(run_keys[run.id], stage)
-            content = render_brief(source, interpretation, run, stage, stage_id=stage_id, position=index)
+            content = render_brief(
+                source,
+                interpretation,
+                run,
+                stage,
+                stage_id=stage_id,
+                position=index,
+                include_goal=include_goal,
+            )
             relative = f"briefs/{_slug(run.id) or 'run'}/{index:02d}-{_slug(stage.label) or 'stage'}.md"
             briefs[(run.id, stage.label)] = (stage_id, relative, content)
     return briefs
@@ -1851,6 +1876,19 @@ def approve_plan(
         )
     if record.get("version") != INTAKE_VERSION:
         raise IntakeError(f"unsupported intake record version {record.get('version')!r}")
+    # A legacy intake recorded no brief_format_version at all -- it was
+    # prepared before the ## Goal paragraph existed, so its on-disk briefs
+    # (and their recorded digests) are in the pre-Goal form. Re-render every
+    # brief in whichever form this intake actually recorded, not whatever
+    # render_brief defaults to today, or a legacy intake's briefs would never
+    # match again and could never be approved.
+    brief_format = record.get("brief_format_version")
+    if brief_format is None:
+        include_goal = False
+    elif brief_format == BRIEF_FORMAT_VERSION:
+        include_goal = True
+    else:
+        raise IntakeError(f"intake.json records an unsupported brief format {brief_format!r}; run prepare-plan again")
     marker_problem = completion_marker_problem(intake_dir, record)
     if marker_problem:
         raise IntakeError(marker_problem)
@@ -1909,7 +1947,7 @@ def approve_plan(
     ):
         raise IntakeError("intake.json does not record a run key for every run slice; run prepare-plan again")
     inspected = _recorded_repositories(record)
-    briefs = _render_briefs(source, interpretation, run_keys)
+    briefs = _render_briefs(source, interpretation, run_keys, include_goal=include_goal)
 
     # The person reviewed report.md. Approving is only meaningful if it is
     # the report this intake renders, so a stale or edited one refuses.
