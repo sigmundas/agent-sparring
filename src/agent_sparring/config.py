@@ -45,6 +45,11 @@ class ProjectConfig:
     # they can be reported as a setup problem and removed by ``fix-config``;
     # nothing resolves a provider turn from them.
     obsolete_agent_settings: tuple["ObsoleteAgentSetting", ...] = ()
+    # ``[migrations]``: read-only migration-order detection (see
+    # :mod:`agent_sparring.migration_status`). ``None`` when the project does
+    # not opt in -- every migration command then refuses with a clear
+    # "not configured" message rather than guessing a default.
+    migrations: "MigrationsConfig | None" = None
 
     def command(self, name: str) -> str | None:
         """Return a configured project command by name, if any."""
@@ -59,6 +64,30 @@ class ObsoleteAgentSetting:
     role: str
     field: str
     value: str
+
+
+@dataclass(frozen=True)
+class MigrationsConfig:
+    """``[migrations]``: where a project's schema-migration history lives, and
+    which saved snapshot/registry files describe it.
+
+    Stage A is detection only: nothing here names a command to run, and
+    ``adapter`` is deliberately a closed set of *parsers* (currently just
+    ``"supabase"``, for its ``migration list`` table format and
+    ``<14 digits>_name.sql`` naming), never a live probe. There is
+    intentionally no ``probe``/command field to invoke a CLI or a database --
+    such a key is rejected by the closed schema below like any other unknown
+    field, exactly so it cannot be added by accident later without this
+    module's own review.
+    """
+
+    adapter: str
+    directory: str
+    main_ref: str
+    target: str = "production"
+    target_ref: str | None = None
+    deferred_registry: str | None = None
+    max_observation_age_minutes: int = 60
 
 
 def _require_str(table: Mapping[str, Any], key: str, *, where: str) -> str:
@@ -89,6 +118,15 @@ def _optional_bool(table: Mapping[str, Any], key: str, *, where: str) -> bool | 
     value = table[key]
     if not isinstance(value, bool):
         raise ProjectConfigError(f"{where} field '{key}' must be a boolean if present")
+    return value
+
+
+def _optional_int(table: Mapping[str, Any], key: str, *, where: str, default: int) -> int:
+    if key not in table:
+        return default
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProjectConfigError(f"{where} field '{key}' must be an integer")
     return value
 
 
@@ -124,6 +162,70 @@ def _reject_unknown_agent_keys(table: Mapping[str, Any], *, where: str) -> None:
     raise ProjectConfigError(
         f"{where} has unknown field(s) {', '.join(repr(key) for key in unknown)}; "
         f"supported fields: {known}"
+    )
+
+
+# The complete schema of ``[migrations]``. Kept closed for the same reason as
+# ``_AGENT_ROLE_KEYS``: a misspelled or invented key (``probe``, say -- a live
+# database/CLI check has no place in Stage A) must be refused loudly rather
+# than silently ignored.
+_MIGRATIONS_KEYS: frozenset[str] = frozenset(
+    {
+        "adapter",
+        "directory",
+        "main_ref",
+        "target",
+        "target_ref",
+        "deferred_registry",
+        "max_observation_age_minutes",
+    }
+)
+
+# Parsers this engine knows how to read saved migration-history/registry
+# output for. Not a plugin point yet -- adding one means adding the parser in
+# :mod:`agent_sparring.migration_adapters` too.
+MIGRATIONS_ADAPTERS: frozenset[str] = frozenset({"supabase"})
+
+
+def _parse_migrations(table: Mapping[str, Any], *, source: str) -> MigrationsConfig | None:
+    if "migrations" not in table:
+        return None
+    raw = table["migrations"]
+    if not isinstance(raw, Mapping):
+        raise ProjectConfigError(f"{source} field 'migrations' must be a table")
+    where = f"{source} [migrations]"
+    unknown = sorted(set(raw) - _MIGRATIONS_KEYS)
+    if unknown:
+        known = ", ".join(sorted(_MIGRATIONS_KEYS))
+        raise ProjectConfigError(
+            f"{where} has unknown field(s) {', '.join(repr(key) for key in unknown)}; "
+            f"supported fields: {known}"
+        )
+
+    adapter = _require_str(raw, "adapter", where=where)
+    if adapter not in MIGRATIONS_ADAPTERS:
+        raise ProjectConfigError(
+            f"{where} field 'adapter' must be one of {sorted(MIGRATIONS_ADAPTERS)}, got {adapter!r}"
+        )
+    directory = _require_str(raw, "directory", where=where)
+    main_ref = _require_str(raw, "main_ref", where=where)
+    target = _optional_str(raw, "target", where=where) or "production"
+    target_ref = _optional_str(raw, "target_ref", where=where)
+    deferred_registry = _optional_str(raw, "deferred_registry", where=where)
+    max_age = _optional_int(raw, "max_observation_age_minutes", where=where, default=60)
+    if max_age <= 0:
+        raise ProjectConfigError(
+            f"{where} field 'max_observation_age_minutes' must be a positive integer"
+        )
+
+    return MigrationsConfig(
+        adapter=adapter,
+        directory=directory,
+        main_ref=main_ref,
+        target=target,
+        target_ref=target_ref,
+        deferred_registry=deferred_registry,
+        max_observation_age_minutes=max_age,
     )
 
 
@@ -181,6 +283,8 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
     stage_table = _optional_table(table, "stage", where=source)
     self_check = _optional_bool(stage_table, "self_check", where=f"{source} [stage]")
 
+    migrations = _parse_migrations(table, source=source)
+
     return ProjectConfig(
         project=project_name,
         repo_root=repo_root,
@@ -190,6 +294,7 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
         default_sparring_mode=default_mode,
         stage_self_check=self_check if self_check is not None else False,
         obsolete_agent_settings=obsolete,
+        migrations=migrations,
     )
 
 
