@@ -36,6 +36,7 @@ from agent_sparring.migration_status import (
     ReconciliationProposal,
     RetimestampProposal,
     classify,
+    next_timestamp_after,
     render_report,
 )
 
@@ -506,12 +507,89 @@ class MigrationStatusFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(MigrationStatusError, "deferred registry"):
             self._classify(SNAPSHOT_A, branch_ref="no-registry")
 
+    # Finding 6: proposals are valid UTC timestamps after every known version.
+    def _proposed(self, report) -> dict[str, str]:
+        return {
+            p.old_version: p.new_version for p in report.proposals if isinstance(p, RetimestampProposal)
+        }
+
+    def test_proposals_roll_over_a_day_and_month_boundary(self):
+        head = "20260930235959"
+        report = self._classify(_snapshot(APPLIED_VERSIONS + [head], head, "2026-09-30T18:50:00Z"))
+        self.assertEqual(
+            self._proposed(report),
+            {PENDING_ONE_VERSION: "20261001000000", PENDING_TWO_VERSION: "20261001000001"},
+        )
+
+    def test_proposals_roll_over_a_year_boundary(self):
+        head = "20261231235959"
+        report = self._classify(_snapshot(APPLIED_VERSIONS + [head], head, "2026-09-30T18:50:00Z"))
+        self.assertEqual(
+            self._proposed(report),
+            {PENDING_ONE_VERSION: "20270101000000", PENDING_TWO_VERSION: "20270101000001"},
+        )
+
+    def test_proposal_lands_after_every_existing_version_not_just_the_head(self):
+        # Head at a minute boundary, just before the still-deployable
+        # PENDING_TWO (20260929130000): the proposal must clear that too.
+        head = "20260929125959"
+        report = self._classify(_snapshot(APPLIED_VERSIONS + [head], head, "2026-09-30T18:50:00Z"))
+        self.assertEqual(self._status(report, PENDING_TWO_VERSION).classification, CLASS_UNAPPLIED)
+        self.assertEqual(self._proposed(report), {PENDING_ONE_VERSION: "20260929130001"})
+
+    def test_an_invalid_timestamp_head_still_gets_a_valid_proposal(self):
+        head = "20260930235960"  # not a real time, but a recorded version nonetheless
+        report = self._classify(_snapshot(APPLIED_VERSIONS + [head], head, "2026-09-30T18:50:00Z"))
+        self.assertEqual(
+            self._proposed(report),
+            {PENDING_ONE_VERSION: "20261001000000", PENDING_TWO_VERSION: "20261001000001"},
+        )
+
     def test_migration_repair_never_appears_in_rendered_report(self):
         for snapshot in (None, SNAPSHOT_A, SNAPSHOT_B):
             report = self._classify(snapshot)
             text = render_report(report)
             self.assertNotIn("migration repair", text.lower())
             self.assertNotIn("migration repair", json.dumps(report.as_dict()).lower())
+
+
+class NextTimestampTests(unittest.TestCase):
+    def test_valid_timestamps_advance_one_second_with_carries(self):
+        cases = {
+            "20260929125959": "20260929130000",
+            "20260930235959": "20261001000000",
+            "20260228235959": "20260301000000",
+            "20240228235959": "20240229000000",
+            "20261231235959": "20270101000000",
+        }
+        for floor, expected in cases.items():
+            with self.subTest(floor=floor):
+                self.assertEqual(next_timestamp_after(floor), expected)
+
+    def test_invalid_floors_give_the_smallest_valid_timestamp_after_them(self):
+        cases = {
+            "20260930235960": "20261001000000",
+            "20260930236000": "20261001000000",
+            "20260931000000": "20261001000000",
+            "20261300000000": "20270101000000",
+            "20260000000000": "20260101000000",
+            "20260100000000": "20260101000000",
+        }
+        for floor, expected in cases.items():
+            with self.subTest(floor=floor):
+                self.assertEqual(next_timestamp_after(floor), expected)
+
+    def test_other_width_floors_are_compared_as_strings(self):
+        # A 14-digit result must sort after the floor as a string, the order
+        # the Supabase CLI uses.
+        for floor in ("1", "3", "202609301234", "202609302359599", "9"):
+            with self.subTest(floor=floor):
+                result = next_timestamp_after(floor)
+                self.assertEqual(len(result), 14)
+                self.assertGreater(result, floor)
+                datetime.strptime(result, "%Y%m%d%H%M%S")
+        self.assertEqual(next_timestamp_after("1"), "10000101000000")
+        self.assertEqual(next_timestamp_after("202609302359599"), "20261001000000")
 
 
 if __name__ == "__main__":

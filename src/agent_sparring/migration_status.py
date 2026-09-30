@@ -31,10 +31,11 @@ anticipate one.
 
 from __future__ import annotations
 
+import calendar
 import posixpath
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Union
 
@@ -389,6 +390,80 @@ def _load_registry(repo_root: Path, migrations: MigrationsConfig, ref: str) -> D
         raise MigrationStatusError(f"could not read deferred registry: {exc}") from exc
 
 
+_TIMESTAMP_WIDTH = 14
+
+
+def _format_timestamp(moment: datetime) -> str:
+    return (
+        f"{moment.year:04d}{moment.month:02d}{moment.day:02d}"
+        f"{moment.hour:02d}{moment.minute:02d}{moment.second:02d}"
+    )
+
+
+def _smallest_valid_timestamp_at_or_after(digits: str) -> str | None:
+    """The smallest valid ``YYYYMMDDHHMMSS`` UTC timestamp that is ``>=``
+    the 14-digit string ``digits`` (equal only when ``digits`` is itself
+    valid), or ``None`` if none exists before year 10000."""
+
+    year, month, day = int(digits[0:4]), int(digits[4:6]), int(digits[6:8])
+    hour, minute, second = int(digits[8:10]), int(digits[10:12]), int(digits[12:14])
+    try:
+        return _format_timestamp(datetime(year, month, day, hour, minute, second))
+    except ValueError:
+        pass
+    # The leftmost out-of-range field decides: roll it forward to its next
+    # valid value and reset every field to its right to the minimum.
+    try:
+        if year == 0:
+            moment = datetime(1, 1, 1)
+        elif month == 0:
+            moment = datetime(year, 1, 1)
+        elif month > 12:
+            moment = datetime(year + 1, 1, 1)
+        elif day == 0:
+            moment = datetime(year, month, 1)
+        elif day > calendar.monthrange(year, month)[1]:
+            moment = datetime(year + month // 12, month % 12 + 1, 1)
+        elif hour > 23:
+            moment = datetime(year, month, day) + timedelta(days=1)
+        elif minute > 59:
+            moment = datetime(year, month, day, hour) + timedelta(hours=1)
+        else:  # second > 59
+            moment = datetime(year, month, day, hour, minute) + timedelta(minutes=1)
+    except (ValueError, OverflowError):
+        return None
+    return _format_timestamp(moment)
+
+
+def next_timestamp_after(floor: str) -> str | None:
+    """The smallest valid 14-digit UTC timestamp version (``YYYYMMDDHHMMSS``)
+    that sorts strictly after ``floor`` as a string -- the order the
+    Supabase CLI compares versions in -- or ``None`` if there is none.
+
+    ``floor`` is normally a 14-digit timestamp (the result is then one
+    second later, with carries), but any digit string is handled: a shorter
+    one is compared as its zero-padded prefix, a longer one by its first 14
+    digits, and an out-of-range one (``...235960``) gives the first real
+    timestamp after it.
+    """
+
+    if len(floor) < _TIMESTAMP_WIDTH:
+        # floor is a proper prefix of its zero-padding, so anything >= the
+        # padding is already strictly after floor.
+        return _smallest_valid_timestamp_at_or_after(floor.ljust(_TIMESTAMP_WIDTH, "0"))
+    prefix = floor[:_TIMESTAMP_WIDTH]
+    candidate = _smallest_valid_timestamp_at_or_after(prefix)
+    if candidate is None:
+        return None
+    if candidate == prefix:  # prefix is a valid timestamp; strictly after it
+        try:
+            moment = datetime.strptime(prefix, "%Y%m%d%H%M%S") + timedelta(seconds=1)
+        except (ValueError, OverflowError):
+            return None
+        candidate = _format_timestamp(moment) if moment.year < 10000 else None
+    return candidate
+
+
 def classify(
     repo_root: Path,
     migrations: MigrationsConfig,
@@ -481,18 +556,29 @@ def classify(
 
     proposals: list[Proposal] = []
     if remote_head is not None and stale_versions:
-        next_value = int(adapter.order_key(remote_head)) + 1
+        # Strictly after the head *and* every other version anyone knows
+        # about (local, main, applied, deferred), so a proposal can never
+        # collide with or sort before an existing migration; consecutive
+        # proposals keep the stale versions' relative order.
+        # (Only digit-string versions can be compared with a timestamp; a
+        # hand-edited snapshot could carry anything else.)
+        floor = max(
+            (v for v in used_versions | {remote_head} if v.isascii() and v.isdigit()),
+            key=adapter.order_key,
+            default="0",
+        )
         for old_version in stale_versions:  # already ascending (sorted above)
-            while str(next_value) in used_versions:
-                next_value += 1
-            new_version = str(next_value)
-            used_versions.add(new_version)
+            new_version = next_timestamp_after(floor)
+            if new_version is None:
+                raise MigrationStatusError(
+                    f"no valid timestamp version sorts after {floor}; cannot propose a retimestamp"
+                )
+            floor = new_version
             old_path = branch_versions.get(old_version) or main_versions.get(old_version)
             references = _references(repo_root, branch_ref, old_version, old_path)
             proposals.append(
                 RetimestampProposal(old_version=old_version, new_version=new_version, references=references)
             )
-            next_value += 1
 
     for version in remote_only_versions:
         proposals.append(
@@ -620,5 +706,6 @@ __all__ = [
     "RetimestampProposal",
     "VersionStatus",
     "classify",
+    "next_timestamp_after",
     "render_report",
 ]
