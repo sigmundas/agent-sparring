@@ -10,6 +10,7 @@ reference it links into.
 | [Run a whole plan](plans.md) | `run-plan` / `resume-plan`, the Markdown stage convention, manifests, pausing, human checks, pushing |
 | [Plan intake](intake.md) *(experimental)* | `prepare-plan` / `approve-plan`: turning a human plan into approved run slices |
 | [Human gates](gates.md) | how `NEEDS_YOU` asks for a check and how an answer is matched to it |
+| [Migration-order detection](migrations.md) *(Stage A, read-only)* | `[migrations]`, recorded history snapshots, the deferred registry, `check-migrations` |
 | [Reference](reference.md) | cross-repository candidates, review-only stages, who owns which artifact |
 | [Design](design.md) | principles, architecture and build history |
 
