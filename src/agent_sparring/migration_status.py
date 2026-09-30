@@ -699,6 +699,7 @@ __all__ = [
     "PROBLEM_UNRECOGNISED_FILE",
     "PROPOSAL_RECONCILIATION",
     "PROPOSAL_RETIMESTAMP",
+    "REPORT_VERSION",
     "FileProblem",
     "MigrationReport",
     "MigrationStatusError",

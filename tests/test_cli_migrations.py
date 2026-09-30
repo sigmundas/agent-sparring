@@ -1,16 +1,17 @@
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import conftest_path  # noqa: F401
 
 from agent_sparring.cli import CHECK_MIGRATIONS_EXIT_FINDINGS, main
 from agent_sparring.migration_history import now_observed_at
-from agent_sparring.setup_check import setup_problems
 
 VALID_LISTING = (
     "        Local          | Remote         | Time (UTC)\n"
@@ -47,50 +48,146 @@ def _init_repo(repo: Path) -> None:
     _run_git(repo, "config", "user.name", "Test")
 
 
-class CheckMigrationsWithoutTableTests(unittest.TestCase):
-    """Required regression: a repo without [migrations] is unaffected."""
+# What show-config and check-config print for NO_MIGRATIONS_TOML, captured by
+# running the engine at 2e33833 -- the commit before [migrations] existed --
+# on this same fixture (paths replaced by <REPO>/<XDG>). A project without
+# [migrations] must see exactly this. If an unrelated change to these
+# commands alters it, re-capture it from that change's parent, not from a
+# checkout that has migration code.
+NO_MIGRATIONS_TOML = (
+    'project = "fictitious-widgets"\n\n'
+    "[commands]\n"
+    'test = "pytest -q"\n\n'
+    "[agents.stage]\n"
+    'provider = "claude-cli"\n'
+)
+BASELINE_SHOW_CONFIG_TEXT = (
+    "project.toml: <REPO>/.sparring/project.toml\n"
+    "stage agent: claude-cli (project) | model: provider default | effort: provider default\n"
+    "sparring agent: codex-cli (engine-default) | model: provider default | effort: provider default\n"
+)
+BASELINE_SHOW_CONFIG_JSON_KEYS = [
+    "config_path",
+    "config_exists",
+    "project",
+    "error",
+    "user_config_path",
+    "user_config_exists",
+    "stage",
+    "sparring",
+    "setup_problems",
+]
+BASELINE_SETUP_PROBLEMS = [
+    ("not-ignored", "stage artifacts", ".sparring/stages/"),
+    ("not-ignored", "plan-run state", ".sparring/plans/"),
+    ("not-ignored", "plan intake", ".sparring/intake/"),
+]
+BASELINE_CHECK_CONFIG_EXIT = 1
+BASELINE_CHECK_CONFIG_STDOUT = (
+    "project: fictitious-widgets\n"
+    "repo_root: .\n"
+    "commands: {'test': 'pytest -q'}\n"
+    "stage_agent_provider: claude-cli\n"
+    "sparring_agent_provider: None\n"
+    "default_sparring_mode: None\n"
+    "PROJECT.md present: False\n"
+    "user preferences: <XDG>/agent-sparring/config.toml\n"
+    "stage agent: claude-cli (project) | model: provider default | effort: provider default\n"
+    "sparring agent: codex-cli (engine-default) | model: provider default | effort: provider default\n"
+    "stage artifacts git-ignored: NO\n"
+    "plan-run state git-ignored: NO\n"
+    "plan intake git-ignored: NO\n"
+)
+
+
+class NoMigrationsTableTests(unittest.TestCase):
+    """A project without [migrations] behaves exactly as before the feature:
+    no history directory, no new output, and the migration commands say
+    plainly that the feature is not configured (exit 1, as documented)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.repo = Path(self._tmp.name) / "repo"
+        root = Path(self._tmp.name).resolve()
+        self.repo = root / "repo"
+        self.xdg = root / "xdg"
         _init_repo(self.repo)
         _write(self.repo, "f.txt", "hi\n")
-        _run_git(self.repo, "add", "f.txt")
+        _write(self.repo, ".sparring/project.toml", NO_MIGRATIONS_TOML)
+        _run_git(self.repo, "add", "-A")
         _run_git(self.repo, "commit", "-q", "-m", "base")
         self.sparring_dir = self.repo / ".sparring"
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SPARRING_")}
+        env["XDG_CONFIG_HOME"] = str(self.xdg)
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def test_check_migrations_refuses_clearly_without_migrations_table(self):
-        exit_code = main(["--sparring-dir", str(self.sparring_dir), "check-migrations", "--json"])
-        self.assertEqual(exit_code, 1)
-        # Nothing is written anywhere -- no history dir, no .sparring dir.
+    def _run(self, *argv: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--sparring-dir", str(self.sparring_dir), *argv])
+        placeholders = lambda text: text.replace(str(self.repo), "<REPO>").replace(str(self.xdg), "<XDG>")
+        return code, placeholders(out.getvalue()), placeholders(err.getvalue())
+
+    def _assert_no_migration_state(self):
         self.assertFalse((self.repo / ".git" / "agent-sparring").exists())
-        self.assertFalse(self.sparring_dir.exists())
+        self.assertEqual(sorted(p.name for p in self.sparring_dir.iterdir()), ["project.toml"])
 
-    def test_record_migration_history_refuses_clearly_without_migrations_table(self):
-        listing_path = Path(self._tmp.name) / "listing.txt"
-        listing_path.write_text(VALID_LISTING, encoding="utf-8")
-        exit_code = main(
-            [
-                "--sparring-dir",
-                str(self.sparring_dir),
-                "record-migration-history",
-                "--file",
-                str(listing_path),
-            ]
+    def test_check_migrations_says_not_configured_with_exit_1(self):
+        code, out, _ = self._run("check-migrations", "--json")
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertEqual(payload["version"], 1)
+        self.assertIs(payload["configured"], False)
+        self.assertIn("not configured", payload["error"])
+        self._assert_no_migration_state()
+
+        code, out, err = self._run("check-migrations")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("not configured", err)
+        self._assert_no_migration_state()
+
+    def test_check_migrations_without_any_project_toml_says_not_configured(self):
+        (self.sparring_dir / "project.toml").unlink()
+        code, out, _ = self._run("check-migrations", "--json")
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertIs(payload["configured"], False)
+        self.assertIn("not configured", payload["error"])
+        self.assertFalse((self.repo / ".git" / "agent-sparring").exists())
+
+    def test_record_migration_history_says_not_configured_and_writes_nothing(self):
+        listing = Path(self._tmp.name) / "listing.txt"
+        listing.write_text(VALID_LISTING, encoding="utf-8")
+        code, _, err = self._run("record-migration-history", "--file", str(listing))
+        self.assertEqual(code, 1)
+        self.assertIn("not configured", err)
+        self._assert_no_migration_state()
+
+    def test_show_config_text_is_unchanged(self):
+        self.assertEqual(self._run("show-config"), (0, BASELINE_SHOW_CONFIG_TEXT, ""))
+        self._assert_no_migration_state()
+
+    def test_show_config_json_and_setup_problems_are_unchanged(self):
+        code, out, err = self._run("show-config", "--json")
+        self.assertEqual((code, err), (0, ""))
+        payload = json.loads(out)
+        self.assertEqual(list(payload), BASELINE_SHOW_CONFIG_JSON_KEYS)
+        self.assertEqual(
+            [(p["kind"], p["what"], p["ignore_line"]) for p in payload["setup_problems"]],
+            BASELINE_SETUP_PROBLEMS,
         )
-        self.assertEqual(exit_code, 1)
-        self.assertFalse((self.repo / ".git" / "agent-sparring").exists())
+        self.assertNotIn("migration", out.lower())
+        self._assert_no_migration_state()
 
-    def test_show_config_and_setup_problems_unaffected_by_absent_migrations_table(self):
-        # No project.toml at all: show-config's setup-problem reporting must
-        # behave exactly as it did before this feature existed -- whatever
-        # pre-existing workflow-state problems it reports (unrelated to
-        # migrations), it must report none that mention migrations at all.
-        exit_code = main(["--sparring-dir", str(self.sparring_dir), "show-config", "--json"])
-        self.assertEqual(exit_code, 0)
-        problems = setup_problems(self.repo, self.sparring_dir)
-        self.assertFalse(any("migration" in p.as_dict()["what"].lower() for p in problems))
+    def test_check_config_output_is_unchanged(self):
+        code, out, err = self._run("check-config")
+        self.assertEqual(code, BASELINE_CHECK_CONFIG_EXIT)
+        self.assertEqual(out, BASELINE_CHECK_CONFIG_STDOUT)
+        self.assertNotIn("migration", err.lower())
+        self._assert_no_migration_state()
 
 
 class RecordAndCheckMigrationsEndToEndTests(unittest.TestCase):

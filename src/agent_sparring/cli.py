@@ -63,6 +63,7 @@ from agent_sparring.intake import (
 )
 from agent_sparring.manifest import ManifestError
 from agent_sparring.migration_history import MigrationHistoryError, record_history_snapshot
+from agent_sparring.migration_status import REPORT_VERSION as MIGRATION_REPORT_VERSION
 from agent_sparring.migration_status import MigrationStatusError, classify
 from agent_sparring.migration_status import render_report as render_migration_report
 from agent_sparring.plan import (
@@ -389,22 +390,34 @@ def _cmd_fix_config(args: argparse.Namespace) -> int:
 CHECK_MIGRATIONS_EXIT_FINDINGS = 2
 
 
+class MigrationsNotConfiguredError(ProjectConfigError):
+    """The project has not opted into migration-order detection: there is no
+    ``project.toml``, or it has no ``[migrations]`` table."""
+
+
 def _load_migrations_config(sparring_dir: Path) -> ProjectConfig:
     """Load ``project.toml`` and require it to carry a ``[migrations]``
     table.
 
-    Raised as :class:`ProjectConfigError`, the same type every other
-    configuration problem in this file raises, so callers that already
-    catch it (every command below) need no new exception type: a project
-    that has not opted into migration-order detection is reported exactly
-    like any other misconfiguration, not a crash.
+    Raised as :class:`ProjectConfigError` (the "not configured" case as its
+    :class:`MigrationsNotConfiguredError` subclass), the same type every
+    other configuration problem in this file raises, so callers that
+    already catch it need no new handler: a project that has not opted into
+    migration-order detection is reported plainly, exit 1, never a crash --
+    and nothing is written for it.
     """
 
+    config_path = sparring_dir / CONFIG_FILENAME
+    if not config_path.is_file():
+        raise MigrationsNotConfiguredError(
+            f"migration-order detection is not configured: {config_path} does not exist "
+            "(see docs/migrations.md)"
+        )
     config = load_project_config(sparring_dir)
     if config.migrations is None:
-        raise ProjectConfigError(
-            f"{sparring_dir / CONFIG_FILENAME} has no [migrations] table; add one "
-            "(see docs/migrations.md) to use migration commands"
+        raise MigrationsNotConfiguredError(
+            f"migration-order detection is not configured: {config_path} has no "
+            "[migrations] table; add one (see docs/migrations.md) to use migration commands"
         )
     return config
 
@@ -463,7 +476,9 @@ def _cmd_check_migrations(args: argparse.Namespace) -> int:
     Exit codes: ``0`` clean, :data:`CHECK_MIGRATIONS_EXIT_FINDINGS` when the
     report has anything to say (stale/tampered/remote-only/modified/unknown/
     stale snapshot), ``1`` when the answer could not be determined at all
-    (bad configuration, an unreadable ``main_ref``, ...).
+    (not configured, bad configuration, an unreadable ``main_ref``, ...).
+    With ``--json`` an error is ``{"version", "configured", "error"}``, where
+    ``configured`` is false only when there is no ``[migrations]`` table.
     """
 
     sparring_dir = Path(args.sparring_dir)
@@ -473,7 +488,15 @@ def _cmd_check_migrations(args: argparse.Namespace) -> int:
         report = classify(repo_root, migrations, branch_ref=args.branch_ref)
     except (ProjectConfigError, GitContextError, MigrationStatusError) as exc:
         if args.json:
-            json.dump({"error": str(exc)}, sys.stdout, indent=2)
+            json.dump(
+                {
+                    "version": MIGRATION_REPORT_VERSION,
+                    "configured": not isinstance(exc, MigrationsNotConfiguredError),
+                    "error": str(exc),
+                },
+                sys.stdout,
+                indent=2,
+            )
             print()
         else:
             print(f"could not check migrations: {exc}", file=sys.stderr)

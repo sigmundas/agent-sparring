@@ -121,13 +121,10 @@ class MigrationsConfigTests(unittest.TestCase):
         'main_ref = "origin/main"\n'
     )
 
-    def test_absent_migrations_table_is_none_and_changes_nothing_else(self):
-        # When [migrations] is absent, behaviour must be byte-identical to a
-        # config parsed before this table existed at all.
-        config = parse_project_config(MINIMAL_TOML)
-        self.assertIsNone(config.migrations)
-        baseline = parse_project_config(MINIMAL_TOML)
-        self.assertEqual(config, baseline)
+    def test_absent_migrations_table_is_none(self):
+        # The command-level proof that an absent table changes no behaviour
+        # lives in tests/test_cli_migrations.py (NoMigrationsTableTests).
+        self.assertIsNone(parse_project_config(MINIMAL_TOML).migrations)
 
     def test_minimal_migrations_table_uses_defaults(self):
         config = parse_project_config(self.VALID)
