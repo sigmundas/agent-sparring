@@ -62,6 +62,9 @@ from agent_sparring.intake import (
     prepare_plan,
 )
 from agent_sparring.manifest import ManifestError
+from agent_sparring.migration_history import MigrationHistoryError, record_history_snapshot
+from agent_sparring.migration_status import MigrationStatusError, classify
+from agent_sparring.migration_status import render_report as render_migration_report
 from agent_sparring.plan import (
     PLANS_DIRNAME,
     PlanError,
@@ -376,6 +379,112 @@ def _cmd_fix_config(args: argparse.Namespace) -> int:
     if not fix.removed and not fix.added:
         print("nothing to fix: no obsolete settings, and every workflow-state directory is already ignored by git")
     return 0
+
+
+# check-migrations' distinct non-zero exit for "the report has findings",
+# separate from the ordinary error exit code (1) every other command in this
+# file uses for a misconfiguration -- a caller (a CI step, say) can then tell
+# "this ran fine but something needs attention" apart from "this could not
+# even determine the answer".
+CHECK_MIGRATIONS_EXIT_FINDINGS = 2
+
+
+def _load_migrations_config(sparring_dir: Path) -> ProjectConfig:
+    """Load ``project.toml`` and require it to carry a ``[migrations]``
+    table.
+
+    Raised as :class:`ProjectConfigError`, the same type every other
+    configuration problem in this file raises, so callers that already
+    catch it (every command below) need no new exception type: a project
+    that has not opted into migration-order detection is reported exactly
+    like any other misconfiguration, not a crash.
+    """
+
+    config = load_project_config(sparring_dir)
+    if config.migrations is None:
+        raise ProjectConfigError(
+            f"{sparring_dir / CONFIG_FILENAME} has no [migrations] table; add one "
+            "(see docs/migrations.md) to use migration commands"
+        )
+    return config
+
+
+def _cmd_record_migration_history(args: argparse.Namespace) -> int:
+    """Parse a captured migration-history listing and record it as a new,
+    versioned snapshot (see :mod:`agent_sparring.migration_history`).
+
+    Record, don't interpret: this never compares the result against anything
+    else and never fails because of what the history says, only because it
+    could not be read at all.
+    """
+
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        migrations = _load_migrations_config(sparring_dir).migrations
+        try:
+            raw_text = Path(args.file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise MigrationHistoryError(f"could not read --file {args.file}: {exc}") from exc
+        snapshot, path = record_history_snapshot(
+            repo_root,
+            adapter_id=migrations.adapter,
+            raw_text=raw_text,
+            target_ref=migrations.target_ref,
+            observed_at=args.observed_at,
+        )
+    except (ProjectConfigError, GitContextError, MigrationHistoryError) as exc:
+        if args.json:
+            json.dump({"recorded": False, "path": None, "error": str(exc)}, sys.stdout, indent=2)
+            print()
+        else:
+            print(f"could not record migration history: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        json.dump(
+            {"recorded": True, "path": str(path), "error": None, "snapshot": snapshot.as_dict()},
+            sys.stdout,
+            indent=2,
+        )
+        print()
+        return 0
+    print(f"recorded {len(snapshot.applied)} applied version(s) observed at {snapshot.observed_at}")
+    print(f"head: {snapshot.head or '(none)'}")
+    print(f"written to {path}")
+    return 0
+
+
+def _cmd_check_migrations(args: argparse.Namespace) -> int:
+    """Report migration-order drift for the configured target: a read-only
+    classification against the last recorded snapshot, never a live probe
+    (see :mod:`agent_sparring.migration_status`).
+
+    Exit codes: ``0`` clean, :data:`CHECK_MIGRATIONS_EXIT_FINDINGS` when the
+    report has anything to say (stale/tampered/remote-only/modified/unknown/
+    stale snapshot), ``1`` when the answer could not be determined at all
+    (bad configuration, an unreadable ``main_ref``, ...).
+    """
+
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        migrations = _load_migrations_config(sparring_dir).migrations
+        report = classify(repo_root, migrations, branch_ref=args.branch_ref)
+    except (ProjectConfigError, GitContextError, MigrationStatusError) as exc:
+        if args.json:
+            json.dump({"error": str(exc)}, sys.stdout, indent=2)
+            print()
+        else:
+            print(f"could not check migrations: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        json.dump(report.as_dict(), sys.stdout, indent=2)
+        print()
+    else:
+        print(render_migration_report(report))
+    return CHECK_MIGRATIONS_EXIT_FINDINGS if report.has_findings() else 0
 
 
 def _cmd_init_config(args: argparse.Namespace) -> int:
@@ -2107,6 +2216,58 @@ def build_parser() -> argparse.ArgumentParser:
     fix_config.add_argument("--repo-root", default=None, help="repository root (default: [repo].root, else the parent of --sparring-dir)")
     fix_config.add_argument("--json", action="store_true", help="report what was added as JSON")
     fix_config.set_defaults(func=_cmd_fix_config)
+
+    record_migration_history = subparsers.add_parser(
+        "record-migration-history",
+        help=(
+            "parse a captured 'supabase migration list' (or other configured adapter) "
+            "output and record it as a new, versioned migration-history snapshot -- "
+            "never runs anything against a database or CLI itself"
+        ),
+        description=(
+            "Record, don't interpret: parses --file with the project's configured "
+            "[migrations].adapter and writes what it found (applied versions, observed "
+            "time, a hash of the raw input) as a new snapshot under this repository's "
+            "git common directory. Refuses clearly on unparseable input or when there "
+            "is no [migrations] table or no usable git common directory."
+        ),
+    )
+    record_migration_history.add_argument(
+        "--file", required=True, help="path to the captured migration-listing output"
+    )
+    record_migration_history.add_argument(
+        "--observed-at",
+        default=None,
+        help="ISO-8601 timestamp for when --file was captured (default: now, UTC)",
+    )
+    record_migration_history.add_argument("--repo-root", default=None, help="repository root (default: [repo].root, else the parent of --sparring-dir)")
+    record_migration_history.add_argument("--json", action="store_true", help="report what was recorded as JSON")
+    record_migration_history.set_defaults(func=_cmd_record_migration_history)
+
+    check_migrations = subparsers.add_parser(
+        "check-migrations",
+        help=(
+            "read-only migration-order report against the last recorded snapshot: "
+            "stale/tampered/remote-only migrations and remediation proposals as data"
+        ),
+        description=(
+            "Classifies every migration version this branch and [migrations].main_ref "
+            "know about, against the most recently recorded history snapshot and the "
+            "deferred-migration registry (if configured). Never runs anything against "
+            "a database or migration CLI, and never proposes running one -- proposals "
+            "are plain data for a person to act on. Exit codes: 0 clean, "
+            f"{CHECK_MIGRATIONS_EXIT_FINDINGS} when the report has findings, 1 when "
+            "the answer could not be determined (misconfiguration, a bad main_ref, ...)."
+        ),
+    )
+    check_migrations.add_argument("--repo-root", default=None, help="repository root (default: [repo].root, else the parent of --sparring-dir)")
+    check_migrations.add_argument(
+        "--branch-ref",
+        default="HEAD",
+        help="the branch/commit to read local migration files from (default: HEAD)",
+    )
+    check_migrations.add_argument("--json", action="store_true", help="emit the report as JSON")
+    check_migrations.set_defaults(func=_cmd_check_migrations)
 
     usage_parser = subparsers.add_parser(
         "usage",
