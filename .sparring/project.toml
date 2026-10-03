@@ -1,0 +1,23 @@
+# Agent Sparring project configuration.
+#
+# This file is yours. Managed runs read it and never write it; agents taking
+# part in a run are instructed not to edit it.
+
+project = "agent-sparring"
+
+[repo]
+# Repository root, relative to this file's project (the parent of .sparring).
+root = "."
+
+[commands]
+test = ".venv/bin/python -m pytest -q"
+
+# Which provider runs each role is a project decision. Model and effort are
+# your own preferences, shared by every project: set them with
+#   sparring set-config stage --model <exact model id> --effort <level>
+# (or from the VS Code cockpit), never here.
+[agents.stage]
+provider = "claude-cli"
+
+[agents.sparring]
+provider = "codex-cli"
