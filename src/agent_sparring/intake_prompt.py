@@ -20,6 +20,7 @@ from typing import Mapping, Sequence
 
 MODE_FAITHFUL = "faithful"
 MODE_REFINE = "refine"
+MODE_COMPILE = "compile"
 
 
 def number_lines(text: str) -> str:
@@ -209,6 +210,55 @@ stands (the manifest executes the source text as you sliced it, never the
 amendment), so do not rely on amended text in any stage. Once the person
 adopts the amendment, running intake again interprets the amended plan.
 Use null only when no change to the plan's text is needed.""",
+    MODE_COMPILE: """\
+## Mode: compile
+
+You are compiling the plan into an execution topology. You may normalize how
+the plan is executed -- node labels, attached context, a review barrier
+split into its own node, an order its dependencies require -- but never what
+it asks for. `amended_plan` must be null; compile mode never proposes an
+amendment. The execution model above still holds in full.
+
+Each finding carries a `disposition` INSTEAD of a severity (the engine
+derives the severity from it):
+
+- `auto_resolved`: you normalized something the plan leaves implicit, using
+  exactly one `transform` below. Only these transforms exist, and the engine
+  verifies each one deterministically; an auto-resolution it cannot verify is
+  downgraded to `needs_decision`, so cite precisely:
+  - `relabel_stage`: a stage keeps a label the plan uses (`3A`, `3B`) as a
+    node. `stages`: those labels. Each stage's `source_ranges` must be its
+    whole heading section, unchanged.
+  - `attach_context`: plan-wide text attached to stages. `stages`: the
+    stages; `ranges`: the cited text, inside context blocks every one of
+    those stages attaches.
+  - `split_review_barrier`: an independent review the plan states inside a
+    stage becomes its own `independent_review` node. `stages`: the
+    implementation node then the review node, both inside the same source
+    stage section; `ranges`: the source text stating the review.
+  - `gate_at_boundary`: a gate the plan states mid-way moves to a node
+    boundary. `stages`: the stages the gate follows or blocks; `ranges`:
+    the gate's source text, which must stay a declared gate of the same
+    kind.
+  - `reorder_within_candidate`: nodes of one run slice run in an order other
+    than document order. `stages`: those nodes, each its whole heading
+    section; `ranges`: the source text stating the dependency.
+  - `conditional_sibling`: a sibling repository the plan changes only
+    conditionally is declared on the node anyway (it is pinned even if
+    unchanged). `stages`: those nodes, each declaring the sibling; `ranges`:
+    the condition's source text, carried by those nodes' briefs. The sibling
+    must be named by the plan or PROJECT.md and listed under Repositories.
+- `plan_note`: worth the reviewer's attention; execution is unaffected.
+  `transform` must be null.
+- `needs_decision`: a person must choose before this can run. `transform`
+  must be null and `decision` must be set: an `id`, the `question`, `why` it
+  matters, and at least two `options`, each with an `id`, a `label` and its
+  `consequence`. A repository the plan and PROJECT.md never name is always a
+  decision, never an auto-resolution.
+- `refuse`: the plan cannot be compiled faithfully as written; say why.
+  `transform` must be null.
+
+`decision` is null for every disposition except `needs_decision`.""",
 }
 
 
@@ -258,4 +308,4 @@ def assemble_intake_prompt(
     return "\n\n".join(sections) + "\n"
 
 
-__all__ = ["MODE_FAITHFUL", "MODE_REFINE", "assemble_intake_prompt", "number_lines"]
+__all__ = ["MODE_COMPILE", "MODE_FAITHFUL", "MODE_REFINE", "assemble_intake_prompt", "number_lines"]

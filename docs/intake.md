@@ -19,7 +19,7 @@ step that does, with a person approving the result:
 
 ```sh
 # check out the branch the slice runs on first
-sparring prepare-plan docs/plans/active/foo.md [--mode faithful|refine] \
+sparring prepare-plan docs/plans/active/foo.md [--mode faithful|refine|compile] \
     [--context-repository web=../web]
 # review .sparring/intake/<id>/report.md, briefs/, amendment.diff
 sparring approve-plan .sparring/intake/<id> --run <slice> \
@@ -118,6 +118,29 @@ is run again.
   inside an intake envelope — and then creates `approval.json` exactly
   once. Repeating an identical approval returns it; a conflicting one
   refuses; neither rewrites it.
+
+**Compile mode** (`--mode compile`, Stage 1 of the
+[run-plan compiler plan](plans/run-plan-compiler.md)). The agent may
+normalize the execution topology, never what the plan asks for, and never
+proposes an amendment. Each agent finding carries a `disposition` instead of
+a severity — `auto_resolved` (info), `plan_note` (recommendation),
+`needs_decision` or `refuse` (both blocking) — and a `needs_decision` one a
+`decision` (id, question, why, at least two options). `auto_resolved` is
+kept only with a `transform` from a closed set (`relabel_stage`,
+`attach_context`, `split_review_barrier`, `gate_at_boundary`,
+`reorder_within_candidate`, `conditional_sibling`) whose deterministic guard
+holds; otherwise the engine downgrades it to `needs_decision` and says why
+in `report.md`. Every check above still applies, plus: a source line
+stating an independent review must reach a node; a paragraph that states a
+gate (a stage reference with an approval word such as "go-ahead", or with
+a gate-like event and a prerequisite word such as "before" or "requires") must be carried by a declared gate, not by a brief or an
+exclusion; a moved gate's text must evidence its kind and no other; a repository neither the plan nor `PROJECT.md` names is
+`needs_decision`; a named one that was not inspected refuses with the
+`--context-repository` to add. `intake.json` records the repository names
+these were checked against, so approval recomputes the same findings.
+`gate_at_boundary` is validated but not yet rendered: a gate inside a slice
+is still the blocking `gate_inside_run`. Answering decisions is not
+implemented yet; approval goes through the same `approve-plan` path.
 
 **What `run-plan --manifest` verifies.** An intake envelope runs only with
 the `approval.json` beside it, and before anything is recorded or any

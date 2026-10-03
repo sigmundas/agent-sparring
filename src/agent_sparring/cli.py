@@ -54,6 +54,7 @@ from agent_sparring.handoff import generate_handoff
 from agent_sparring.loop import DEFAULT_MAX_SEND_BACK_CYCLES, LoopError, run_unattended_loop
 from agent_sparring.human_gate import HumanGate, HumanGateError
 from agent_sparring.intake import (
+    DISPOSITIONS as INTAKE_DISPOSITIONS,
     INTAKE_DIRNAME,
     MODES as INTAKE_MODES,
     IntakeError,
@@ -1968,6 +1969,10 @@ def _cmd_prepare_plan(args: argparse.Namespace) -> int:
         print(f"run slice {run.id} ({run.primary_repository}): {labels}")
     blocking = result.blocking
     print(f"findings: {len(result.findings)} ({len(blocking)} blocking)")
+    dispositions = [f.disposition for f in result.findings if f.disposition]
+    if dispositions:
+        counts = ", ".join(f"{d}={dispositions.count(d)}" for d in INTAKE_DISPOSITIONS if d in dispositions)
+        print(f"dispositions: {counts}")
     print(f"review: {result.directory / 'report.md'}")
     # Nothing is executable yet either way; a blocking finding only means
     # approval will refuse, so this is reported as its own exit status.
@@ -2721,7 +2726,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=INTAKE_MODES[0],
         help=(
             "faithful: interpret the staging as written; refine: the agent may propose "
-            "different stage boundaries and a plan amendment for review (default: faithful)"
+            "different stage boundaries and a plan amendment for review; compile: the agent "
+            "may normalize the execution topology through engine-checked transforms, and "
+            "findings carry a disposition (auto_resolved, plan_note, needs_decision, refuse); "
+            "never an amendment (default: faithful)"
         ),
     )
     prepare.add_argument(
