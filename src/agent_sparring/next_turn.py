@@ -356,8 +356,10 @@ def resolve_resume_turn(
     (even the one chosen) is refused and nothing is recorded; a choice never
     overrides or re-pins the engine's record.
 
-    Returns ``None`` when there is no marker and none can be derived without
-    overriding gate state.
+    Returns :data:`NO_TURN_OWED` when there is no marker and the recorded
+    gate (READY, NEEDS_YOU, ESCALATE) decides instead; callers must route
+    that through gate handling (see :func:`resolve_legacy_ready`), never to
+    an implementation turn.
     """
 
     if choice is not None:
@@ -376,12 +378,49 @@ def resolve_resume_turn(
         return NEXT_TURN_STAGE
     derived = derive_next_turn(repo_root, stage, state)
     if derived == NO_TURN_OWED:
-        return None
+        # Gate state decides; never mapped to an implementation turn.
+        return NO_TURN_OWED
     candidate = (
         capture_candidate(repo_root, stage, state) if derived == NEXT_TURN_SPARRING else None
     )
     record_next_turn(stage, derived, candidate=candidate, source="derived")
     return derived
+
+
+def resolve_legacy_ready(repo_root: Path, stage: Stage) -> str:
+    """Where a resume enters a READY recorded before the next_turn marker
+    existed, with nothing after it: never an implementation turn.
+
+    - reviewed content still uncommitted -> ``finalization`` (the bounded
+      commit turn, held to the uncommitted content);
+    - a clean committed candidate -> ``sparring``, recorded as a derived
+      marker over the current commit: which commit READY was given over is
+      not recorded, so the reviewer rules on this one before acceptance.
+
+    Anything that is not a recorded READY is refused.
+    """
+
+    outcome = read_recorded_outcome(stage)
+    if outcome is None or outcome.action is not RoutingAction.READY:
+        raise NextTurnError(
+            f"stage {stage.stage_id!r} records "
+            f"{outcome.action.value if outcome else 'no verdict'} with no implementation turn "
+            "after it; no agent turn is owed until that gate is answered (--evidence)."
+        )
+    try:
+        uncommitted = _uncommitted_content_paths(repo_root, stage)
+    except FinalizationError as exc:
+        raise NextTurnError(f"could not read the candidate content: {exc}") from exc
+    if uncommitted:
+        return NEXT_TURN_FINALIZATION
+    state = stage.read_state()
+    record_next_turn(
+        stage,
+        NEXT_TURN_SPARRING,
+        candidate=capture_candidate(repo_root, stage, state),
+        source="derived",
+    )
+    return NEXT_TURN_SPARRING
 
 
 def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> str:
@@ -473,6 +512,8 @@ def standalone_start_with(
             "Human evidence' in notes.md) and run the reviewer (run-sparring)."
         )
     marker = resolve_resume_turn(repo_root, stage, choice=choice)
+    if marker == NO_TURN_OWED:
+        return resolve_legacy_ready(repo_root, stage)
     if marker == NEXT_TURN_FINALIZATION:
         resolved = resolve_finalization(repo_root, stage, stage.read_state())
         if resolved == RESUME_ACCEPT:
@@ -497,6 +538,7 @@ __all__ = [
     "derive_next_turn",
     "record_next_turn",
     "resolve_finalization",
+    "resolve_legacy_ready",
     "resolve_resume_turn",
     "standalone_start_with",
     "verify_candidate",

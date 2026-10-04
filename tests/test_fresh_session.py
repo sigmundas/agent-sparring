@@ -36,6 +36,7 @@ from agent_sparring.stage import CandidateRepository, PinnedAgent, Stage, StageS
 from agent_sparring.usage import collect_stage_usage, render_stage_usage
 
 from test_plan import (
+    ESCALATE,
     NEEDS_YOU,
     READY,
     S1,
@@ -1007,7 +1008,18 @@ class NoTurnOwedTests(_PlanRepoTestCase):
                 self.assert_refused(stage, contains="READY with no implementation turn")
                 self.assert_refused(stage, contains="READY with no implementation turn",
                                     fresh_roles=("stage",), fresh_reason="x")
-                if not committed:
+                if committed:
+                    # Without the flag: the reviewer rules on the commit
+                    # before acceptance; no implementation turn.
+                    stage_adapter, sparring = (
+                        _StageAdapter(self.repo, commit=True), _SparringAdapter([READY])
+                    )
+                    result = self._resume(stage_adapter, sparring, stop_after_stage=S1)
+                    self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
+                    self.assertEqual(len(sparring.start_calls + sparring.resume_calls), 1)
+                    self.assertEqual(dict(result.accepted)[S1], _head(self.repo))
+                    self.assertIs(stage.read_state().status, StageStatus.ACCEPTED)
+                else:
                     # Without the flag the existing finalization path runs:
                     # a commit turn, never an unrestricted implementation turn.
                     stage_adapter = _StageAdapter(self.repo, fail_at=1)
@@ -1016,6 +1028,35 @@ class NoTurnOwedTests(_PlanRepoTestCase):
                     prompts = stage_adapter.start_calls + [p for _, p in stage_adapter.resume_calls]
                     self.assertEqual(len(prompts), 1)
                     self.assertIn("## Finalize this candidate", prompts[0])
+
+    def test_standalone_legacy_ready_never_starts_an_implementation_turn(self):
+        from agent_sparring.next_turn import standalone_start_with
+
+        for committed, entry in ((False, "finalization"), (True, "sparring")):
+            with self.subTest(committed=committed):
+                self.setUp()
+                stage = self.leave_legacy_ready(committed=committed)
+                self.assertEqual(standalone_start_with(self.repo, stage), entry)
+                state = stage.read_state()
+                if committed:
+                    self.assertEqual((state.next_turn, state.next_turn_source),
+                                     ("sparring", "derived"))
+                    self.assertEqual(state.next_turn_candidate.head_sha, _head(self.repo))
+                else:
+                    self.assertIsNone(state.next_turn)
+
+    def test_escalate_refuses_choices_and_keeps_the_pause(self):
+        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([ESCALATE]),
+                    stop_after_stage=S1)
+        stage = self._stage(S1)
+        self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
+        for strip in (False, True):
+            if strip:
+                _strip_marker(stage)
+            for fresh in ((), ("stage",), ("sparring",)):
+                self.assert_refused(stage, contains="waiting for a person",
+                                    fresh_roles=fresh, fresh_reason="x")
+        self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
 
     def test_an_untouched_stage_refuses_both_choices(self):
         self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]),

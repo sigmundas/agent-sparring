@@ -199,10 +199,12 @@ from agent_sparring.loop import (
     run_unattended_loop,
 )
 from agent_sparring.next_turn import (
+    NO_TURN_OWED,
     RESUME_ACCEPT,
     NextTurnError,
     check_next_turn_choice,
     resolve_finalization,
+    resolve_legacy_ready,
     resolve_resume_turn,
     verify_candidate,
 )
@@ -3720,7 +3722,12 @@ def _drive(
                         choice, next_turn_choice = next_turn_choice, None
                         try:
                             marker = resolve_resume_turn(repo_root, stage, choice=choice)
-                            if marker == NEXT_TURN_FINALIZATION:
+                            if marker == NO_TURN_OWED:
+                                # Legacy READY with nothing after it (an
+                                # uncommitted one was routed to finalization
+                                # above): review the commit, never implement.
+                                marker = resolve_legacy_ready(repo_root, stage)
+                            elif marker == NEXT_TURN_FINALIZATION:
                                 # Matched against the candidate READY was given
                                 # over: commit it, review its commit, or refuse --
                                 # never an implementation turn.
