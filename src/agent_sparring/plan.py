@@ -568,6 +568,10 @@ class PlanRunState:
     #: Replaced by any other pause or failure, cleared when the run next
     #: starts running. Omitted while ``None``.
     provider_pause: dict[str, Any] | None = None
+    #: In memory only: the :attr:`provider_pause` this process cleared on
+    #: leaving the pause, restored if the resume is then refused before any
+    #: provider turn -- a refused resume leaves the recorded reason as it was.
+    left_provider_pause: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -593,6 +597,7 @@ class PlanRunState:
             payload.pop("evidence_pending", None)
         if self.provider_pause is None:
             payload.pop("provider_pause", None)
+        payload.pop("left_provider_pause", None)
         return payload
 
     # -- the obligation ledger -------------------------------------------
@@ -2602,6 +2607,12 @@ def _recorded_pause(stage: Stage) -> RecordedOutcome | None:
     return outcome if outcome is not None and outcome.awaits_a_human else None
 
 
+def _leave_provider_pause(state: PlanRunState) -> None:
+    if state.provider_pause is not None:
+        state.left_provider_pause = state.provider_pause
+    state.provider_pause = None
+
+
 def _pause(
     state: PlanRunState, state_path: Path, *, provider_pause: dict[str, Any] | None = None
 ) -> None:
@@ -3253,6 +3264,7 @@ def _apply_fresh_sessions(
             state_path,
             activity,
             why="fresh session refused",
+            refusal=True,
             message=(
                 f"plan {state.plan} stopped at stage {stage.stage_id!r} before any provider "
                 f"turn: {exc}"
@@ -3289,6 +3301,7 @@ def _refuse_unapplied(
         state_path,
         activity,
         why="resume request not applicable",
+        refusal=True,
         message=(
             f"plan {state.plan} stopped at stage {stage.stage_id!r} before any provider turn: "
             f"{' and '.join(asked)} was asked for, but {why}. Nothing was changed"
@@ -3303,13 +3316,20 @@ def _fail(
     *,
     why: str,
     message: str,
+    refusal: bool = False,
 ) -> PlanRunError:
     """Pause the run, mirror ``plan.failed`` with a fixed phrase (``why`` is
     orchestration-authored; the exception text, which can carry provider
     output or paths, is never copied into telemetry), and build the
-    :class:`PlanRunError` for the caller to raise."""
+    :class:`PlanRunError` for the caller to raise. A ``refusal`` -- a resume
+    request refused before any provider turn -- keeps the recorded
+    ``provider_pause`` it found, even one already cleared on entry."""
 
-    _pause(state, state_path)
+    _pause(
+        state,
+        state_path,
+        provider_pause=(state.provider_pause or state.left_provider_pause) if refusal else None,
+    )
     activity.emit("plan.failed", summary=why)
     return PlanRunError(message)
 
@@ -3470,6 +3490,9 @@ def _drive(
             report(f"stage {position} {stage.stage_id}: already ACCEPTED at "
                    f"{stage_state.candidate_sha}; advancing")
             accepted.append((stage.stage_id, str(stage_state.candidate_sha)))
+            # Leaving the pause without a turn still leaves it: the reason
+            # must not survive into the advance or completion saves.
+            _leave_provider_pause(state)
             # Nothing ran here, and something may still be owed: a stage
             # accepted by hand, or by a run killed between the acceptance
             # gate and the ledger write, carries its reviewer's deferral in
@@ -3527,7 +3550,7 @@ def _drive(
             state.awaiting = None
             # Likewise the provider failure that paused it: descriptive of
             # the pause being left, never read to choose what runs now.
-            state.provider_pause = None
+            _leave_provider_pause(state)
             state.save(state_path)
             # The declared cross-repository candidate set belongs to the
             # stage, so the acceptance gate finds it wherever it is invoked

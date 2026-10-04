@@ -48,7 +48,7 @@ from agent_sparring.sessions import generations, start_fresh_session
 from agent_sparring.stage import Stage, StageStatus
 
 from test_fresh_session import _head, _LoopRepo, _Stuck
-from test_plan import NEEDS_YOU, READY, S1, _PlanRepoTestCase, _SparringAdapter, _StageAdapter, _run_git
+from test_plan import NEEDS_YOU, READY, S1, S2, _PlanRepoTestCase, _SparringAdapter, _StageAdapter, _run_git
 from test_stage_agent_pin import PROVIDERS_ONLY
 
 
@@ -315,6 +315,43 @@ class ProviderPauseRecordTests(_Stuck):
 
         self._resume(stage_adapter, _SparringAdapter([NEEDS_YOU]))
         self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
+        self.assertNotIn("provider_pause", json.loads(self.state_path.read_text()))
+
+    def test_a_refused_fresh_session_keeps_it(self):
+        with self.assertRaises(ProviderPause):
+            self._start(_UnavailableBeforeSession(self.repo, commit=True), _SparringAdapter([READY]))
+        before = self._plan_state().provider_pause
+        retry = _StageAdapter(self.repo, commit=True)
+        with self.assertRaises(PlanRunError) as ctx:
+            self._resume(
+                retry, _SparringAdapter([READY]), fresh_roles=("stage",), fresh_reason="x",
+            )
+        self.assertNotIsInstance(ctx.exception, ProviderPause)
+        self.assertEqual(retry.start_calls + retry.resume_calls, [])
+        state = self._plan_state()
+        self.assertIs(state.status, PlanRunStatus.PAUSED)
+        self.assertEqual(state.provider_pause, before)
+
+    def test_manual_acceptance_then_completion_clears_it(self):
+        class _SecondDown(_StageAdapter):
+            def start(self, prompt):
+                if self.start_calls:
+                    self.start_calls.append(prompt)
+                    raise ProviderUnavailable("usage limit reached")
+                return super().start(prompt)
+
+        stage_adapter = _SecondDown(self.repo)
+        with self.assertRaises(ProviderPause):
+            self._start(stage_adapter, _SparringAdapter([READY]))
+        self.assertEqual(self._plan_state().provider_pause["stage_id"], S2)
+        from agent_sparring.acceptance import accept_candidate, freeze_candidate
+
+        stage2 = self._stage(S2)
+        freeze_candidate(stage2, self.sparring_dir, self.repo, expected_branch="feature/x")
+        accept_candidate(stage2, self.repo, expected_branch="feature/x")
+
+        result = self._resume(_StageAdapter(self.repo), _SparringAdapter([]))
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
         self.assertNotIn("provider_pause", json.loads(self.state_path.read_text()))
 
     def test_absent_field_round_trips_byte_identically(self):
