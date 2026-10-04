@@ -195,6 +195,7 @@ from agent_sparring.gate_answers import (
 from agent_sparring.git_context import GitContextError, is_ignored, resolve_commit
 from agent_sparring.loop import (
     DEFAULT_MAX_SEND_BACK_CYCLES,
+    CandidateRefused,
     LoopError,
     LoopResult,
     run_unattended_loop,
@@ -2434,6 +2435,7 @@ def _awaiting_finalization(
             state_path,
             activity,
             why="candidate content unreadable",
+            refusal=True,
             message=(
                 f"plan {state.plan} stopped at stage {stage.stage_id!r}: its recorded "
                 f"verdict is READY, but its candidate content could not be read to tell "
@@ -2468,6 +2470,7 @@ def _declare_mode(
             state_path,
             activity,
             why="stage mode mismatch",
+            refusal=True,
             message=f"plan {state.plan} stopped at stage {stage.stage_id!r}: {exc}",
         ) from exc
 
@@ -2522,6 +2525,7 @@ def _run_review(
             state_path,
             activity,
             why="review subject unusable",
+            refusal=True,
             message=(
                 f"plan {state.plan} stopped at stage {stage.stage_id!r} before any "
                 f"provider turn: {exc}"
@@ -2554,6 +2558,7 @@ def _run_review(
             state_path,
             activity,
             why="adapter construction failed",
+            refusal=True,
             message=(
                 f"plan {state.plan} stopped at stage {stage.stage_id!r} before any "
                 f"provider turn: could not build the provider adapters: {exc}"
@@ -2561,7 +2566,7 @@ def _run_review(
         ) from exc
 
     try:
-        return run_independent_review(
+        result = run_independent_review(
             stage,
             sparring_dir,
             repo_root,
@@ -2584,6 +2589,9 @@ def _run_review(
                 f"not advanced): {exc}"
             ),
         ) from exc
+    # A provider turn ran: no later stop can be a refusal of this resume.
+    state.left_provider_pause = None
+    return result
 
 
 def _recorded_pause(stage: Stage) -> RecordedOutcome | None:
@@ -2611,6 +2619,19 @@ def _leave_provider_pause(state: PlanRunState) -> None:
     if state.provider_pause is not None:
         state.left_provider_pause = state.provider_pause
     state.provider_pause = None
+
+
+def _kept_provider_pause(state: PlanRunState) -> dict[str, Any] | None:
+    """The record a refused resume leaves in place: the one still recorded,
+    or the one this resume cleared on entry while it is still about the
+    stage being entered and no provider turn has run since."""
+
+    if state.provider_pause is not None:
+        return state.provider_pause
+    left = state.left_provider_pause
+    if left is not None and left.get("stage_id") == state.current_stage:
+        return left
+    return None
 
 
 def _pause(
@@ -3197,7 +3218,12 @@ def _fail_or_pause_for_provider(
 
     failure = recoverable_provider_failure(exc)
     if failure is None:
-        return _fail(state, state_path, activity, why=why, message=message)
+        # A candidate refusal before any turn is a refused resume, which
+        # leaves the recorded provider pause as it was.
+        return _fail(
+            state, state_path, activity, why=why, message=message,
+            refusal=isinstance(exc, CandidateRefused),
+        )
     role = _failed_role(exc)
     try:
         has_session = current_session_id(stage.read_state(), role) is not None
@@ -3328,7 +3354,7 @@ def _fail(
     _pause(
         state,
         state_path,
-        provider_pause=(state.provider_pause or state.left_provider_pause) if refusal else None,
+        provider_pause=_kept_provider_pause(state) if refusal else None,
     )
     activity.emit("plan.failed", summary=why)
     return PlanRunError(message)
@@ -3465,6 +3491,7 @@ def _drive(
                 state_path,
                 activity,
                 why="stage state unreadable",
+                refusal=True,
                 message=f"plan {state.plan} stopped at {stage.stage_id!r}: {exc}",
             ) from exc
 
@@ -3709,6 +3736,7 @@ def _drive(
                             state_path,
                             activity,
                             why="next turn undetermined",
+                            refusal=True,
                             message=(
                                 f"plan {state.plan} stopped at stage {stage.stage_id!r} "
                                 f"before any provider turn: {exc}"
@@ -3808,6 +3836,7 @@ def _drive(
                                 state_path,
                                 activity,
                                 why="next turn undetermined",
+                                refusal=True,
                                 message=(
                                     f"plan {state.plan} stopped at stage {stage.stage_id!r} "
                                     f"before any provider turn: {exc}"
@@ -3871,6 +3900,7 @@ def _drive(
                             state_path,
                             activity,
                             why="adapter construction failed",
+                            refusal=True,
                             message=(
                                 f"plan {state.plan} stopped at stage {stage.stage_id!r} before "
                                 f"any provider turn: could not build the provider adapters: "
@@ -3907,6 +3937,9 @@ def _drive(
                             ),
                         ) from exc
 
+                    # A provider turn ran: no later stop can be a refusal
+                    # of this resume.
+                    state.left_provider_pause = None
                     _retire_pending_evidence(state, state_path)
                     if loop_result.outcome is not RoutingAction.READY:
                         _pause(state, state_path)

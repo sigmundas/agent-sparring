@@ -332,6 +332,45 @@ class ProviderPauseRecordTests(_Stuck):
         self.assertIs(state.status, PlanRunStatus.PAUSED)
         self.assertEqual(state.provider_pause, before)
 
+    def test_a_resume_refused_for_a_changed_candidate_keeps_it(self):
+        _, stage_adapter = self.pause_reviewer()
+        before = self._plan_state().provider_pause
+        (self.repo / "drift.txt").write_text("not reviewed\n")
+        _run_git(self.repo, "add", "drift.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "drift")
+        turns = len(stage_adapter.start_calls) + len(stage_adapter.resume_calls)
+        sparring = _SparringAdapter([READY])
+
+        with self.assertRaises(PlanRunError):
+            self._resume(stage_adapter, sparring, stop_after_stage=S1)
+
+        self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), turns)
+        state = self._plan_state()
+        self.assertIs(state.status, PlanRunStatus.PAUSED)
+        self.assertEqual(state.provider_pause, before)
+
+    def test_a_resume_refused_over_a_moved_finalization_candidate_keeps_it(self):
+        from agent_sparring.next_turn import capture_candidate, record_next_turn
+
+        stage, stage_adapter = self.pause_reviewer()
+        record_next_turn(stage, "finalization",
+                         candidate=capture_candidate(self.repo, stage, stage.read_state()))
+        before = self._plan_state().provider_pause
+        (self.repo / "drift.txt").write_text("not reviewed\n")
+        _run_git(self.repo, "add", "drift.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "drift")
+        turns = len(stage_adapter.start_calls) + len(stage_adapter.resume_calls)
+        sparring = _SparringAdapter([READY])
+
+        with self.assertRaises(PlanRunError) as ctx:
+            self._resume(stage_adapter, sparring, stop_after_stage=S1)
+
+        self.assertIn("before any provider turn", str(ctx.exception))
+        self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), turns)
+        self.assertEqual(self._plan_state().provider_pause, before)
+
     def test_manual_acceptance_then_completion_clears_it(self):
         class _SecondDown(_StageAdapter):
             def start(self, prompt):
@@ -892,6 +931,36 @@ class EvidenceRetryTests(_PlanRepoTestCase):
 
 
 from test_independent_review import REVIEW_STAGE, _ReviewRepoTestCase  # noqa: E402
+
+
+class ReviewOnlyProviderPauseRecordTests(_ReviewRepoTestCase):
+    def test_a_review_refused_over_a_moved_candidate_keeps_it(self):
+        class _ReadyThenDown(_SparringAdapter):
+            def start(self, prompt):
+                if self.start_calls:
+                    self.start_calls.append(prompt)
+                    raise ProviderUnavailable("usage limit reached")
+                return super().start(prompt)
+
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        with self.assertRaises(ProviderPause) as ctx:
+            self.start(stage_adapter, _ReadyThenDown([READY]))
+        self.assertEqual(ctx.exception.stage_id, REVIEW_STAGE)
+        before = self.plan_state().provider_pause
+        self.assertEqual(before["stage_id"], REVIEW_STAGE)
+
+        (self.repo / "later.txt").write_text("after the review began\n", encoding="utf-8")
+        _run_git(self.repo, "add", "later.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "moved on")
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        reviewer = _SparringAdapter([READY])
+
+        with self.assertRaises(PlanRunError) as ctx:
+            self.resume(stage_adapter, reviewer)
+
+        self.assertIn("not at the accepted candidate", str(ctx.exception))
+        self.assertEqual(reviewer.start_calls + reviewer.resume_calls, [])
+        self.assertEqual(self.plan_state().provider_pause, before)
 
 
 class ReviewOnlyEvidenceRetryTests(_ReviewRepoTestCase):

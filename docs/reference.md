@@ -307,7 +307,11 @@ role's current conversation never started; `recorded_at` is UTC ISO 8601.
 Only the engine writes it, in the same save that pauses the run. It is
 replaced by any other pause or failure (removed when that is not a provider
 pause), removed when the run next starts running (plain resume or
-`--fresh-*`), and left untouched by a refused resume. The field is absent
+`--fresh-*`), and left untouched by a refused resume -- one that stops
+before any provider turn at the stage it describes (an inapplicable or
+refused fresh session or next-turn choice, a moved or unreadable candidate,
+a mode mismatch, an unusable review subject, unbuildable adapters). The
+field is absent
 otherwise. It is descriptive only: resume never reads it, and `next_turn`,
 gates and candidate checks remain the only authority over what runs next.
 Standalone `run-loop` has no plan-run state and records nothing; its printed

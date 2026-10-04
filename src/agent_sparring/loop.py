@@ -175,6 +175,12 @@ class LoopRunawayError(LoopError):
     without the sparring agent reaching READY, NEEDS_YOU, or ESCALATE."""
 
 
+class CandidateRefused(LoopError):
+    """Raised when the recorded candidate no longer matches before the first
+    review of this invocation, with no agent turn run yet: the resume was
+    refused, nothing was executed."""
+
+
 class FinalizationRefused(LoopError):
     """Raised when the bounded commit/push turn did not produce the exact
     candidate that was reviewed -- work left uncommitted, or committed
@@ -512,6 +518,8 @@ def run_unattended_loop(
                 verify_candidate(repo_root, stage, current)
             except NextTurnError as exc:
                 activity.emit("loop.stopped", cycle=cycle, summary="candidate drifted before review")
+                if cycle == 1 and stage_run is None:
+                    raise CandidateRefused(str(exc)) from exc
                 raise LoopError(str(exc)) from exc
 
         try:
