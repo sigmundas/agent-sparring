@@ -198,7 +198,7 @@ from agent_sparring.loop import (
     LoopResult,
     run_unattended_loop,
 )
-from agent_sparring.next_turn import NextTurnError, resolve_resume_turn
+from agent_sparring.next_turn import NextTurnError, resolve_finalization, resolve_resume_turn
 from agent_sparring.manifest import ManifestError, ManifestPlanSource, load_manifest_source
 from agent_sparring.intake_approval import (
     SOURCE_KIND as INTAKE_SOURCE_KIND,
@@ -228,6 +228,7 @@ from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import RecordedOutcome, read_recorded_outcome
 from agent_sparring.stage import (
     HUMAN_EVIDENCE_HEADING,
+    NEXT_TURN_FINALIZATION,
     NEXT_TURN_SPARRING,
     Stage,
     StageError,
@@ -3208,13 +3209,15 @@ def _drive(
                     if sparrer_first:
                         start_with = "sparring"
                         sparrer_first = False  # only the stage this resume entered
-                    elif next_turn_choice is None and _awaiting_finalization(
-                        state, state_path, activity, repo_root, stage
+                    elif (
+                        next_turn_choice is None
+                        and stage_state.next_turn is None
+                        and _awaiting_finalization(state, state_path, activity, repo_root, stage)
                     ):
                         # Stopped between the reviewer's READY and the commit that
-                        # acceptance can freeze -- where a run that predates the
-                        # finalization cycle was left, and where any process killed
-                        # between those two points stops.
+                        # acceptance can freeze, in state written before the
+                        # next_turn marker existed. With a marker, the marker's
+                        # own reviewed candidate decides instead (below).
                         start_with = "finalization"
                     else:
                         # The engine's own record of whose turn it is (see
@@ -3223,6 +3226,13 @@ def _drive(
                         choice, next_turn_choice = next_turn_choice, None
                         try:
                             marker = resolve_resume_turn(repo_root, stage, choice=choice)
+                            if marker == NEXT_TURN_FINALIZATION:
+                                # Matched against the candidate READY was given
+                                # over: commit it, review its commit, or refuse --
+                                # never an implementation turn.
+                                marker = resolve_finalization(
+                                    repo_root, stage, stage.read_state()
+                                )
                         except NextTurnError as exc:
                             raise _fail(
                                 state,
@@ -3234,7 +3244,10 @@ def _drive(
                                     f"before any provider turn: {exc}"
                                 ),
                             ) from exc
-                        start_with = "next_turn" if marker == NEXT_TURN_SPARRING else "stage"
+                        start_with = {
+                            NEXT_TURN_SPARRING: "next_turn",
+                            NEXT_TURN_FINALIZATION: "finalization",
+                        }.get(marker, "stage")
                     entering = {
                         "next_turn": "; reviewing the recorded candidate",
                         "sparring": "; sparring first",

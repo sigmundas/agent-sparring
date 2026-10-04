@@ -635,8 +635,11 @@ class StuckRunRecoveryTests(_RepoCase):
         self.assertEqual(_run_git(self.repo, "rev-parse", "HEAD"), _head(self.repo))
 
     def test_a_recorded_ready_over_a_committed_candidate_resumes_normally(self):
-        # Nothing to finalize: the ordinary implementation <-> sparring loop
-        # takes it, exactly as before.
+        # Nothing to finalize: the reviewed content was committed by hand,
+        # exactly as reviewed. The next_turn marker recorded what READY was
+        # given over, so the reviewer rules on that commit -- no
+        # implementation turn on human-verified work -- and acceptance
+        # follows. The only implementation turn is stage 2's own.
         stage = self._leave_stuck()
         _run_git(self.repo, "add", "-A")
         _run_git(self.repo, "commit", "-q", "-m", "committed by hand meanwhile")
@@ -645,6 +648,8 @@ class StuckRunRecoveryTests(_RepoCase):
         stage_adapter = _StageAdapter(self.repo, ["noop", "noop"])
         result = self._resume(stage_adapter, _SparringAdapter([READY, NEEDS_YOU]))
 
+        self.assertEqual(len(stage_adapter.prompts), 1)
+        self.assertIn(S2, stage_adapter.prompts[0])
         self.assertNotIn("## Finalize this candidate", stage_adapter.prompts[0])
         self.assertIn("## Scope reminder", stage_adapter.prompts[0])
         self.assertEqual(dict(result.accepted)[S1], _head(self.repo))

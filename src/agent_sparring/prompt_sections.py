@@ -140,10 +140,13 @@ def stage_turn_kind(*, resume: bool, finalize_only: bool, fresh: bool = False) -
     not a different name for the turn.
     """
 
-    if finalize_only:
-        return TURN_FINALIZATION
+    # A fresh session's first turn is labelled as such whatever else it is:
+    # that it started a new conversation is the fact a reader of the
+    # capture cannot recover any other way.
     if fresh:
         return TURN_FRESH
+    if finalize_only:
+        return TURN_FINALIZATION
     return TURN_RESUME if resume else TURN_ORIGINAL
 
 
@@ -163,12 +166,12 @@ def sparring_turn_kind(
     which is why neither is guessed here.
     """
 
+    if fresh:
+        return TURN_FRESH
     if finalization:
         return TURN_FINALIZED_REVIEW
     if evidence_first:
         return TURN_EVIDENCE_REVIEW
-    if fresh:
-        return TURN_FRESH
     return TURN_RESUME if resume else TURN_ORIGINAL
 
 
@@ -184,7 +187,7 @@ def review_turn_kind(*, resume: bool, evidence_first: bool = False, fresh: bool 
     which by definition has no gate to have answered.
     """
 
-    if fresh and not evidence_first:
+    if fresh:
         return TURN_FRESH
     if not resume:
         return TURN_ORIGINAL

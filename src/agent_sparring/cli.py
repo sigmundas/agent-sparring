@@ -95,7 +95,7 @@ from agent_sparring.providers.codex_cli import PROVIDER_ID as CODEX_PROVIDER_ID,
 from agent_sparring.recovery import RecoveryError, reopen_for_failed_check, reset_stage
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
 from agent_sparring.next_turn import NextTurnError, standalone_start_with
-from agent_sparring.sessions import record_pin
+from agent_sparring.sessions import is_fresh, record_pin
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.sparring_prompt import build_sparring_prompt
@@ -1312,10 +1312,21 @@ def _build_loop_adapters(
     """
 
     effective = _resolve_agents(args, sparring_dir)
+    deferred: tuple[str, ...] = ()
     if stage is not None:
-        # One configuration for the whole stage: pinned before its first
-        # turn, reused by every later turn and every later process.
-        effective = _stage_agents(stage, effective)
+        # One configuration per provider session: pinned before its first
+        # turn, reused by every later turn and every later process. A
+        # pending fresh generation is the exception: it may not run in this
+        # loop at all (an implementation turn may be owed first and fail),
+        # so its pin is written at its own first turn (see
+        # agent_sparring.sessions.pin_pending_generation), never here.
+        state = stage.read_state()
+        deferred = tuple(role for role in (ROLE_STAGE, ROLE_SPARRING) if is_fresh(state, role))
+        effective = _stage_agents(
+            stage,
+            effective,
+            record=tuple(role for role in (ROLE_STAGE, ROLE_SPARRING) if role not in deferred),
+        )
     _emit_resolved(activity_log, effective.stage)
     _emit_resolved(activity_log, effective.sparring)
     stage_adapter = ClaudeCliAdapter(
@@ -1344,6 +1355,12 @@ def _build_loop_adapters(
             else None
         ),
     )
+    for role, adapter, resolved in (
+        (ROLE_STAGE, stage_adapter, effective.stage),
+        (ROLE_SPARRING, sparring_adapter, effective.sparring),
+    ):
+        if role in deferred:
+            adapter.pending_pin = _pin_of(resolved)  # type: ignore[attr-defined]
     return stage_adapter, sparring_adapter
 
 

@@ -138,20 +138,27 @@ engine and only after the preceding operation fully succeeded:
 
 | `next_turn` | Written when | Ordinary resume does |
 | --- | --- | --- |
-| `stage` | a full cycle begins; a SEND_BACK or READY verdict is recorded | an implementation turn |
+| `stage` | a full cycle begins; a SEND_BACK verdict is recorded | an implementation turn |
 | `sparring` | an implementation turn, its handoff and its session are all recorded | a review of exactly `next_turn_candidate`, no implementation turn |
-| `finalization` | READY is recorded over a candidate that is still uncommitted | the bounded commit/push turn |
+| `finalization` | a READY verdict is recorded, with the candidate it was given over | see below |
 
 `next_turn_candidate` pins what a `sparring` marker refers to: HEAD, whether
 the candidate is a `commit` or still partly in the `worktree`, a digest of
 the candidate content (stage artifacts excluded), and every declared sibling
-repository's HEAD. Before such a review starts the engine re-reads all of
+repository's HEAD; a declared sibling that cannot be read refuses the
+capture instead of being pinned as unknown. Before such a review starts the engine re-reads all of
 them, and any difference is refused with both identities named; it never
 falls back to running the other agent. A failed provider turn never advances
 the marker, and NEEDS_YOU / ESCALATE leave it where it is -- the recorded
-gate decides what happens next. A standalone `run-loop` follows the same marker:
-`finalization` enters the bounded commit cycle while the reviewed candidate is
-still uncommitted, and a recorded NEEDS_YOU / ESCALATE is refused (running an
+gate decides what happens next. A `finalization` marker is matched against the candidate READY was given
+over, by both `resume-plan` and `run-loop`: the same uncommitted candidate
+gets the bounded commit/push turn; that exact content already committed (by
+an interrupted commit turn, or by hand) and nothing uncommitted is re-marked
+`sparring` and reviewed at that commit before acceptance; anything else is
+refused. It never leads to an implementation turn. (READY over a candidate
+that was already a commit needed no finalization; there the acceptance and
+push gates decide, and a later loop entry is an ordinary `stage` turn.)
+A standalone `run-loop` also refuses a recorded NEEDS_YOU / ESCALATE (running an
 agent would not answer it) unless an implementation turn is already owed.
 `resume-plan --evidence` keeps its existing
 meaning (the reviewer judges the answer against the candidate as it stands)
@@ -203,7 +210,12 @@ and Codex both report it early), so a fresh conversation that fails before
 its turn finishes is resumed next time, not replaced. A fresh independent
 reviewer gets the same notice and history as a fresh sparrer. A role whose
 configuration is pinned but which has never started a conversation has
-nothing to replace, and a fresh session for it is refused.
+nothing to replace, and a fresh session for it is refused. A pending fresh
+generation is pinned at its own first provider turn, not when a loop builds
+its adapters: if an owed implementation turn fails first, the fresh
+reviewer stays unpinned and a later preference still applies to it. A fresh
+session's first turn is captured as `fresh` even when it is also an
+evidence, finalization or finalized-commit review.
 
 Generations are recorded as `sessions: {role: [...]}` in `state.json`, each
 with its `generation`, `session_id` (null until the provider reports one),

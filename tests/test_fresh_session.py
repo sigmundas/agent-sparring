@@ -483,6 +483,14 @@ class ConfigurationPerSessionTests(unittest.TestCase):
         start_fresh_session(self.stage, "stage", "switch model", repo_root=self.repo)
         fresh, _ = self.build()
         self.assertEqual(fresh.model, "claude-sonnet-5-5")
+        # Building the adapters pins nothing for the pending generation...
+        self.assertNotIn("stage", self.stage.read_state().agents)
+        # ...its first turn does (what run_stage_agent does before starting).
+        from agent_sparring.sessions import pin_pending_generation
+
+        state = self.stage.read_state()
+        self.assertTrue(pin_pending_generation(state, "stage", fresh))
+        self.stage.write_state(state)
         self._record_session("stage", "impl-2")
         # Later turns of the fresh session keep its own pin.
         _set("stage", "--model", "claude-haiku-4-5-20251001")
@@ -555,6 +563,8 @@ class _DirtyStageAdapter(_StageAdapter):
 
     def _turn(self, session_id):
         self._calls += 1
+        if self.fail_at == self._calls:
+            raise ProviderError("stage provider boom")
         (self.repo / "work.txt").write_text(f"turn {self._calls}\n")
         from agent_sparring.providers import StageAgentResult
 
@@ -640,10 +650,21 @@ class SendBackFindingTests(_LoopRepo):
 
         (self.repo / "work.txt").write_text("reviewed, uncommitted\n")
         record_sparring(self.stage, RoutingResult(action=RoutingAction.READY, summary="ok"))
-        record_next_turn(self.stage, "finalization")
+        record_next_turn(self.stage, "finalization",
+                         candidate=capture_candidate(self.repo, self.stage, self.stage.read_state()))
         self.assertEqual(standalone_start_with(self.repo, self.stage), "finalization")
-        (self.repo / "work.txt").unlink()
-        self.assertEqual(standalone_start_with(self.repo, self.stage), "stage")
+        # The reviewed content changed before its commit: refused, never an
+        # implementation turn.
+        (self.repo / "work.txt").write_text("changed after READY\n")
+        with self.assertRaises(AmbiguousNextTurn):
+            standalone_start_with(self.repo, self.stage)
+        # The reviewed content was committed but nothing verified it yet:
+        # the reviewer rules on that commit.
+        (self.repo / "work.txt").write_text("reviewed, uncommitted\n")
+        _run_git(self.repo, "add", "work.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "finalized, unverified")
+        self.assertEqual(standalone_start_with(self.repo, self.stage), "sparring")
+        self.assertEqual(self.stage.read_state().next_turn_candidate.head_sha, _head(self.repo))
 
         candidate = capture_candidate(self.repo, self.stage, self.stage.read_state())
         record_next_turn(self.stage, "sparring", candidate=candidate)
@@ -679,6 +700,96 @@ class SendBackFindingTests(_LoopRepo):
         self.assertEqual(assembled.turn_kind, "fresh")
         self.assertIn(FRESH_REVIEWER_NOTICE, assembled.text)
         self.assertIn("old finding X", assembled.text)
+
+
+class SecondReviewFindingTests(_LoopRepo):
+    def test_an_unreadable_declared_sibling_refuses_candidate_capture(self):
+        state = self.stage.read_state()
+        state.repositories = (
+            CandidateRepository(name="lib", path=str(self.repo.parent / "missing"), branch="main"),
+        )
+        self.stage.write_state(state)
+        with self.assertRaises(NextTurnError) as ctx:
+            capture_candidate(self.repo, self.stage, self.stage.read_state())
+        self.assertIn("sibling repository 'lib'", str(ctx.exception))
+
+    def test_fresh_is_the_captured_turn_kind_whatever_else_the_turn_is(self):
+        from agent_sparring.prompt_sections import (
+            review_turn_kind,
+            sparring_turn_kind,
+            stage_turn_kind,
+        )
+
+        self.assertEqual(stage_turn_kind(resume=False, finalize_only=True, fresh=True), "fresh")
+        for kwargs in ({"evidence_first": True}, {"finalization": True}):
+            self.assertEqual(sparring_turn_kind(resume=False, fresh=True, **kwargs), "fresh")
+        self.assertEqual(review_turn_kind(resume=False, evidence_first=True, fresh=True), "fresh")
+
+    def test_a_pending_fresh_reviewer_is_not_pinned_until_its_first_turn(self):
+        from agent_sparring.sessions import pin_pending_generation, record_session_id
+
+        state = self.stage.read_state()
+        state.agents = {"sparring": PinnedAgent("codex-cli", "B", "user", None, "provider-default")}
+        record_session_id(state, "sparring", "spar-1")
+        self.stage.write_state(state)
+        start_fresh_session(self.stage, "sparring", "new eyes", repo_root=self.repo)
+
+        # An owed implementation turn fails; the fresh reviewer never runs.
+        class _Built:
+            pending_pin = PinnedAgent("codex-cli", "B", "user", None, "provider-default")
+
+        with self.assertRaises(LoopError):
+            run_unattended_loop(
+                self.stage, self.sparring_dir, self.repo, _StageAdapter(self.repo, fail_at=1),
+                _SparringAdapter([READY]), expected_branch="feature/x",
+            )
+        self.assertNotIn("sparring", self.stage.read_state().agents or {})
+        # A later preference C is therefore free to apply at its first turn.
+        later = _Built()
+        later.pending_pin = PinnedAgent("codex-cli", "C", "user", None, "provider-default")
+        state = self.stage.read_state()
+        self.assertTrue(pin_pending_generation(state, "sparring", later))
+        self.assertEqual(state.agents["sparring"].model, "C")
+        self.assertEqual(state.sessions["sparring"][-1].agent.model, "C")
+        self.assertEqual(state.sessions["sparring"][0].agent.model, "B")
+
+    def test_a_fresh_reviewer_turn_writes_its_pin_before_the_provider_starts(self):
+        from agent_sparring.sessions import record_session_id
+
+        state = self.stage.read_state()
+        record_session_id(state, "sparring", "spar-0")
+        state.agents = {"sparring": PinnedAgent("codex-cli", "B", "user", None, "provider-default")}
+        self.stage.write_state(state)
+        start_fresh_session(self.stage, "sparring", "new eyes", repo_root=self.repo)
+        reviewer = _FailingSparringAdapter([FAIL])
+        reviewer.pending_pin = PinnedAgent("codex-cli", "C", "user", None, "provider-default")
+        with self.assertRaises(LoopError):
+            run_unattended_loop(
+                self.stage, self.sparring_dir, self.repo, _StageAdapter(self.repo), reviewer,
+                expected_branch="feature/x",
+            )
+        self.assertEqual(self.stage.read_state().agents["sparring"].model, "C")
+
+
+class FinalizationRecoveryTests(_LoopRepo):
+    def test_interrupted_between_ready_and_its_commit_routes_finalization_not_implementation(self):
+        from agent_sparring.loop import FinalizationRefused
+
+        # READY over an uncommitted candidate, then the process stops before
+        # the commit turn runs (simulated: the commit turn raises).
+        with self.assertRaises(LoopError):
+            run_unattended_loop(
+                self.stage, self.sparring_dir, self.repo,
+                _DirtyStageAdapter(self.repo, fail_at=2), _SparringAdapter([READY]),
+                expected_branch="feature/x",
+            )
+        state = self.stage.read_state()
+        self.assertEqual(state.next_turn, "finalization")
+        self.assertEqual(state.next_turn_candidate.kind, "worktree")
+        from agent_sparring.next_turn import standalone_start_with
+
+        self.assertEqual(standalone_start_with(self.repo, self.stage), "finalization")
+        self.assertIsNotNone(FinalizationRefused)
 
 
 class CodexEarlySessionTests(unittest.TestCase):

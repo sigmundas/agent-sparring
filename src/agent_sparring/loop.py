@@ -554,6 +554,21 @@ def run_unattended_loop(
                     f"stage {stage.stage_id!r} reached READY but its candidate content "
                     f"could not be read: {exc}"
                 ) from exc
+            # The candidate READY was given over, read before anything else
+            # can touch it: an interrupted run is matched against exactly
+            # this (agent_sparring.next_turn.resolve_finalization) instead of
+            # being routed to an implementation turn.
+            try:
+                reviewed = capture_candidate(repo_root, stage, stage.read_state())
+            except NextTurnError as exc:
+                activity.emit(
+                    "loop.stopped", cycle=cycle, summary="candidate identity unreadable"
+                )
+                raise LoopError(
+                    f"stage {stage.stage_id!r} reached READY but its candidate identity "
+                    f"could not be recorded: {exc}"
+                ) from exc
+            record_next_turn(stage, NEXT_TURN_FINALIZATION, candidate=reviewed)
             if pending is not None:
                 if finalization_count >= _MAX_FINALIZATION_CYCLES:
                     activity.emit(
@@ -569,7 +584,6 @@ def run_unattended_loop(
                         + ", ".join(pending.uncommitted_paths)
                     )
                 finalization_count += 1
-                record_next_turn(stage, NEXT_TURN_FINALIZATION)
                 activity.emit(
                     "loop.finalization_required",
                     cycle=cycle,

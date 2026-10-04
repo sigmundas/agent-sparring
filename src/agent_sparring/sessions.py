@@ -136,6 +136,29 @@ def record_pin(state: StageState, role: str, pin: PinnedAgent) -> None:
         current.agent = pin
 
 
+def pin_pending_generation(state: StageState, role: str, adapter: object) -> bool:
+    """Pin a pending fresh generation's configuration at its first turn.
+
+    The loop adapters are built before either role runs, so the
+    configuration they were built with for a pending fresh generation is
+    carried on the adapter (``pending_pin``) instead of being written when
+    it was resolved. It becomes the generation's pin only here, immediately
+    before that generation's first provider turn. Returns whether ``state``
+    changed (the caller writes it). An adapter without ``pending_pin`` -- a
+    fake, ``run-stage`` / ``run-sparring``, which pin at once -- changes
+    nothing.
+    """
+
+    pin = getattr(adapter, "pending_pin", None)
+    if not isinstance(pin, PinnedAgent) or not is_fresh(state, role):
+        return False
+    if (state.agents or {}).get(role) is not None:
+        return False
+    record_pin(state, role, pin)
+    state.agents = {**(state.agents or {}), role: pin}
+    return True
+
+
 def start_fresh_session(
     stage: Stage,
     role: str,
@@ -217,6 +240,7 @@ def start_fresh_session(
 
 
 __all__ = [
+    "pin_pending_generation",
     "ROLES",
     "ROLE_SPARRING",
     "ROLE_STAGE",

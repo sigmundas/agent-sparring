@@ -36,7 +36,6 @@ from agent_sparring.finalization import (
     FinalizationError,
     _is_stage_artifact,
     _uncommitted_content_paths,
-    pending_finalization,
     read_worktree_content,
 )
 from agent_sparring.git_context import GitContextError, resolve_commit
@@ -76,12 +75,17 @@ def capture_candidate(repo_root: Path, stage: Stage, state: StageState) -> TurnC
         raise NextTurnError(f"could not read the candidate identity: {exc}") from exc
     pins = []
     for repository in state.repositories:
+        # A declared sibling that cannot be read has no identity to pin, and
+        # "unreadable" must never compare equal to "unreadable" later.
         try:
-            sibling_head: str | None = resolve_commit(
+            sibling_head = resolve_commit(
                 sibling_root(repo_root, repository), "HEAD", label=f"sibling {repository.name}"
             )
-        except GitContextError:
-            sibling_head = None
+        except GitContextError as exc:
+            raise NextTurnError(
+                f"could not read declared sibling repository {repository.name!r} "
+                f"({repository.path}): {exc}"
+            ) from exc
         pins.append(SiblingPin(name=repository.name, head_sha=sibling_head))
     return TurnCandidate(
         head_sha=head,
@@ -99,11 +103,12 @@ def record_next_turn(
     source: str = "engine",
 ) -> None:
     """Persist the marker, re-reading state.json so only these three fields
-    change."""
+    change. ``candidate`` is kept for ``sparring`` (what the reviewer owes a
+    verdict on) and ``finalization`` (what the reviewer said READY over)."""
 
     state = stage.read_state()
     state.next_turn = next_turn
-    state.next_turn_candidate = candidate if next_turn == NEXT_TURN_SPARRING else None
+    state.next_turn_candidate = candidate if next_turn != NEXT_TURN_STAGE else None
     state.next_turn_source = source
     stage.write_state(state)
 
@@ -301,6 +306,57 @@ def resolve_resume_turn(
     return derived
 
 
+def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> str:
+    """Where a resume enters for a recorded ``finalization`` marker.
+
+    The marker carries the candidate the reviewer said READY over. Resuming
+    is only safe when the repository can be matched against it exactly:
+
+    - the same uncommitted candidate -> ``finalization`` (the bounded commit
+      turn, held to that content);
+    - the reviewed content now committed and nothing uncommitted -- a
+      finalization or a person committed it, but nothing verified that yet
+      -> ``sparring``: the marker is re-recorded over that commit so the
+      reviewer rules on it before acceptance;
+    - anything else is refused. Never an implementation turn: an
+      unrestricted turn on reviewed (perhaps human-verified) work is the one
+      thing this state must not lead to.
+
+    READY over a candidate that was *already a commit* needed no
+    finalization; the marker only says acceptance is next, which the
+    acceptance gate and the push gate decide on their own records. If the
+    run reaches the loop again it continues as an ordinary ``stage`` turn,
+    exactly as before the marker existed.
+    """
+
+    reviewed = state.next_turn_candidate
+    if reviewed is None:
+        raise AmbiguousNextTurn(
+            f"stage {stage.stage_id!r} is waiting to finalize a READY candidate, but the "
+            "candidate it was reviewed as is not recorded; choose explicitly (next_turn = "
+            "stage | sparring)."
+        )
+    if reviewed.kind == "commit":
+        return NEXT_TURN_STAGE
+    current = capture_candidate(repo_root, stage, state)
+    if current == reviewed and current.kind == "worktree":
+        return NEXT_TURN_FINALIZATION
+    if (
+        current.kind == "commit"
+        and current.content_digest == reviewed.content_digest
+        and current.repositories == reviewed.repositories
+    ):
+        record_next_turn(stage, NEXT_TURN_SPARRING, candidate=current)
+        return NEXT_TURN_SPARRING
+    raise AmbiguousNextTurn(
+        f"stage {stage.stage_id!r} was READY over {reviewed.describe()}, but the repository "
+        f"now holds {current.describe()}. That is neither the reviewed candidate awaiting its "
+        "commit nor a commit of exactly the reviewed content, so the engine will not commit "
+        "it, review it or implement on it by itself; restore the reviewed candidate, or "
+        "choose explicitly (next_turn = stage | sparring)."
+    )
+
+
 def standalone_start_with(repo_root: Path, stage: Stage) -> str:
     """Where a standalone ``run-loop`` resume enters the loop:
     ``stage``, ``sparring`` or ``finalization``.
@@ -309,8 +365,7 @@ def standalone_start_with(repo_root: Path, stage: Stage) -> str:
     run has. A recorded human gate (NEEDS_YOU / ESCALATE) still stands
     unless the marker already says an implementation turn is owed: running
     either agent would not answer it, so it is refused. A ``finalization``
-    marker enters the bounded commit cycle while the reviewed candidate is
-    still uncommitted, and is otherwise discharged (``stage``).
+    marker is resolved by :func:`resolve_finalization`.
     """
 
     marker = resolve_resume_turn(repo_root, stage)
@@ -323,11 +378,7 @@ def standalone_start_with(repo_root: Path, stage: Stage) -> str:
             "Human evidence' in notes.md) and run the reviewer (run-sparring)."
         )
     if marker == NEXT_TURN_FINALIZATION:
-        try:
-            pending = pending_finalization(repo_root, stage)
-        except FinalizationError as exc:
-            raise NextTurnError(f"could not read the candidate content: {exc}") from exc
-        return NEXT_TURN_FINALIZATION if pending is not None else NEXT_TURN_STAGE
+        return resolve_finalization(repo_root, stage, stage.read_state())
     return marker if marker == NEXT_TURN_SPARRING else NEXT_TURN_STAGE
 
 
@@ -337,6 +388,7 @@ __all__ = [
     "capture_candidate",
     "derive_next_turn",
     "record_next_turn",
+    "resolve_finalization",
     "resolve_resume_turn",
     "standalone_start_with",
     "verify_candidate",

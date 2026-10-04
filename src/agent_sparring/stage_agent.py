@@ -25,7 +25,12 @@ from agent_sparring.handoff import generate_handoff
 from agent_sparring.providers import ProviderError, StageAgentAdapter, StageAgentResult
 from agent_sparring.stage import Stage, StageState, StageStatus
 from agent_sparring.prompt_capture import capture_prompt
-from agent_sparring.sessions import ROLE_STAGE, is_fresh, record_session_id
+from agent_sparring.sessions import (
+    ROLE_STAGE,
+    is_fresh,
+    pin_pending_generation,
+    record_session_id,
+)
 from agent_sparring.stage_prompt import assemble_stage_prompt
 
 
@@ -201,6 +206,8 @@ def run_stage_agent(
             # conversation and is told it is continuing the same stage.
             resume_id = state.implementation_session_id
             fresh = resume_id is None and is_fresh(state, ROLE_STAGE)
+            if fresh and pin_pending_generation(state, ROLE_STAGE, adapter):
+                stage.write_state(state)
 
             if state.base_sha is not None:
                 base_sha = state.base_sha
