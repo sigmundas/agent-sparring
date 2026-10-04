@@ -139,6 +139,13 @@ EFFORT_LEVELS: tuple[str, ...] = (
 MODEL_LIST_TIMEOUT_SECONDS = 15
 
 
+
+def _error_data(stderr: str, error_payloads: list[str]) -> str | None:
+    """Codex's provider error data: process stderr and its ``turn.failed`` /
+    ``error`` event payloads -- never the rest of the stdout stream."""
+
+    return "\n".join(part for part in (stderr, *error_payloads) if part) or None
+
 @dataclass(frozen=True)
 class CatalogModel:
     """One model as Codex's own catalog lists it."""
@@ -876,6 +883,8 @@ class CodexCliAdapter:
         stdout = result.stdout or ""
         thread_id: str | None = None
         turn_failed_message: str | None = None
+        # Provider error data: turn.failed and error event payloads only.
+        error_payloads: list[str] = []
         events: list[dict[str, Any]] = []
 
         for line in stdout.splitlines():
@@ -900,24 +909,39 @@ class CodexCliAdapter:
                     turn_failed_message = str(error.get("message") or error)
                 else:
                     turn_failed_message = str(error)
+                error_payloads.append(json.dumps(error, sort_keys=True, default=str))
+            elif event_type == "error":
+                error_payloads.append(
+                    json.dumps(
+                        {k: v for k, v in event.items() if k != "type"},
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
 
         if thread_id is None:
             # Verified above: e.g. resuming an unknown thread id prints a
             # plain-text error to stderr and no JSONL at all.
-            detail = (result.stderr or "").strip() or stdout.strip() or "(no output)"
+            stderr = (result.stderr or "").strip()
+            detail = stderr or stdout.strip() or "(no output)"
             raise ProviderError(
                 f"{self.executable} exec produced no thread.started event with a "
-                f"usable thread_id (exit {result.returncode}): {detail}"
+                f"usable thread_id (exit {result.returncode}): {detail}",
+                error_data=_error_data(stderr, error_payloads),
             )
 
         if turn_failed_message is not None:
-            raise ProviderError(f"{self.executable} exec turn failed: {turn_failed_message}")
+            raise ProviderError(
+                f"{self.executable} exec turn failed: {turn_failed_message}",
+                error_data=_error_data((result.stderr or "").strip(), error_payloads),
+            )
 
         if result.returncode != 0:
             detail = (result.stderr or "").strip() or "(no stderr)"
             raise ProviderError(
                 f"{self.executable} exec exited {result.returncode} without a "
-                f"turn.failed event: {detail}"
+                f"turn.failed event: {detail}",
+                error_data=_error_data((result.stderr or "").strip(), error_payloads),
             )
 
         try:

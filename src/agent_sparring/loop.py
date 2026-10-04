@@ -128,6 +128,7 @@ from agent_sparring.providers import (
     SparringAgentAdapter,
     StageAgentAdapter,
     classify_failure_text,
+    structured_error_data,
 )
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
@@ -426,13 +427,20 @@ def run_unattended_loop(
             # A turn the provider ended for capacity (quota, usage or rate
             # limit) is typed as such, so a managed run pauses for a person
             # instead of failing; its session is resumable, so only that.
-            unavailable = classify_failure_text(stage_run.result.text or "", resuming=False)
+            # Only the provider's structured error fields are read, never
+            # the result text the agent wrote.
+            error_data = structured_error_data(stage_run.result.raw)
+            unavailable = classify_failure_text(error_data or "", resuming=False)
             raise LoopError(
                 f"stage-agent turn for stage {stage.stage_id!r} reported "
                 f"is_error=true (session {stage_run.result.session_id!r}); "
                 "refusing to send a failed implementation turn to the "
                 "sparrer"
-            ) from (unavailable(stage_run.result.text) if unavailable is not None else None)
+            ) from (
+                unavailable(error_data, error_data=error_data)
+                if unavailable is not None
+                else None
+            )
 
         if pending is not None:
             # The commit turn is held to the tree it was given, before the

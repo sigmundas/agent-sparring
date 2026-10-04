@@ -160,8 +160,7 @@ turn: if that exact commit (HEAD, content, sibling HEADs) is still the
 candidate, `resume-plan` runs only the push and acceptance gates for it, with
 no agent turn; if it has moved, the resume is refused. `run-loop`, which
 never accepts, refuses it as owing no agent turn. A `finalization` marker
-never leads to an implementation turn unless the caller explicitly chooses
-`next_turn = stage`.
+never leads to an implementation turn.
 A standalone `run-loop` also refuses a recorded NEEDS_YOU / ESCALATE (running an
 agent would not answer it) unless an implementation turn is already owed.
 `resume-plan --evidence` answering a gate raised over a recorded candidate
@@ -189,6 +188,12 @@ after the last SEND_BACK. Anything else -- for example HEAD having moved
 past the handoff's candidate -- is refused with what was found; the caller
 then chooses explicitly (`--next-turn stage|sparring` on `resume-plan` /
 `run-loop`; `resume_plan(..., next_turn=...)`).
+That choice is only for this ambiguous legacy state: it is refused, and
+nothing is recorded, whenever a marker is already recorded, when derivation
+gives a different unambiguous answer, or while a recorded NEEDS_YOU /
+ESCALATE is waiting -- a choice never overrides the engine's record or
+answers a person. The one exception is `--evidence … --next-turn sparring`
+over a recorded `sparring` marker, which re-pins the same owed review.
 The result is recorded with `next_turn_source` = `derived` or `manual` and
 is never derived again.
 

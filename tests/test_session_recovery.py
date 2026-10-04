@@ -221,8 +221,10 @@ class ProviderPauseTests(_Stuck):
         class _LimitedTurn(_StageAdapter):
             def start(self, prompt):
                 self.start_calls.append(prompt)
+                # Classified from the provider's structured errors only.
                 return StageAgentResult(
-                    session_id="impl-1", text="Claude AI usage limit reached", is_error=True
+                    session_id="impl-1", text="", is_error=True,
+                    raw={"errors": ["usage_limit_reached"]},
                 )
 
         with self.assertRaises(ProviderPause) as ctx:
@@ -510,6 +512,107 @@ class ClaudeStructuredErrorTests(_LoopRepo):
         payload = {"is_error": True, "session_id": "c-1", "errors": ["tool crashed"]}
         result = ClaudeCliAdapter(repo_root=Path("."), runner=_claude_runner(payload)).start("go")
         self.assertTrue(result.is_error)
+
+
+# Agent-written text that names provider failures; never provider error data.
+_AGENT_SAYS = (
+    "session not found",
+    "No conversation found with session ID: c-1",
+    "quota",
+    "rate limit",
+    "overloaded",
+    "invalid_encrypted_content",
+    "429 Too Many Requests",
+)
+
+
+class AgentTextIsNeverClassifiedTests(_LoopRepo):
+    """Only provider error data (structured fields, stderr) is classified;
+    transcripts and result text are the agent's and may say anything."""
+
+    def assert_plain(self, raised):
+        self.assertIsInstance(raised, ProviderError)
+        self.assertNotIsInstance(raised, (ProviderSessionUnresumable, ProviderUnavailable))
+        self.assertIsNone(recoverable_provider_failure(raised))
+
+    def test_claude_transcript_without_a_result_is_not_classified(self):
+        for text in _AGENT_SAYS:
+            with self.subTest(text=text):
+                transcript = json.dumps(
+                    {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+                )
+                runner = lambda *a, t=transcript: _completed(stdout=t + "\n")
+                with self.assertRaises(ProviderError) as ctx:
+                    ClaudeCliAdapter(repo_root=self.repo, runner=runner).resume("c-1", "go")
+                self.assert_plain(ctx.exception)
+
+    def test_claude_payload_without_session_id_is_not_classified_by_result_text(self):
+        for text in _AGENT_SAYS:
+            with self.subTest(text=text):
+                runner = _claude_runner({"is_error": True, "result": text})
+                with self.assertRaises(ProviderError) as ctx:
+                    ClaudeCliAdapter(repo_root=self.repo, runner=runner).resume("c-1", "go")
+                self.assert_plain(ctx.exception)
+
+    def test_claude_is_error_result_text_is_not_classified(self):
+        for text in _AGENT_SAYS:
+            with self.subTest(text=text):
+                payload = {"is_error": True, "session_id": "c-1", "result": text}
+                adapter = ClaudeCliAdapter(repo_root=self.repo, runner=_claude_runner(payload))
+                self.assertTrue(adapter.resume("c-1", "go").is_error)
+
+    def test_codex_stdout_is_not_classified(self):
+        for text in _AGENT_SAYS:
+            with self.subTest(text=text):
+                item = json.dumps(
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+                )
+                # No thread.started: the stdout transcript is the only text.
+                runner = lambda *a, t=item: _completed(stdout=t + "\n")
+                with self.assertRaises(ProviderError) as ctx:
+                    CodexCliAdapter(repo_root=self.repo, runner=runner).resume("t-1", "review")
+                self.assert_plain(ctx.exception)
+                # With a thread and a non-zero exit, still only stderr counts.
+                stdout = '{"type":"thread.started","thread_id":"t-1"}\n' + item + "\n"
+                runner = lambda *a, o=stdout: _completed(stdout=o, stderr="boom")
+                with self.assertRaises(ProviderError) as ctx:
+                    CodexCliAdapter(repo_root=self.repo, runner=runner).resume("t-1", "review")
+                self.assert_plain(ctx.exception)
+
+    def test_loop_is_error_result_text_is_not_classified(self):
+        for index, text in enumerate(_AGENT_SAYS):
+            with self.subTest(text=text):
+                stage = Stage.resolve(self.sparring_dir, f"err{index}").create()
+
+                class _ErrorText(_StageAdapter):
+                    def _turn(self, session_id, t=text):
+                        return StageAgentResult(session_id="c-1", text=t, is_error=True)
+
+                with self.assertRaises(LoopError) as ctx:
+                    run_unattended_loop(
+                        stage, self.sparring_dir, self.repo, _ErrorText(self.repo),
+                        _SparringAdapter([READY]), expected_branch="feature/x",
+                    )
+                self.assertIsNone(recoverable_provider_failure(ctx.exception))
+
+    def test_structured_fields_and_stderr_are_still_classified(self):
+        payload = {"is_error": True, "session_id": "c-1", "subtype": "error_during_execution",
+                   "errors": [{"type": "rate_limit_error"}]}
+        with self.assertRaises(ProviderUnavailable):
+            ClaudeCliAdapter(repo_root=self.repo, runner=_claude_runner(payload)).start("go")
+        stdout = (
+            '{"type":"thread.started","thread_id":"t-1"}\n'
+            '{"type":"error","message":"thread not found: t-1"}\n'
+            '{"type":"turn.failed","error":{"message":"stream disconnected"}}\n'
+        )
+        with self.assertRaises(ProviderSessionUnresumable):
+            CodexCliAdapter(repo_root=self.repo, runner=lambda *a: _completed(stdout=stdout)
+                            ).resume("t-1", "review")
+        with self.assertRaises(ProviderUnavailable):
+            CodexCliAdapter(
+                repo_root=self.repo,
+                runner=lambda *a: _completed(stderr="Error: usage_limit_reached"),
+            ).start("review")
 
 
 class RetryCommandTests(unittest.TestCase):

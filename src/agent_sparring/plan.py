@@ -1617,6 +1617,9 @@ def resume_plan(
     that marker existed is derived once from engine records; when that is
     ambiguous the resume is refused, and ``next_turn`` (``stage`` |
     ``sparring``) is the caller's explicit choice, recorded as ``manual``.
+    That choice is refused, with nothing recorded, whenever a marker is
+    already recorded or derivation answers differently, and never answers a
+    recorded human gate.
     Evidence, a recorded human gate and a pending finalization keep their
     existing precedence over the marker. Evidence answering a gate raised
     over a recorded candidate (``next_turn = sparring``) is refused, before
@@ -1755,7 +1758,7 @@ def resume_plan(
                     "review, so there is no candidate to re-pin with --next-turn sparring"
                 )
             try:
-                resolve_resume_turn(repo_root, stage, choice=next_turn)
+                resolve_resume_turn(repo_root, stage, choice=next_turn, repin=True)
                 current_state = stage.read_state()
             except NextTurnError as exc:
                 raise PlanError(str(exc)) from exc

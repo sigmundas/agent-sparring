@@ -2486,9 +2486,11 @@ def _add_recovery_arguments(parser: argparse.ArgumentParser) -> None:
         choices=("stage", "sparring"),
         default=None,
         help=(
-            "whose turn it is, for state the engine cannot read unambiguously (it refuses "
-            "and says so); recorded as a manual choice. 'sparring' reviews the repository "
-            "as it is now"
+            "whose turn it is, only for ambiguous legacy state the engine refuses to read "
+            "(it says so); recorded as a manual choice. Refused when a next_turn marker is "
+            "recorded, when the engine can derive a different answer, and while a person's "
+            "gate (NEEDS_YOU / ESCALATE) is waiting. 'sparring' reviews the repository as "
+            "it is now"
         ),
     )
 

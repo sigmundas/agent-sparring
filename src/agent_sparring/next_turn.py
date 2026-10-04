@@ -280,20 +280,50 @@ def resolve_resume_turn(
     stage: Stage,
     *,
     choice: str | None = None,
+    repin: bool = False,
 ) -> str | None:
     """The marker an ordinary resume obeys, deriving and recording it once
     for legacy state.
 
-    An explicit ``choice`` (``stage`` | ``sparring``) is recorded as
-    ``manual`` -- with the current candidate for ``sparring`` -- and wins
-    over both a recorded marker and derivation. Returns ``None`` when there
-    is no marker and none can be derived without overriding gate state.
+    An explicit ``choice`` (``stage`` | ``sparring``) is only for ambiguous
+    legacy state: it is honoured -- and recorded as ``manual``, with the
+    current candidate for ``sparring`` -- only when no marker is recorded
+    and derivation is ambiguous or has no answer. A recorded marker, or a
+    derived answer that differs from the choice, is refused and nothing is
+    recorded; a choice never overrides the engine's record.
+
+    ``repin`` is the one exception, used only by ``resume-plan --evidence
+    --next-turn sparring``: over a recorded ``sparring`` marker the person
+    re-pins the repository as it is now for the same reviewer turn the
+    marker already owes. It never changes which actor runs.
+
+    Returns ``None`` when there is no marker and none can be derived without
+    overriding gate state.
     """
 
     state = stage.read_state()
     if choice is not None:
         if choice not in (NEXT_TURN_STAGE, NEXT_TURN_SPARRING):
             raise NextTurnError(f"next_turn must be 'stage' or 'sparring', got {choice!r}")
+        if state.next_turn is not None:
+            if not (repin and choice == NEXT_TURN_SPARRING == state.next_turn):
+                raise NextTurnError(
+                    f"stage {stage.stage_id!r} already records next_turn = {state.next_turn} "
+                    f"(source: {state.next_turn_source or 'engine'}); --next-turn {choice} is "
+                    "only for state the engine cannot read unambiguously and cannot override "
+                    "a recorded marker. Nothing was changed; resume without --next-turn."
+                )
+        else:
+            try:
+                derived = derive_next_turn(repo_root, stage, state)
+            except AmbiguousNextTurn:
+                derived = None
+            if derived is not None and derived != choice:
+                raise NextTurnError(
+                    f"stage {stage.stage_id!r} unambiguously owes next_turn = {derived}; "
+                    f"--next-turn {choice} is only for state the engine cannot read "
+                    "unambiguously. Nothing was changed; resume without --next-turn."
+                )
         candidate = (
             capture_candidate(repo_root, stage, state) if choice == NEXT_TURN_SPARRING else None
         )
@@ -338,8 +368,9 @@ def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> st
     if reviewed is None:
         raise AmbiguousNextTurn(
             f"stage {stage.stage_id!r} is waiting to finalize a READY candidate, but the "
-            "candidate it was reviewed as is not recorded; choose explicitly (next_turn = "
-            "stage | sparring)."
+            "candidate it was reviewed as is not recorded. A recorded marker is not "
+            "overridden by --next-turn; deliberately choose how to continue (for example "
+            "'sparring reset-stage')."
         )
     current = capture_candidate(repo_root, stage, state)
     if reviewed.kind == "commit":
@@ -349,8 +380,8 @@ def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> st
             f"stage {stage.stage_id!r} was READY over the commit {reviewed.describe()}, but "
             f"the repository now holds {current.describe()}. Only that reviewed commit may be "
             "pushed and accepted, and the engine will not start an agent turn on a READY stage "
-            "by itself; restore the reviewed commit, or choose explicitly (next_turn = stage | "
-            "sparring)."
+            "by itself; restore the reviewed commit, or deliberately choose how to continue "
+            "(for example 'sparring reset-stage')."
         )
     if current == reviewed and current.kind == "worktree":
         return NEXT_TURN_FINALIZATION
@@ -366,7 +397,7 @@ def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> st
         f"now holds {current.describe()}. That is neither the reviewed candidate awaiting its "
         "commit nor a commit of exactly the reviewed content, so the engine will not commit "
         "it, review it or implement on it by itself; restore the reviewed candidate, or "
-        "choose explicitly (next_turn = stage | sparring)."
+        "deliberately choose how to continue (for example 'sparring reset-stage')."
     )
 
 
@@ -379,21 +410,26 @@ def standalone_start_with(
     The same precedence as a managed resume, minus the parts only a managed
     run has. A recorded human gate (NEEDS_YOU / ESCALATE) still stands
     unless the marker already says an implementation turn is owed: running
-    either agent would not answer it, so it is refused. A ``finalization``
+    either agent would not answer it, so it is refused -- before anything is
+    recorded, and always when a ``choice`` is given. A ``finalization``
     marker is resolved by :func:`resolve_finalization`. ``choice`` is the
     caller's explicit ``stage`` | ``sparring`` (see
     :func:`resolve_resume_turn`).
     """
 
-    marker = resolve_resume_turn(repo_root, stage, choice=choice)
+    # The recorded gate is checked before anything is recorded: a choice can
+    # never answer or bypass it, and a refusal leaves state.json untouched.
     outcome = read_recorded_outcome(stage)
-    if outcome is not None and outcome.awaits_a_human and marker != NEXT_TURN_STAGE:
+    if outcome is not None and outcome.awaits_a_human and (
+        choice is not None or stage.read_state().next_turn != NEXT_TURN_STAGE
+    ):
         raise NextTurnError(
             f"stage {stage.stage_id!r} is waiting for a person ({outcome.action.value}: "
             f"{outcome.summary or 'see sparring.md'}); running either agent would not answer "
             "it. Record the answer (resume-plan --evidence for a managed run, or under '## "
             "Human evidence' in notes.md) and run the reviewer (run-sparring)."
         )
+    marker = resolve_resume_turn(repo_root, stage, choice=choice)
     if marker == NEXT_TURN_FINALIZATION:
         resolved = resolve_finalization(repo_root, stage, stage.read_state())
         if resolved == RESUME_ACCEPT:

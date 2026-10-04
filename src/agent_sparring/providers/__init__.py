@@ -12,13 +12,27 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+import json
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
 from agent_sparring.providers.subprocess_runner import LineSink
 
 
 class ProviderError(RuntimeError):
-    """Raised when a provider invocation fails or returns unusable output."""
+    """Raised when a provider invocation fails or returns unusable output.
+
+    ``error_data`` is the provider's own structured error data for this
+    failure, kept apart from the message: Claude's final result ``errors`` /
+    ``subtype``, Codex ``turn.failed`` / ``error`` event payloads, or process
+    stderr. It is the only thing :func:`classify_provider_error` reads --
+    never stdout transcripts, tool output or agent result text, which the
+    message may embed and an agent can write anything into. ``None`` means
+    there is no provider error data, and the failure stays unclassified.
+    """
+
+    def __init__(self, *args: object, error_data: str | None = None) -> None:
+        super().__init__(*args)
+        self.error_data = error_data
 
 
 class ProviderSessionUnresumable(ProviderError):
@@ -34,12 +48,14 @@ class ProviderUnavailable(ProviderError):
     session on another provider, can succeed."""
 
 
-# Matched case-insensitively against the provider's own failure text. Only
-# ever used to *classify* a failure the adapter already raises; a match never
-# turns a success into a failure, and no match leaves a plain ProviderError.
+# Matched case-insensitively against provider error data only (see
+# ProviderError.error_data), never agent-authored text. Only ever used to
+# *classify* a failure the adapter already raises; a match never turns a
+# success into a failure, and no match leaves a plain ProviderError. Kept to
+# explicit provider error codes and messages rather than loose words.
 _UNRESUMABLE_MARKERS = (
     "invalid_encrypted_content",
-    "no conversation found",
+    "no conversation found with session id",
     "conversation not found",
     "thread not found",
     "session not found",
@@ -47,15 +63,33 @@ _UNRESUMABLE_MARKERS = (
     "no such session",
 )
 _UNAVAILABLE_MARKERS = (
-    "rate limit",
-    "rate_limit",
-    "ratelimit",
-    "usage limit",
-    "usage_limit",
-    "quota",
-    "too many requests",
-    "overloaded",
+    "rate_limit_error",
+    "rate_limit_exceeded",
+    "rate limit reached",
+    "usage_limit_reached",
+    "usage_limit_exceeded",
+    "hit your usage limit",
+    "insufficient_quota",
+    "429 too many requests",
+    "overloaded_error",
 )
+
+
+def structured_error_data(payload: Mapping[str, Any]) -> str | None:
+    """The provider error data of a final result object: its ``subtype`` and
+    ``errors`` fields only, never its ``result`` text. ``None`` if neither."""
+
+    details: list[str] = []
+    subtype = payload.get("subtype")
+    if isinstance(subtype, str) and subtype:
+        details.append(subtype)
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        details += [
+            error if isinstance(error, str) else json.dumps(error, sort_keys=True)
+            for error in errors
+        ]
+    return "; ".join(details) or None
 
 
 def classify_failure_text(text: str, *, resuming: bool) -> type[ProviderError] | None:
@@ -75,15 +109,18 @@ def classify_failure_text(text: str, *, resuming: bool) -> type[ProviderError] |
 
 
 def classify_provider_error(exc: ProviderError, *, resuming: bool) -> ProviderError:
-    """``exc`` as its recoverable subclass when its text says so, else
-    ``exc`` itself. The classified error keeps the original message."""
+    """``exc`` as its recoverable subclass when its provider error data says
+    so, else ``exc`` itself. The message is never read; the classified error
+    keeps it unchanged."""
 
     if isinstance(exc, (ProviderSessionUnresumable, ProviderUnavailable)):
         return exc
-    kind = classify_failure_text(str(exc), resuming=resuming)
+    if not exc.error_data:
+        return exc
+    kind = classify_failure_text(exc.error_data, resuming=resuming)
     if kind is None:
         return exc
-    classified = kind(str(exc))
+    classified = kind(str(exc), error_data=exc.error_data)
     classified.__cause__ = exc
     return classified
 
@@ -238,5 +275,6 @@ __all__ = [
     "SparringAgentAdapter",
     "classify_failure_text",
     "classify_provider_error",
+    "structured_error_data",
     "recoverable_provider_failure",
 ]

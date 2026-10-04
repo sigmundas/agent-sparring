@@ -49,6 +49,7 @@ from agent_sparring.providers import (
     StageAgentResult,
     classify_failure_text,
     classify_provider_error,
+    structured_error_data,
 )
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 
@@ -541,16 +542,20 @@ class ClaudeCliAdapter:
         stdout = result.stdout or ""
         payload = self._final_payload(stdout)
         if payload is None:
-            detail = stdout.strip() or (result.stderr or "").strip() or "(no output)"
+            stderr = (result.stderr or "").strip()
+            detail = stdout.strip() or stderr or "(no output)"
+            # Only stderr is provider error data; stdout is the transcript.
             raise ProviderError(
                 f"{self.executable} did not return a JSON result (exit "
-                f"{result.returncode}): {detail}"
+                f"{result.returncode}): {detail}",
+                error_data=stderr or None,
             )
 
         session_id = payload.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             raise ProviderError(
-                f"{self.executable} JSON output has no usable session_id: {payload!r}"
+                f"{self.executable} JSON output has no usable session_id: {payload!r}",
+                error_data=structured_error_data(payload),
             )
 
         text = payload.get("result")
@@ -562,18 +567,15 @@ class ClaudeCliAdapter:
             # ``errors`` list (e.g. "429 Too Many Requests"), with no result
             # text at all. A recoverable reason is raised as its typed
             # failure; anything else stays an is_error result as before.
-            errors = payload.get("errors")
-            details = [text] if text else []
-            if isinstance(errors, list):
-                details += [
-                    error if isinstance(error, str) else json.dumps(error, sort_keys=True)
-                    for error in errors
-                ]
-            detail = "; ".join(details)
-            kind = classify_failure_text(detail, resuming=resuming)
+            # Only ``errors`` / ``subtype`` are classified, never the result
+            # text, which is the agent's own words.
+            error_data = structured_error_data(payload)
+            kind = classify_failure_text(error_data or "", resuming=resuming)
             if kind is not None:
+                detail = "; ".join(part for part in (text, error_data) if part)
                 raise kind(
-                    f"{self.executable} reported is_error=true (session {session_id}): {detail}"
+                    f"{self.executable} reported is_error=true (session {session_id}): {detail}",
+                    error_data=error_data,
                 )
 
         return StageAgentResult(

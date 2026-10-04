@@ -335,6 +335,90 @@ class LegacyDerivationTests(_Stuck):
         self.assertIs(stage.read_state().status, StageStatus.ACCEPTED)
 
 
+class ExplicitChoiceAuthorityTests(_Stuck):
+    """--next-turn answers only ambiguous legacy state; it never overrides a
+    recorded marker or a recorded human gate."""
+
+    def _state_bytes(self, stage):
+        return (stage.directory / "state.json").read_bytes()
+
+    def leave_owed_stage(self):
+        stage_adapter = _StageAdapter(self.repo, commit=True, fail_at=2)
+        with self.assertRaises(PlanRunError):
+            self._start(stage_adapter, _SparringAdapter([SEND_BACK]))
+        stage = self._stage(S1)
+        self.assertEqual(stage.read_state().next_turn, "stage")
+        return stage, stage_adapter
+
+    def test_sparring_over_a_recorded_stage_marker_is_refused_by_run_loop(self):
+        from agent_sparring.next_turn import standalone_start_with
+
+        stage, _ = self.leave_owed_stage()
+        before = self._state_bytes(stage)
+        with self.assertRaises(NextTurnError) as ctx:
+            standalone_start_with(self.repo, stage, choice="sparring")
+        self.assertIn("already records next_turn = stage", str(ctx.exception))
+        self.assertEqual(self._state_bytes(stage), before)
+
+    def test_sparring_over_a_recorded_stage_marker_is_refused_by_resume_plan(self):
+        stage, stage_adapter = self.leave_owed_stage()
+        before = self._state_bytes(stage)
+        sparring = _SparringAdapter([READY])
+        with self.assertRaises(PlanRunError) as ctx:
+            self._resume(stage_adapter, sparring, stop_after_stage=S1, next_turn="sparring")
+        self.assertIn("already records next_turn = stage", str(ctx.exception))
+        self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
+        self.assertEqual(self._state_bytes(stage), before)
+
+    def test_stage_over_a_recorded_sparring_marker_is_refused(self):
+        from agent_sparring.next_turn import standalone_start_with
+
+        stage, stage_adapter = self.leave_stuck()
+        before = self._state_bytes(stage)
+        with self.assertRaises(NextTurnError):
+            standalone_start_with(self.repo, stage, choice="stage")
+        with self.assertRaises(PlanRunError):
+            self._resume(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1,
+                         next_turn="stage")
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 2)
+        self.assertEqual(self._state_bytes(stage), before)
+
+    def test_stage_over_a_recorded_finalization_marker_is_refused(self):
+        stage, _ = self.leave_stuck()
+        record_next_turn(stage, "finalization",
+                         candidate=capture_candidate(self.repo, stage, stage.read_state()))
+        before = self._state_bytes(stage)
+        with self.assertRaises(NextTurnError) as ctx:
+            resolve_resume_turn(self.repo, stage, choice="stage")
+        self.assertIn("already records next_turn = finalization", str(ctx.exception))
+        self.assertEqual(self._state_bytes(stage), before)
+
+    def test_a_choice_differing_from_an_unambiguous_derivation_is_refused(self):
+        stage, _ = self.leave_stuck()
+        _strip_marker(stage)
+        before = self._state_bytes(stage)
+        with self.assertRaises(NextTurnError) as ctx:
+            resolve_resume_turn(self.repo, stage, choice="stage")
+        self.assertIn("unambiguously owes next_turn = sparring", str(ctx.exception))
+        self.assertEqual(self._state_bytes(stage), before)
+
+    def test_run_loop_choice_under_needs_you_is_refused_without_a_marker(self):
+        from agent_sparring.next_turn import standalone_start_with
+
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        self._start(stage_adapter, _SparringAdapter([NEEDS_YOU]), stop_after_stage=S1)
+        stage = self._stage(S1)
+        _strip_marker(stage)
+        before = self._state_bytes(stage)
+        for choice in ("stage", "sparring"):
+            with self.subTest(choice=choice):
+                with self.assertRaises(NextTurnError) as ctx:
+                    standalone_start_with(self.repo, stage, choice=choice)
+                self.assertIn("waiting for a person", str(ctx.exception))
+                self.assertEqual(self._state_bytes(stage), before)
+                self.assertIsNone(stage.read_state().next_turn)
+
+
 class _LoopRepo(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

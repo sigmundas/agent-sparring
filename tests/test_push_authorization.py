@@ -668,20 +668,19 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertEqual(stage_adapter.turns, 0)
         self.assertNothingPushed()
 
-        # Choosing explicitly to continue implementation runs the ordinary
-        # loop; the candidate it produces is a commit nobody authorized.
-        # Nothing reached the remote and nothing was accepted.
-        result = self._resume(
-            stage_adapter,
-            _SparringAdapter([READY]),
-            stop_after_stage=S1,
-            next_turn="stage",
-        )
-        self.assertEqual(stage_adapter.turns, 1)
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertIsNotNone(result.awaiting)
-        self.assertNotEqual(result.awaiting.candidate_sha, first)
-        self.assertEqual(result.awaiting.candidate_sha, _head_sha(self.repo))
+        # An explicit --next-turn cannot override the recorded finalization
+        # marker either: no unrestricted implementation turn on reviewed
+        # work, and nothing recorded, pushed or accepted.
+        with self.assertRaises(PlanRunError) as ctx:
+            self._resume(
+                stage_adapter,
+                _SparringAdapter([READY]),
+                stop_after_stage=S1,
+                next_turn="stage",
+            )
+        self.assertIn("already records next_turn = finalization", str(ctx.exception))
+        self.assertEqual(stage_adapter.turns, 0)
+        self.assertEqual(self._stage(S1).read_state().next_turn, "finalization")
         self.assertNothingPushed()
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
