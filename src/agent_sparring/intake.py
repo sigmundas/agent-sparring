@@ -241,26 +241,31 @@ STAGE_MODES: tuple[str, ...] = tuple(mode.value for mode in StageMode)
 _HORIZONTAL_RULE_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+\S")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
-#: Source lines compile mode treats as a review requirement or a gate, for
-#: the "maps to a node" and "no gate disappears" guards. Deliberately
-#: narrow: a false match only makes the guard stricter.
+#: Source lines compile mode treats as a review requirement, for the "maps
+#: to a node" guard.
 _REVIEW_REQUIREMENT_RE = re.compile(r"\bindependent(ly)?\s+review", re.IGNORECASE)
-#: A paragraph states a gate when it names a gate-like event, a prerequisite
-#: relation and a stage: "run a canary ... before Stage 3A", "Activate the
-#: release after Stage 1A, with explicit go-ahead". Ordinary work that
-#: merely mentions such a word ("tests for the deployment parser") names no
-#: prerequisite; a plan-wide policy names no stage.
+#: The "no gate disappears" guard works per sentence (headings, fenced code and
+#: inline code spans ignored). A sentence states a gate when it names a
+#: gate-like event and a stage is the object of a prerequisite relation:
+#: "run a canary ... before Stage 3A", "Activate the release after Stage 1A,
+#: with explicit go-ahead", "Stage 3A requires the owner's go-ahead". A stage
+#: merely mentioned near such a word ("rendered in Stage 2", "Status: not
+#: approved") is not a gate. A false match is not harmless: it refuses an
+#: honest compile, so these patterns stay specific.
 _GATE_TEXT_RE = re.compile(
-    r"\b(gate[sd]?|canar(y|ies)|deploy\w*|go-ahead|sign-?off|approv(al|e|ed)|activat\w*)\b", re.IGNORECASE
-)
-_PREREQUISITE_RE = re.compile(
-    r"\b(before|after|until|once|prior to|requires?|required|needs?|must|without|wait\w*|do not|don't)\b",
+    r"(?<![\w-])(gate[sd]?|canar(y|ies)|deploy\w*|go-ahead|sign-?off|approv(al|e|ed)|authori[sz]\w*|activat\w*)(?![\w-])",
     re.IGNORECASE,
 )
-#: An approval word next to a stage reference is a gate on its own: no
-#: phrasing of an owner's go-ahead is evidence that it is optional.
-_APPROVAL_TEXT_RE = re.compile(r"\b(go-ahead|sign-?off|approv(al|e|ed)|authori[sz]\w*)\b", re.IGNORECASE)
-_STAGE_REFERENCE_RE = re.compile(r"\bstages?\s+[A-Za-z]*\d", re.IGNORECASE)
+_NEGATED_GATE_RE = re.compile(r"\bnot\s+(yet\s+)?(approved|authori[sz]ed|signed[- ]off|gated)\b", re.IGNORECASE)
+_STAGE_REF = r"stages?\s+[A-Za-z]*\d\w*"
+_STAGE_AS_PREREQUISITE_RE = re.compile(
+    rf"\b(before|after|until|once|prior\s+to)\s+(the\s+)?{_STAGE_REF}"
+    rf"|\b{_STAGE_REF}(\'s)?\s+(\w+\s+)?(requires?|needs?|must\s+wait|waits?|cannot\s+start|can\'t\s+start"
+    r"|may\s+not\s+start|must\s+not\s+start|is\s+(gated|blocked)|depends)\b",
+    re.IGNORECASE,
+)
+_INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 #: Evidence, in a gate's own source text, of each gate kind -- what
 #: ``gate_at_boundary`` checks so a moved gate cannot silently change kind.
 _GATE_KIND_EVIDENCE: dict[str, re.Pattern[str]] = {
@@ -831,13 +836,36 @@ class CompileContext:
         named, inspected = value.get("named_repositories"), value.get("inspected_repositories")
         if not all(isinstance(v, list) and all(isinstance(n, str) for n in v) for v in (named, inspected)):
             raise IntakeError("intake.json records a malformed compile context; run prepare-plan again")
+        repositories = record.get("repositories")
+        if not isinstance(repositories, Mapping) or set(inspected) != set(repositories):
+            raise IntakeError(
+                "intake.json's compile context does not match its recorded repositories; run prepare-plan again"
+            )
         return cls(named=frozenset(named), inspected=frozenset(inspected))
 
 
 def names_repository(text: str, name: str) -> bool:
-    """Whether ``text`` names repository ``name`` as a whole word."""
+    """Whether ``text`` names repository ``name`` as a repository.
 
-    return bool(name) and re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", text, re.IGNORECASE) is not None
+    Conservative, so a plain word in prose ("the web client", "an app
+    restart") does not count: the name must be in a code span, next to
+    "repository"/"repo" (including a "Repos: a, b" list), or be a qualified name (containing ``-``, ``_``,
+    ``.`` or ``/``) appearing as a whole token.
+    """
+
+    if not name:
+        return False
+    escaped = re.escape(name)
+    token = rf"(?<![\w./-]){escaped}(?![\w/-])(?!\.\w)"
+    patterns = [
+        rf"`{escaped}`",
+        # "repository web", "Repos: app, web", "repos `app` and web"
+        rf"\b(repository|repositories|repo|repos)\b:?\s+(`?[\w./-]+`?\s*(,|and)\s*)*`?{token}",
+        rf"{token}\s+(repository|repo)\b",
+    ]
+    if re.search(r"[-_./]", name):
+        patterns.append(token)
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
 
 
 def compile_context_for(
@@ -1109,20 +1137,52 @@ def _lines(ranges: Iterable[LineRange], total: int) -> set[int]:
     return {n for r in ranges if 1 <= r.start <= r.end <= total for n in range(r.start, r.end + 1)}
 
 
-def _paragraphs(source: SourcePlan) -> list[list[int]]:
-    """Line numbers of each run of consecutive non-blank lines."""
+def _sentences(source: SourcePlan) -> list[tuple[list[int], str]]:
+    """Each prose sentence with the line numbers it spans. Headings and
+    fenced code are skipped; inline code spans are blanked."""
 
-    out: list[list[int]] = []
-    current: list[int] = []
+    out: list[tuple[list[int], str]] = []
+    paragraph: list[int] = []
+    fenced = False
+
+    def flush() -> None:
+        if not paragraph:
+            return
+        text, owner = "", []
+        for number in paragraph:
+            line = _INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), source.lines[number - 1])
+            text += line + " "
+            owner += [number] * (len(line) + 1)
+        start = 0
+        for match in [*_SENTENCE_END_RE.finditer(text), None]:
+            end = match.start() if match else len(text)
+            sentence = text[start:end]
+            if sentence.strip():
+                first = start + len(sentence) - len(sentence.lstrip())
+                last = start + len(sentence.rstrip()) - 1
+                out.append((sorted(set(owner[first : last + 1])), sentence.strip()))
+            if match:
+                start = match.end()
+        paragraph.clear()
+
     for number, line in enumerate(source.lines, start=1):
-        if line.strip():
-            current.append(number)
-        elif current:
-            out.append(current)
-            current = []
-    if current:
-        out.append(current)
+        if _FENCE_RE.match(line):
+            flush()
+            fenced = not fenced
+            continue
+        if fenced or _HEADING_RE.match(line) or not line.strip():
+            flush()
+            continue
+        paragraph.append(number)
+    flush()
     return out
+
+
+def states_gate(sentence: str) -> bool:
+    """Whether one prose sentence states a gate on a stage."""
+
+    text = _NEGATED_GATE_RE.sub(" ", sentence)
+    return bool(_GATE_TEXT_RE.search(text) and _STAGE_AS_PREREQUISITE_RE.search(text))
 
 
 def _compile_checks(
@@ -1135,8 +1195,8 @@ def _compile_checks(
 
     - Every source line stating an independent review maps to a node: it is
       some stage's own text or context a stage attaches.
-    - No gate disappears: every line of a paragraph that states a gate (see
-      :data:`_GATE_TEXT_RE`) is part of a declared gate. Stage text, context
+    - No gate disappears: every line of a sentence that states a gate (see
+      :func:`states_gate`) is part of a declared gate. Stage text, context
       or an exclusion does not substitute for an enforced prerequisite.
     - A repository neither the plan nor PROJECT.md names needs a decision; a
       named one intake did not inspect refuses, saying how to supply it.
@@ -1164,11 +1224,8 @@ def _compile_checks(
                 ranges=[LineRange(number, number)],
             )
 
-    for paragraph in _paragraphs(source):
-        text = " ".join(source.lines[n - 1] for n in paragraph)
-        if not _STAGE_REFERENCE_RE.search(text):
-            continue
-        if not (_APPROVAL_TEXT_RE.search(text) or (_GATE_TEXT_RE.search(text) and _PREREQUISITE_RE.search(text))):
+    for paragraph, text in _sentences(source):
+        if not states_gate(text):
             continue
         missing = [n for n in paragraph if n in substantive and n not in gated]
         if missing:
@@ -1850,7 +1907,7 @@ def prepare_plan(
         brief_digests[stage_id] = sha256_text(content)
 
     amendment = None
-    if interpretation.amended_plan is not None and interpretation.amended_plan != text:
+    if mode != MODE_COMPILE and interpretation.amended_plan is not None and interpretation.amended_plan != text:
         amendment = amendment_diff(source, interpretation.amended_plan)
         _write(directory / "amendment.diff", amendment)
 
@@ -2278,14 +2335,15 @@ def render_report(
             f"`{str(snapshot.get('head'))[:12]}`" + (f"; {len(dirty)} dirty path(s)" if dirty else "")
         )
 
-    out += ["", "## Proposed amendment", ""]
-    out.append(
-        "See `amendment.diff`. It is a proposal for the source plan and is not applied; the "
-        "manifest executes the source text as sliced above. Approval requires "
-        "--without-amendment, or apply it to the plan and run intake again."
-        if amendment
-        else "None."
-    )
+    if mode != MODE_COMPILE:  # compile mode never proposes one (amendment_in_compile_mode)
+        out += ["", "## Proposed amendment", ""]
+        out.append(
+            "See `amendment.diff`. It is a proposal for the source plan and is not applied; the "
+            "manifest executes the source text as sliced above. Approval requires "
+            "--without-amendment, or apply it to the plan and run intake again."
+            if amendment
+            else "None."
+        )
 
     out += ["", "## Next step", ""]
     if blocking:
@@ -2520,7 +2578,9 @@ def approve_plan(
     findings = all_findings(interpretation, source, mode=mode, compile_context=compile_context)
     # Derived from the interpretation itself, never taken from intake.json.
     amendment_proposed = (
-        interpretation.amended_plan is not None and interpretation.amended_plan != source.text
+        mode != MODE_COMPILE
+        and interpretation.amended_plan is not None
+        and interpretation.amended_plan != source.text
     )
     blocking = [f for f in findings if f.blocking]
     if blocking:

@@ -27,7 +27,9 @@ from agent_sparring.intake import (
     check_interpretation,
     compile_context_for,
     parse_interpretation,
+    names_repository,
     prepare_plan,
+    states_gate,
 )
 from agent_sparring.intake_approval import load_intake_manifest
 from agent_sparring.providers import SparringAgentResult
@@ -36,6 +38,7 @@ from test_intake import PLAN, _Repo, good_interpretation, lines
 FIXTURES = Path(__file__).parent / "fixtures" / "plans"
 CLOUD = (FIXTURES / "cloud_sync_like.md").read_text(encoding="utf-8")
 CONTRADICTORY = (FIXTURES / "cloud_sync_contradictory.md").read_text(encoding="utf-8")
+COMPILER = (FIXTURES / "run_plan_compiler.md").read_text(encoding="utf-8")
 CONTEXT = CompileContext(named=frozenset({"app", "web"}), inspected=frozenset({"app", "web"}))
 ALL = ["1", "2", "3A", "3B", "4", "4R", "5"]
 
@@ -460,6 +463,120 @@ class CompileEndToEndTests(_Repo):
         refused = [f for f in result.blocking if f.code == "sibling_not_supplied"]
         self.assertEqual(len(refused), 1)
         self.assertIn("--context-repository web=<path>", refused[0].message)
+
+
+def compiler_interpretation() -> dict:
+    """An honest compile answer for this repository's own run-plan-compiler
+    plan (fixture copy): five stages, the design as context, no gates."""
+
+    text = COMPILER
+    labels = [("1", "## Stage 1 "), ("2", "## Stage 2 "), ("3", "## Stage 3 "), ("4", "## Stage 4 "), ("5", "## Stage 5 ")]
+    stops = [first for _, first in labels[1:]] + ["## Explicitly out of scope"]
+    stages = [
+        node(text, label, f"Stage {label}", first, stop, context_ids=["design"], depends_on=[labels[i - 1][0]] if i else [])
+        for i, ((label, first), stop) in enumerate(zip(labels, stops))
+    ]
+    return {
+        "verdict": "executable_with_recommendations",
+        "summary": "Five stages in one slice.",
+        "context": [{"id": "design", "title": "Design", "ranges": [until(text, "# Run Plan", "## Stage 1 ")], "reason": "design"}],
+        "runs": [{"id": "app", "primary_repository": "app", "expected_branch": None, "rationale": "", "stages": stages}],
+        "gates": [],
+        "excluded": [{"ranges": [until(text, "## Explicitly out of scope")], "reason": "scope"}],
+        "findings": [],
+        "amended_plan": None,
+    }
+
+
+class GateDetectionTests(unittest.TestCase):
+    def test_this_repositorys_own_plan_compiles_without_a_dropped_gate(self):
+        findings = compile_check(compiler_interpretation(), text=COMPILER)
+        self.assertNotIn("gate_dropped", [f.code for f in findings])
+
+    def test_false_positives(self):
+        for sentence in (
+            "Stage 5). Status: proposed, not approved.",
+            "Status: proposed, not approved, covering Stage 1 to Stage 5.",
+            "Review focus: Stage 1 must keep the `approve-plan` path unchanged.",
+            "`gate_at_boundary` is validated here but rendered in Stage 2.",
+            "Stage 2 adds manifest v2 and between-stage gates.",
+            "Stage 1 must add tests for the deployment parser.",
+            "The approval path in Stage 3 seals the manifest.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertFalse(states_gate(sentence))
+
+    def test_true_positives(self):
+        for sentence in (
+            "If Stage 2's sync metrics regress, run a canary on 5% of devices before Stage 3A starts.",
+            "Activate the release after Stage 1A, with explicit go-ahead.",
+            "Stage 3A requires the owner's go-ahead.",
+            "Stage 4 needs sign-off from the owner.",
+            "Deploy to production before Stage 2 begins.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertTrue(states_gate(sentence))
+
+    def test_only_the_gate_sentence_must_be_covered(self):
+        text = CLOUD.replace(
+            "If Stage 2's sync metrics regress, run a canary on 5% of devices before\nStage 3A starts.",
+            "Notes on Stage 2 metrics. Run a canary before\nStage 3A starts.",
+        )
+        payload = cloud_interpretation(text)
+        canary = payload["gates"][0]["ranges"][0]
+        line = next(i for i, l in enumerate(text.splitlines(), 1) if l.startswith("Notes on Stage 2"))
+        payload["gates"][0]["ranges"] = [{"start": line, "end": canary["end"]}]
+        self.assertNotIn("gate_dropped", [f.code for f in compile_check(payload, text=text)])
+        payload["gates"] = []
+        payload["excluded"].append({"ranges": [canary], "reason": "x"})
+        payload["findings"] = [f for f in payload["findings"] if f["transform"] != "gate_at_boundary"]
+        dropped = [f for f in compile_check(payload, text=text) if f.code == "gate_dropped"]
+        self.assertEqual(len(dropped), 1)
+        self.assertTrue(dropped[0].blocking)
+
+    def test_gate_text_in_code_or_a_heading_is_not_a_gate(self):
+        from agent_sparring.intake import _sentences
+
+        text = "## Deploy before Stage 3\n\n```\ndeploy before Stage 3\n```\n\nRun `deploy before Stage 3`.\n"
+        found = _sentences(SourcePlan(label="p", text=text))
+        self.assertEqual([lines for lines, _ in found], [[7]])
+        self.assertFalse(any(states_gate(sentence) for _, sentence in found))
+
+
+class RepositoryNamingTests(unittest.TestCase):
+    def test_a_plain_word_in_prose_does_not_name_a_repository(self):
+        self.assertFalse(names_repository("Stage 3B checks the web client and an app restart.", "web"))
+        self.assertFalse(names_repository("the Web client", "web"))
+
+    def test_repository_contexts_name_it(self):
+        for text in ("update `web`", "the web repository", "repository web", "Repos: app, web.", "sibling sporely-web"):
+            with self.subTest(text=text):
+                name = "sporely-web" if "sporely" in text else "web"
+                self.assertTrue(names_repository(text, name))
+
+    def test_an_unnamed_repository_needs_a_decision(self):
+        text = CLOUD.replace("`web`", "web")  # same line numbers; "web" only in prose
+        findings = compile_check(cloud_interpretation(), text=text)
+        self.assertIn(("unnamed_repository", "needs_decision"), [(f.code, f.disposition) for f in findings])
+
+    def test_from_record_refuses_a_context_that_does_not_match_the_repositories(self):
+        record = {"compile": CONTEXT.as_dict(), "repositories": {"app": {}, "web": {}}}
+        self.assertEqual(CompileContext.from_record(record), CONTEXT)
+        record["repositories"] = {"app": {}}
+        with self.assertRaisesRegex(IntakeError, "does not match"):
+            CompileContext.from_record(record)
+
+
+class CompileAmendmentTests(_Repo):
+    def test_compile_mode_writes_no_amendment_even_if_one_is_returned(self):
+        payload = compile_widget_interpretation()
+        payload["amended_plan"] = PLAN + "\nmore\n"
+        result = self.prepare(payload, mode="compile")
+        self.assertIn("amendment_in_compile_mode", [f.code for f in result.blocking])
+        self.assertFalse((result.directory / "amendment.diff").exists())
+        report = (result.directory / "report.md").read_text(encoding="utf-8")
+        self.assertNotIn("Proposed amendment", report)
+        self.assertNotIn("--without-amendment", report)
 
 
 if __name__ == "__main__":
