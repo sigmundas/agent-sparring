@@ -198,6 +198,7 @@ from agent_sparring.loop import (
     LoopResult,
     run_unattended_loop,
 )
+from agent_sparring.next_turn import NextTurnError, resolve_resume_turn
 from agent_sparring.manifest import ManifestError, ManifestPlanSource, load_manifest_source
 from agent_sparring.intake_approval import (
     SOURCE_KIND as INTAKE_SOURCE_KIND,
@@ -227,6 +228,7 @@ from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import RecordedOutcome, read_recorded_outcome
 from agent_sparring.stage import (
     HUMAN_EVIDENCE_HEADING,
+    NEXT_TURN_SPARRING,
     Stage,
     StageError,
     StageStatus,
@@ -1481,6 +1483,7 @@ def resume_plan(
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
     stop_after_stage: str | None = None,
+    next_turn: str | None = None,
     report: Reporter = lambda message: None,
 ) -> PlanRunResult:
     """Continue a recorded plan run at its current stage.
@@ -1526,6 +1529,15 @@ def resume_plan(
     them and stop being asked in the same action. Either one is recorded in
     the run's own state before anything runs, so it survives a reload and a
     later resume; neither is ever inferred from evidence text.
+
+    An ordinary resume obeys the current stage's recorded ``next_turn``
+    (see :mod:`agent_sparring.next_turn`): ``sparring`` reviews the recorded
+    candidate directly, with no implementation turn. State written before
+    that marker existed is derived once from engine records; when that is
+    ambiguous the resume is refused, and ``next_turn`` (``stage`` |
+    ``sparring``) is the caller's explicit choice, recorded as ``manual``.
+    Evidence, a recorded human gate and a pending finalization keep their
+    existing precedence over the marker.
 
     A current stage that is already ACCEPTED (by hand, after an ESCALATE
     sparred elsewhere, or by a run that stopped between accept and advance)
@@ -1667,6 +1679,7 @@ def resume_plan(
         report=report,
         sparrer_first=sparrer_first,
         stop_after_stage=stop_after_stage,
+        next_turn_choice=next_turn,
     )
 
 
@@ -2926,6 +2939,7 @@ def _drive(
     report: Reporter,
     sparrer_first: bool = False,
     stop_after_stage: str | None = None,
+    next_turn_choice: str | None = None,
 ) -> PlanRunResult:
     """Walk the plan's stages from the recorded position until it pauses,
     fails or completes.
@@ -3194,15 +3208,35 @@ def _drive(
                     if sparrer_first:
                         start_with = "sparring"
                         sparrer_first = False  # only the stage this resume entered
-                    elif _awaiting_finalization(state, state_path, activity, repo_root, stage):
+                    elif next_turn_choice is None and _awaiting_finalization(
+                        state, state_path, activity, repo_root, stage
+                    ):
                         # Stopped between the reviewer's READY and the commit that
                         # acceptance can freeze -- where a run that predates the
                         # finalization cycle was left, and where any process killed
                         # between those two points stops.
                         start_with = "finalization"
                     else:
-                        start_with = "stage"
+                        # The engine's own record of whose turn it is (see
+                        # agent_sparring.next_turn): derived once for state
+                        # written before it existed, or chosen explicitly.
+                        choice, next_turn_choice = next_turn_choice, None
+                        try:
+                            marker = resolve_resume_turn(repo_root, stage, choice=choice)
+                        except NextTurnError as exc:
+                            raise _fail(
+                                state,
+                                state_path,
+                                activity,
+                                why="next turn undetermined",
+                                message=(
+                                    f"plan {state.plan} stopped at stage {stage.stage_id!r} "
+                                    f"before any provider turn: {exc}"
+                                ),
+                            ) from exc
+                        start_with = "next_turn" if marker == NEXT_TURN_SPARRING else "stage"
                     entering = {
+                        "next_turn": "; reviewing the recorded candidate",
                         "sparring": "; sparring first",
                         "finalization": "; finalizing the reviewed candidate",
                         "stage": "",
@@ -3215,6 +3249,10 @@ def _drive(
                         f"stage {position} {stage.stage_id}: "
                         + {
                             "sparring": "resuming the sparrer against the unchanged candidate",
+                            "next_turn": (
+                                "an implementation turn already completed; reviewing its "
+                                "recorded candidate without another implementation turn"
+                            ),
                             "finalization": (
                                 "the sparrer already said READY and the reviewed candidate is "
                                 "not committed; committing and pushing exactly that work, then "
@@ -3253,7 +3291,10 @@ def _drive(
                             expected_branch=state.expected_branch,
                             max_send_back_cycles=max_send_back_cycles,
                             self_check=self_check,
-                            start_with=start_with,
+                            start_with="sparring" if start_with == "next_turn" else start_with,
+                            sparring_first_reason=(
+                                "next_turn" if start_with == "next_turn" else "evidence"
+                            ),
                             pending_deferred=state.unresolved_deferred,
                         )
                     except LoopError as exc:

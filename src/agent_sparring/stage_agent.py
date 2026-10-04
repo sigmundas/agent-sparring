@@ -25,6 +25,7 @@ from agent_sparring.handoff import generate_handoff
 from agent_sparring.providers import ProviderError, StageAgentAdapter, StageAgentResult
 from agent_sparring.stage import Stage, StageState, StageStatus
 from agent_sparring.prompt_capture import capture_prompt
+from agent_sparring.sessions import ROLE_STAGE, is_fresh, note_session_id
 from agent_sparring.stage_prompt import assemble_stage_prompt
 
 
@@ -94,6 +95,7 @@ def _session_recorded_early(
         if not session_id or state.implementation_session_id == session_id:
             return
         state.implementation_session_id = session_id
+        note_session_id(state, ROLE_STAGE, session_id)
         stage.write_state(state)
 
     previous = adapter.on_session_observed  # type: ignore[attr-defined]
@@ -195,7 +197,11 @@ def run_stage_agent(
                     "work belongs to a new stage."
                 )
 
+            # The current generation's session (see agent_sparring.sessions):
+            # a fresh generation has none yet, so it starts a new
+            # conversation and is told it is continuing the same stage.
             resume_id = state.implementation_session_id
+            fresh = resume_id is None and is_fresh(state, ROLE_STAGE)
 
             if state.base_sha is not None:
                 base_sha = state.base_sha
@@ -218,6 +224,7 @@ def run_stage_agent(
                 expected_branch=expected_branch,
                 self_check=self_check,
                 finalize_only=finalize_only,
+                fresh=fresh,
             )
             prompt = assembled.text
 
@@ -289,6 +296,7 @@ def run_stage_agent(
             # state.base_sha was already persisted above (before the provider
             # ran) if this was the first run; it is never moved forward here.
             state.implementation_session_id = result.session_id
+            note_session_id(state, ROLE_STAGE, result.session_id)
             stage.write_state(state)
             activity.emit(
                 "turn.finished",

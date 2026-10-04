@@ -131,6 +131,85 @@ branch and at the preceding accepted candidate; an attempt that modified
 tracked, committed content; and any dirty path it cannot account for — your
 uncommitted work is never swept aside to make a recovery possible.
 
+## Whose turn it is: `next_turn`
+
+Each stage's `state.json` records whose turn it is, written only by the
+engine and only after the preceding operation fully succeeded:
+
+| `next_turn` | Written when | Ordinary resume does |
+| --- | --- | --- |
+| `stage` | a full cycle begins; a SEND_BACK or READY verdict is recorded | an implementation turn |
+| `sparring` | an implementation turn, its handoff and its session are all recorded | a review of exactly `next_turn_candidate`, no implementation turn |
+| `finalization` | READY is recorded over a candidate that is still uncommitted | the bounded commit/push turn |
+
+`next_turn_candidate` pins what a `sparring` marker refers to: HEAD, whether
+the candidate is a `commit` or still partly in the `worktree`, a digest of
+the candidate content (stage artifacts excluded), and every declared sibling
+repository's HEAD. Before such a review starts the engine re-reads all of
+them, and any difference is refused with both identities named; it never
+falls back to running the other agent. A failed provider turn never advances
+the marker, and NEEDS_YOU / ESCALATE leave it where it is -- the recorded
+gate decides what happens next. `resume-plan --evidence` keeps its existing
+meaning (the reviewer judges the answer against the candidate as it stands)
+and is not held to the pinned candidate. `activity.jsonl` may mirror these
+decisions but is never read to make them.
+
+**State written before the marker existed** is reconstructed once, on the
+first resume, from engine-owned records only: the prompt-capture index, the
+handoff (its recorded candidate commit and the verdict it embeds), the
+routing block of `sparring.md`, and the repository now. It derives
+`sparring` only when the last completed implementation turn is later than
+the last verdict and its candidate is still HEAD (with no unrecorded
+uncommitted content), and `stage` when no implementation turn completed
+after the last SEND_BACK. Anything else -- for example HEAD having moved
+past the handoff's candidate -- is refused with what was found; the caller
+then chooses explicitly (`resume_plan(..., next_turn="stage" | "sparring")`).
+The result is recorded with `next_turn_source` = `derived` or `manual` and
+is never derived again.
+
+## Resume, fresh session, reset
+
+Three different things, from least to most disruptive:
+
+- **Resume** (`resume-plan`, `run-loop`) continues the same stage in the
+  same provider conversations, with the configuration locked at each
+  conversation's first turn. It obeys `next_turn`.
+- **A fresh session** (`agent_sparring.sessions.start_fresh_session(stage,
+  role, reason)`) discards one role's conversation and continues the *same*
+  stage in a new one: a new *session generation*. Its configuration is
+  resolved anew at its first turn, so a changed model, effort or provider
+  preference (or an explicit override) takes effect there. Its first prompt
+  is the full prompt plus the engine-owned record of where the stage stands:
+  a fresh stage agent sees the latest sparring exchange and is told to
+  address its SEND_BACK findings without redoing earlier work; a fresh
+  reviewer sees its predecessor's exchange as historical evidence, to be
+  re-checked independently but not silently dropped. Captured prompts show
+  the turn kind `fresh`. Nothing else changes: candidate, base, branch,
+  mode, brief, handoff, `sparring.md`, notes, deferred ledger, plan digest,
+  sibling pins, freeze/accept state, prompts, activity history and
+  `next_turn` are all left as they were, so a fresh session cannot reach
+  acceptance without a normal READY review. It is the single path for
+  discarding a session; nothing rolls over automatically today.
+- **[`reset-stage`](#restarting-a-stage-started-under-the-wrong-mode)**
+  archives the attempt and reinitialises the stage itself.
+
+Generations are recorded as `sessions: {role: [...]}` in `state.json`, each
+with its `generation`, `session_id` (null until the provider reports one),
+pinned `agent`, `started_at`, `start_reason` (`initial` or
+`fresh:<reason>`) and, once closed, `ended_at` / `end_reason`.
+`implementation_session_id`, `sparring_session_id` and `agents[role]`
+always hold the *current* generation's values.
+
+### Compatibility of existing `state.json` files
+
+`next_turn`, `next_turn_candidate`, `next_turn_source` and `sessions` are
+all optional and absent until first written: an existing file reads back
+unchanged and stays byte-identical until the engine writes the marker or a
+fresh session is started. A recorded session id with no `sessions` list is
+generation 1, and is materialized as such when the list is first written.
+A stage that has had any session generation cannot change its mode, exactly
+as one with a recorded session could not before.
+
 ## Who owns which artifact
 
 Every file a run reads or writes has exactly one authority. Paths are
@@ -150,7 +229,7 @@ itself, which is an ordinary repository file.
 | `stages/<stage>/notes.md` | engine (and a person editing by hand) | no | skeleton at creation, then appended to by section | a human's recorded answer or check results (`## Human evidence`) |
 | `stages/<stage>/handoff.md` | engine | no | regenerated in full by every implementation turn | that turn's claims, git identity and evidence, for the sparrer |
 | `stages/<stage>/sparring.md` | engine | no | rewritten in full by every sparring exchange | the latest verdict, rendered from the structured routing result |
-| `stages/<stage>/state.json` | engine | no | rewritten on every lifecycle change | status, candidate identity, provider session ids |
+| `stages/<stage>/state.json` | engine | no | rewritten on every lifecycle change | status, candidate identity, whose turn it is, provider session generations |
 | `stages/<stage>/dialogue.jsonl` | engine | no | append-only; one record per question and answer | provenance for the read-only conversation a person holds with the reviewer (`sparring ask`) |
 | `stages/<stage>/activity.jsonl` | engine | no | append-only, never read by orchestration | observational telemetry only |
 

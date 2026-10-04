@@ -94,6 +94,8 @@ from agent_sparring.providers import ProviderError
 from agent_sparring.providers.codex_cli import PROVIDER_ID as CODEX_PROVIDER_ID, CodexCliAdapter
 from agent_sparring.recovery import RecoveryError, reopen_for_failed_check, reset_stage
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
+from agent_sparring.next_turn import NextTurnError, resolve_resume_turn
+from agent_sparring.sessions import note_pin
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.sparring_prompt import build_sparring_prompt
@@ -975,29 +977,33 @@ def _pin_of(resolved: ResolvedAgentConfig) -> PinnedAgent:
 
 
 def _apply_pin(resolved: ResolvedAgentConfig, pin: PinnedAgent) -> ResolvedAgentConfig:
-    """This stage's recorded configuration for one role, or a refusal.
+    """The current session's recorded configuration for one role, or a
+    refusal.
 
-    A preference changed since the stage started is simply not used here: it
-    applies from the next stage. An explicit command-line or environment
-    override that asks for something else mid-stage is refused rather than
-    ignored, because it is a request the person made for this invocation.
+    The lock is per session generation (see :mod:`agent_sparring.sessions`):
+    a preference changed since the session started is simply not used here;
+    it applies from the next stage or from a fresh session. An explicit
+    command-line or environment override that asks for something else
+    mid-session is refused rather than ignored, because it is a request the
+    person made for this invocation.
     """
 
     if resolved.provider != pin.provider:
         raise AgentConfigError(
-            f"this stage started with {pin.provider} as its {resolved.role} agent and runs with it "
-            f"to the end; the provider now resolves to {resolved.provider}. A provider change "
-            f"applies from the next stage"
+            f"this {resolved.role} session started with {pin.provider} and keeps it for the whole "
+            f"session; the provider now resolves to {resolved.provider}. A provider change applies "
+            f"from the next stage, or from a fresh {resolved.role} session for this one"
         )
     for field, pinned in (("model", pin.model), ("effort", pin.effort)):
         value = getattr(resolved, field)
         source = getattr(resolved, f"{field}_source")
         if source in (SOURCE_CLI, SOURCE_ENV) and value != pinned:
             raise AgentConfigError(
-                f"this stage runs its {resolved.role} agent with {field} "
+                f"this {resolved.role} session runs with {field} "
                 f"{pinned if pinned is not None else 'provider default'!s} from its first turn to its "
                 f"last; the {source} override asks for {value!r}. A {field} change applies from the "
-                f"next stage: drop the override to continue this one"
+                f"next stage, or from a fresh {resolved.role} session: drop the override to continue "
+                f"this one"
             )
     return replace(
         resolved,
@@ -1009,9 +1015,9 @@ def _apply_pin(resolved: ResolvedAgentConfig, pin: PinnedAgent) -> ResolvedAgent
 
 
 def _stage_agents(stage: Stage, fresh: EffectiveAgents, *, record: bool = True) -> EffectiveAgents:
-    """The configuration ``stage`` runs with: pinned at its first provider
-    turn (``record``) and reused by every later one (see
-    :class:`agent_sparring.stage.PinnedAgent`)."""
+    """The configuration ``stage`` runs with: pinned at each session
+    generation's first provider turn (``record``) and reused by every later
+    turn of that session (see :class:`agent_sparring.stage.PinnedAgent`)."""
 
     state = stage.read_state()
     pins = dict(state.agents or {})
@@ -1019,6 +1025,9 @@ def _stage_agents(stage: Stage, fresh: EffectiveAgents, *, record: bool = True) 
     if missing and record:
         for resolved in missing:
             pins[resolved.role] = _pin_of(resolved)
+            # A pending fresh generation gets its configuration here, at its
+            # first turn, exactly like a stage's first generation.
+            note_pin(state, resolved.role, pins[resolved.role])
         state.agents = pins
         stage.write_state(state)
     return EffectiveAgents(
@@ -1341,6 +1350,9 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             args, sparring_dir, repo_root, activity_log=stage.activity_log(), stage=stage
         )
 
+        # An ordinary resume obeys the engine's record of whose turn it is
+        # (derived once for state written before it existed).
+        marker = resolve_resume_turn(repo_root, stage)
         loop_result = run_unattended_loop(
             stage,
             sparring_dir,
@@ -1350,8 +1362,17 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             expected_branch=args.expected_branch,
             max_send_back_cycles=args.max_send_back_cycles,
             self_check=self_check,
+            start_with="sparring" if marker == "sparring" else "stage",
+            sparring_first_reason="next_turn",
         )
-    except (StageError, LoopError, ProjectConfigError, GitContextError, ProviderError) as exc:
+    except (
+        StageError,
+        LoopError,
+        NextTurnError,
+        ProjectConfigError,
+        GitContextError,
+        ProviderError,
+    ) as exc:
         print(f"could not run unattended loop: {exc}", file=sys.stderr)
         return 1
 

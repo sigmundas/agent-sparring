@@ -93,6 +93,7 @@ from agent_sparring.routing import RoutingResult, RoutingResultError
 from agent_sparring.sparring_exchange import record_sparring_result
 from agent_sparring.prompt_capture import capture_prompt
 from agent_sparring.review_prompt import assemble_review_prompt
+from agent_sparring.sessions import ROLE_SPARRING, is_fresh, note_session_id
 from agent_sparring.sparring_prompt import assemble_sparring_prompt
 from agent_sparring.stage import Stage
 
@@ -348,7 +349,10 @@ def _run_sparring_agent_locked(
     pending_deferred: tuple[DeferredObligation, ...] = (),
 ) -> SparringAgentRunResult:
     state = stage.read_state()
+    # The current generation's session; a pending fresh generation has none
+    # and is told it replaces an earlier reviewer conversation.
     resume_id = state.sparring_session_id
+    fresh = resume_id is None and is_fresh(state, ROLE_SPARRING)
 
     if review_candidate_set is not None:
         assembled = assemble_review_prompt(
@@ -369,6 +373,7 @@ def _run_sparring_agent_locked(
             finalization=finalization,
             evidence_first=evidence_first,
             pending_deferred=pending_deferred,
+            fresh=fresh,
         )
     prompt = assembled.text
 
@@ -493,6 +498,7 @@ def _run_sparring_agent_locked(
     # forward from a snapshot taken before the provider turn.
     current_state = stage.read_state()
     current_state.sparring_session_id = result.session_id
+    note_session_id(current_state, ROLE_SPARRING, result.session_id)
     stage.write_state(current_state)
 
     recorded = record_sparring_result(stage, routing, findings=findings_text)

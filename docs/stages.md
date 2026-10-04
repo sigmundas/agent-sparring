@@ -66,6 +66,14 @@ sparring usage <stage-id>           # one stage
 sparring usage <stage-id> --json    # the same records, machine-readable
 ```
 
+A role that has had more than one provider conversation (see
+[fresh sessions](reference.md#resume-fresh-session-reset)) is reported one
+*session generation* at a time: a `---- <role> session generation N (<why
+it started>; <provider, model, effort>) ----` boundary, that generation's
+own token figures (providers count cumulatively per session, so each
+generation is summed separately), and a line totalling all generations. Turn
+rows then name the generation, e.g. `sparrer#2`.
+
 For each role it reports the provider, model and effort the turn ran with
 and **where each was set** (`cli`, `env`, `project`, `engine-default` or
 `provider-default`), then the token totals the providers reported, then one

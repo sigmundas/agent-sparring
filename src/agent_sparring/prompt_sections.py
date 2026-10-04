@@ -43,6 +43,8 @@ TURN_RESUME = "resume"
 TURN_FINALIZATION = "finalization"
 TURN_EVIDENCE_REVIEW = "evidence_review"
 TURN_FINALIZED_REVIEW = "finalized_review"
+# The first turn of a fresh session generation (agent_sparring.sessions).
+TURN_FRESH = "fresh"
 
 ROLE_STAGE = "stage"
 ROLE_SPARRER = "sparrer"
@@ -127,7 +129,7 @@ class AssembledPrompt:
         return tuple(offsets)
 
 
-def stage_turn_kind(*, resume: bool, finalize_only: bool) -> str:
+def stage_turn_kind(*, resume: bool, finalize_only: bool, fresh: bool = False) -> str:
     """The turn kind for a stage-agent prompt.
 
     A turn carrying a human's recorded answer is deliberately not its own
@@ -140,11 +142,17 @@ def stage_turn_kind(*, resume: bool, finalize_only: bool) -> str:
 
     if finalize_only:
         return TURN_FINALIZATION
+    if fresh:
+        return TURN_FRESH
     return TURN_RESUME if resume else TURN_ORIGINAL
 
 
 def sparring_turn_kind(
-    *, resume: bool, evidence_first: bool = False, finalization: bool = False
+    *,
+    resume: bool,
+    evidence_first: bool = False,
+    finalization: bool = False,
+    fresh: bool = False,
 ) -> str:
     """The turn kind for a sparring-agent prompt.
 
@@ -159,6 +167,8 @@ def sparring_turn_kind(
         return TURN_FINALIZED_REVIEW
     if evidence_first:
         return TURN_EVIDENCE_REVIEW
+    if fresh:
+        return TURN_FRESH
     return TURN_RESUME if resume else TURN_ORIGINAL
 
 
@@ -191,6 +201,7 @@ __all__ = [
     "TURN_EVIDENCE_REVIEW",
     "TURN_FINALIZATION",
     "TURN_FINALIZED_REVIEW",
+    "TURN_FRESH",
     "TURN_ORIGINAL",
     "TURN_RESUME",
     "review_turn_kind",

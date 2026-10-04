@@ -249,7 +249,34 @@ def record_sparring_result(
         )
     content = render_sparring(stage, result, findings=findings)
     stage.write_sparring(content)
+    _discharge_review_turn(stage, result.action)
     return SparringRecord(content=content, result=result)
+
+
+def _discharge_review_turn(stage: Stage, action: RoutingAction) -> None:
+    """Move ``next_turn`` off ``sparring`` once a verdict that ends the
+    review is recorded (see :mod:`agent_sparring.next_turn`).
+
+    SEND_BACK owes the implementation agent a turn; READY hands over to
+    acceptance (the loop sets ``finalization`` itself when the candidate is
+    still uncommitted). NEEDS_YOU and ESCALATE leave the marker where it is:
+    the recorded gate already decides what happens next. State with no
+    marker is left byte-identical. Done here, where every verdict is
+    written, so a verdict recorded by hand cannot leave a stale marker.
+    """
+
+    if action not in (RoutingAction.SEND_BACK, RoutingAction.READY):
+        return
+    try:
+        state = stage.read_state()
+    except StageError:
+        return
+    if state.next_turn is None:
+        return
+    state.next_turn = "stage"
+    state.next_turn_candidate = None
+    state.next_turn_source = "engine"
+    stage.write_state(state)
 
 
 @dataclass(frozen=True)
