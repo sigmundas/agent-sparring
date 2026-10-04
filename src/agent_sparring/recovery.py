@@ -333,6 +333,7 @@ def reopen_for_failed_check(
     # describe a question that is no longer asked.
     run_state.awaiting = None
     run_state.status = PlanRunStatus.PAUSED
+    run_state.provider_pause = None
     run_state.save(run.path)
     report(
         f"withdrew asking {instance_id} ({obligation.gate.title}); if it still applies to "
@@ -789,6 +790,7 @@ def reset_stage(
     digest = source.digest()
     run_state.plan_digest = digest
     run_state.status = PlanRunStatus.PAUSED
+    run_state.provider_pause = None
     # The stage that was stopped is gone, so any typed reason the run was
     # stopped *at* it is gone with it -- a request to push a candidate whose
     # stage has just been archived describes nothing. A recorded push

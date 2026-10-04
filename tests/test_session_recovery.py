@@ -30,6 +30,7 @@ from agent_sparring.plan import (
     PAUSE_SESSION_UNRESUMABLE,
     PlanError,
     PlanRunError,
+    PlanRunState,
     PlanRunStatus,
     ProviderPause,
 )
@@ -232,6 +233,115 @@ class ProviderPauseTests(_Stuck):
         self.assertEqual((ctx.exception.role, ctx.exception.kind), ("stage", PAUSE_PROVIDER_UNAVAILABLE))
         # The turn ran, so its session is real and kept for a deliberate retry.
         self.assertTrue(ctx.exception.has_session)
+
+
+class ProviderPauseRecordTests(_Stuck):
+    """``provider_pause`` in the plan-run state: descriptive, engine-written."""
+
+    def pause_reviewer(self):
+        stage, stage_adapter = self.leave_stuck()
+        with self.assertRaises(ProviderPause):
+            self._resume(stage_adapter, _UnresumableReviewer([READY]), stop_after_stage=S1)
+        return stage, stage_adapter
+
+    def test_an_unresumable_reviewer_is_recorded(self):
+        self.pause_reviewer()
+        record = self._plan_state().provider_pause
+        self.assertEqual(
+            {k: v for k, v in record.items() if k != "recorded_at"},
+            {"kind": PAUSE_SESSION_UNRESUMABLE, "role": "sparring", "stage_id": S1, "has_session": True},
+        )
+        self.assertRegex(record["recorded_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertIn("provider_pause", json.loads(self.state_path.read_text()))
+
+    def test_an_unavailable_stage_turn_before_its_session_is_recorded(self):
+        with self.assertRaises(ProviderPause):
+            self._start(_UnavailableBeforeSession(self.repo, commit=True), _SparringAdapter([READY]))
+        record = self._plan_state().provider_pause
+        self.assertEqual(
+            (record["kind"], record["role"], record["stage_id"], record["has_session"]),
+            (PAUSE_PROVIDER_UNAVAILABLE, "stage", S1, False),
+        )
+
+    def test_a_resume_that_runs_clears_it(self):
+        for fresh in ((), ("sparring",)):
+            with self.subTest(fresh=fresh):
+                self.setUp()
+                _, stage_adapter = self.pause_reviewer()
+                self._resume(
+                    stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1,
+                    fresh_roles=fresh, fresh_reason="session-unresumable" if fresh else None,
+                )
+                self.assertIsNone(self._plan_state().provider_pause)
+                self.assertNotIn("provider_pause", json.loads(self.state_path.read_text()))
+
+    def test_a_refused_resume_keeps_it(self):
+        _, stage_adapter = self.pause_reviewer()
+        before = self.state_path.read_bytes()
+        with self.assertRaises(PlanError):
+            self._resume(stage_adapter, _SparringAdapter([READY]), next_turn="stage")
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertIsNotNone(self._plan_state().provider_pause)
+
+    def test_a_different_pause_or_failure_replaces_it(self):
+        _, stage_adapter = self.pause_reviewer()
+
+        class _Down(_SparringAdapter):
+            def resume(self, session_id, prompt):
+                raise ProviderUnavailable("rate limit")
+
+        with self.assertRaises(ProviderPause):
+            self._resume(stage_adapter, _Down([]))
+        self.assertEqual(self._plan_state().provider_pause["kind"], PAUSE_PROVIDER_UNAVAILABLE)
+
+        class _Broken(_SparringAdapter):
+            def resume(self, session_id, prompt):
+                raise ProviderError("segfault")
+
+        with self.assertRaises(PlanRunError):
+            self._resume(stage_adapter, _Broken([]))
+        self.assertIsNone(self._plan_state().provider_pause)
+
+    def test_ordinary_failures_and_needs_you_never_write_it(self):
+        stage, stage_adapter = self.leave_stuck()
+
+        class _Broken(_SparringAdapter):
+            def resume(self, session_id, prompt):
+                raise ProviderError("segfault")
+
+        with self.assertRaises(PlanRunError):
+            self._resume(stage_adapter, _Broken([]))
+        self.assertNotIn("provider_pause", json.loads(self.state_path.read_text()))
+
+        self._resume(stage_adapter, _SparringAdapter([NEEDS_YOU]))
+        self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
+        self.assertNotIn("provider_pause", json.loads(self.state_path.read_text()))
+
+    def test_absent_field_round_trips_byte_identically(self):
+        self.leave_stuck()
+        raw = self.state_path.read_bytes()
+        self.assertNotIn(b"provider_pause", raw)
+        PlanRunState.load(self.state_path).save(self.state_path)
+        self.assertEqual(self.state_path.read_bytes(), raw)
+
+    def test_resume_routing_ignores_the_field(self):
+        observed = []
+        for strip in (False, True):
+            with self.subTest(strip=strip):
+                self.setUp()
+                stage, stage_adapter = self.pause_reviewer()
+                if strip:
+                    payload = json.loads(self.state_path.read_text())
+                    del payload["provider_pause"]
+                    self.state_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                sparring = _SparringAdapter([READY])
+                result = self._resume(stage_adapter, sparring, stop_after_stage=S1)
+                observed.append((
+                    len(sparring.start_calls), [sid for sid, _ in sparring.resume_calls],
+                    len(stage_adapter.start_calls) + len(stage_adapter.resume_calls),
+                    tuple(sid for sid, _ in result.accepted), result.status,
+                ))
+        self.assertEqual(observed[0], observed[1])
 
 
 class EvidenceCandidateTests(_PlanRepoTestCase):

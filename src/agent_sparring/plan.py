@@ -153,6 +153,7 @@ import hashlib
 import json
 import re
 import uuid
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -559,6 +560,14 @@ class PlanRunState:
     #: pause. Any new verdict rewrites sparring.md and so retires it.
     #: Omitted while ``None``.
     evidence_pending: dict[str, str] | None = None
+    #: Why the last provider failure paused this run, for clients to show:
+    #: ``{"kind", "role", "stage_id", "has_session", "recorded_at"}``,
+    #: written only by :func:`_fail_or_pause_for_provider` in the save that
+    #: pauses. Descriptive only -- nothing reads it to route a resume;
+    #: ``next_turn``, gates and candidate checks remain the authority.
+    #: Replaced by any other pause or failure, cleared when the run next
+    #: starts running. Omitted while ``None``.
+    provider_pause: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -582,6 +591,8 @@ class PlanRunState:
             payload.pop("run", None)
         if self.evidence_pending is None:
             payload.pop("evidence_pending", None)
+        if self.provider_pause is None:
+            payload.pop("provider_pause", None)
         return payload
 
     # -- the obligation ledger -------------------------------------------
@@ -682,6 +693,11 @@ class PlanRunState:
                 evidence_pending=(
                     {str(k): str(v) for k, v in payload["evidence_pending"].items()}
                     if isinstance(payload.get("evidence_pending"), dict)
+                    else None
+                ),
+                provider_pause=(
+                    dict(payload["provider_pause"])
+                    if isinstance(payload.get("provider_pause"), dict)
                     else None
                 ),
             )
@@ -2586,8 +2602,15 @@ def _recorded_pause(stage: Stage) -> RecordedOutcome | None:
     return outcome if outcome is not None and outcome.awaits_a_human else None
 
 
-def _pause(state: PlanRunState, state_path: Path) -> None:
+def _pause(
+    state: PlanRunState, state_path: Path, *, provider_pause: dict[str, Any] | None = None
+) -> None:
+    """Persist the run as paused. ``provider_pause`` is the descriptive
+    record of why, set only by :func:`_fail_or_pause_for_provider`; every
+    other pause or failure clears whatever an earlier one left."""
+
     state.status = PlanRunStatus.PAUSED
+    state.provider_pause = provider_pause
     state.save(state_path)
 
 
@@ -3181,7 +3204,19 @@ def _fail_or_pause_for_provider(
             "the provider declined the turn for quota / rate-limit reasons; retry when it is "
             "available again, or continue in a fresh session on another provider"
         )
-    _pause(state, state_path)
+    _pause(
+        state,
+        state_path,
+        provider_pause={
+            "kind": kind,
+            "role": role,
+            "stage_id": stage.stage_id,
+            "has_session": has_session,
+            "recorded_at": datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+        },
+    )
     activity.emit("plan.paused", summary=f"{role} {kind}")
     return ProviderPause(
         f"{message}. Paused, not failed: {explanation}. Nothing was retried, no session was "
@@ -3490,6 +3525,9 @@ def _drive(
             # never the one it might reach next; it is cleared on entry so it
             # can only ever be re-recorded by the step that means it.
             state.awaiting = None
+            # Likewise the provider failure that paused it: descriptive of
+            # the pause being left, never read to choose what runs now.
+            state.provider_pause = None
             state.save(state_path)
             # The declared cross-repository candidate set belongs to the
             # stage, so the acceptance gate finds it wherever it is invoked

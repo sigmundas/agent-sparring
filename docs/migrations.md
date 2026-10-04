@@ -198,5 +198,16 @@ adds:
 | `next_turn`, `next_turn_candidate`, `next_turn_source` | state from before the marker; the first resume derives it once from engine records, or refuses as ambiguous and takes an explicit choice (`manual`) | the loop advances the marker, a verdict is recorded, or a derived/manual marker is persisted |
 | `sessions` | the recorded session ids and `agents` pins are generation 1 (`started_at` unknown) | a role's configuration is pinned or its session id is recorded, or a fresh session is started |
 
+The plan-run state (`.sparring/plans/<run>.json`) likewise gains one
+optional, engine-written field; a file without it reads back and is rewritten
+byte-identically:
+
+| Field | Absent means | Written when |
+| --- | --- | --- |
+| `provider_pause` | the run is not paused by a classified provider failure | a provider failure pauses the run: `{kind, role, stage_id, has_session, recorded_at}`, `kind` ∈ `session-unresumable` \| `provider-unavailable`, `role` ∈ `stage` \| `sparring`; removed when the run next starts running or pauses/fails for another reason (client contract and semantics: [reference](reference.md#resume-fresh-session-reset)) |
+
+It is descriptive only; resume routing never reads it. Standalone `run-loop`
+has no plan-run state and is unchanged.
+
 Resume, fresh session and `reset-stage` are different operations; see
 [Resume, fresh session, reset](reference.md#resume-fresh-session-reset).

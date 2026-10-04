@@ -287,6 +287,32 @@ failure before the provider announced a session records no session id, so a
 plain retry starts that (possibly pending fresh) conversation again. Any
 other provider error still fails the run as before.
 
+The same pause is recorded, read-only, in the plan-run state
+(`.sparring/plans/<run>.json`) as `provider_pause`, so a client can show it
+from authoritative data rather than from stdout:
+
+```json
+"provider_pause": {
+  "kind": "session-unresumable",
+  "role": "sparring",
+  "stage_id": "…-stage-2-…",
+  "has_session": true,
+  "recorded_at": "2026-10-04T12:00:00Z"
+}
+```
+
+`kind` is `session-unresumable` or `provider-unavailable`; `role` is `stage`
+(implementer) or `sparring` (reviewer); `has_session` is false when that
+role's current conversation never started; `recorded_at` is UTC ISO 8601.
+Only the engine writes it, in the same save that pauses the run. It is
+replaced by any other pause or failure (removed when that is not a provider
+pause), removed when the run next starts running (plain resume or
+`--fresh-*`), and left untouched by a refused resume. The field is absent
+otherwise. It is descriptive only: resume never reads it, and `next_turn`,
+gates and candidate checks remain the only authority over what runs next.
+Standalone `run-loop` has no plan-run state and records nothing; its printed
+retry is the whole report.
+
 Generations are recorded as `sessions: {role: [...]}` in `state.json`, each
 with its `generation`, `session_id` (null until the provider reports one),
 pinned `agent`, `started_at`, `start_reason` (`initial` or
