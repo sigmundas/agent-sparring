@@ -198,7 +198,12 @@ from agent_sparring.loop import (
     LoopResult,
     run_unattended_loop,
 )
-from agent_sparring.next_turn import NextTurnError, resolve_finalization, resolve_resume_turn
+from agent_sparring.next_turn import (
+    RESUME_ACCEPT,
+    NextTurnError,
+    resolve_finalization,
+    resolve_resume_turn,
+)
 from agent_sparring.manifest import ManifestError, ManifestPlanSource, load_manifest_source
 from agent_sparring.intake_approval import (
     SOURCE_KIND as INTAKE_SOURCE_KIND,
@@ -3190,6 +3195,36 @@ def _drive(
                 loop_result: LoopResult | None = None
                 authorized_push = _resuming_authorized_push(repo_root, stage, pending_push)
                 pending_push = None  # only the stage this resume entered
+                # READY was recorded over a candidate that was already a
+                # commit, and the run stopped before acceptance: the
+                # next_turn marker says so, with the commit it was given
+                # over. Only the push and acceptance gates are left, for
+                # exactly that commit; a moved candidate is refused rather
+                # than handed to either agent.
+                ready_commit = False
+                if (
+                    authorized_push is None
+                    and not sparrer_first
+                    and next_turn_choice is None
+                    and stage_state.next_turn == NEXT_TURN_FINALIZATION
+                    and stage_state.next_turn_candidate is not None
+                    and stage_state.next_turn_candidate.kind == "commit"
+                ):
+                    try:
+                        ready_commit = (
+                            resolve_finalization(repo_root, stage, stage_state) == RESUME_ACCEPT
+                        )
+                    except NextTurnError as exc:
+                        raise _fail(
+                            state,
+                            state_path,
+                            activity,
+                            why="next turn undetermined",
+                            message=(
+                                f"plan {state.plan} stopped at stage {stage.stage_id!r} "
+                                f"before any provider turn: {exc}"
+                            ),
+                        ) from exc
                 if authorized_push is not None:
                     # Both flags belong to the one stage this resume entered;
                     # neither may leak into the next stage, whose
@@ -3204,6 +3239,17 @@ def _drive(
                         f"stage {position} {stage.stage_id}: the reviewer already said READY "
                         f"over {authorized_push.candidate_sha}; pushing exactly that commit "
                         "as authorized and then running the acceptance gate. No agent runs."
+                    )
+                elif ready_commit:
+                    activity.emit(
+                        "plan.stage.entered",
+                        summary=f"{plan_stage.display} ({position}); completing a recorded READY",
+                    )
+                    report(
+                        f"stage {position} {stage.stage_id}: the reviewer already said READY over "
+                        f"{stage_state.next_turn_candidate.head_sha}, which is still the "
+                        "candidate; running the push and acceptance gates for exactly that "
+                        "commit. No agent runs."
                     )
                 else:
                     if sparrer_first:
@@ -3233,6 +3279,13 @@ def _drive(
                                 marker = resolve_finalization(
                                     repo_root, stage, stage.read_state()
                                 )
+                                if marker == RESUME_ACCEPT:
+                                    # Handled before this branch; never mapped
+                                    # to an agent turn if it ever arrives here.
+                                    raise NextTurnError(
+                                        f"stage {stage.stage_id!r} is READY over its "
+                                        "committed candidate; no agent turn is owed"
+                                    )
                         except NextTurnError as exc:
                             raise _fail(
                                 state,

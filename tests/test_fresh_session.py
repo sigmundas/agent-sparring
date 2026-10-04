@@ -792,6 +792,62 @@ class FinalizationRecoveryTests(_LoopRepo):
         self.assertIsNotNone(FinalizationRefused)
 
 
+class ReadyOverCommitRecoveryTests(_PlanRepoTestCase):
+    def leave_ready_unaccepted(self):
+        """READY over a committed candidate, then the run stops before the
+        acceptance gate completes."""
+
+        from agent_sparring.acceptance import AcceptanceError
+
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        with mock.patch(
+            "agent_sparring.plan.freeze_candidate", side_effect=AcceptanceError("stopped here")
+        ):
+            with self.assertRaises(PlanRunError):
+                self._start(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1)
+        stage = self._stage(S1)
+        state = stage.read_state()
+        self.assertEqual(state.next_turn, "finalization")
+        self.assertEqual(state.next_turn_candidate.kind, "commit")
+        self.assertEqual(state.next_turn_candidate.head_sha, _head(self.repo))
+        return stage
+
+    def test_resume_completes_acceptance_for_the_reviewed_commit_with_no_agent_turn(self):
+        stage = self.leave_ready_unaccepted()
+        reviewed = _head(self.repo)
+        stage_adapter, sparring = _StageAdapter(self.repo, commit=True), _SparringAdapter([])
+
+        result = self._resume(stage_adapter, sparring, stop_after_stage=S1)
+
+        self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
+        self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
+        self.assertEqual(dict(result.accepted)[S1], reviewed)
+        self.assertIs(stage.read_state().status, StageStatus.ACCEPTED)
+
+    def test_a_moved_candidate_after_ready_is_refused_not_implemented(self):
+        stage = self.leave_ready_unaccepted()
+        (self.repo / "later.txt").write_text("later\n")
+        _run_git(self.repo, "add", "later.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "moved on")
+        stage_adapter, sparring = _StageAdapter(self.repo, commit=True), _SparringAdapter([])
+
+        with self.assertRaises(PlanRunError) as ctx:
+            self._resume(stage_adapter, sparring, stop_after_stage=S1)
+
+        self.assertIn("Only that reviewed commit may be pushed and accepted", str(ctx.exception))
+        self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
+        self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
+        self.assertIsNot(stage.read_state().status, StageStatus.ACCEPTED)
+
+    def test_standalone_run_loop_owes_no_agent_turn_after_a_committed_ready(self):
+        from agent_sparring.next_turn import standalone_start_with
+
+        stage = self.leave_ready_unaccepted()
+        with self.assertRaises(NextTurnError) as ctx:
+            standalone_start_with(self.repo, stage)
+        self.assertIn("no agent turn is owed", str(ctx.exception))
+
+
 class CodexEarlySessionTests(unittest.TestCase):
     def test_the_codex_stream_announces_its_thread_without_telemetry(self):
         from agent_sparring.providers.codex_cli import _CodexStreamTranslator

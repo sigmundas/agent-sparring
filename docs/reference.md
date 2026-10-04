@@ -155,9 +155,13 @@ over, by both `resume-plan` and `run-loop`: the same uncommitted candidate
 gets the bounded commit/push turn; that exact content already committed (by
 an interrupted commit turn, or by hand) and nothing uncommitted is re-marked
 `sparring` and reviewed at that commit before acceptance; anything else is
-refused. It never leads to an implementation turn. (READY over a candidate
-that was already a commit needed no finalization; there the acceptance and
-push gates decide, and a later loop entry is an ordinary `stage` turn.)
+refused. READY over a candidate that was already a commit needs no commit
+turn: if that exact commit (HEAD, content, sibling HEADs) is still the
+candidate, `resume-plan` runs only the push and acceptance gates for it, with
+no agent turn; if it has moved, the resume is refused. `run-loop`, which
+never accepts, refuses it as owing no agent turn. A `finalization` marker
+never leads to an implementation turn unless the caller explicitly chooses
+`next_turn = stage`.
 A standalone `run-loop` also refuses a recorded NEEDS_YOU / ESCALATE (running an
 agent would not answer it) unless an implementation turn is already owed.
 `resume-plan --evidence` keeps its existing

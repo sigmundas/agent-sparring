@@ -54,6 +54,11 @@ from agent_sparring.stage import (
 )
 
 
+# Not a marker value: what resolve_finalization returns when the only step
+# left is the push / acceptance gates for the exact reviewed commit.
+RESUME_ACCEPT = "accept"
+
+
 class NextTurnError(RuntimeError):
     """The recorded or derivable next turn cannot be honoured."""
 
@@ -322,11 +327,11 @@ def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> st
       unrestricted turn on reviewed (perhaps human-verified) work is the one
       thing this state must not lead to.
 
-    READY over a candidate that was *already a commit* needed no
-    finalization; the marker only says acceptance is next, which the
-    acceptance gate and the push gate decide on their own records. If the
-    run reaches the loop again it continues as an ordinary ``stage`` turn,
-    exactly as before the marker existed.
+    READY over a candidate that was *already a commit* needed no commit
+    turn: what is left is the push and acceptance gates for exactly that
+    commit. That is :data:`RESUME_ACCEPT` when the repository still holds it
+    (HEAD, content and sibling HEADs), and a refusal otherwise -- no agent
+    turn of either kind.
     """
 
     reviewed = state.next_turn_candidate
@@ -336,9 +341,17 @@ def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> st
             "candidate it was reviewed as is not recorded; choose explicitly (next_turn = "
             "stage | sparring)."
         )
-    if reviewed.kind == "commit":
-        return NEXT_TURN_STAGE
     current = capture_candidate(repo_root, stage, state)
+    if reviewed.kind == "commit":
+        if current == reviewed:
+            return RESUME_ACCEPT
+        raise AmbiguousNextTurn(
+            f"stage {stage.stage_id!r} was READY over the commit {reviewed.describe()}, but "
+            f"the repository now holds {current.describe()}. Only that reviewed commit may be "
+            "pushed and accepted, and the engine will not start an agent turn on a READY stage "
+            "by itself; restore the reviewed commit, or choose explicitly (next_turn = stage | "
+            "sparring)."
+        )
     if current == reviewed and current.kind == "worktree":
         return NEXT_TURN_FINALIZATION
     if (
@@ -378,13 +391,23 @@ def standalone_start_with(repo_root: Path, stage: Stage) -> str:
             "Human evidence' in notes.md) and run the reviewer (run-sparring)."
         )
     if marker == NEXT_TURN_FINALIZATION:
-        return resolve_finalization(repo_root, stage, stage.read_state())
+        resolved = resolve_finalization(repo_root, stage, stage.read_state())
+        if resolved == RESUME_ACCEPT:
+            # run-loop never accepts; the managed run (or `freeze`/`accept`)
+            # does. Running an agent here would only re-do a recorded READY.
+            raise NextTurnError(
+                f"stage {stage.stage_id!r} is READY over its committed candidate; no agent turn "
+                "is owed. Complete it through the acceptance gate (resume-plan for a managed "
+                "run)."
+            )
+        return resolved
     return marker if marker == NEXT_TURN_SPARRING else NEXT_TURN_STAGE
 
 
 __all__ = [
     "AmbiguousNextTurn",
     "NextTurnError",
+    "RESUME_ACCEPT",
     "capture_candidate",
     "derive_next_turn",
     "record_next_turn",

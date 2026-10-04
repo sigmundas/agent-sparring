@@ -313,7 +313,16 @@ def reopen_for_failed_check(
     # The reverse order -- an open stage still owing a withdrawn asking --
     # merely stops again and asks, which is safe.
     failed = tuple(result.check_id for result in obligation.failed)
-    stage.write_state(replace(stage_state, status=StageStatus.WORKING))
+    reopened = replace(stage_state, status=StageStatus.WORKING)
+    if reopened.next_turn is not None:
+        # The failed check is implementation work owed against the reviewed
+        # candidate: the stage's next turn is the implementation agent's,
+        # not the acceptance of a READY the failure has overturned. (A stage
+        # written before next_turn existed stays byte-identical.)
+        reopened.next_turn = "stage"
+        reopened.next_turn_candidate = None
+        reopened.next_turn_source = "engine"
+    stage.write_state(reopened)
     report(
         f"stage {obligation.stage_id}: ACCEPTED -> WORKING; its candidate "
         f"{stage_state.candidate_sha}, both sessions and its notes are unchanged, and the "

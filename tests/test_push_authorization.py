@@ -654,16 +654,29 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertNotEqual(moved, first)
 
         stage_adapter = self._unpushed()
+        # HEAD had moved, so this resume is not the authorized push, and the
+        # stage's next_turn marker records READY over the *first* commit: the
+        # moved candidate is refused outright -- no agent turn, no push.
+        with self.assertRaises(PlanRunError) as ctx:
+            self._resume(
+                stage_adapter,
+                _SparringAdapter([READY]),
+                allow_push_candidate=first,
+                stop_after_stage=S1,
+            )
+        self.assertIn("Only that reviewed commit may be pushed and accepted", str(ctx.exception))
+        self.assertEqual(stage_adapter.turns, 0)
+        self.assertNothingPushed()
+
+        # Choosing explicitly to continue implementation runs the ordinary
+        # loop; the candidate it produces is a commit nobody authorized.
+        # Nothing reached the remote and nothing was accepted.
         result = self._resume(
             stage_adapter,
             _SparringAdapter([READY]),
-            allow_push_candidate=first,
             stop_after_stage=S1,
+            next_turn="stage",
         )
-
-        # HEAD had moved, so this resume was not the authorized push: the
-        # ordinary loop ran, and the candidate it produced is a commit nobody
-        # authorized. Nothing reached the remote and nothing was accepted.
         self.assertEqual(stage_adapter.turns, 1)
         self.assertIs(result.status, PlanRunStatus.PAUSED)
         self.assertIsNotNone(result.awaiting)
