@@ -184,3 +184,19 @@ With `--json`, an exit-`1` result is `{"version": 1, "configured": ...,
 is not configured. For a project without `[migrations]`, both migration
 commands exit `1` with that message and write nothing. Every other command's
 output is unchanged.
+
+## Not a database migration: stage `state.json` format changes
+
+Everything above is about *database* migrations. The engine's own stage
+`state.json` also gains fields over time, and needs no migration step: new
+fields are optional, so an existing file reads back unchanged and stays
+byte-identical until the engine next writes it. The fresh-agent-session work
+adds:
+
+| Field | Absent means | Written when |
+| --- | --- | --- |
+| `next_turn`, `next_turn_candidate`, `next_turn_source` | state from before the marker; the first resume derives it once from engine records, or refuses as ambiguous and takes an explicit choice (`manual`) | the loop advances the marker, a verdict is recorded, or a derived/manual marker is persisted |
+| `sessions` | the recorded session ids and `agents` pins are generation 1 (`started_at` unknown) | a role's configuration is pinned or its session id is recorded, or a fresh session is started |
+
+Resume, fresh session and `reset-stage` are different operations; see
+[Resume, fresh session, reset](reference.md#resume-fresh-session-reset).

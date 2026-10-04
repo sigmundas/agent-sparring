@@ -19,6 +19,7 @@ was written.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -176,7 +177,13 @@ class _RepoCase(unittest.TestCase):
 
     def _authoritative_snapshot(self) -> dict[str, str]:
         return {
-            "state": (self.stage.directory / "state.json").read_text(encoding="utf-8"),
+            # Session generation timestamps are wall-clock bookkeeping, not
+            # decisions, so two runs are compared without them.
+            "state": re.sub(
+                r'"(started|ended)_at": "[^"]*"',
+                r'"\1_at": "<ts>"',
+                (self.stage.directory / "state.json").read_text(encoding="utf-8"),
+            ),
             "handoff": self.stage.read_handoff(),
             "sparring": self.stage.read_sparring(),
         }

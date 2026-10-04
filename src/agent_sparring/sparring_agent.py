@@ -75,9 +75,10 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from agent_sparring.activity import ActivityEmitter
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
@@ -93,7 +94,7 @@ from agent_sparring.routing import RoutingResult, RoutingResultError
 from agent_sparring.sparring_exchange import record_sparring_result
 from agent_sparring.prompt_capture import capture_prompt
 from agent_sparring.review_prompt import assemble_review_prompt
-from agent_sparring.sessions import ROLE_SPARRING, is_fresh, note_session_id
+from agent_sparring.sessions import ROLE_SPARRING, is_fresh, record_session_id
 from agent_sparring.sparring_prompt import assemble_sparring_prompt
 from agent_sparring.stage import Stage
 
@@ -302,8 +303,11 @@ def run_sparring_agent(
     (and the repository was not touched); the provider's final message is
     not a usable routing verdict; or, on resume, the provider returns a
     different session id than the one it was asked to resume. In every
-    raised case, the sparring result is not recorded: neither
-    ``sparring_session_id`` nor ``sparring.md`` is updated.
+    raised case, the sparring result is not recorded: ``sparring.md`` is not
+    updated, and ``sparring_session_id`` changes only when a *new* session's
+    id was announced by an adapter with ``on_session_observed`` before the
+    failure (see :func:`_session_recorded_early`), so the next turn resumes
+    that conversation instead of opening another.
     """
 
     if not expected_branch or not expected_branch.strip():
@@ -336,6 +340,39 @@ def run_sparring_agent(
         ) from exc
 
 
+@contextmanager
+def _session_recorded_early(adapter: SparringAgentAdapter, stage: Stage) -> "Iterator[None]":
+    """Persist a *new* reviewer session's id as soon as the provider
+    announces it, mirroring :func:`agent_sparring.stage_agent.
+    _session_recorded_early`.
+
+    A reviewer that announces its thread and then fails before a usable
+    verdict would otherwise leave its generation pending, and the next
+    resume would open yet another conversation. Only the session identity
+    is written here -- never ``sparring.md`` or any verdict -- and only for a
+    fresh start: on resume the post-turn identity check stays the single
+    authority. An adapter without ``on_session_observed`` is left as it was.
+    """
+
+    if not hasattr(adapter, "on_session_observed"):
+        yield
+        return
+
+    def record(session_id: str) -> None:
+        state = stage.read_state()
+        if not session_id or state.sparring_session_id == session_id:
+            return
+        record_session_id(state, ROLE_SPARRING, session_id)
+        stage.write_state(state)
+
+    previous = adapter.on_session_observed  # type: ignore[attr-defined]
+    adapter.on_session_observed = record  # type: ignore[attr-defined]
+    try:
+        yield
+    finally:
+        adapter.on_session_observed = previous  # type: ignore[attr-defined]
+
+
 def _run_sparring_agent_locked(
     stage: Stage,
     sparring_dir: Path,
@@ -363,6 +400,7 @@ def _run_sparring_agent_locked(
             candidate_set=review_candidate_set,
             evidence_first=evidence_first,
             pending_deferred=pending_deferred,
+            fresh=fresh,
         )
     else:
         assembled = assemble_sparring_prompt(
@@ -411,7 +449,8 @@ def _run_sparring_agent_locked(
         if resume_id:
             result = adapter.resume(resume_id, prompt)
         else:
-            result = adapter.start(prompt)
+            with _session_recorded_early(adapter, stage):
+                result = adapter.start(prompt)
     except ProviderError as exc:
         provider_error = exc
     duration_ms = int((time.monotonic() - started_at) * 1000)
@@ -497,8 +536,7 @@ def _run_sparring_agent_locked(
     # reverting status or candidate_sha: they are read fresh, not carried
     # forward from a snapshot taken before the provider turn.
     current_state = stage.read_state()
-    current_state.sparring_session_id = result.session_id
-    note_session_id(current_state, ROLE_SPARRING, result.session_id)
+    record_session_id(current_state, ROLE_SPARRING, result.session_id)
     stage.write_state(current_state)
 
     recorded = record_sparring_result(stage, routing, findings=findings_text)

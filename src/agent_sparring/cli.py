@@ -94,8 +94,8 @@ from agent_sparring.providers import ProviderError
 from agent_sparring.providers.codex_cli import PROVIDER_ID as CODEX_PROVIDER_ID, CodexCliAdapter
 from agent_sparring.recovery import RecoveryError, reopen_for_failed_check, reset_stage
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
-from agent_sparring.next_turn import NextTurnError, resolve_resume_turn
-from agent_sparring.sessions import note_pin
+from agent_sparring.next_turn import NextTurnError, standalone_start_with
+from agent_sparring.sessions import record_pin
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.sparring_prompt import build_sparring_prompt
@@ -1014,20 +1014,30 @@ def _apply_pin(resolved: ResolvedAgentConfig, pin: PinnedAgent) -> ResolvedAgent
     )
 
 
-def _stage_agents(stage: Stage, fresh: EffectiveAgents, *, record: bool = True) -> EffectiveAgents:
+def _stage_agents(
+    stage: Stage, fresh: EffectiveAgents, *, record: "tuple[str, ...]" = (ROLE_STAGE, ROLE_SPARRING)
+) -> EffectiveAgents:
     """The configuration ``stage`` runs with: pinned at each session
-    generation's first provider turn (``record``) and reused by every later
-    turn of that session (see :class:`agent_sparring.stage.PinnedAgent`)."""
+    generation's first provider turn and reused by every later turn of that
+    session (see :class:`agent_sparring.stage.PinnedAgent`).
+
+    ``record`` names the roles about to run a turn; only those are pinned,
+    so running one role never locks the other's configuration before that
+    role has a conversation."""
 
     state = stage.read_state()
     pins = dict(state.agents or {})
-    missing = [resolved for resolved in (fresh.stage, fresh.sparring) if resolved.role not in pins]
-    if missing and record:
+    missing = [
+        resolved
+        for resolved in (fresh.stage, fresh.sparring)
+        if resolved.role not in pins and resolved.role in record
+    ]
+    if missing:
         for resolved in missing:
             pins[resolved.role] = _pin_of(resolved)
-            # A pending fresh generation gets its configuration here, at its
-            # first turn, exactly like a stage's first generation.
-            note_pin(state, resolved.role, pins[resolved.role])
+            # Generation 1, or a pending fresh generation, gets its
+            # configuration here, at its first turn.
+            record_pin(state, resolved.role, pins[resolved.role])
         state.agents = pins
         stage.write_state(state)
     return EffectiveAgents(
@@ -1084,6 +1094,7 @@ def _cmd_run_stage(args: argparse.Namespace) -> int:
                 _optional_project_config(sparring_dir),
                 stage=RoleOverrides(provider=args.provider, model=args.model, effort=args.effort),
             ),
+            record=(ROLE_STAGE,),
         ).stage
         _emit_resolved(stage.activity_log(), effective)
         adapter = ClaudeCliAdapter(
@@ -1149,7 +1160,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
                 _optional_project_config(sparring_dir),
                 sparring=RoleOverrides(provider=args.provider, model=args.model, effort=args.effort),
             ),
-            record=False,
+            record=(),
         ).sparring
         _emit_resolved(stage.activity_log(), effective)
         adapter = CodexCliAdapter(
@@ -1224,6 +1235,7 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
                 _optional_project_config(sparring_dir),
                 sparring=RoleOverrides(provider=args.provider, model=args.model, effort=args.effort),
             ),
+            record=(ROLE_SPARRING,),
         ).sparring
         # No --sandbox override is exposed here: CodexCliAdapter has no
         # sandbox field or extra_args passthrough at all -- read-only is
@@ -1344,15 +1356,15 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             raise StageError(f"stage {args.stage_id!r} does not exist at {stage.directory}")
 
         self_check = _resolve_self_check(sparring_dir)
+        # An ordinary resume obeys the engine's record of whose turn it is
+        # (derived once for state written before it existed), decided before
+        # anything is pinned or any provider starts.
+        start_with = standalone_start_with(repo_root, stage)
         # Both adapters append to this stage's activity.jsonl (see
         # agent_sparring.activity): observational only, never read back.
         stage_adapter, sparring_adapter = _build_loop_adapters(
             args, sparring_dir, repo_root, activity_log=stage.activity_log(), stage=stage
         )
-
-        # An ordinary resume obeys the engine's record of whose turn it is
-        # (derived once for state written before it existed).
-        marker = resolve_resume_turn(repo_root, stage)
         loop_result = run_unattended_loop(
             stage,
             sparring_dir,
@@ -1362,7 +1374,7 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             expected_branch=args.expected_branch,
             max_send_back_cycles=args.max_send_back_cycles,
             self_check=self_check,
-            start_with="sparring" if marker == "sparring" else "stage",
+            start_with=start_with,
             sparring_first_reason="next_turn",
         )
     except (

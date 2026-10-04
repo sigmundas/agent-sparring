@@ -465,14 +465,10 @@ class ConfigurationPerSessionTests(unittest.TestCase):
         )
 
     def _record_session(self, role: str, session_id: str) -> None:
-        from agent_sparring.sessions import note_session_id
+        from agent_sparring.sessions import record_session_id
 
         state = self.stage.read_state()
-        if role == "stage":
-            state.implementation_session_id = session_id
-        else:
-            state.sparring_session_id = session_id
-        note_session_id(state, role, session_id)
+        record_session_id(state, role, session_id)
         self.stage.write_state(state)
 
     def test_model_switch_takes_effect_only_in_a_fresh_session(self):
@@ -501,6 +497,7 @@ class ConfigurationPerSessionTests(unittest.TestCase):
     def test_an_override_mid_session_names_a_fresh_session_as_the_way(self):
         _set("stage", "--model", "claude-opus-5-5")
         self.build()
+        self._record_session("stage", "impl-1")
         with self.assertRaisesRegex(AgentConfigError, "fresh stage session"):
             self.build(stage_model="claude-sonnet-5-5")
         start_fresh_session(self.stage, "stage", "override", repo_root=self.repo)
@@ -514,12 +511,12 @@ class ConfigurationPerSessionTests(unittest.TestCase):
         self._record_session("sparring", "spar-1")
         start_fresh_session(self.stage, "sparring", "switch provider", repo_root=self.repo)
         state = self.stage.read_state()
-        from agent_sparring.sessions import note_pin
+        from agent_sparring.sessions import record_pin
 
         other = PinnedAgent(provider="fake-reviewer-b", model=None, model_source="cli",
                             effort=None, effort_source="provider-default")
         state.agents = {**(state.agents or {}), "sparring": other}
-        note_pin(state, "sparring", other)
+        record_pin(state, "sparring", other)
         self.stage.write_state(state)
         gens = generations(self.stage.read_state(), "sparring")
         self.assertEqual([g.agent.provider for g in gens], ["codex-cli", "fake-reviewer-b"])
@@ -551,6 +548,148 @@ class UsageTests(_Stuck):
         self.assertIn("sparring session generation 2 (fresh:stuck; codex-cli, model gpt-6", text)
         self.assertIn("all 2 generations: tokens   in 140  out 14  total 154", text)
         self.assertIn("sparrer#2", text)
+
+
+class _DirtyStageAdapter(_StageAdapter):
+    """Leaves its work uncommitted: the candidate is the working tree."""
+
+    def _turn(self, session_id):
+        self._calls += 1
+        (self.repo / "work.txt").write_text(f"turn {self._calls}\n")
+        from agent_sparring.providers import StageAgentResult
+
+        return StageAgentResult(session_id=session_id, text="claims", is_error=False)
+
+
+class _EarlyAnnouncingFailingReviewer(_SparringAdapter):
+    """Announces its new thread id, then fails before a verdict -- what a
+    real reviewer that crashes mid-turn does."""
+
+    def __init__(self, verdicts):
+        super().__init__(verdicts)
+        self.on_session_observed = None
+
+    def start(self, prompt):
+        self.start_calls.append(prompt)
+        self._starts += 1
+        sid = f"spar-{self._starts}"
+        if self.on_session_observed is not None:
+            self.on_session_observed(sid)
+        if self._verdicts and self._verdicts[0] == FAIL:
+            self._verdicts.pop(0)
+            raise ProviderError("reviewer crashed after announcing its thread")
+        return self._next(sid)
+
+
+class SendBackFindingTests(_LoopRepo):
+    """Regressions for the first review of this stage."""
+
+    def run_loop(self, stage_adapter, sparring, **kwargs):
+        return run_unattended_loop(
+            self.stage, self.sparring_dir, self.repo, stage_adapter, sparring,
+            expected_branch="feature/x", **kwargs,
+        )
+
+    def test_initial_generations_are_persisted_with_their_start(self):
+        self.run_loop(_StageAdapter(self.repo), _SparringAdapter([READY]))
+        state = self.stage.read_state()
+        for role, sid in (("stage", "impl-1"), ("sparring", "spar-1")):
+            with self.subTest(role=role):
+                gen = state.sessions[role]
+                self.assertEqual(len(gen), 1)
+                self.assertEqual((gen[0].generation, gen[0].session_id), (1, sid))
+                self.assertEqual(gen[0].start_reason, "initial")
+                self.assertIsNotNone(gen[0].started_at)
+
+    def test_a_fresh_reviewers_announced_session_is_recorded_before_it_fails(self):
+        with self.assertRaises(LoopError):
+            self.run_loop(_StageAdapter(self.repo), _SparringAdapter([SEND_BACK, SEND_BACK]),
+                          max_send_back_cycles=1)
+        start_fresh_session(self.stage, "sparring", "crashy", repo_root=self.repo)
+        sparring_md = (self.stage.directory / "sparring.md").read_text()
+        reviewer = _EarlyAnnouncingFailingReviewer([FAIL, READY])
+        with self.assertRaises(LoopError):
+            self.run_loop(_StageAdapter(self.repo), reviewer,
+                          start_with="sparring", sparring_first_reason="next_turn")
+        state = self.stage.read_state()
+        self.assertEqual(state.sparring_session_id, "spar-1")
+        self.assertEqual(state.sessions["sparring"][-1].session_id, "spar-1")
+        self.assertEqual((self.stage.directory / "sparring.md").read_text(), sparring_md)
+        # The next turn resumes that conversation instead of opening a third.
+        self.run_loop(_StageAdapter(self.repo), reviewer,
+                      start_with="sparring", sparring_first_reason="next_turn")
+        self.assertEqual([sid for sid, _ in reviewer.resume_calls], ["spar-1"])
+        self.assertEqual(len(reviewer.start_calls), 1)
+
+    def test_legacy_uncommitted_candidate_is_never_derived_as_sparring(self):
+        with self.assertRaises(LoopError):
+            self.run_loop(_DirtyStageAdapter(self.repo), _FailingSparringAdapter([SEND_BACK, FAIL]))
+        self.assertEqual(self.stage.read_state().next_turn_candidate.kind, "worktree")
+        _strip_marker(self.stage)
+        # Same dirty path, edited bytes: the handoff cannot tell these apart.
+        (self.repo / "work.txt").write_text("edited after the turn\n")
+        with self.assertRaises(AmbiguousNextTurn) as ctx:
+            resolve_resume_turn(self.repo, self.stage)
+        self.assertIn("uncommitted content", str(ctx.exception))
+
+    def test_standalone_resume_honours_finalization_and_human_gates(self):
+        from agent_sparring.next_turn import standalone_start_with
+        from agent_sparring.routing import HumanGate, RoutingAction, RoutingResult
+        from agent_sparring.sparring_exchange import record_sparring
+        from test_plan import human_gate
+
+        (self.repo / "work.txt").write_text("reviewed, uncommitted\n")
+        record_sparring(self.stage, RoutingResult(action=RoutingAction.READY, summary="ok"))
+        record_next_turn(self.stage, "finalization")
+        self.assertEqual(standalone_start_with(self.repo, self.stage), "finalization")
+        (self.repo / "work.txt").unlink()
+        self.assertEqual(standalone_start_with(self.repo, self.stage), "stage")
+
+        candidate = capture_candidate(self.repo, self.stage, self.stage.read_state())
+        record_next_turn(self.stage, "sparring", candidate=candidate)
+        record_sparring(
+            self.stage,
+            RoutingResult(action=RoutingAction.NEEDS_YOU, summary="check it",
+                          human_gate=HumanGate.from_dict(human_gate())),
+        )
+        with self.assertRaises(NextTurnError) as ctx:
+            standalone_start_with(self.repo, self.stage)
+        self.assertIn("waiting for a person", str(ctx.exception))
+
+    def test_run_stage_pins_only_the_stage_role(self):
+        from agent_sparring.agent_config import RoleOverrides, resolve_agent_configs
+        from agent_sparring.cli import _stage_agents
+
+        _stage_agents(self.stage, resolve_agent_configs(None, stage=RoleOverrides()),
+                      record=("stage",))
+        state = self.stage.read_state()
+        self.assertEqual(set(state.agents), {"stage"})
+        self.assertNotIn("sparring", state.sessions)
+        with self.assertRaises(SessionError):
+            start_fresh_session(self.stage, "sparring", "too early", repo_root=self.repo)
+
+    def test_a_fresh_independent_reviewer_gets_the_fresh_context(self):
+        from agent_sparring.review_prompt import assemble_review_prompt
+
+        (self.stage.directory / "sparring.md").write_text("## Routing outcome\n\nold finding X\n")
+        assembled = assemble_review_prompt(
+            self.stage, self.sparring_dir, resume=False, expected_branch="feature/x",
+            candidate_set="(set)", fresh=True,
+        )
+        self.assertEqual(assembled.turn_kind, "fresh")
+        self.assertIn(FRESH_REVIEWER_NOTICE, assembled.text)
+        self.assertIn("old finding X", assembled.text)
+
+
+class CodexEarlySessionTests(unittest.TestCase):
+    def test_the_codex_stream_announces_its_thread_without_telemetry(self):
+        from agent_sparring.providers.codex_cli import _CodexStreamTranslator
+
+        seen = []
+        translator = _CodexStreamTranslator(None, Path("."), on_session=seen.append)
+        translator.feed(json.dumps({"type": "thread.started", "thread_id": "t-1"}))
+        translator.feed(json.dumps({"type": "thread.started", "thread_id": "t-1"}))
+        self.assertEqual(seen, ["t-1"])
 
 
 if __name__ == "__main__":

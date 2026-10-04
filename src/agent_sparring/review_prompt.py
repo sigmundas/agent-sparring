@@ -42,7 +42,7 @@ from agent_sparring.prompt_sections import (
     review_turn_kind,
     section,
 )
-from agent_sparring.sparring_prompt import pending_deferred_section
+from agent_sparring.sparring_prompt import FRESH_REVIEWER_NOTICE, pending_deferred_section
 from agent_sparring.stage import (
     BRIEF_FILENAME,
     HUMAN_EVIDENCE_HEADING,
@@ -199,6 +199,7 @@ def assemble_review_prompt(
     candidate_set: str,
     evidence_first: bool = False,
     pending_deferred: tuple[DeferredObligation, ...] = (),
+    fresh: bool = False,
 ) -> AssembledPrompt:
     """Assemble the bounded prompt for one independent-review turn.
 
@@ -219,6 +220,11 @@ def assemble_review_prompt(
     answered that gate. It changes no text -- the human-evidence section
     below is already read live from ``notes.md`` -- and only labels the
     captured prompt with what the caller knew and this module cannot infer.
+
+    ``fresh`` marks the first turn of a fresh reviewer session (see
+    :mod:`agent_sparring.sessions`): the previous review exchange is
+    included as historical evidence under the same fresh-reviewer notice as
+    a sparring turn, and the captured turn kind is ``fresh``.
     """
 
     parts: list[PromptSection] = [
@@ -298,7 +304,24 @@ def assemble_review_prompt(
             )
         )
 
-    if resume:
+    if fresh:
+        try:
+            previous = stage.read_sparring().strip()
+        except StageError:
+            previous = ""
+        parts.append(section("Fresh reviewer", ["## Fresh reviewer", "", FRESH_REVIEWER_NOTICE]))
+        parts.append(
+            section(
+                "Previous review exchange (historical evidence)",
+                [
+                    "## Previous review exchange (historical evidence)",
+                    "",
+                    previous or "(no sparring.md available)",
+                ],
+                source=_stage_file(stage, SPARRING_FILENAME),
+            )
+        )
+    elif resume:
         try:
             previous = stage.read_sparring().strip()
         except StageError:
@@ -324,7 +347,7 @@ def assemble_review_prompt(
     return AssembledPrompt(
         role=ROLE_REVIEWER,
         stage_id=stage.stage_id,
-        turn_kind=review_turn_kind(resume=resume, evidence_first=evidence_first),
+        turn_kind=review_turn_kind(resume=resume, evidence_first=evidence_first, fresh=fresh),
         resumed=resume,
         expected_branch=expected_branch,
         sections=tuple(parts),

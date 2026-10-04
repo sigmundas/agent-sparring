@@ -172,7 +172,7 @@ def sparring_turn_kind(
     return TURN_RESUME if resume else TURN_ORIGINAL
 
 
-def review_turn_kind(*, resume: bool, evidence_first: bool = False) -> str:
+def review_turn_kind(*, resume: bool, evidence_first: bool = False, fresh: bool = False) -> str:
     """The turn kind for an independent reviewer's prompt.
 
     A review-only stage has no implementation turn and therefore no
@@ -184,6 +184,8 @@ def review_turn_kind(*, resume: bool, evidence_first: bool = False) -> str:
     which by definition has no gate to have answered.
     """
 
+    if fresh and not evidence_first:
+        return TURN_FRESH
     if not resume:
         return TURN_ORIGINAL
     return TURN_EVIDENCE_REVIEW if evidence_first else TURN_RESUME

@@ -149,7 +149,11 @@ repository's HEAD. Before such a review starts the engine re-reads all of
 them, and any difference is refused with both identities named; it never
 falls back to running the other agent. A failed provider turn never advances
 the marker, and NEEDS_YOU / ESCALATE leave it where it is -- the recorded
-gate decides what happens next. `resume-plan --evidence` keeps its existing
+gate decides what happens next. A standalone `run-loop` follows the same marker:
+`finalization` enters the bounded commit cycle while the reviewed candidate is
+still uncommitted, and a recorded NEEDS_YOU / ESCALATE is refused (running an
+agent would not answer it) unless an implementation turn is already owed.
+`resume-plan --evidence` keeps its existing
 meaning (the reviewer judges the answer against the candidate as it stands)
 and is not held to the pinned candidate. `activity.jsonl` may mirror these
 decisions but is never read to make them.
@@ -159,8 +163,9 @@ first resume, from engine-owned records only: the prompt-capture index, the
 handoff (its recorded candidate commit and the verdict it embeds), the
 routing block of `sparring.md`, and the repository now. It derives
 `sparring` only when the last completed implementation turn is later than
-the last verdict and its candidate is still HEAD (with no unrecorded
-uncommitted content), and `stage` when no implementation turn completed
+the last verdict and its candidate is still HEAD with no uncommitted
+candidate content (the handoff records dirty path names, not bytes, so an
+uncommitted candidate cannot be matched exactly and is ambiguous), and `stage` when no implementation turn completed
 after the last SEND_BACK. Anything else -- for example HEAD having moved
 past the handoff's candidate -- is refused with what was found; the caller
 then chooses explicitly (`resume_plan(..., next_turn="stage" | "sparring")`).
@@ -193,6 +198,13 @@ Three different things, from least to most disruptive:
 - **[`reset-stage`](#restarting-a-stage-started-under-the-wrong-mode)**
   archives the attempt and reinitialises the stage itself.
 
+A new session's id is recorded the moment the provider announces it (Claude
+and Codex both report it early), so a fresh conversation that fails before
+its turn finishes is resumed next time, not replaced. A fresh independent
+reviewer gets the same notice and history as a fresh sparrer. A role whose
+configuration is pinned but which has never started a conversation has
+nothing to replace, and a fresh session for it is refused.
+
 Generations are recorded as `sessions: {role: [...]}` in `state.json`, each
 with its `generation`, `session_id` (null until the provider reports one),
 pinned `agent`, `started_at`, `start_reason` (`initial` or
@@ -204,9 +216,11 @@ always hold the *current* generation's values.
 
 `next_turn`, `next_turn_candidate`, `next_turn_source` and `sessions` are
 all optional and absent until first written: an existing file reads back
-unchanged and stays byte-identical until the engine writes the marker or a
-fresh session is started. A recorded session id with no `sessions` list is
-generation 1, and is materialized as such when the list is first written.
+unchanged and stays byte-identical until the engine writes the marker or
+records a session. New stages record generation 1 (with `started_at`) at its
+first pin or session id; a recorded session id with no `sessions` list is
+generation 1 with `started_at` unknown, materialized when the list is first
+written.
 A stage that has had any session generation cannot change its mode, exactly
 as one with a recorded session could not before.
 

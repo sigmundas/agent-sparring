@@ -98,22 +98,42 @@ def is_fresh(state: StageState, role: str) -> bool:
     return len(recorded) > 1 and recorded[-1].session_id is None and recorded[-1].ended_at is None
 
 
-def note_session_id(state: StageState, role: str, session_id: str) -> None:
-    """Record ``session_id`` on the current generation, when generations are
-    recorded. Callers set the flat field themselves, exactly as before."""
+def _current_generation(state: StageState, role: str) -> SessionGeneration:
+    """The role's current generation, materializing the list first.
+
+    Called *before* the flat fields are changed, so state written before
+    generations existed (a recorded session id or pin, no list) becomes its
+    generation 1 -- with ``started_at`` unknown, because nothing recorded
+    it -- while a role nothing has run for gets a generation 1 starting now.
+    """
 
     recorded = state.sessions.get(role)
-    if recorded:
-        recorded[-1].session_id = session_id
+    if not recorded:
+        recorded = generations(state, role) or [
+            SessionGeneration(generation=1, started_at=_now(), start_reason="initial")
+        ]
+        state.sessions[role] = recorded
+    return recorded[-1]
 
 
-def note_pin(state: StageState, role: str, pin: PinnedAgent) -> None:
-    """Record the configuration pinned for the current generation, when
-    generations are recorded."""
+def record_session_id(state: StageState, role: str, session_id: str) -> None:
+    """Record ``session_id`` as the role's current session: on the current
+    generation and on the flat field existing readers use. The caller
+    writes ``state``."""
 
-    recorded = state.sessions.get(role)
-    if recorded and recorded[-1].agent is None:
-        recorded[-1].agent = pin
+    _validate_role(role)
+    _current_generation(state, role).session_id = session_id
+    _set_current_session_id(state, role, session_id)
+
+
+def record_pin(state: StageState, role: str, pin: PinnedAgent) -> None:
+    """Record the configuration pinned for the role's current generation.
+    The caller sets ``agents[role]`` and writes ``state``."""
+
+    _validate_role(role)
+    current = _current_generation(state, role)
+    if current.agent is None:
+        current.agent = pin
 
 
 def start_fresh_session(
@@ -154,6 +174,12 @@ def start_fresh_session(
                 raise SessionError(
                     f"stage {stage.stage_id!r} has no {role} session yet; its first turn "
                     "already starts a new conversation"
+                )
+            if existing[-1].session_id is None and not is_fresh(state, role):
+                raise SessionError(
+                    f"stage {stage.stage_id!r} has no {role} conversation yet (its configuration "
+                    "is pinned, but no provider session was started); there is nothing to "
+                    "replace"
                 )
             if is_fresh(state, role):
                 raise SessionError(
@@ -198,7 +224,7 @@ __all__ = [
     "current_session_id",
     "generations",
     "is_fresh",
-    "note_pin",
-    "note_session_id",
+    "record_pin",
+    "record_session_id",
     "start_fresh_session",
 ]

@@ -25,7 +25,7 @@ from agent_sparring.handoff import generate_handoff
 from agent_sparring.providers import ProviderError, StageAgentAdapter, StageAgentResult
 from agent_sparring.stage import Stage, StageState, StageStatus
 from agent_sparring.prompt_capture import capture_prompt
-from agent_sparring.sessions import ROLE_STAGE, is_fresh, note_session_id
+from agent_sparring.sessions import ROLE_STAGE, is_fresh, record_session_id
 from agent_sparring.stage_prompt import assemble_stage_prompt
 
 
@@ -94,8 +94,7 @@ def _session_recorded_early(
     def record(session_id: str) -> None:
         if not session_id or state.implementation_session_id == session_id:
             return
-        state.implementation_session_id = session_id
-        note_session_id(state, ROLE_STAGE, session_id)
+        record_session_id(state, ROLE_STAGE, session_id)
         stage.write_state(state)
 
     previous = adapter.on_session_observed  # type: ignore[attr-defined]
@@ -295,8 +294,7 @@ def run_stage_agent(
 
             # state.base_sha was already persisted above (before the provider
             # ran) if this was the first run; it is never moved forward here.
-            state.implementation_session_id = result.session_id
-            note_session_id(state, ROLE_STAGE, result.session_id)
+            record_session_id(state, ROLE_STAGE, result.session_id)
             stage.write_state(state)
             activity.emit(
                 "turn.finished",

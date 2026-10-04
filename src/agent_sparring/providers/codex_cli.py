@@ -94,7 +94,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
 from agent_sparring.deferred_gate import CHECKPOINTS
@@ -488,8 +488,11 @@ class _CodexStreamTranslator:
         emitter: ActivityEmitter | None,
         repo_root: Path,
         codex_home: Path | None = None,
+        on_session: "Callable[[str], None] | None" = None,
     ) -> None:
         self._emitter = emitter
+        self._on_session = on_session
+        self._session_announced = False
         self._repo_root = repo_root
         self._started_items: set[str] = set()
         self._last_usage: dict[str, Any] = {}
@@ -499,7 +502,7 @@ class _CodexStreamTranslator:
         self._thread_id: str | None = None
 
     def feed(self, line: str) -> None:
-        if self._emitter is None:
+        if self._emitter is None and self._on_session is None:
             return
         line = line.strip()
         if not line:
@@ -509,6 +512,13 @@ class _CodexStreamTranslator:
         except json.JSONDecodeError:
             return
         if not isinstance(event, dict):
+            return
+        if event.get("type") == "thread.started" and self._on_session is not None:
+            thread_id = _str_or_none(event.get("thread_id"))
+            if thread_id and not self._session_announced:
+                self._session_announced = True
+                self._on_session(thread_id)
+        if self._emitter is None:
             return
         # Budget first, and on *every* event: which event type carries the
         # numbers is the provider's business and has changed between
@@ -688,6 +698,11 @@ class CodexCliAdapter:
     # CODEX_HOME; this exists so tests can point at a fixture. Telemetry
     # only -- nothing about the verdict depends on it.
     codex_home: Path | None = None
+    # Called with the thread id as soon as Codex announces it, while the
+    # turn is still running, so the orchestrator can record a fresh
+    # reviewer session before the turn can fail or be killed (see
+    # agent_sparring.sparring_agent). Unset, nothing changes.
+    on_session_observed: "Callable[[str], None] | None" = None
 
     provider_id: str = PROVIDER_ID
 
@@ -823,7 +838,10 @@ class CodexCliAdapter:
 
             args = self._build_args(prompt, resume_session_id, schema_path, output_path)
             translator = _CodexStreamTranslator(
-                self.activity, self.repo_root, self.codex_home
+                self.activity,
+                self.repo_root,
+                self.codex_home,
+                on_session=self.on_session_observed if resume_session_id is None else None,
             )
             try:
                 result = self.runner(

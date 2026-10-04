@@ -34,7 +34,9 @@ from pathlib import Path
 from agent_sparring.acceptance import sibling_root
 from agent_sparring.finalization import (
     FinalizationError,
+    _is_stage_artifact,
     _uncommitted_content_paths,
+    pending_finalization,
     read_worktree_content,
 )
 from agent_sparring.git_context import GitContextError, resolve_commit
@@ -43,6 +45,7 @@ from agent_sparring.prompt_capture import INDEX_FILENAME, prompts_dir
 from agent_sparring.routing import RoutingAction
 from agent_sparring.sparring_exchange import read_recorded_outcome
 from agent_sparring.stage import (
+    NEXT_TURN_FINALIZATION,
     NEXT_TURN_SPARRING,
     NEXT_TURN_STAGE,
     SiblingPin,
@@ -228,13 +231,29 @@ def derive_next_turn(repo_root: Path, stage: Stage, state: StageState) -> str | 
             uncommitted = set(_uncommitted_content_paths(repo_root, stage))
         except FinalizationError as exc:
             raise NextTurnError(str(exc)) from exc
-        if head == handoff.candidate_sha and uncommitted <= handoff.dirty_paths:
+        # The handoff records a commit and dirty path *names*, never content.
+        # Only a committed candidate can therefore be matched exactly: an
+        # uncommitted one may have been edited since without a name changing.
+        handoff_content_dirty = any(
+            not _is_stage_artifact(repo_root, stage, path) for path in handoff.dirty_paths
+        )
+        if head == handoff.candidate_sha and not uncommitted and not handoff_content_dirty:
             return NEXT_TURN_SPARRING
+        if head != handoff.candidate_sha:
+            found = f"HEAD is now {head}"
+        elif handoff_content_dirty or uncommitted:
+            found = (
+                "the candidate includes uncommitted content ("
+                + (", ".join(sorted(uncommitted)) or "recorded as dirty in the handoff")
+                + "), whose bytes the handoff does not record, so it cannot be matched exactly"
+            )
+        else:  # pragma: no cover -- the first branch returned
+            found = "the candidate does not match"
         raise AmbiguousNextTurn(
             f"stage {stage.stage_id!r} has no recorded next_turn. Its last completed "
             f"implementation turn recorded candidate {handoff.candidate_sha}, later than the "
-            f"last verdict ({outcome.action.value if outcome else 'none'}), but HEAD is now "
-            f"{head} (uncommitted: {', '.join(sorted(uncommitted)) or 'none'}). The engine cannot tell whether the reviewer should see HEAD or the "
+            f"last verdict ({outcome.action.value if outcome else 'none'}), but {found}. The "
+            "engine cannot tell whether the reviewer should see the current candidate or the "
             "implementation agent should continue; choose explicitly (next_turn = stage | "
             "sparring)."
         )
@@ -282,6 +301,36 @@ def resolve_resume_turn(
     return derived
 
 
+def standalone_start_with(repo_root: Path, stage: Stage) -> str:
+    """Where a standalone ``run-loop`` resume enters the loop:
+    ``stage``, ``sparring`` or ``finalization``.
+
+    The same precedence as a managed resume, minus the parts only a managed
+    run has. A recorded human gate (NEEDS_YOU / ESCALATE) still stands
+    unless the marker already says an implementation turn is owed: running
+    either agent would not answer it, so it is refused. A ``finalization``
+    marker enters the bounded commit cycle while the reviewed candidate is
+    still uncommitted, and is otherwise discharged (``stage``).
+    """
+
+    marker = resolve_resume_turn(repo_root, stage)
+    outcome = read_recorded_outcome(stage)
+    if outcome is not None and outcome.awaits_a_human and marker != NEXT_TURN_STAGE:
+        raise NextTurnError(
+            f"stage {stage.stage_id!r} is waiting for a person ({outcome.action.value}: "
+            f"{outcome.summary or 'see sparring.md'}); running either agent would not answer "
+            "it. Record the answer (resume-plan --evidence for a managed run, or under '## "
+            "Human evidence' in notes.md) and run the reviewer (run-sparring)."
+        )
+    if marker == NEXT_TURN_FINALIZATION:
+        try:
+            pending = pending_finalization(repo_root, stage)
+        except FinalizationError as exc:
+            raise NextTurnError(f"could not read the candidate content: {exc}") from exc
+        return NEXT_TURN_FINALIZATION if pending is not None else NEXT_TURN_STAGE
+    return marker if marker == NEXT_TURN_SPARRING else NEXT_TURN_STAGE
+
+
 __all__ = [
     "AmbiguousNextTurn",
     "NextTurnError",
@@ -289,5 +338,6 @@ __all__ = [
     "derive_next_turn",
     "record_next_turn",
     "resolve_resume_turn",
+    "standalone_start_with",
     "verify_candidate",
 ]
