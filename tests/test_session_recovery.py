@@ -19,7 +19,11 @@ from unittest import mock
 
 import conftest_path  # noqa: F401
 
-from agent_sparring.cli import _retry_lines, build_parser, main
+import argparse
+import json
+import shlex
+
+from agent_sparring.cli import _retry_command, _retry_lines, build_parser, main
 from agent_sparring.loop import LoopError, run_unattended_loop
 from agent_sparring.plan import (
     PAUSE_PROVIDER_UNAVAILABLE,
@@ -411,7 +415,8 @@ class CliTests(_LoopRepo):
         self.assertEqual(code, 1)
         self.assertIn("paused: stage s1: sparring provider turn session-unresumable", err)
         self.assertIn(
-            f"sparring run-loop s1 --repo-root {self.repo} --expected-branch feature/x "
+            f"sparring --sparring-dir {self.sparring_dir.resolve()} run-loop s1 --repo-root "
+            f"{self.repo.resolve()} --expected-branch feature/x "
             "--fresh-sparrer --fresh-reason session-unresumable",
             err,
         )
@@ -457,6 +462,187 @@ class CliTests(_LoopRepo):
         self.assertEqual(code, 1)
         self.assertIn("fresh sparring session", err)
         loop.assert_not_called()
+
+
+def _claude_runner(payload):
+    line = json.dumps({"type": "result", **payload})
+    return lambda *a: _completed(stdout=line + "\n", returncode=1)
+
+
+class ClaudeStructuredErrorTests(_LoopRepo):
+    def run_loop(self, adapter):
+        return run_unattended_loop(
+            self.stage, self.sparring_dir, self.repo, adapter, _SparringAdapter([READY]),
+            expected_branch="feature/x",
+        )
+
+    def test_a_rate_limit_only_in_errors_is_unavailable_through_the_loop(self):
+        payload = {"is_error": True, "session_id": "c-1", "errors": ["429 Too Many Requests"]}
+        adapter = ClaudeCliAdapter(repo_root=self.repo, runner=_claude_runner(payload))
+        with self.assertRaises(ProviderUnavailable) as ctx:
+            adapter.start("go")
+        self.assertIn("429 Too Many Requests", str(ctx.exception))
+
+        with self.assertRaises(LoopError) as ctx:
+            self.run_loop(ClaudeCliAdapter(repo_root=self.repo, runner=_claude_runner(payload)))
+        self.assertIsInstance(recoverable_provider_failure(ctx.exception), ProviderUnavailable)
+        self.assertEqual(self.stage.read_state().next_turn, "stage")
+
+    def test_an_unknown_conversation_only_in_errors_is_unresumable_on_resume(self):
+        from agent_sparring.sessions import record_session_id
+
+        state = self.stage.read_state()
+        record_session_id(state, "stage", "c-1")
+        self.stage.write_state(state)
+        payload = {
+            "is_error": True,
+            "session_id": "c-1",
+            "errors": ["No conversation found with session ID: c-1"],
+        }
+        with self.assertRaises(LoopError) as ctx:
+            self.run_loop(ClaudeCliAdapter(repo_root=self.repo, runner=_claude_runner(payload)))
+        self.assertIsInstance(
+            recoverable_provider_failure(ctx.exception), ProviderSessionUnresumable
+        )
+        self.assertEqual(self.stage.read_state().implementation_session_id, "c-1")
+
+    def test_an_unclassified_error_result_is_still_an_is_error_result(self):
+        payload = {"is_error": True, "session_id": "c-1", "errors": ["tool crashed"]}
+        result = ClaudeCliAdapter(repo_root=Path("."), runner=_claude_runner(payload)).start("go")
+        self.assertTrue(result.is_error)
+
+
+class RetryCommandTests(unittest.TestCase):
+    def test_the_printed_command_parses_back_to_the_same_run(self):
+        args = argparse.Namespace(
+            expected_branch="feature/x y",
+            stage_provider=None, sparring_provider="codex-cli", stage_model=None,
+            sparring_model="m 2", stage_effort=None, sparring_effort=None,
+            stop_after_stage="s 1", claude_executable="/opt/my claude",
+            codex_executable="codex", permission_mode="acceptEdits", max_send_back_cycles=7,
+        )
+        command = _retry_command(
+            args, Path("/tmp/my state/.sparring"), Path("/tmp/my repo"),
+            ["resume-plan", "/tmp/my repo/docs/plan.md", "--run-key", "k1"],
+        )
+        argv = shlex.split(command)
+        self.assertEqual(argv[0], "sparring")
+        parsed = build_parser().parse_args(argv[1:] + ["--fresh-sparrer"])
+        self.assertEqual(parsed.sparring_dir, str(Path("/tmp/my state/.sparring").resolve()))
+        self.assertEqual(parsed.repo_root, str(Path("/tmp/my repo").resolve()))
+        self.assertEqual(parsed.plan_path, "/tmp/my repo/docs/plan.md")
+        self.assertEqual(
+            (parsed.run_key, parsed.expected_branch, parsed.sparring_model, parsed.stop_after_stage),
+            ("k1", "feature/x y", "m 2", "s 1"),
+        )
+        self.assertEqual((parsed.claude_executable, parsed.max_send_back_cycles), ("/opt/my claude", 7))
+        self.assertEqual(parsed.sparring_provider, "codex-cli")
+
+
+def _printed_commands(err: str) -> list[list[str]]:
+    return [shlex.split(line.strip())[1:] for line in err.splitlines() if line.startswith("  sparring ")]
+
+
+class _UnavailableReviewer(_SparringAdapter):
+    def resume(self, session_id, prompt):
+        self.resume_calls.append((session_id, prompt))
+        raise ProviderUnavailable("usage limit reached")
+
+
+class EvidenceRetryTests(_PlanRepoTestCase):
+    """The printed retry after a failed evidence review re-enters that
+    evidence turn, over the same verified candidate."""
+
+    def cli(self, argv, stage_adapter, sparring):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch(
+            "agent_sparring.cli._build_loop_adapters", return_value=(stage_adapter, sparring)
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def fail_evidence_review(self, reviewer):
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        self._start(stage_adapter, _SparringAdapter([NEEDS_YOU]))
+        code, _, err = self.cli(
+            ["--sparring-dir", str(self.sparring_dir), "resume-plan", str(self.plan_path),
+             "--repo-root", str(self.repo), "--expected-branch", "feature/x",
+             "--stop-after-stage", S1, "--evidence", "checked on device"],
+            stage_adapter, reviewer,
+        )
+        self.assertEqual(code, 1, err)
+        self.assertIn("paused: stage", err)
+        return stage_adapter, _printed_commands(err)
+
+    def test_plain_retry_after_an_unavailable_evidence_review(self):
+        stage_adapter, commands = self.fail_evidence_review(_UnavailableReviewer([]))
+        reviewer = _SparringAdapter([READY])
+        code, out, err = self.cli(commands[0], stage_adapter, reviewer)
+        self.assertEqual(code, 0, err)
+        self.assertIn("checked on device", reviewer.resume_calls[0][1])
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 1)
+
+    def test_fresh_retry_after_an_unresumable_evidence_review(self):
+        stage_adapter, commands = self.fail_evidence_review(_UnresumableReviewer([]))
+        self.assertIn("--fresh-sparrer", commands[0])
+        reviewer = _SparringAdapter([READY])
+        code, _, err = self.cli(commands[0], stage_adapter, reviewer)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(reviewer.start_calls), 1)
+        self.assertIn("checked on device", reviewer.start_calls[0])
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+        self.assertEqual(len(generations(self._stage(S1).read_state(), "sparring")), 2)
+
+    def test_the_replayed_evidence_turn_still_verifies_the_candidate(self):
+        stage_adapter, commands = self.fail_evidence_review(_UnavailableReviewer([]))
+        (self.repo / "drift.txt").write_text("not reviewed\n")
+        reviewer = _SparringAdapter([READY])
+        code, _, err = self.cli(commands[0], stage_adapter, reviewer)
+        self.assertEqual(code, 1)
+        self.assertIn("waiting for review of", err)
+        self.assertEqual(reviewer.start_calls + reviewer.resume_calls, [])
+
+    def test_a_new_verdict_retires_the_pending_evidence(self):
+        stage_adapter, commands = self.fail_evidence_review(_UnavailableReviewer([]))
+        # The evidence turn now completes with another NEEDS_YOU ...
+        self.cli(commands[0], stage_adapter, _SparringAdapter([NEEDS_YOU]))
+        # ... so a plain resume keeps that new pause instead of replaying.
+        reviewer = _SparringAdapter([READY])
+        result = self._resume(stage_adapter, reviewer)
+        self.assertIsNotNone(result.recorded)
+        self.assertEqual(reviewer.start_calls + reviewer.resume_calls, [])
+
+
+from test_independent_review import REVIEW_STAGE, _ReviewRepoTestCase  # noqa: E402
+
+
+class ReviewOnlyEvidenceRetryTests(_ReviewRepoTestCase):
+    def cli(self, argv, stage_adapter, sparring):
+        return EvidenceRetryTests.cli(self, argv, stage_adapter, sparring)
+
+    def test_retries_after_a_failed_independent_evidence_review(self):
+        for failing, expect_fresh in ((_UnavailableReviewer([]), False), (_UnresumableReviewer([]), True)):
+            with self.subTest(failing=type(failing).__name__):
+                self.setUp()
+                stage_adapter = _StageAdapter(self.repo, commit=True)
+                self.start(stage_adapter, _SparringAdapter([READY, NEEDS_YOU]))
+                code, _, err = self.cli(
+                    ["--sparring-dir", str(self.sparring_dir), "resume-plan",
+                     "--manifest", str(self.manifest_path), "--repo-root", str(self.repo),
+                     "--expected-branch", "feature/x", "--evidence", "verified by hand"],
+                    stage_adapter, failing,
+                )
+                self.assertEqual(code, 1, err)
+                commands = _printed_commands(err)
+                self.assertEqual("--fresh-sparrer" in commands[0], expect_fresh)
+                reviewer = _SparringAdapter([READY])
+                code, _, err = self.cli(commands[0], stage_adapter, reviewer)
+                self.assertEqual(code, 0, err)
+                prompts = reviewer.start_calls + [p for _, p in reviewer.resume_calls]
+                self.assertEqual(len(prompts), 1)
+                self.assertIn("verified by hand", prompts[0])
+                self.assertIs(self.stage(REVIEW_STAGE).read_state().status, StageStatus.ACCEPTED)
 
 
 if __name__ == "__main__":

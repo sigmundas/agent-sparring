@@ -266,7 +266,18 @@ kind and whether the role has a conversation to replace) with the run
 recorded as paused; the CLI prints the role, the provider's message and the
 exact command to continue -- `… --fresh-sparrer --fresh-reason
 session-unresumable`, or a plain retry plus a fresh-session alternative --
-and exits 1. `run-loop` prints the same. The engine never acts on it: no
+and exits 1. The command is shell-quoted and self-contained: absolute
+`--sparring-dir`, `--repo-root` and plan/manifest path, the run key, branch,
+and every provider/model/effort, executable, `--max-send-back-cycles` and
+`--stop-after-stage` option the failed invocation was given (one-time
+requests -- fresh flags, `--next-turn`, `--evidence`, push grants -- are not
+repeated; they were already applied). Evidence whose reviewer turn failed
+is not lost: the run state records it (`evidence_pending`, tied to the exact
+`sparring.md` it answers), so the printed retry -- plain or fresh -- re-enters
+that evidence turn over the same, re-verified candidate, for implementation
+and review-only stages alike. Any new verdict retires it. A Claude error
+result whose reason is only in its structured `errors` list is classified
+the same way. `run-loop` prints the same. The engine never acts on it: no
 retry, no session discarded, no candidate touched, `next_turn` unchanged. A
 failure before the provider announced a session records no session id, so a
 plain retry starts that (possibly pending fresh) conversation again. Any

@@ -546,6 +546,15 @@ class PlanRunState:
     #: the plan's completion, no longer this run's. Provenance only; omitted
     #: while empty so every other run's file is unchanged.
     carried_deferred: tuple[str, ...] = field(default_factory=tuple)
+    #: Human evidence recorded by ``resume-plan --evidence`` whose reviewer
+    #: turn has not produced a verdict yet: ``{"stage": <stage id>,
+    #: "sparring_digest": <sha256 of the sparring.md it answers>}``. A resume
+    #: re-enters that evidence turn while the stage's sparring.md is still
+    #: exactly the gate it answered, so a provider failure during the
+    #: evidence review neither loses the answer nor falls back to the old
+    #: pause. Any new verdict rewrites sparring.md and so retires it.
+    #: Omitted while ``None``.
+    evidence_pending: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -567,6 +576,8 @@ class PlanRunState:
         # the plan key it was always filed under.
         if self.run is None:
             payload.pop("run", None)
+        if self.evidence_pending is None:
+            payload.pop("evidence_pending", None)
         return payload
 
     # -- the obligation ledger -------------------------------------------
@@ -664,6 +675,11 @@ class PlanRunState:
                     DeferredObligation.from_dict(entry) for entry in raw_deferred
                 ),
                 carried_deferred=tuple(str(entry) for entry in payload.get("carried_deferred") or ()),
+                evidence_pending=(
+                    {str(k): str(v) for k, v in payload["evidence_pending"].items()}
+                    if isinstance(payload.get("evidence_pending"), dict)
+                    else None
+                ),
             )
         except (PushError, DeferredGateError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -1796,6 +1812,13 @@ def resume_plan(
                     f"stage {current.stage_id}: resuming the sparrer against the unchanged "
                     "candidate with this evidence; the stage agent is not started"
                 )
+        if sparrer_first:
+            # Until a reviewer turn answers it (see _evidence_awaiting_review).
+            state.evidence_pending = {
+                "stage": stage.stage_id,
+                "sparring_digest": _sparring_digest(stage),
+            }
+            state.save(state_path)
 
     return _drive(
         source,
@@ -3020,6 +3043,31 @@ def _plan_emitter(stage: Stage) -> ActivityEmitter:
     return stage.activity_log().bind("plan")
 
 
+def _sparring_digest(stage: Stage) -> str:
+    return hashlib.sha256(stage.read_sparring().encode("utf-8")).hexdigest()
+
+
+def _evidence_awaiting_review(state: PlanRunState, stage: Stage) -> bool:
+    """Is recorded evidence for ``stage`` still waiting for the reviewer
+    turn that answers it (see :attr:`PlanRunState.evidence_pending`)?"""
+
+    pending = state.evidence_pending
+    if not pending or pending.get("stage") != stage.stage_id:
+        return False
+    try:
+        return pending.get("sparring_digest") == _sparring_digest(stage)
+    except (OSError, StageError):
+        return False
+
+
+def _retire_pending_evidence(state: PlanRunState, state_path: Path) -> None:
+    """A reviewer verdict was recorded: any pending evidence has had its turn."""
+
+    if state.evidence_pending is not None:
+        state.evidence_pending = None
+        state.save(state_path)
+
+
 def _failed_role(exc: BaseException) -> str:
     """Whose turn ``exc`` came from: the reviewer's when a sparring /
     independent-review turn is anywhere in its cause chain, else the stage
@@ -3277,6 +3325,20 @@ def _drive(
         # Like sparrer_first: a request about the stage this resume enters,
         # never about the stages after it.
         entering_fresh, fresh_roles = fresh_roles, ()
+        if state.evidence_pending is not None:
+            if not sparrer_first and _evidence_awaiting_review(state, stage):
+                # The evidence turn a person already asked for failed before
+                # its verdict (e.g. the reviewer's provider was unavailable):
+                # retrying it, plainly or with a fresh reviewer, re-enters
+                # that same turn over the same, re-verified candidate.
+                sparrer_first = True
+                report(
+                    f"stage {stage.stage_id}: the human evidence recorded earlier has not "
+                    "been reviewed yet; resuming the sparrer with it"
+                )
+            elif not sparrer_first:
+                state.evidence_pending = None
+                state.save(state_path)
         try:
             stage_state = stage.read_state()
         except StageError as exc:
@@ -3405,6 +3467,7 @@ def _drive(
                     report=report,
                 )
                 sparrer_first = False  # only the stage this resume entered
+                _retire_pending_evidence(state, state_path)
                 if review.outcome is not RoutingAction.READY:
                     _pause(state, state_path)
                     activity.emit("plan.paused", action=review.outcome.value)
@@ -3707,6 +3770,7 @@ def _drive(
                             ),
                         ) from exc
 
+                    _retire_pending_evidence(state, state_path)
                     if loop_result.outcome is not RoutingAction.READY:
                         _pause(state, state_path)
                         activity.emit("plan.paused", action=loop_result.outcome.value)

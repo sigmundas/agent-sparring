@@ -47,6 +47,7 @@ from agent_sparring.providers import (
     ProviderError,
     Runner,
     StageAgentResult,
+    classify_failure_text,
     classify_provider_error,
 )
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
@@ -496,7 +497,7 @@ class ClaudeCliAdapter:
                 f"{self.executable} timed out after {self.timeout_seconds}s"
             ) from exc
         try:
-            return self._parse(result)
+            return self._parse(result, resuming=resume_session_id is not None)
         except ProviderError as exc:
             # The same failure, typed when its text says it is one a
             # person can recover from (see agent_sparring.providers).
@@ -534,7 +535,9 @@ class ClaudeCliAdapter:
                 final = message
         return final
 
-    def _parse(self, result: "subprocess.CompletedProcess[str]") -> StageAgentResult:
+    def _parse(
+        self, result: "subprocess.CompletedProcess[str]", *, resuming: bool = False
+    ) -> StageAgentResult:
         stdout = result.stdout or ""
         payload = self._final_payload(stdout)
         if payload is None:
@@ -553,6 +556,25 @@ class ClaudeCliAdapter:
         text = payload.get("result")
         if not isinstance(text, str):
             text = ""
+
+        if payload.get("is_error"):
+            # An error result may carry its reason only in the structured
+            # ``errors`` list (e.g. "429 Too Many Requests"), with no result
+            # text at all. A recoverable reason is raised as its typed
+            # failure; anything else stays an is_error result as before.
+            errors = payload.get("errors")
+            details = [text] if text else []
+            if isinstance(errors, list):
+                details += [
+                    error if isinstance(error, str) else json.dumps(error, sort_keys=True)
+                    for error in errors
+                ]
+            detail = "; ".join(details)
+            kind = classify_failure_text(detail, resuming=resuming)
+            if kind is not None:
+                raise kind(
+                    f"{self.executable} reported is_error=true (session {session_id}): {detail}"
+                )
 
         return StageAgentResult(
             session_id=session_id,

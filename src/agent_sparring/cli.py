@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -1449,6 +1450,50 @@ def _fresh_roles(args: argparse.Namespace) -> tuple[str, ...]:
     return roles
 
 
+def _retry_command(
+    args: argparse.Namespace, sparring_dir: Path, repo_root: Path, command: list[str]
+) -> str:
+    """The shell command that repeats this invocation's run after a provider
+    pause: the same state directory and repository (absolute, so it works
+    from anywhere), the same branch, and every provider, executable and
+    limit option that was given -- shell-quoted. One-time requests (fresh
+    sessions, --next-turn, --evidence, push grants) are not repeated: each
+    was already applied and recorded by this invocation."""
+
+    parts = [
+        "sparring",
+        "--sparring-dir",
+        str(Path(sparring_dir).resolve()),
+        *command,
+        "--repo-root",
+        str(Path(repo_root).resolve()),
+        "--expected-branch",
+        args.expected_branch,
+    ]
+    for option in (
+        "stage_provider",
+        "sparring_provider",
+        "stage_model",
+        "sparring_model",
+        "stage_effort",
+        "sparring_effort",
+        "stop_after_stage",
+    ):
+        value = getattr(args, option, None)
+        if value is not None:
+            parts += [f"--{option.replace('_', '-')}", str(value)]
+    for option, default in (
+        ("claude_executable", "claude"),
+        ("codex_executable", "codex"),
+        ("permission_mode", DEFAULT_PERMISSION_MODE),
+        ("max_send_back_cycles", DEFAULT_MAX_SEND_BACK_CYCLES),
+    ):
+        value = getattr(args, option, default)
+        if value != default:
+            parts += [f"--{option.replace('_', '-')}", str(value)]
+    return shlex.join(parts)
+
+
 def _retry_lines(command: str, *, role: str, kind: str, has_session: bool) -> list[str]:
     """The exact command(s) a person can run to continue after a provider
     pause. Never run by the engine."""
@@ -1545,9 +1590,8 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             ),
             has_session=current_session_id(state, role) is not None,
             detail=str(exc),
-            command=(
-                f"sparring run-loop {args.stage_id} --repo-root {args.repo_root or '.'} "
-                f"--expected-branch {args.expected_branch}"
+            command=_retry_command(
+                args, sparring_dir, repo_root, ["run-loop", args.stage_id]
             ),
         )
         return 1
@@ -1872,9 +1916,19 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
             kind=exc.kind,
             has_session=exc.has_session,
             detail=str(exc),
-            command=(
-                f"sparring resume-plan {_plan_input_args(args, exc.run)} --repo-root "
-                f"{args.repo_root or '.'} --expected-branch {args.expected_branch}"
+            command=_retry_command(
+                args,
+                sparring_dir,
+                repo_root,
+                [
+                    "resume-plan",
+                    *(
+                        ["--manifest", str(Path(args.manifest).resolve())]
+                        if args.manifest
+                        else [str(Path(args.plan_path).resolve())]
+                    ),
+                    *(["--run-key", exc.run] if exc.run else []),
+                ],
             ),
         )
         return 1
