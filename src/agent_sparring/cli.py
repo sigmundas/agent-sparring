@@ -72,6 +72,8 @@ from agent_sparring.plan import (
     PlanRunError,
     PlanRunResult,
     PlanRunStatus,
+    PAUSE_SESSION_UNRESUMABLE,
+    ProviderPause,
     load_plan_source,
     plan_label,
     plan_state_not_ignored_message,
@@ -95,7 +97,18 @@ from agent_sparring.providers.codex_cli import PROVIDER_ID as CODEX_PROVIDER_ID,
 from agent_sparring.recovery import RecoveryError, reopen_for_failed_check, reset_stage
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
 from agent_sparring.next_turn import NextTurnError, standalone_start_with
-from agent_sparring.sessions import is_fresh, record_pin
+from agent_sparring.sessions import (
+    SessionError,
+    current_session_id,
+    generations,
+    is_fresh,
+    record_pin,
+    start_fresh_sessions,
+)
+from agent_sparring.providers import (
+    ProviderSessionUnresumable,
+    recoverable_provider_failure,
+)
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.sparring_prompt import build_sparring_prompt
@@ -1329,6 +1342,8 @@ def _build_loop_adapters(
         )
     _emit_resolved(activity_log, effective.stage)
     _emit_resolved(activity_log, effective.sparring)
+    if stage is not None:
+        _print_resolved_agents(stage, effective, args)
     stage_adapter = ClaudeCliAdapter(
         repo_root=repo_root,
         executable=args.claude_executable,
@@ -1364,6 +1379,113 @@ def _build_loop_adapters(
     return stage_adapter, sparring_adapter
 
 
+_FRESH_FLAGS = {ROLE_STAGE: "--fresh-stage-agent", ROLE_SPARRING: "--fresh-sparrer"}
+
+
+def _print_resolved_agents(stage: Stage, effective: EffectiveAgents, args: argparse.Namespace) -> None:
+    """Say, before any provider starts, exactly what each role will run as.
+
+    Adapter, the configured model and effort with where each came from, which
+    conversation the role continues (or that a new / fresh one starts), the
+    model the provider itself last reported for that conversation, and the
+    backend/account -- which no adapter can read safely today, so it says
+    so. The reported model comes from activity.jsonl and is display only.
+    """
+
+    state = stage.read_state()
+    usage = collect_stage_usage(stage)
+    executables = {
+        CLAUDE_PROVIDER_ID: getattr(args, "claude_executable", "claude"),
+        CODEX_PROVIDER_ID: getattr(args, "codex_executable", "codex"),
+    }
+    print(f"agents for stage {stage.stage_id}:", file=sys.stderr)
+    for label, resolved in (("stage agent", effective.stage), ("sparrer", effective.sparring)):
+        role = resolved.role
+        history = generations(state, role)
+        session = current_session_id(state, role)
+        if is_fresh(state, role):
+            conversation = (
+                f"fresh conversation, generation {history[-1].generation} "
+                f"({history[-1].start_reason})"
+            )
+        elif session is not None:
+            generation = history[-1].generation if history else 1
+            conversation = f"resuming generation {generation}, session {session}"
+        else:
+            conversation = "new conversation at its first turn"
+        reported = None
+        if session is not None:
+            role_usage = usage.roles.get(role)
+            reported = role_usage.reported_model if role_usage is not None else None
+        model = resolved.model if resolved.model is not None else "provider default"
+        effort = resolved.effort if resolved.effort is not None else "provider default"
+        print(
+            f"  {label}: adapter {resolved.provider} ({executables.get(resolved.provider, '?')}); "
+            f"configured model {model} [{resolved.model_source}]; effort {effort} "
+            f"[{resolved.effort_source}]",
+            file=sys.stderr,
+        )
+        print(
+            f"    {conversation}; provider-reported model {reported or 'not reported'}; "
+            "backend/account not reported",
+            file=sys.stderr,
+        )
+
+
+def _fresh_roles(args: argparse.Namespace) -> tuple[str, ...]:
+    """The roles ``--fresh-stage-agent`` / ``--fresh-sparrer`` name, refusing
+    a ``--fresh-reason`` that accompanies neither."""
+
+    roles = tuple(
+        role
+        for role, flag in ((ROLE_STAGE, "fresh_stage_agent"), (ROLE_SPARRING, "fresh_sparrer"))
+        if getattr(args, flag, False)
+    )
+    if getattr(args, "fresh_reason", None) is not None and not roles:
+        raise AgentConfigError(
+            "--fresh-reason explains a fresh session; give --fresh-sparrer and/or "
+            "--fresh-stage-agent with it"
+        )
+    return roles
+
+
+def _retry_lines(command: str, *, role: str, kind: str, has_session: bool) -> list[str]:
+    """The exact command(s) a person can run to continue after a provider
+    pause. Never run by the engine."""
+
+    flag = _FRESH_FLAGS[role]
+    prefix = "--stage" if role == ROLE_STAGE else "--sparring"
+    if kind == PAUSE_SESSION_UNRESUMABLE:
+        return [
+            "Continue the same stage in a fresh conversation for that role:",
+            f"  {command} {flag} --fresh-reason session-unresumable",
+        ]
+    lines = ["Retry the same conversation once the provider is available again:", f"  {command}"]
+    if has_session:
+        lines += [
+            f"or continue in a fresh conversation (optionally choosing {prefix}-provider / "
+            f"{prefix}-model / {prefix}-effort anew):",
+            f"  {command} {flag} --fresh-reason provider-unavailable",
+        ]
+    return lines
+
+
+def _report_provider_pause(
+    *,
+    stage_id: str,
+    role: str,
+    kind: str,
+    has_session: bool,
+    detail: str,
+    command: str,
+) -> None:
+    print(f"paused: stage {stage_id}: {role} provider turn {kind}", file=sys.stderr)
+    print(detail, file=sys.stderr)
+    print("The engine did not retry, discard a session or touch the candidate.", file=sys.stderr)
+    for line in _retry_lines(command, role=role, kind=kind, has_session=has_session):
+        print(line, file=sys.stderr)
+
+
 def _cmd_run_loop(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
     try:
@@ -1376,7 +1498,19 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
         # An ordinary resume obeys the engine's record of whose turn it is
         # (derived once for state written before it existed), decided before
         # anything is pinned or any provider starts.
-        start_with = standalone_start_with(repo_root, stage)
+        fresh_roles = _fresh_roles(args)
+        start_with = standalone_start_with(repo_root, stage, choice=args.next_turn)
+        if fresh_roles:
+            # After every refusal above, before any configuration is
+            # resolved for the roles it replaces.
+            for role, pending in start_fresh_sessions(
+                stage, fresh_roles, args.fresh_reason or "manual", repo_root=repo_root
+            ).items():
+                print(
+                    f"starting a fresh {role} session (generation {pending.generation}, "
+                    f"{pending.start_reason}); same stage, candidate and artifacts",
+                    file=sys.stderr,
+                )
         # Both adapters append to this stage's activity.jsonl (see
         # agent_sparring.activity): observational only, never read back.
         stage_adapter, sparring_adapter = _build_loop_adapters(
@@ -1394,9 +1528,32 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             start_with=start_with,
             sparring_first_reason="next_turn",
         )
+    except LoopError as exc:
+        failure = recoverable_provider_failure(exc)
+        if failure is None:
+            print(f"could not run unattended loop: {exc}", file=sys.stderr)
+            return 1
+        role = _loop_failed_role(exc)
+        state = stage.read_state()
+        _report_provider_pause(
+            stage_id=stage.stage_id,
+            role=role,
+            kind=(
+                PAUSE_SESSION_UNRESUMABLE
+                if isinstance(failure, ProviderSessionUnresumable)
+                else "provider-unavailable"
+            ),
+            has_session=current_session_id(state, role) is not None,
+            detail=str(exc),
+            command=(
+                f"sparring run-loop {args.stage_id} --repo-root {args.repo_root or '.'} "
+                f"--expected-branch {args.expected_branch}"
+            ),
+        )
+        return 1
     except (
         StageError,
-        LoopError,
+        SessionError,
         NextTurnError,
         ProjectConfigError,
         GitContextError,
@@ -1412,6 +1569,17 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return 0
+
+
+def _loop_failed_role(exc: BaseException) -> str:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, SparringAgentRunError):
+            return ROLE_SPARRING
+        if isinstance(current, StageAgentRunError):
+            return ROLE_STAGE
+        current = current.__cause__
+    return ROLE_STAGE
 
 
 def _plan_input_args(args: argparse.Namespace, run: str = "") -> str:
@@ -1670,6 +1838,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
             report=report,
         )
         if resume:
+            fresh_roles = _fresh_roles(args)
             result = resume_plan(
                 source,
                 sparring_dir,
@@ -1681,6 +1850,9 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
                 ),
                 allow_push_candidate=args.allow_push_candidate,
                 allow_push_for_run=args.allow_push_for_run,
+                next_turn=args.next_turn,
+                fresh_roles=fresh_roles,
+                fresh_reason=args.fresh_reason,
                 **common,
             )
         else:
@@ -1693,6 +1865,19 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
                 allow_push_for_run=args.allow_push_for_run,
                 **common,
             )
+    except ProviderPause as exc:
+        _report_provider_pause(
+            stage_id=exc.stage_id,
+            role=exc.role,
+            kind=exc.kind,
+            has_session=exc.has_session,
+            detail=str(exc),
+            command=(
+                f"sparring resume-plan {_plan_input_args(args, exc.run)} --repo-root "
+                f"{args.repo_root or '.'} --expected-branch {args.expected_branch}"
+            ),
+        )
+        return 1
     except (
         PlanError,
         PlanRunError,
@@ -2204,6 +2389,52 @@ def _add_loop_arguments(
             "runaway limit: stop with an error after this many SEND_BACK "
             f"cycles without reaching READY/NEEDS_YOU/ESCALATE (default: "
             f"{DEFAULT_MAX_SEND_BACK_CYCLES})"
+        ),
+    )
+
+
+def _add_recovery_arguments(parser: argparse.ArgumentParser) -> None:
+    """The resume-only recovery flags run-loop and resume-plan share: start a
+    fresh provider conversation for a role, and choose the next turn when
+    legacy state is ambiguous. Neither ever happens without being asked."""
+
+    parser.add_argument(
+        "--fresh-sparrer",
+        action="store_true",
+        help=(
+            "continue this stage with a new reviewer conversation (a new session "
+            "generation): same stage, candidate and artifacts; the earlier conversation is "
+            "closed, and --sparring-provider/--sparring-model/--sparring-effort may choose "
+            "its configuration anew. Without this flag an override that conflicts with the "
+            "active session is refused"
+        ),
+    )
+    parser.add_argument(
+        "--fresh-stage-agent",
+        action="store_true",
+        help=(
+            "continue this stage with a new implementation-agent conversation; "
+            "--stage-provider/--stage-model/--stage-effort may choose its configuration "
+            "anew"
+        ),
+    )
+    parser.add_argument(
+        "--fresh-reason",
+        default=None,
+        metavar="REASON",
+        help=(
+            "why the fresh session was started, recorded with the new generation as "
+            "'fresh:<REASON>' (default: manual)"
+        ),
+    )
+    parser.add_argument(
+        "--next-turn",
+        choices=("stage", "sparring"),
+        default=None,
+        help=(
+            "whose turn it is, for state the engine cannot read unambiguously (it refuses "
+            "and says so); recorded as a manual choice. 'sparring' reviews the repository "
+            "as it is now"
         ),
     )
 
@@ -2748,6 +2979,7 @@ def build_parser() -> argparse.ArgumentParser:
         repo_root_help,
         branch_help="the branch this unattended loop is meant to modify and review; required",
     )
+    _add_recovery_arguments(run_loop)
     run_loop.set_defaults(func=_cmd_run_loop)
 
     manifest_help = (
@@ -3039,6 +3271,7 @@ def build_parser() -> argparse.ArgumentParser:
             "at a time without giving up its position, digest and acceptance handling"
         ),
     )
+    _add_recovery_arguments(resume_plan_parser)
     resume_plan_parser.set_defaults(func=_cmd_resume_plan, adopt=False)
 
     reset_stage_parser = subparsers.add_parser(

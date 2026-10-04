@@ -494,7 +494,7 @@ def _run_sparring_agent_locked(
             duration_ms=duration_ms,
             summary="provider error",
         )
-        raise SparringAgentRunError(str(provider_error))
+        raise SparringAgentRunError(str(provider_error)) from provider_error
 
     assert result is not None  # provider_error is None, so the call above succeeded
 

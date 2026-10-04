@@ -203,6 +203,7 @@ from agent_sparring.next_turn import (
     NextTurnError,
     resolve_finalization,
     resolve_resume_turn,
+    verify_candidate,
 )
 from agent_sparring.manifest import ManifestError, ManifestPlanSource, load_manifest_source
 from agent_sparring.intake_approval import (
@@ -220,7 +221,22 @@ from agent_sparring.push_gate import (
     authorization_for_run,
     ensure_candidate_pushed,
 )
-from agent_sparring.providers import SparringAgentAdapter, StageAgentAdapter
+from agent_sparring.providers import (
+    ProviderSessionUnresumable,
+    SparringAgentAdapter,
+    StageAgentAdapter,
+    recoverable_provider_failure,
+)
+from agent_sparring.sessions import (
+    ROLE_SPARRING,
+    ROLE_STAGE,
+    SessionError,
+    current_session_id,
+    generations,
+    start_fresh_sessions,
+)
+from agent_sparring.sparring_agent import SparringAgentRunError
+from agent_sparring.stage_agent import StageAgentRunError
 from agent_sparring.review import (
     ReviewError,
     ReviewResult,
@@ -272,6 +288,47 @@ class PlanRunError(RuntimeError):
     The plan position has been persisted as paused before this is raised;
     the current stage was neither accepted nor advanced.
     """
+
+
+#: :attr:`ProviderPause.kind` values.
+PAUSE_SESSION_UNRESUMABLE = "session-unresumable"
+PAUSE_PROVIDER_UNAVAILABLE = "provider-unavailable"
+
+
+class ProviderPause(PlanRunError):
+    """The run paused because a provider turn failed in a way a person can
+    recover from: the role's recorded conversation can no longer be resumed
+    (:class:`~agent_sparring.providers.ProviderSessionUnresumable`), or the
+    provider declined the turn for quota / rate-limit reasons
+    (:class:`~agent_sparring.providers.ProviderUnavailable`).
+
+    Like every :class:`PlanRunError`, the run is already persisted as paused
+    and the stage neither accepted nor advanced. Nothing was retried, no
+    session was discarded and the candidate was not touched: choosing a
+    fresh session (or waiting) is the person's decision, never the engine's.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage_id: str,
+        role: str,
+        kind: str,
+        has_session: bool,
+        run: str = "",
+    ) -> None:
+        super().__init__(message)
+        #: The run instance key, for the retry command.
+        self.run = run
+        self.stage_id = stage_id
+        #: ``stage`` or ``sparring``: whose turn failed.
+        self.role = role
+        #: :data:`PAUSE_SESSION_UNRESUMABLE` or :data:`PAUSE_PROVIDER_UNAVAILABLE`.
+        self.kind = kind
+        #: Whether the role has a conversation a fresh session could
+        #: replace; a role whose first session never started has none.
+        self.has_session = has_session
 
 
 # -- plan parsing -----------------------------------------------------------
@@ -1490,6 +1547,8 @@ def resume_plan(
     self_check: bool = False,
     stop_after_stage: str | None = None,
     next_turn: str | None = None,
+    fresh_roles: tuple[str, ...] = (),
+    fresh_reason: str | None = None,
     report: Reporter = lambda message: None,
 ) -> PlanRunResult:
     """Continue a recorded plan run at its current stage.
@@ -1543,7 +1602,19 @@ def resume_plan(
     ambiguous the resume is refused, and ``next_turn`` (``stage`` |
     ``sparring``) is the caller's explicit choice, recorded as ``manual``.
     Evidence, a recorded human gate and a pending finalization keep their
-    existing precedence over the marker.
+    existing precedence over the marker. Evidence answering a gate raised
+    over a recorded candidate (``next_turn = sparring``) is refused, before
+    it is recorded, when the repository no longer holds that candidate.
+
+    ``fresh_roles`` (``stage`` / ``sparring``) discards those roles'
+    conversations for the stage this resume enters and continues it in new
+    ones (see :func:`agent_sparring.sessions.start_fresh_sessions`), with
+    ``fresh_reason`` recorded. Applied only where an agent turn is about to
+    run; refused, with nothing changed, where none is owed.
+
+    A provider turn that fails as unresumable or unavailable raises
+    :class:`ProviderPause` (a :class:`PlanRunError`) naming the role, so the
+    caller can print the exact retry command.
 
     A current stage that is already ACCEPTED (by hand, after an ESCALATE
     sparred elsewhere, or by a run that stopped between accept and advance)
@@ -1623,6 +1694,17 @@ def resume_plan(
         report=report,
     )
 
+    if next_turn is not None and evidence is not None and evidence.strip():
+        if next_turn != NEXT_TURN_SPARRING:
+            raise PlanError(
+                "evidence is judged by the reviewer, so it can only be combined with "
+                f"--next-turn {NEXT_TURN_SPARRING} (which re-pins the candidate the reviewer "
+                f"judges it against), not --next-turn {next_turn}"
+            )
+    for role in fresh_roles:
+        if role not in (ROLE_STAGE, ROLE_SPARRING):
+            raise PlanError(f"unknown fresh-session role {role!r}")
+
     # Before anything runs, and before the ordinary evidence path: these
     # answer the run's own checkpoint rather than a stage's review, and a
     # refusal here must stop the resume rather than leave half of it applied.
@@ -1639,14 +1721,56 @@ def resume_plan(
     if evidence is not None and evidence.strip():
         current = stages[state.current_stage_index]
         stage = _ensure_stage(sparring_dir, current, owner=owner, report=report)
-        record_human_evidence(stage, evidence)
-        report(f"recorded human evidence in {stage.directory / 'notes.md'}")
-        # Observational only: that evidence was recorded, never what it says.
-        _plan_emitter(stage).emit("plan.evidence_recorded")
         try:
             current_state = stage.read_state()
         except StageError as exc:
             raise PlanError(f"cannot read the state of {current.stage_id!r}: {exc}") from exc
+        if next_turn is not None:
+            # Evidence plus an explicit sparring turn: the person says the
+            # repository as it stands now is what the reviewer should judge
+            # the answer against (for example after deliberately committing
+            # after the gate). Recorded as a manual marker over the current
+            # candidate, never inferred.
+            if current.review_only or current_state.status is StageStatus.ACCEPTED or not (
+                generations(current_state, ROLE_STAGE)
+            ):
+                raise PlanError(
+                    f"stage {current.stage_id!r} has no implementation candidate awaiting "
+                    "review, so there is no candidate to re-pin with --next-turn sparring"
+                )
+            try:
+                resolve_resume_turn(repo_root, stage, choice=next_turn)
+                current_state = stage.read_state()
+            except NextTurnError as exc:
+                raise PlanError(str(exc)) from exc
+            report(
+                f"stage {current.stage_id}: re-pinned the current candidate for review "
+                "(next turn = sparring, recorded as manual)"
+            )
+            next_turn = None
+        if (
+            not current.review_only
+            and current_state.status is not StageStatus.ACCEPTED
+            and current_state.next_turn == NEXT_TURN_SPARRING
+        ):
+            # The gate this evidence answers was raised over the recorded
+            # candidate; the reviewer must judge the answer against exactly
+            # that content. Checked before the evidence is recorded, so a
+            # refusal leaves notes.md as it was and the same command can be
+            # repeated once the candidate is restored. (The loop checks
+            # again immediately before the reviewer starts.)
+            try:
+                verify_candidate(repo_root, stage, current_state)
+            except NextTurnError as exc:
+                raise PlanError(
+                    f"refusing to record evidence for stage {current.stage_id!r}: {exc} "
+                    "If the change is deliberate and the reviewer should judge the evidence "
+                    "against the repository as it is now, repeat with --next-turn sparring"
+                ) from exc
+        record_human_evidence(stage, evidence)
+        report(f"recorded human evidence in {stage.directory / 'notes.md'}")
+        # Observational only: that evidence was recorded, never what it says.
+        _plan_emitter(stage).emit("plan.evidence_recorded")
         if current.review_only:
             # A review-only stage has no implementation session to gate on
             # and no implementation turn to skip: its whole lifecycle is the
@@ -1662,9 +1786,10 @@ def resume_plan(
                     "candidate set"
                 )
         else:
-            sparrer_first = (
-                current_state.status is not StageStatus.ACCEPTED
-                and current_state.implementation_session_id is not None
+            # Any implementation conversation, including one a pending
+            # fresh generation has just replaced: the candidate exists.
+            sparrer_first = current_state.status is not StageStatus.ACCEPTED and bool(
+                generations(current_state, ROLE_STAGE)
             )
             if sparrer_first:
                 report(
@@ -1686,6 +1811,8 @@ def resume_plan(
         sparrer_first=sparrer_first,
         stop_after_stage=stop_after_stage,
         next_turn_choice=next_turn,
+        fresh_roles=tuple(fresh_roles),
+        fresh_reason=fresh_reason,
     )
 
 
@@ -2252,6 +2379,8 @@ def _run_review(
     position: str,
     evidence_first: bool,
     pending_deferred: tuple[DeferredObligation, ...] = (),
+    fresh_roles: tuple[str, ...] = (),
+    fresh_reason: str | None = None,
     report: Reporter,
 ) -> ReviewResult:
     """Enter a review-only stage and run its one independent-review turn.
@@ -2307,6 +2436,9 @@ def _run_review(
         )
     )
 
+    _apply_fresh_sessions(
+        state, state_path, activity, repo_root, stage, fresh_roles, fresh_reason, report=report
+    )
     try:
         _stage_adapter, reviewer_adapter = make_adapters(stage)
     except Exception as exc:
@@ -2333,10 +2465,12 @@ def _run_review(
             pending_deferred=pending_deferred,
         )
     except ReviewError as exc:
-        raise _fail(
+        raise _fail_or_pause_for_provider(
             state,
             state_path,
             activity,
+            stage,
+            exc,
             why="independent review failed",
             message=(
                 f"plan {state.plan} stopped at stage {stage.stage_id!r} (not accepted, "
@@ -2886,6 +3020,136 @@ def _plan_emitter(stage: Stage) -> ActivityEmitter:
     return stage.activity_log().bind("plan")
 
 
+def _failed_role(exc: BaseException) -> str:
+    """Whose turn ``exc`` came from: the reviewer's when a sparring /
+    independent-review turn is anywhere in its cause chain, else the stage
+    agent's."""
+
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, (SparringAgentRunError, ReviewError)):
+            return ROLE_SPARRING
+        if isinstance(current, StageAgentRunError):
+            return ROLE_STAGE
+        current = current.__cause__
+    return ROLE_STAGE
+
+
+def _fail_or_pause_for_provider(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    stage: Stage,
+    exc: BaseException,
+    *,
+    why: str,
+    message: str,
+) -> PlanRunError:
+    """:func:`_fail`, except that a turn failing as unresumable or
+    unavailable becomes a typed :class:`ProviderPause` for the role whose
+    turn it was. Either way the run is paused and nothing is retried,
+    discarded or touched."""
+
+    failure = recoverable_provider_failure(exc)
+    if failure is None:
+        return _fail(state, state_path, activity, why=why, message=message)
+    role = _failed_role(exc)
+    try:
+        has_session = current_session_id(stage.read_state(), role) is not None
+    except StageError:
+        has_session = False
+    if isinstance(failure, ProviderSessionUnresumable):
+        kind = PAUSE_SESSION_UNRESUMABLE
+        explanation = (
+            f"the provider can no longer resume the recorded {role} conversation; retrying "
+            "it cannot succeed. Continue the same stage in a fresh session for that role"
+        )
+    else:
+        kind = PAUSE_PROVIDER_UNAVAILABLE
+        explanation = (
+            "the provider declined the turn for quota / rate-limit reasons; retry when it is "
+            "available again, or continue in a fresh session on another provider"
+        )
+    _pause(state, state_path)
+    activity.emit("plan.paused", summary=f"{role} {kind}")
+    return ProviderPause(
+        f"{message}. Paused, not failed: {explanation}. Nothing was retried, no session was "
+        "discarded and the candidate was not touched",
+        stage_id=stage.stage_id,
+        role=role,
+        kind=kind,
+        has_session=has_session,
+        run=_RunOwner.of(state).key,
+    )
+
+
+def _apply_fresh_sessions(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    repo_root: Path,
+    stage: Stage,
+    roles: tuple[str, ...],
+    reason: str | None,
+    *,
+    report: Reporter,
+) -> None:
+    """Start the fresh sessions a person asked for, immediately before the
+    stage's agent turns, or stop the run with nothing changed."""
+
+    if not roles:
+        return
+    try:
+        opened = start_fresh_sessions(stage, roles, reason or "manual", repo_root=repo_root)
+    except SessionError as exc:
+        raise _fail(
+            state,
+            state_path,
+            activity,
+            why="fresh session refused",
+            message=(
+                f"plan {state.plan} stopped at stage {stage.stage_id!r} before any provider "
+                f"turn: {exc}"
+            ),
+        ) from exc
+    for role, pending in opened.items():
+        report(
+            f"stage {stage.stage_id}: starting a fresh {role} session (generation "
+            f"{pending.generation}, {pending.start_reason}); same stage, candidate and "
+            "artifacts, new provider conversation"
+        )
+
+
+def _refuse_unapplied(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    stage: Stage,
+    *,
+    fresh_roles: tuple[str, ...],
+    next_turn_choice: str | None,
+    why: str,
+) -> None:
+    """Refuse a fresh-session or next-turn request the stage this resume
+    enters cannot honour, instead of silently ignoring it."""
+
+    asked = [f"a fresh {role} session" for role in fresh_roles]
+    if next_turn_choice is not None:
+        asked.append(f"next turn = {next_turn_choice}")
+    if not asked:
+        return
+    raise _fail(
+        state,
+        state_path,
+        activity,
+        why="resume request not applicable",
+        message=(
+            f"plan {state.plan} stopped at stage {stage.stage_id!r} before any provider turn: "
+            f"{' and '.join(asked)} was asked for, but {why}. Nothing was changed"
+        ),
+    )
+
+
 def _fail(
     state: PlanRunState,
     state_path: Path,
@@ -2946,6 +3210,8 @@ def _drive(
     sparrer_first: bool = False,
     stop_after_stage: str | None = None,
     next_turn_choice: str | None = None,
+    fresh_roles: tuple[str, ...] = (),
+    fresh_reason: str | None = None,
 ) -> PlanRunResult:
     """Walk the plan's stages from the recorded position until it pauses,
     fails or completes.
@@ -3008,6 +3274,9 @@ def _drive(
             raise
         activity = _plan_emitter(stage)
         last_activity = activity
+        # Like sparrer_first: a request about the stage this resume enters,
+        # never about the stages after it.
+        entering_fresh, fresh_roles = fresh_roles, ()
         try:
             stage_state = stage.read_state()
         except StageError as exc:
@@ -3025,6 +3294,15 @@ def _drive(
         if stage_state.status is StageStatus.ACCEPTED:
             # Already through the hard gate (by hand, or by a run that stopped
             # between accept and advance): nothing to run, just move on.
+            _refuse_unapplied(
+                state,
+                state_path,
+                activity,
+                stage,
+                fresh_roles=entering_fresh,
+                next_turn_choice=next_turn_choice,
+                why="the stage is already ACCEPTED and no agent turn is owed",
+            )
             activity.emit(
                 "plan.stage.entered",
                 summary=f"{plan_stage.display} ({position}); already accepted, advancing",
@@ -3040,6 +3318,20 @@ def _drive(
         else:
             waiting = None if sparrer_first else _recorded_pause(stage)
             if waiting is not None:
+                # Neither a new conversation nor a chosen next turn answers
+                # a person's gate; refused rather than recorded for later.
+                _refuse_unapplied(
+                    state,
+                    state_path,
+                    activity,
+                    stage,
+                    fresh_roles=entering_fresh,
+                    next_turn_choice=next_turn_choice,
+                    why=(
+                        f"the stage is waiting for a person ({waiting.action.value}); answer it "
+                        "with --evidence (a fresh reviewer session may accompany the evidence)"
+                    ),
+                )
                 # This stage already stopped for a person, and nothing here
                 # answers that. Running the stage agent would spend a turn on
                 # a question it cannot answer and move the very candidate the
@@ -3080,6 +3372,15 @@ def _drive(
             _declare_repositories(stage, plan_stage)
 
             if plan_stage.review_only:
+                _refuse_unapplied(
+                    state,
+                    state_path,
+                    activity,
+                    stage,
+                    fresh_roles=tuple(role for role in entering_fresh if role == ROLE_STAGE),
+                    next_turn_choice=next_turn_choice,
+                    why="the stage is review-only: it has no stage agent and no turn to choose",
+                )
                 # No implementation turn exists for this stage, so none of
                 # the implementation-first machinery below applies to it:
                 # one fresh independent reviewer over the candidate set the
@@ -3099,6 +3400,8 @@ def _drive(
                     position=position,
                     evidence_first=sparrer_first,
                     pending_deferred=state.unresolved_deferred,
+                    fresh_roles=entering_fresh,
+                    fresh_reason=fresh_reason,
                     report=report,
                 )
                 sparrer_first = False  # only the stage this resume entered
@@ -3225,6 +3528,19 @@ def _drive(
                                 f"before any provider turn: {exc}"
                             ),
                         ) from exc
+                if authorized_push is not None or ready_commit:
+                    _refuse_unapplied(
+                        state,
+                        state_path,
+                        activity,
+                        stage,
+                        fresh_roles=entering_fresh,
+                        next_turn_choice=None,
+                        why=(
+                            "the reviewer already said READY over this commit; only the push "
+                            "and acceptance gates are left and no agent runs"
+                        ),
+                    )
                 if authorized_push is not None:
                     # Both flags belong to the one stage this resume entered;
                     # neither may leak into the next stage, whose
@@ -3333,6 +3649,20 @@ def _drive(
                     # run_stage_agent/run_sparring_agent pass to resume(); it does
                     # not depend on the adapter objects from an earlier stage or an
                     # earlier process.
+                    #
+                    # A requested fresh session is started here: after every
+                    # refusal that could still stop this stage before a turn,
+                    # and before the adapters resolve its configuration.
+                    _apply_fresh_sessions(
+                        state,
+                        state_path,
+                        activity,
+                        repo_root,
+                        stage,
+                        entering_fresh,
+                        fresh_reason,
+                        report=report,
+                    )
                     try:
                         stage_adapter, sparring_adapter = make_adapters(stage)
                     except Exception as exc:
@@ -3364,10 +3694,12 @@ def _drive(
                             pending_deferred=state.unresolved_deferred,
                         )
                     except LoopError as exc:
-                        raise _fail(
+                        raise _fail_or_pause_for_provider(
                             state,
                             state_path,
                             activity,
+                            stage,
+                            exc,
                             why="stage loop failed",
                             message=(
                                 f"plan {state.plan} stopped at stage {stage.stage_id!r} (not "

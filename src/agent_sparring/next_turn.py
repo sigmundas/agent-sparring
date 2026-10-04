@@ -370,7 +370,9 @@ def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> st
     )
 
 
-def standalone_start_with(repo_root: Path, stage: Stage) -> str:
+def standalone_start_with(
+    repo_root: Path, stage: Stage, *, choice: str | None = None
+) -> str:
     """Where a standalone ``run-loop`` resume enters the loop:
     ``stage``, ``sparring`` or ``finalization``.
 
@@ -378,10 +380,12 @@ def standalone_start_with(repo_root: Path, stage: Stage) -> str:
     run has. A recorded human gate (NEEDS_YOU / ESCALATE) still stands
     unless the marker already says an implementation turn is owed: running
     either agent would not answer it, so it is refused. A ``finalization``
-    marker is resolved by :func:`resolve_finalization`.
+    marker is resolved by :func:`resolve_finalization`. ``choice`` is the
+    caller's explicit ``stage`` | ``sparring`` (see
+    :func:`resolve_resume_turn`).
     """
 
-    marker = resolve_resume_turn(repo_root, stage)
+    marker = resolve_resume_turn(repo_root, stage, choice=choice)
     outcome = read_recorded_outcome(stage)
     if outcome is not None and outcome.awaits_a_human and marker != NEXT_TURN_STAGE:
         raise NextTurnError(

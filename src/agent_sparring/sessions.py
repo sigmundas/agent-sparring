@@ -159,14 +159,66 @@ def pin_pending_generation(state: StageState, role: str, adapter: object) -> boo
     return True
 
 
-def start_fresh_session(
+def _refuse_fresh(stage: Stage, state: StageState, role: str) -> None:
+    """Raise :class:`SessionError` unless ``role`` has a conversation a fresh
+    session could replace."""
+
+    if state.status is StageStatus.ACCEPTED:
+        raise SessionError(
+            f"stage {stage.stage_id!r} is ACCEPTED; nothing will run for it again, so "
+            "there is no session to replace"
+        )
+    existing = generations(state, role)
+    if not existing:
+        raise SessionError(
+            f"stage {stage.stage_id!r} has no {role} session yet; its first turn "
+            "already starts a new conversation"
+        )
+    if is_fresh(state, role):
+        raise SessionError(
+            f"stage {stage.stage_id!r} already has a fresh {role} session pending "
+            f"(generation {existing[-1].generation}); it starts at the next {role} turn"
+        )
+    if existing[-1].session_id is None:
+        raise SessionError(
+            f"stage {stage.stage_id!r} has no {role} conversation yet (its configuration "
+            "is pinned, but no provider session was started); there is nothing to "
+            "replace"
+        )
+
+
+def _open_fresh_generation(state: StageState, role: str, reason: str) -> SessionGeneration:
+    # Materialize: from here on the list is the record.
+    recorded = state.sessions.setdefault(role, list(generations(state, role)))
+    now = _now()
+    current = recorded[-1]
+    current.ended_at = now
+    current.end_reason = f"fresh:{reason}"
+    pending = SessionGeneration(
+        generation=current.generation + 1,
+        session_id=None,
+        agent=None,
+        started_at=now,
+        start_reason=f"fresh:{reason}",
+    )
+    recorded.append(pending)
+    _set_current_session_id(state, role, None)
+    if state.agents and role in state.agents:
+        agents = dict(state.agents)
+        del agents[role]
+        state.agents = agents or None
+    return pending
+
+
+def start_fresh_sessions(
     stage: Stage,
-    role: str,
+    roles: "tuple[str, ...] | list[str]",
     reason: str,
     *,
     repo_root: Path,
-) -> SessionGeneration:
-    """Close ``role``'s current conversation and open a pending fresh one.
+) -> dict[str, SessionGeneration]:
+    """Close each of ``roles``' current conversations and open a pending
+    fresh one for each, all or nothing.
 
     Under the worktree lock: materializes the generation list if this is the
     first fresh session, closes the current generation (``ended_at``,
@@ -175,68 +227,54 @@ def start_fresh_session(
     pending generation with ``start_reason = "fresh:<reason>"``. Nothing
     else in the stage is touched -- in particular not ``next_turn``.
 
-    Refuses an ACCEPTED stage (nothing will run for it again), a role with no
+    Every role is checked before any is changed, and the state is written
+    once: a refusal for one role leaves the other untouched. Refuses an
+    ACCEPTED stage (nothing will run for it again), a role with no
     conversation to replace, and a role whose fresh generation is still
     pending (starting another would discard nothing).
     """
 
-    _validate_role(role)
+    roles = tuple(dict.fromkeys(roles))
+    if not roles:
+        raise SessionError("a fresh session needs at least one role")
+    for role in roles:
+        _validate_role(role)
     if not reason or not reason.strip():
         raise SessionError("a fresh session needs a reason")
     reason = reason.strip()
+    opened: dict[str, SessionGeneration] = {}
     try:
         with worktree_lock(repo_root):
             state = stage.read_state()
-            if state.status is StageStatus.ACCEPTED:
-                raise SessionError(
-                    f"stage {stage.stage_id!r} is ACCEPTED; nothing will run for it again, so "
-                    "there is no session to replace"
-                )
-            existing = generations(state, role)
-            if not existing:
-                raise SessionError(
-                    f"stage {stage.stage_id!r} has no {role} session yet; its first turn "
-                    "already starts a new conversation"
-                )
-            if existing[-1].session_id is None and not is_fresh(state, role):
-                raise SessionError(
-                    f"stage {stage.stage_id!r} has no {role} conversation yet (its configuration "
-                    "is pinned, but no provider session was started); there is nothing to "
-                    "replace"
-                )
-            if is_fresh(state, role):
-                raise SessionError(
-                    f"stage {stage.stage_id!r} already has a fresh {role} session pending "
-                    f"(generation {existing[-1].generation}); it starts at the next {role} turn"
-                )
-            # Materialize: from here on the list is the record.
-            recorded = state.sessions.setdefault(role, list(existing))
-            now = _now()
-            current = recorded[-1]
-            current.ended_at = now
-            current.end_reason = f"fresh:{reason}"
-            pending = SessionGeneration(
-                generation=current.generation + 1,
-                session_id=None,
-                agent=None,
-                started_at=now,
-                start_reason=f"fresh:{reason}",
-            )
-            recorded.append(pending)
-            _set_current_session_id(state, role, None)
-            if state.agents and role in state.agents:
-                agents = dict(state.agents)
-                del agents[role]
-                state.agents = agents or None
+            for role in roles:
+                _refuse_fresh(stage, state, role)
+            for role in roles:
+                opened[role] = _open_fresh_generation(state, role, reason)
             stage.write_state(state)
     except WorktreeLockError as exc:
-        raise SessionError(f"cannot start a fresh {role} session: {exc}") from exc
+        raise SessionError(
+            f"cannot start a fresh {' and '.join(roles)} session: {exc}"
+        ) from exc
     # Observational only; `sparring usage` uses it to draw the generation
     # boundary in its report. Nothing in orchestration reads it.
-    stage.activity_log().bind(ROLE_ACTORS[role]).emit(
-        "session.fresh", role=role, summary=pending.start_reason
-    )
-    return pending
+    for role, pending in opened.items():
+        stage.activity_log().bind(ROLE_ACTORS[role]).emit(
+            "session.fresh", role=role, summary=pending.start_reason
+        )
+    return opened
+
+
+def start_fresh_session(
+    stage: Stage,
+    role: str,
+    reason: str,
+    *,
+    repo_root: Path,
+) -> SessionGeneration:
+    """Close ``role``'s current conversation and open a pending fresh one
+    (see :func:`start_fresh_sessions`, of which this is the one-role form)."""
+
+    return start_fresh_sessions(stage, (role,), reason, repo_root=repo_root)[role]
 
 
 __all__ = [
@@ -251,4 +289,5 @@ __all__ = [
     "record_pin",
     "record_session_id",
     "start_fresh_session",
+    "start_fresh_sessions",
 ]

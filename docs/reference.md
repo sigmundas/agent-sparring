@@ -164,10 +164,18 @@ never leads to an implementation turn unless the caller explicitly chooses
 `next_turn = stage`.
 A standalone `run-loop` also refuses a recorded NEEDS_YOU / ESCALATE (running an
 agent would not answer it) unless an implementation turn is already owed.
-`resume-plan --evidence` keeps its existing
-meaning (the reviewer judges the answer against the candidate as it stands)
-and is not held to the pinned candidate. `activity.jsonl` may mirror these
-decisions but is never read to make them.
+`resume-plan --evidence` answering a gate raised over a recorded candidate
+(`next_turn = sparring`) is held to that candidate: if HEAD, the uncommitted
+content or a sibling HEAD has moved since, the evidence is refused *before*
+it is recorded, and nothing runs -- the reviewer never judges an answer
+against different content. If the change was deliberate (for example a fix
+the gate asked for), repeat with `--evidence … --next-turn sparring`, which
+re-pins the repository as it is now as a `manual` marker. A resume without
+evidence over a recorded NEEDS_YOU / ESCALATE keeps that pause and runs
+nothing, whatever the marker says; `--fresh-*` or `--next-turn` alone are
+refused there, because neither answers a person. State with no marker keeps
+the older evidence behaviour. `activity.jsonl` may mirror these decisions
+but is never read to make them.
 
 **State written before the marker existed** is reconstructed once, on the
 first resume, from engine-owned records only: the prompt-capture index, the
@@ -179,7 +187,8 @@ candidate content (the handoff records dirty path names, not bytes, so an
 uncommitted candidate cannot be matched exactly and is ambiguous), and `stage` when no implementation turn completed
 after the last SEND_BACK. Anything else -- for example HEAD having moved
 past the handoff's candidate -- is refused with what was found; the caller
-then chooses explicitly (`resume_plan(..., next_turn="stage" | "sparring")`).
+then chooses explicitly (`--next-turn stage|sparring` on `resume-plan` /
+`run-loop`; `resume_plan(..., next_turn=...)`).
 The result is recorded with `next_turn_source` = `derived` or `manual` and
 is never derived again.
 
@@ -190,8 +199,9 @@ Three different things, from least to most disruptive:
 - **Resume** (`resume-plan`, `run-loop`) continues the same stage in the
   same provider conversations, with the configuration locked at each
   conversation's first turn. It obeys `next_turn`.
-- **A fresh session** (`agent_sparring.sessions.start_fresh_session(stage,
-  role, reason)`) discards one role's conversation and continues the *same*
+- **A fresh session** (`--fresh-sparrer` / `--fresh-stage-agent` on
+  `resume-plan` and `run-loop`, with `--fresh-reason`; in code
+  `agent_sparring.sessions.start_fresh_session(stage, role, reason)`) discards one role's conversation and continues the *same*
   stage in a new one: a new *session generation*. Its configuration is
   resolved anew at its first turn, so a changed model, effort or provider
   preference (or an explicit override) takes effect there. Its first prompt
@@ -220,6 +230,47 @@ its adapters: if an owed implementation turn fails first, the fresh
 reviewer stays unpinned and a later preference still applies to it. A fresh
 session's first turn is captured as `fresh` even when it is also an
 evidence, finalization or finalized-commit review.
+
+On the command line the fresh flags apply to the stage the resume enters,
+just before its agent turns and after every check that could still refuse
+it; both roles are checked before either is changed. The role-scoped
+overrides (`--stage-provider/-model/-effort`,
+`--sparring-provider/-model/-effort`) choose the fresh generation's
+configuration; for a role *not* given a fresh flag, an override that
+conflicts with its active session is still refused. They are refused where
+no agent turn is owed (an ACCEPTED stage, a READY commit waiting only for
+push/acceptance, a recorded human gate without evidence) and
+`--fresh-stage-agent` is refused on a review-only stage. The independent
+review of a review-only stage is entered through `resume-plan`, so
+`--fresh-sparrer` replaces its reviewer conversation there. Before launching,
+`resume-plan` and `run-loop` print each role's resolved configuration: the
+adapter (provider and executable), the configured model and effort with
+their sources, which conversation and generation it continues (or that a new
+or fresh one starts), the model the provider last reported for that
+conversation (`not reported` if none; read from `activity.jsonl`, display
+only), and the backend/account, which no adapter can read safely today and
+is always `not reported`.
+
+### Pausing on provider session failures
+
+Two provider failures are classified, from the provider's own error text,
+and pause a managed run instead of failing it:
+
+| Class | Recognised from | What to do |
+| --- | --- | --- |
+| `ProviderSessionUnresumable` | resuming a recorded conversation: Codex `invalid_encrypted_content`, thread/session not found; Claude "No conversation found" | continue in a fresh session for that role |
+| `ProviderUnavailable` | quota, usage limit, rate limit, too many requests, overloaded (also a Claude turn that ends `is_error` for that reason) | retry later, or continue in a fresh session |
+
+`resume-plan` raises `ProviderPause` (a `PlanRunError` carrying the role,
+kind and whether the role has a conversation to replace) with the run
+recorded as paused; the CLI prints the role, the provider's message and the
+exact command to continue -- `… --fresh-sparrer --fresh-reason
+session-unresumable`, or a plain retry plus a fresh-session alternative --
+and exits 1. `run-loop` prints the same. The engine never acts on it: no
+retry, no session discarded, no candidate touched, `next_turn` unchanged. A
+failure before the provider announced a session records no session id, so a
+plain retry starts that (possibly pending fresh) conversation again. Any
+other provider error still fails the run as before.
 
 Generations are recorded as `sessions: {role: [...]}` in `state.json`, each
 with its `generation`, `session_id` (null until the provider reports one),

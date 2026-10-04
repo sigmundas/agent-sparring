@@ -99,7 +99,12 @@ from typing import Any, Callable, Mapping
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
 from agent_sparring.deferred_gate import CHECKPOINTS
 from agent_sparring.human_gate import HUMAN_GATE_CATEGORIES
-from agent_sparring.providers import ProviderError, Runner, SparringAgentResult
+from agent_sparring.providers import (
+    ProviderError,
+    Runner,
+    SparringAgentResult,
+    classify_provider_error,
+)
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 
 DEFAULT_EXECUTABLE = "codex"
@@ -853,7 +858,17 @@ class CodexCliAdapter:
                 raise ProviderError(
                     f"{self.executable} timed out after {self.timeout_seconds}s"
                 ) from exc
-            return self._parse(result, output_path)
+            try:
+                return self._parse(result, output_path)
+            except ProviderError as exc:
+                # The same failure, typed when its text says it is one a
+                # person can recover from (see agent_sparring.providers).
+                classified = classify_provider_error(
+                    exc, resuming=resume_session_id is not None
+                )
+                if classified is exc:
+                    raise
+                raise classified from exc
 
     def _parse(
         self, result: "subprocess.CompletedProcess[str]", output_path: Path

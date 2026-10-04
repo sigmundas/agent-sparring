@@ -639,7 +639,14 @@ class PlanRunTests(_PlanRepoTestCase):
         _run_git(self.repo, "commit", "-q", "-am", "typo fix outside any stage")
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
 
-        result = self._resume(stage_adapter, sparring_adapter, evidence="done")
+        # The commit moved the candidate the NEEDS_YOU was raised over, so
+        # evidence alone is refused (the reviewer must not judge different
+        # content); re-pinning it deliberately is what lets it through.
+        with self.assertRaises(PlanError):
+            self._resume(stage_adapter, sparring_adapter, evidence="done")
+        result = self._resume(
+            stage_adapter, sparring_adapter, evidence="done", next_turn="sparring"
+        )
 
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
 

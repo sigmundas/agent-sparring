@@ -43,7 +43,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
-from agent_sparring.providers import ProviderError, Runner, StageAgentResult
+from agent_sparring.providers import (
+    ProviderError,
+    Runner,
+    StageAgentResult,
+    classify_provider_error,
+)
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 
 DEFAULT_EXECUTABLE = "claude"
@@ -490,7 +495,15 @@ class ClaudeCliAdapter:
             raise ProviderError(
                 f"{self.executable} timed out after {self.timeout_seconds}s"
             ) from exc
-        return self._parse(result)
+        try:
+            return self._parse(result)
+        except ProviderError as exc:
+            # The same failure, typed when its text says it is one a
+            # person can recover from (see agent_sparring.providers).
+            classified = classify_provider_error(exc, resuming=resume_session_id is not None)
+            if classified is exc:
+                raise
+            raise classified from exc
 
     def _final_payload(self, stdout: str) -> dict[str, Any] | None:
         """The final result object: the last ``type == "result"`` line of a

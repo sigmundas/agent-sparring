@@ -124,7 +124,11 @@ from agent_sparring.next_turn import (
     record_next_turn,
     verify_candidate,
 )
-from agent_sparring.providers import SparringAgentAdapter, StageAgentAdapter
+from agent_sparring.providers import (
+    SparringAgentAdapter,
+    StageAgentAdapter,
+    classify_failure_text,
+)
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
 from agent_sparring.stage import (
@@ -419,12 +423,16 @@ def run_unattended_loop(
             activity.emit(
                 "loop.stopped", cycle=cycle, summary="stage-agent turn reported is_error"
             )
+            # A turn the provider ended for capacity (quota, usage or rate
+            # limit) is typed as such, so a managed run pauses for a person
+            # instead of failing; its session is resumable, so only that.
+            unavailable = classify_failure_text(stage_run.result.text or "", resuming=False)
             raise LoopError(
                 f"stage-agent turn for stage {stage.stage_id!r} reported "
                 f"is_error=true (session {stage_run.result.session_id!r}); "
                 "refusing to send a failed implementation turn to the "
                 "sparrer"
-            )
+            ) from (unavailable(stage_run.result.text) if unavailable is not None else None)
 
         if pending is not None:
             # The commit turn is held to the tree it was given, before the
@@ -484,11 +492,14 @@ def run_unattended_loop(
                     f"could not record the candidate for review of stage {stage.stage_id!r}: {exc}"
                 ) from exc
 
-        # A human-evidence turn keeps its existing semantics -- the reviewer
-        # judges the evidence against the candidate as it stands -- so only a
-        # review the marker routed is held to the recorded candidate.
+        # Every review the marker routes -- an ordinary one, a fresh one,
+        # and a human-evidence turn answering a NEEDS_YOU raised over that
+        # candidate -- is held to the recorded candidate: evidence answers a
+        # question about exactly that content, and a reviewer must never
+        # judge it against anything else. (Legacy state with no marker keeps
+        # its existing evidence semantics.)
         current = stage.read_state()
-        if current.next_turn == NEXT_TURN_SPARRING and not evidence_first:
+        if current.next_turn == NEXT_TURN_SPARRING:
             try:
                 verify_candidate(repo_root, stage, current)
             except NextTurnError as exc:
