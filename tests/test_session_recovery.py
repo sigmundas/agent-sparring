@@ -270,7 +270,7 @@ class EvidenceCandidateTests(_PlanRepoTestCase):
                     self._resume(stage_adapter, sparring, evidence="checked")
 
                 self.assertIn("waiting for review of", str(ctx.exception))
-                self.assertIn("--next-turn sparring", str(ctx.exception))
+                self.assertIn("--next-turn cannot re-pin", str(ctx.exception))
                 self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
                 self.assertEqual((stage.directory / "notes.md").read_text(), notes)
                 self.assertIsNot(stage.read_state().status, StageStatus.ACCEPTED)
@@ -286,20 +286,27 @@ class EvidenceCandidateTests(_PlanRepoTestCase):
             )
         self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
 
-    def test_an_explicit_re_pin_lets_deliberately_changed_content_be_judged(self):
+    def test_an_explicit_choice_cannot_re_pin_a_recorded_candidate(self):
         stage, stage_adapter = self.leave_needs_you()
+        self.assertEqual(stage.read_state().next_turn, "sparring")
         (self.repo / "fix.txt").write_text("asked for by the gate\n")
         _run_git(self.repo, "add", "fix.txt")
         _run_git(self.repo, "commit", "-q", "-m", "manual fix")
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        state_before = (stage.directory / "state.json").read_bytes()
+        notes_before = (stage.directory / "notes.md").read_text()
         sparring = _SparringAdapter([READY])
 
-        result = self._resume(
-            stage_adapter, sparring, evidence="fixed by hand", next_turn="sparring",
-            stop_after_stage=S1,
-        )
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(
+                stage_adapter, sparring, evidence="fixed by hand", next_turn="sparring",
+                stop_after_stage=S1,
+            )
 
-        self.assertEqual(dict(result.accepted)[S1], _head(self.repo))
+        self.assertIn("already records next_turn = sparring", str(ctx.exception))
+        self.assertEqual((stage.directory / "state.json").read_bytes(), state_before)
+        self.assertEqual((stage.directory / "notes.md").read_text(), notes_before)
+        self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
         self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 1)
 
     def test_evidence_with_next_turn_stage_is_refused(self):
@@ -594,6 +601,21 @@ class AgentTextIsNeverClassifiedTests(_LoopRepo):
                         _SparringAdapter([READY]), expected_branch="feature/x",
                     )
                 self.assertIsNone(recoverable_provider_failure(ctx.exception))
+
+    def test_claude_stderr_is_classified_alongside_a_json_result(self):
+        payload = {"is_error": True, "session_id": "c-1", "result": "ok"}
+        line = json.dumps({"type": "result", **payload}) + "\n"
+        runner = lambda *a: _completed(stdout=line, stderr="Error: rate_limit_error")
+        with self.assertRaises(ProviderUnavailable):
+            ClaudeCliAdapter(repo_root=self.repo, runner=runner).start("go")
+
+        # No session id: stderr still joins the structured subtype.
+        line = json.dumps({"type": "result", "is_error": True, "subtype": "error"}) + "\n"
+        runner = lambda *a: _completed(stdout=line, stderr="Error: rate_limit_error")
+        with self.assertRaises(ProviderUnavailable) as ctx:
+            ClaudeCliAdapter(repo_root=self.repo, runner=runner).start("go")
+        self.assertIn("rate_limit_error", ctx.exception.error_data)
+        self.assertIn("error", ctx.exception.error_data.splitlines()[0])
 
     def test_structured_fields_and_stderr_are_still_classified(self):
         payload = {"is_error": True, "session_id": "c-1", "subtype": "error_during_execution",

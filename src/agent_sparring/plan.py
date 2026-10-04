@@ -1618,8 +1618,8 @@ def resume_plan(
     ambiguous the resume is refused, and ``next_turn`` (``stage`` |
     ``sparring``) is the caller's explicit choice, recorded as ``manual``.
     That choice is refused, with nothing recorded, whenever a marker is
-    already recorded or derivation answers differently, and never answers a
-    recorded human gate.
+    already recorded or derivation has an unambiguous answer, and never
+    answers a recorded human gate.
     Evidence, a recorded human gate and a pending finalization keep their
     existing precedence over the marker. Evidence answering a gate raised
     over a recorded candidate (``next_turn = sparring``) is refused, before
@@ -1717,8 +1717,8 @@ def resume_plan(
         if next_turn != NEXT_TURN_SPARRING:
             raise PlanError(
                 "evidence is judged by the reviewer, so it can only be combined with "
-                f"--next-turn {NEXT_TURN_SPARRING} (which re-pins the candidate the reviewer "
-                f"judges it against), not --next-turn {next_turn}"
+                f"--next-turn {NEXT_TURN_SPARRING} (for ambiguous legacy state only), not "
+                f"--next-turn {next_turn}"
             )
     for role in fresh_roles:
         if role not in (ROLE_STAGE, ROLE_SPARRING):
@@ -1745,11 +1745,10 @@ def resume_plan(
         except StageError as exc:
             raise PlanError(f"cannot read the state of {current.stage_id!r}: {exc}") from exc
         if next_turn is not None:
-            # Evidence plus an explicit sparring turn: the person says the
-            # repository as it stands now is what the reviewer should judge
-            # the answer against (for example after deliberately committing
-            # after the gate). Recorded as a manual marker over the current
-            # candidate, never inferred.
+            # Evidence plus an explicit sparring turn, for ambiguous legacy
+            # state only: recorded as a manual marker over the current
+            # candidate. A recorded marker is never overridden or re-pinned;
+            # refused here before the evidence is recorded.
             if current.review_only or current_state.status is StageStatus.ACCEPTED or not (
                 generations(current_state, ROLE_STAGE)
             ):
@@ -1758,12 +1757,12 @@ def resume_plan(
                     "review, so there is no candidate to re-pin with --next-turn sparring"
                 )
             try:
-                resolve_resume_turn(repo_root, stage, choice=next_turn, repin=True)
+                resolve_resume_turn(repo_root, stage, choice=next_turn)
                 current_state = stage.read_state()
             except NextTurnError as exc:
                 raise PlanError(str(exc)) from exc
             report(
-                f"stage {current.stage_id}: re-pinned the current candidate for review "
+                f"stage {current.stage_id}: pinned the current candidate for review "
                 "(next turn = sparring, recorded as manual)"
             )
             next_turn = None
@@ -1783,8 +1782,7 @@ def resume_plan(
             except NextTurnError as exc:
                 raise PlanError(
                     f"refusing to record evidence for stage {current.stage_id!r}: {exc} "
-                    "If the change is deliberate and the reviewer should judge the evidence "
-                    "against the repository as it is now, repeat with --next-turn sparring"
+                    "(--next-turn cannot re-pin a recorded candidate.)"
                 ) from exc
         record_human_evidence(stage, evidence)
         report(f"recorded human evidence in {stage.directory / 'notes.md'}")

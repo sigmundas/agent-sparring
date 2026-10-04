@@ -280,7 +280,6 @@ def resolve_resume_turn(
     stage: Stage,
     *,
     choice: str | None = None,
-    repin: bool = False,
 ) -> str | None:
     """The marker an ordinary resume obeys, deriving and recording it once
     for legacy state.
@@ -288,14 +287,10 @@ def resolve_resume_turn(
     An explicit ``choice`` (``stage`` | ``sparring``) is only for ambiguous
     legacy state: it is honoured -- and recorded as ``manual``, with the
     current candidate for ``sparring`` -- only when no marker is recorded
-    and derivation is ambiguous or has no answer. A recorded marker, or a
-    derived answer that differs from the choice, is refused and nothing is
-    recorded; a choice never overrides the engine's record.
-
-    ``repin`` is the one exception, used only by ``resume-plan --evidence
-    --next-turn sparring``: over a recorded ``sparring`` marker the person
-    re-pins the repository as it is now for the same reviewer turn the
-    marker already owes. It never changes which actor runs.
+    and derivation is ambiguous or has no answer. A recorded marker (of any
+    value, including the one chosen) or any unambiguous derived answer
+    (even the one chosen) is refused and nothing is recorded; a choice never
+    overrides or re-pins the engine's record.
 
     Returns ``None`` when there is no marker and none can be derived without
     overriding gate state.
@@ -306,19 +301,19 @@ def resolve_resume_turn(
         if choice not in (NEXT_TURN_STAGE, NEXT_TURN_SPARRING):
             raise NextTurnError(f"next_turn must be 'stage' or 'sparring', got {choice!r}")
         if state.next_turn is not None:
-            if not (repin and choice == NEXT_TURN_SPARRING == state.next_turn):
-                raise NextTurnError(
-                    f"stage {stage.stage_id!r} already records next_turn = {state.next_turn} "
-                    f"(source: {state.next_turn_source or 'engine'}); --next-turn {choice} is "
-                    "only for state the engine cannot read unambiguously and cannot override "
-                    "a recorded marker. Nothing was changed; resume without --next-turn."
-                )
+            raise NextTurnError(
+                f"stage {stage.stage_id!r} already records next_turn = {state.next_turn} "
+                f"(source: {state.next_turn_source or 'engine'}); --next-turn {choice} is "
+                "only for state the engine cannot read unambiguously and cannot override "
+                "or re-pin a recorded marker. Nothing was changed; resume without "
+                "--next-turn."
+            )
         else:
             try:
                 derived = derive_next_turn(repo_root, stage, state)
             except AmbiguousNextTurn:
                 derived = None
-            if derived is not None and derived != choice:
+            if derived is not None:
                 raise NextTurnError(
                     f"stage {stage.stage_id!r} unambiguously owes next_turn = {derived}; "
                     f"--next-turn {choice} is only for state the engine cannot read "

@@ -167,9 +167,9 @@ agent would not answer it) unless an implementation turn is already owed.
 (`next_turn = sparring`) is held to that candidate: if HEAD, the uncommitted
 content or a sibling HEAD has moved since, the evidence is refused *before*
 it is recorded, and nothing runs -- the reviewer never judges an answer
-against different content. If the change was deliberate (for example a fix
-the gate asked for), repeat with `--evidence … --next-turn sparring`, which
-re-pins the repository as it is now as a `manual` marker. A resume without
+against different content. `--next-turn` cannot re-pin a recorded marker:
+restore the recorded candidate, or, if the change was deliberate, choose how
+to continue explicitly (for example `sparring reset-stage`). A resume without
 evidence over a recorded NEEDS_YOU / ESCALATE keeps that pause and runs
 nothing, whatever the marker says; `--fresh-*` or `--next-turn` alone are
 refused there, because neither answers a person. State with no marker keeps
@@ -189,11 +189,10 @@ past the handoff's candidate -- is refused with what was found; the caller
 then chooses explicitly (`--next-turn stage|sparring` on `resume-plan` /
 `run-loop`; `resume_plan(..., next_turn=...)`).
 That choice is only for this ambiguous legacy state: it is refused, and
-nothing is recorded, whenever a marker is already recorded, when derivation
-gives a different unambiguous answer, or while a recorded NEEDS_YOU /
-ESCALATE is waiting -- a choice never overrides the engine's record or
-answers a person. The one exception is `--evidence … --next-turn sparring`
-over a recorded `sparring` marker, which re-pins the same owed review.
+nothing is recorded, whenever a marker is already recorded (whatever its
+value), when derivation gives an unambiguous answer (even the chosen one),
+or while a recorded NEEDS_YOU / ESCALATE is waiting -- a choice never
+overrides or re-pins the engine's record or answers a person.
 The result is recorded with `next_turn_source` = `derived` or `manual` and
 is never derived again.
 

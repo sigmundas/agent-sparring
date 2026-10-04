@@ -551,11 +551,19 @@ class ClaudeCliAdapter:
                 error_data=stderr or None,
             )
 
+        # Provider error data: the result's errors / subtype and process
+        # stderr -- never its result text or the stdout transcript.
+        error_data = "\n".join(
+            part
+            for part in (structured_error_data(payload), (result.stderr or "").strip())
+            if part
+        ) or None
+
         session_id = payload.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             raise ProviderError(
                 f"{self.executable} JSON output has no usable session_id: {payload!r}",
-                error_data=structured_error_data(payload),
+                error_data=error_data,
             )
 
         text = payload.get("result")
@@ -567,9 +575,8 @@ class ClaudeCliAdapter:
             # ``errors`` list (e.g. "429 Too Many Requests"), with no result
             # text at all. A recoverable reason is raised as its typed
             # failure; anything else stays an is_error result as before.
-            # Only ``errors`` / ``subtype`` are classified, never the result
-            # text, which is the agent's own words.
-            error_data = structured_error_data(payload)
+            # Only ``errors`` / ``subtype`` and stderr are classified, never
+            # the result text, which is the agent's own words.
             kind = classify_failure_text(error_data or "", resuming=resuming)
             if kind is not None:
                 detail = "; ".join(part for part in (text, error_data) if part)

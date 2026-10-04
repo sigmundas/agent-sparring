@@ -402,6 +402,23 @@ class ExplicitChoiceAuthorityTests(_Stuck):
         self.assertIn("unambiguously owes next_turn = sparring", str(ctx.exception))
         self.assertEqual(self._state_bytes(stage), before)
 
+    def assert_matching_choice_refused(self, stage, owed):
+        _strip_marker(stage)
+        before = self._state_bytes(stage)
+        with self.assertRaises(NextTurnError) as ctx:
+            resolve_resume_turn(self.repo, stage, choice=owed)
+        self.assertIn(f"unambiguously owes next_turn = {owed}", str(ctx.exception))
+        self.assertEqual(self._state_bytes(stage), before)
+        self.assertIsNone(stage.read_state().next_turn)
+
+    def test_a_choice_matching_an_unambiguous_sparring_derivation_is_refused(self):
+        stage, _ = self.leave_stuck()
+        self.assert_matching_choice_refused(stage, "sparring")
+
+    def test_a_choice_matching_an_unambiguous_stage_derivation_is_refused(self):
+        stage, _ = self.leave_owed_stage()
+        self.assert_matching_choice_refused(stage, "stage")
+
     def test_run_loop_choice_under_needs_you_is_refused_without_a_marker(self):
         from agent_sparring.next_turn import standalone_start_with
 
