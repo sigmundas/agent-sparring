@@ -670,8 +670,9 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
 
         # An explicit --next-turn cannot override the recorded finalization
         # marker either: no unrestricted implementation turn on reviewed
-        # work, and nothing recorded, pushed or accepted.
-        with self.assertRaises(PlanRunError) as ctx:
+        # work, and nothing recorded, pushed or accepted. Refused before any
+        # plan-run state changes.
+        with self.assertRaises(PlanError) as ctx:
             self._resume(
                 stage_adapter,
                 _SparringAdapter([READY]),

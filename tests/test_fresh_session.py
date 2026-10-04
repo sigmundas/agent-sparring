@@ -23,11 +23,12 @@ from agent_sparring.next_turn import (
     AmbiguousNextTurn,
     NextTurnError,
     capture_candidate,
+    derive_next_turn,
     record_next_turn,
     resolve_resume_turn,
     verify_candidate,
 )
-from agent_sparring.plan import PlanRunError, PlanRunStatus
+from agent_sparring.plan import PlanError, PlanRunError, PlanRunStatus
 from agent_sparring.providers import ProviderError, SparringAgentResult
 from agent_sparring.sessions import SessionError, generations, start_fresh_session
 from agent_sparring.sparring_prompt import FRESH_REVIEWER_NOTICE
@@ -364,7 +365,7 @@ class ExplicitChoiceAuthorityTests(_Stuck):
         stage, stage_adapter = self.leave_owed_stage()
         before = self._state_bytes(stage)
         sparring = _SparringAdapter([READY])
-        with self.assertRaises(PlanRunError) as ctx:
+        with self.assertRaises(PlanError) as ctx:
             self._resume(stage_adapter, sparring, stop_after_stage=S1, next_turn="sparring")
         self.assertIn("already records next_turn = stage", str(ctx.exception))
         self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
@@ -377,7 +378,7 @@ class ExplicitChoiceAuthorityTests(_Stuck):
         before = self._state_bytes(stage)
         with self.assertRaises(NextTurnError):
             standalone_start_with(self.repo, stage, choice="stage")
-        with self.assertRaises(PlanRunError):
+        with self.assertRaises(PlanError):
             self._resume(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1,
                          next_turn="stage")
         self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 2)
@@ -947,6 +948,146 @@ class ReadyOverCommitRecoveryTests(_PlanRepoTestCase):
         with self.assertRaises(NextTurnError) as ctx:
             standalone_start_with(self.repo, stage)
         self.assertIn("no agent turn is owed", str(ctx.exception))
+
+
+class NoTurnOwedTests(_PlanRepoTestCase):
+    """--next-turn is legal only for ambiguous legacy state with no recorded
+    marker; a recorded gate, an untouched stage and a recorded marker refuse
+    it before anything -- plan-run state included -- changes."""
+
+    def snapshot(self, stage=None):
+        files = [self.state_path]
+        if stage is not None:
+            files.append(stage.directory / "state.json")
+        return [path.read_bytes() if path.exists() else None for path in files]
+
+    def assert_refused(self, stage, *, contains, **kwargs):
+        from agent_sparring.next_turn import standalone_start_with
+
+        before = self.snapshot(stage)
+        stage_adapter, sparring = _StageAdapter(self.repo, commit=True), _SparringAdapter([READY])
+        for choice in ("stage", "sparring"):
+            with self.subTest(choice=choice, **{k: str(v) for k, v in kwargs.items()}):
+                with self.assertRaises(PlanError) as ctx:
+                    self._resume(stage_adapter, sparring, stop_after_stage=S1,
+                                 next_turn=choice, **kwargs)
+                self.assertIn(contains, str(ctx.exception))
+                if stage is not None and stage.exists():
+                    with self.assertRaises(NextTurnError):
+                        standalone_start_with(self.repo, stage, choice=choice)
+                self.assertEqual(self.snapshot(stage), before)
+        self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
+        self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
+
+    def leave_legacy_ready(self, *, committed):
+        from agent_sparring.acceptance import AcceptanceError
+
+        if committed:
+            with mock.patch(
+                "agent_sparring.plan.freeze_candidate", side_effect=AcceptanceError("stopped")
+            ):
+                with self.assertRaises(PlanRunError):
+                    self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]),
+                                stop_after_stage=S1)
+        else:
+            # READY over the working tree, then the commit turn fails.
+            with self.assertRaises(PlanRunError):
+                self._start(_DirtyStageAdapter(self.repo, fail_at=2), _SparringAdapter([READY]),
+                            stop_after_stage=S1)
+        stage = self._stage(S1)
+        _strip_marker(stage)
+        self.assertEqual(derive_next_turn(self.repo, stage, stage.read_state()), "no-turn-owed")
+        return stage
+
+    def test_legacy_ready_refuses_every_choice_and_keeps_its_finalization_path(self):
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                self.setUp()
+                stage = self.leave_legacy_ready(committed=committed)
+                self.assert_refused(stage, contains="READY with no implementation turn")
+                self.assert_refused(stage, contains="READY with no implementation turn",
+                                    fresh_roles=("stage",), fresh_reason="x")
+                if not committed:
+                    # Without the flag the existing finalization path runs:
+                    # a commit turn, never an unrestricted implementation turn.
+                    stage_adapter = _StageAdapter(self.repo, fail_at=1)
+                    with self.assertRaises(PlanRunError):
+                        self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
+                    prompts = stage_adapter.start_calls + [p for _, p in stage_adapter.resume_calls]
+                    self.assertEqual(len(prompts), 1)
+                    self.assertIn("## Finalize this candidate", prompts[0])
+
+    def test_an_untouched_stage_refuses_both_choices(self):
+        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]),
+                    stop_after_stage=S1)
+        untouched = self._stage(self._plan_state().current_stage)
+        self.assertFalse(untouched.exists())
+        before = self.snapshot()
+        for choice, why in (("stage", "unnecessary"), ("sparring", "wrong")):
+            with self.subTest(choice=choice):
+                with self.assertRaises(PlanError) as ctx:
+                    self._resume(_StageAdapter(self.repo), _SparringAdapter([]),
+                                 next_turn=choice, fresh_roles=("stage",), fresh_reason="x")
+                self.assertIn(why, str(ctx.exception))
+                self.assertEqual(self.snapshot(), before)
+                self.assertFalse(untouched.exists())
+
+    def test_needs_you_refuses_choices_and_keeps_the_pause(self):
+        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([NEEDS_YOU]),
+                    stop_after_stage=S1)
+        stage = self._stage(S1)
+        self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
+        self.assert_refused(stage, contains="waiting for a person")
+        _strip_marker(stage)
+        self.assert_refused(stage, contains="waiting for a person")
+        self.assert_refused(stage, contains="waiting for a person",
+                            fresh_roles=("sparring",), fresh_reason="x")
+        self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
+
+
+class UntouchedDerivationTests(_LoopRepo):
+    def test_an_untouched_stage_derives_stage_and_refuses_both_choices(self):
+        self.assertEqual(derive_next_turn(self.repo, self.stage, self.stage.read_state()), "stage")
+        before = (self.stage.directory / "state.json").read_bytes()
+        for choice, why in (("stage", "unnecessary"), ("sparring", "wrong")):
+            with self.subTest(choice=choice):
+                with self.assertRaises(NextTurnError) as ctx:
+                    resolve_resume_turn(self.repo, self.stage, choice=choice)
+                self.assertIn(why, str(ctx.exception))
+        self.assertEqual((self.stage.directory / "state.json").read_bytes(), before)
+        # An ordinary resume simply starts the implementation turn.
+        self.assertEqual(resolve_resume_turn(self.repo, self.stage), "stage")
+        self.assertEqual((self.stage.directory / "state.json").read_bytes(), before)
+
+
+class FreshWithNextTurnTests(_Stuck):
+    def test_a_fresh_stage_session_with_a_legal_choice_on_ambiguous_legacy_state(self):
+        stage, stage_adapter = self.leave_stuck()
+        _strip_marker(stage)
+        (self.repo / "later.txt").write_text("later\n")
+        _run_git(self.repo, "add", "later.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "moved on")
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+
+        self._resume(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1,
+                     next_turn="stage", fresh_roles=("stage",), fresh_reason="context full")
+        self.assertEqual(len(stage_adapter.start_calls), 2)  # the fresh one
+        self.assertIn("## Fresh session", stage_adapter.start_calls[-1])
+        self.assertIs(stage.read_state().status, StageStatus.ACCEPTED)
+
+    def test_an_invalid_choice_with_a_fresh_flag_is_refused_exactly_as_without(self):
+        stage, stage_adapter = self.leave_stuck()  # records next_turn = sparring
+        before = (self.state_path.read_bytes(), (stage.directory / "state.json").read_bytes())
+        for fresh in ((), ("stage",), ("sparring",)):
+            with self.subTest(fresh=fresh):
+                with self.assertRaises(PlanError) as ctx:
+                    self._resume(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1,
+                                 next_turn="stage", fresh_roles=fresh, fresh_reason="x")
+                self.assertIn("already records next_turn = sparring", str(ctx.exception))
+                self.assertEqual(
+                    (self.state_path.read_bytes(), (stage.directory / "state.json").read_bytes()),
+                    before,
+                )
 
 
 class CodexEarlySessionTests(unittest.TestCase):

@@ -58,6 +58,10 @@ from agent_sparring.stage import (
 # left is the push / acceptance gates for the exact reviewed commit.
 RESUME_ACCEPT = "accept"
 
+# Not a marker value: what derive_next_turn returns when a recorded gate
+# (READY, NEEDS_YOU, ESCALATE) with nothing after it decides instead.
+NO_TURN_OWED = "no-turn-owed"
+
 
 class NextTurnError(RuntimeError):
     """The recorded or derivable next turn cannot be honoured."""
@@ -200,20 +204,30 @@ def _read_handoff(stage: Stage) -> _Handoff | None:
     )
 
 
-def derive_next_turn(repo_root: Path, stage: Stage, state: StageState) -> str | None:
+def _untouched(stage: Stage, state: StageState) -> bool:
+    """Nothing has run for this stage yet."""
+
+    return (
+        read_recorded_outcome(stage) is None
+        and state.implementation_session_id is None
+        and not state.sessions
+    )
+
+
+def derive_next_turn(repo_root: Path, stage: Stage, state: StageState) -> str:
     """Reconstruct the marker for state written before it existed.
 
-    Returns ``stage`` or ``sparring``, or ``None`` when the recorded verdict
-    is a gate (READY, NEEDS_YOU, ESCALATE) with no later implementation turn
-    -- existing gate handling already decides those. Raises
-    :class:`AmbiguousNextTurn`, explaining what was found, for anything
-    else.
+    Returns ``stage`` (including for an untouched stage, whose first turn is
+    simply next), ``sparring``, or :data:`NO_TURN_OWED` when the recorded
+    verdict is a gate (READY, NEEDS_YOU, ESCALATE) with no later
+    implementation turn -- the gate state is authoritative and existing gate
+    handling decides it. Raises :class:`AmbiguousNextTurn`, explaining what
+    was found, when the engine cannot tell.
     """
 
     outcome = read_recorded_outcome(stage)
-    if outcome is None and state.implementation_session_id is None and not state.sessions:
-        # Nothing has run for this stage: its first turn is simply next.
-        return None
+    if _untouched(stage, state):
+        return NEXT_TURN_STAGE
     order = _index_order(stage)
     handoff = _read_handoff(stage)
 
@@ -272,7 +286,57 @@ def derive_next_turn(repo_root: Path, stage: Stage, state: StageState) -> str | 
         # No implementation turn completed after the last verdict (or there
         # is no verdict at all): the implementation agent owes the next turn.
         return NEXT_TURN_STAGE
-    return None
+    return NO_TURN_OWED
+
+
+def check_next_turn_choice(repo_root: Path, stage: Stage, choice: str) -> None:
+    """Refuse an explicit ``choice`` unless it is legal: no marker recorded
+    and derivation is ambiguous. Records nothing either way."""
+
+    if choice not in (NEXT_TURN_STAGE, NEXT_TURN_SPARRING):
+        raise NextTurnError(f"next_turn must be 'stage' or 'sparring', got {choice!r}")
+    state = stage.read_state()
+    if state.next_turn is not None:
+        raise NextTurnError(
+            f"stage {stage.stage_id!r} already records next_turn = {state.next_turn} "
+            f"(source: {state.next_turn_source or 'engine'}); --next-turn {choice} is "
+            "only for state the engine cannot read unambiguously and cannot override "
+            "or re-pin a recorded marker. Nothing was changed; resume without "
+            "--next-turn."
+        )
+    try:
+        derived = derive_next_turn(repo_root, stage, state)
+    except AmbiguousNextTurn:
+        return
+    if derived == NO_TURN_OWED:
+        outcome = read_recorded_outcome(stage)
+        verdict = outcome.action.value if outcome is not None else "a gate"
+        raise NextTurnError(
+            f"stage {stage.stage_id!r} records {verdict} with no implementation turn after "
+            f"it; that gate decides how the stage continues, and --next-turn {choice} cannot "
+            "override it. Nothing was changed; resume without --next-turn"
+            + (
+                " (a READY stage continues through finalization and acceptance)."
+                if outcome is not None and outcome.action is RoutingAction.READY
+                else " (answer a person's gate with --evidence)."
+            )
+        )
+    if _untouched(stage, state):
+        raise NextTurnError(
+            f"stage {stage.stage_id!r} has not run yet: its first turn is the implementation "
+            f"turn, so --next-turn {choice} is "
+            + (
+                "unnecessary"
+                if choice == NEXT_TURN_STAGE
+                else "wrong (there is no candidate to review)"
+            )
+            + ". Nothing was changed; resume without --next-turn."
+        )
+    raise NextTurnError(
+        f"stage {stage.stage_id!r} unambiguously owes next_turn = {derived}; "
+        f"--next-turn {choice} is only for state the engine cannot read "
+        "unambiguously. Nothing was changed; resume without --next-turn."
+    )
 
 
 def resolve_resume_turn(
@@ -287,7 +351,7 @@ def resolve_resume_turn(
     An explicit ``choice`` (``stage`` | ``sparring``) is only for ambiguous
     legacy state: it is honoured -- and recorded as ``manual``, with the
     current candidate for ``sparring`` -- only when no marker is recorded
-    and derivation is ambiguous or has no answer. A recorded marker (of any
+    and derivation is ambiguous (see :func:`check_next_turn_choice`). A recorded marker (of any
     value, including the one chosen) or any unambiguous derived answer
     (even the one chosen) is refused and nothing is recorded; a choice never
     overrides or re-pins the engine's record.
@@ -296,38 +360,22 @@ def resolve_resume_turn(
     overriding gate state.
     """
 
-    state = stage.read_state()
     if choice is not None:
-        if choice not in (NEXT_TURN_STAGE, NEXT_TURN_SPARRING):
-            raise NextTurnError(f"next_turn must be 'stage' or 'sparring', got {choice!r}")
-        if state.next_turn is not None:
-            raise NextTurnError(
-                f"stage {stage.stage_id!r} already records next_turn = {state.next_turn} "
-                f"(source: {state.next_turn_source or 'engine'}); --next-turn {choice} is "
-                "only for state the engine cannot read unambiguously and cannot override "
-                "or re-pin a recorded marker. Nothing was changed; resume without "
-                "--next-turn."
-            )
-        else:
-            try:
-                derived = derive_next_turn(repo_root, stage, state)
-            except AmbiguousNextTurn:
-                derived = None
-            if derived is not None:
-                raise NextTurnError(
-                    f"stage {stage.stage_id!r} unambiguously owes next_turn = {derived}; "
-                    f"--next-turn {choice} is only for state the engine cannot read "
-                    "unambiguously. Nothing was changed; resume without --next-turn."
-                )
+        check_next_turn_choice(repo_root, stage, choice)
+        state = stage.read_state()
         candidate = (
             capture_candidate(repo_root, stage, state) if choice == NEXT_TURN_SPARRING else None
         )
         record_next_turn(stage, choice, candidate=candidate, source="manual")
         return choice
+    state = stage.read_state()
     if state.next_turn is not None:
         return state.next_turn
+    if _untouched(stage, state):
+        # Its first turn; nothing to reconstruct or record.
+        return NEXT_TURN_STAGE
     derived = derive_next_turn(repo_root, stage, state)
-    if derived is None:
+    if derived == NO_TURN_OWED:
         return None
     candidate = (
         capture_candidate(repo_root, stage, state) if derived == NEXT_TURN_SPARRING else None
@@ -441,9 +489,11 @@ def standalone_start_with(
 
 __all__ = [
     "AmbiguousNextTurn",
+    "NO_TURN_OWED",
     "NextTurnError",
     "RESUME_ACCEPT",
     "capture_candidate",
+    "check_next_turn_choice",
     "derive_next_turn",
     "record_next_turn",
     "resolve_finalization",

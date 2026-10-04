@@ -201,6 +201,7 @@ from agent_sparring.loop import (
 from agent_sparring.next_turn import (
     RESUME_ACCEPT,
     NextTurnError,
+    check_next_turn_choice,
     resolve_finalization,
     resolve_resume_turn,
     verify_candidate,
@@ -251,6 +252,7 @@ from agent_sparring.stage import (
     HUMAN_EVIDENCE_HEADING,
     NEXT_TURN_FINALIZATION,
     NEXT_TURN_SPARRING,
+    NEXT_TURN_STAGE,
     Stage,
     StageError,
     StageStatus,
@@ -1619,7 +1621,9 @@ def resume_plan(
     ``sparring``) is the caller's explicit choice, recorded as ``manual``.
     That choice is refused, with nothing recorded, whenever a marker is
     already recorded or derivation has an unambiguous answer, and never
-    answers a recorded human gate.
+    answers a recorded human gate or reopens a recorded READY. It is
+    validated before any plan-run or stage state changes, independently of
+    ``fresh_roles``.
     Evidence, a recorded human gate and a pending finalization keep their
     existing precedence over the marker. Evidence answering a gate raised
     over a recorded candidate (``next_turn = sparring``) is refused, before
@@ -1704,15 +1708,6 @@ def resume_plan(
     # over that run's stages.
     _refuse_foreign_stages(sparring_dir, stages, owner=owner)
     _require_state_ignored(repo_root, state_path)
-    _grant_push_authorization(
-        state,
-        state_path,
-        Path(repo_root),
-        allow_push_candidate=allow_push_candidate,
-        allow_push_for_run=allow_push_for_run,
-        report=report,
-    )
-
     if next_turn is not None and evidence is not None and evidence.strip():
         if next_turn != NEXT_TURN_SPARRING:
             raise PlanError(
@@ -1723,6 +1718,25 @@ def resume_plan(
     for role in fresh_roles:
         if role not in (ROLE_STAGE, ROLE_SPARRING):
             raise PlanError(f"unknown fresh-session role {role!r}")
+
+    if next_turn is not None:
+        # Validated before any plan-level or stage state changes, so a refused
+        # choice leaves both exactly as they were.
+        _check_next_turn_choice(
+            sparring_dir,
+            repo_root,
+            stages[state.current_stage_index],
+            next_turn,
+            evidence=bool(evidence and evidence.strip()),
+        )
+    _grant_push_authorization(
+        state,
+        state_path,
+        Path(repo_root),
+        allow_push_candidate=allow_push_candidate,
+        allow_push_for_run=allow_push_for_run,
+        report=report,
+    )
 
     # Before anything runs, and before the ordinary evidence path: these
     # answer the run's own checkpoint rather than a stage's review, and a
@@ -1838,6 +1852,52 @@ def resume_plan(
         fresh_roles=tuple(fresh_roles),
         fresh_reason=fresh_reason,
     )
+
+
+def _check_next_turn_choice(
+    sparring_dir: Path,
+    repo_root: Path,
+    planned: PlannedStage,
+    choice: str,
+    *,
+    evidence: bool,
+) -> None:
+    """Refuse (:class:`PlanError`) an explicit next turn the stage this resume
+    enters cannot take, without creating or changing anything."""
+
+    try:
+        stage = Stage.resolve(sparring_dir, planned.stage_id)
+        if not stage.exists():
+            raise PlanError(
+                f"stage {planned.stage_id!r} has not run yet: its first turn is the "
+                f"implementation turn, so --next-turn {choice} is "
+                + (
+                    "unnecessary"
+                    if choice == NEXT_TURN_STAGE
+                    else "wrong (there is no candidate to review)"
+                )
+                + ". Nothing was changed; resume without --next-turn."
+            )
+        if planned.review_only:
+            raise PlanError(
+                f"stage {planned.stage_id!r} is review-only: it has no stage agent and no turn "
+                f"to choose, so --next-turn {choice} is refused. Nothing was changed."
+            )
+        if stage.read_state().status is StageStatus.ACCEPTED:
+            raise PlanError(
+                f"stage {planned.stage_id!r} is already ACCEPTED and no agent turn is owed, so "
+                f"--next-turn {choice} is refused. Nothing was changed."
+            )
+        waiting = None if evidence else _recorded_pause(stage)
+        if waiting is not None:
+            raise PlanError(
+                f"stage {planned.stage_id!r} is waiting for a person ({waiting.action.value}); "
+                f"--next-turn {choice} does not answer it. Nothing was changed; answer it with "
+                "--evidence (a fresh reviewer session may accompany the evidence)."
+            )
+        check_next_turn_choice(repo_root, stage, choice)
+    except (StageError, NextTurnError) as exc:
+        raise PlanError(str(exc)) from exc
 
 
 def _grant_push_authorization(
@@ -3572,7 +3632,6 @@ def _drive(
                 if (
                     authorized_push is None
                     and not sparrer_first
-                    and next_turn_choice is None
                     and stage_state.next_turn == NEXT_TURN_FINALIZATION
                     and stage_state.next_turn_candidate is not None
                     and stage_state.next_turn_candidate.kind == "commit"
@@ -3599,7 +3658,7 @@ def _drive(
                         activity,
                         stage,
                         fresh_roles=entering_fresh,
-                        next_turn_choice=None,
+                        next_turn_choice=next_turn_choice,
                         why=(
                             "the reviewer already said READY over this commit; only the push "
                             "and acceptance gates are left and no agent runs"
@@ -3635,15 +3694,24 @@ def _drive(
                     if sparrer_first:
                         start_with = "sparring"
                         sparrer_first = False  # only the stage this resume entered
-                    elif (
-                        next_turn_choice is None
-                        and stage_state.next_turn is None
-                        and _awaiting_finalization(state, state_path, activity, repo_root, stage)
+                    elif stage_state.next_turn is None and _awaiting_finalization(
+                        state, state_path, activity, repo_root, stage
                     ):
                         # Stopped between the reviewer's READY and the commit that
                         # acceptance can freeze, in state written before the
                         # next_turn marker existed. With a marker, the marker's
                         # own reviewed candidate decides instead (below).
+                        # Never suppressed by --next-turn: a chosen turn is
+                        # refused here rather than reopening reviewed work.
+                        _refuse_unapplied(
+                            state,
+                            state_path,
+                            activity,
+                            stage,
+                            fresh_roles=(),
+                            next_turn_choice=next_turn_choice,
+                            why="the reviewer already said READY; the reviewed work is finalized",
+                        )
                         start_with = "finalization"
                     else:
                         # The engine's own record of whose turn it is (see

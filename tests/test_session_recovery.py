@@ -328,9 +328,14 @@ class EvidenceCandidateTests(_PlanRepoTestCase):
         self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
         self.assertEqual(stage.read_state().next_turn, "sparring")
 
-        for kwargs in ({"fresh_roles": ("sparring",)}, {"next_turn": "sparring"}):
+        # --next-turn is refused up front, before any plan-run state changes;
+        # a fresh session only where the stage is entered.
+        for kwargs, refusal in (
+            ({"fresh_roles": ("sparring",)}, PlanRunError),
+            ({"next_turn": "sparring"}, PlanError),
+        ):
             with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
-                with self.assertRaises(PlanRunError) as ctx:
+                with self.assertRaises(refusal) as ctx:
                     self._resume(stage_adapter, sparring, **kwargs)
                 self.assertIn("waiting for a person", str(ctx.exception))
                 after = stage.read_state()
