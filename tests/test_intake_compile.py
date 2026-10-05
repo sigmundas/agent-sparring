@@ -212,10 +212,10 @@ def compile_check(payload, text=CLOUD):
 class CloudSyncFixtureTests(unittest.TestCase):
     def test_the_fixture_compiles_to_auto_resolved_and_plan_notes_only(self):
         findings = compile_check(cloud_interpretation())
-        # The canary sits inside the slice: gate_at_boundary is validated
-        # here but not rendered until manifest v2, so this one stays blocking.
-        rest = [f for f in findings if f.code != "gate_inside_run"]
-        self.assertEqual([f.code for f in findings if f.code == "gate_inside_run"], ["gate_inside_run"])
+        # The canary sits inside the slice; compile mode renders it into the
+        # manifest as gates_before instead of refusing it.
+        self.assertNotIn("gate_inside_run", {f.code for f in findings})
+        rest = list(findings)
         self.assertEqual({f.disposition for f in rest}, {"auto_resolved", "plan_note"})
         self.assertEqual([f.downgraded for f in rest], [None] * len(rest))
         self.assertEqual(
@@ -517,6 +517,8 @@ class CompileEndToEndTests(_Repo):
         self.assertEqual(code, 0, err)
         manifest = next((intake_dir / "runs" / "app").glob("manifest.json"))
         self.assertEqual([s.label for s in load_intake_manifest(manifest).stages()], ["Stage 0", "Stage 1A"])
+        # No gate rides in this slice's manifest, so it stays version 1.
+        self.assertEqual(load_intake_manifest(manifest).manifest.version, 1)
 
     def test_a_downgraded_auto_resolution_blocks_approval(self):
         payload = compile_widget_interpretation()

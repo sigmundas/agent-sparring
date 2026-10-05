@@ -36,6 +36,23 @@ from agent_sparring.stage import CandidateRepository, StageMode
 
 
 @dataclass(frozen=True)
+class ManifestGate:
+    """A plan-declared human gate a manifest places between two stages, or
+    before the run may report completion (manifest v2).
+
+    ``id`` names the gate, and is the id of the one check the runner asks a
+    person to answer for it; ``kind`` and ``reason`` are the plan's own words
+    for what the gate is and why it exists. Reaching a gate never satisfies
+    it: the runner stops, and only an explicit ``pass`` answer releases it.
+    """
+
+    id: str
+    title: str
+    kind: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class PlannedStage:
     """One stage as the runner sees it, whatever produced it.
 
@@ -72,6 +89,9 @@ class PlannedStage:
     brief: str
     repositories: tuple[CandidateRepository, ...] = field(default_factory=tuple)
     mode: StageMode = StageMode.IMPLEMENTATION
+    #: Gates owed after the preceding stage is accepted and before this one
+    #: is created (manifest v2; always empty for every other plan input).
+    gates_before: tuple[ManifestGate, ...] = field(default_factory=tuple)
 
     @property
     def review_only(self) -> bool:
@@ -134,4 +154,4 @@ def digest_planned_stages(*parts: str) -> str:
     return digest.hexdigest()
 
 
-__all__ = ["PlanSource", "PlannedStage", "StageMode", "digest_planned_stages"]
+__all__ = ["ManifestGate", "PlanSource", "PlannedStage", "StageMode", "digest_planned_stages"]

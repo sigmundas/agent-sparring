@@ -184,6 +184,7 @@ from agent_sparring.deferred_gate import (
     DeferredHumanGate,
     DeferredObligation,
     DeferredVerificationRequired,
+    before_stage_checkpoint,
 )
 from agent_sparring.finalization import FinalizationError, pending_finalization
 from agent_sparring.gate_answers import (
@@ -217,7 +218,7 @@ from agent_sparring.intake_approval import (
     load_intake_manifest,
     refuse_intake_identities,
 )
-from agent_sparring.plan_model import PlanSource, PlannedStage, digest_planned_stages
+from agent_sparring.plan_model import ManifestGate, PlanSource, PlannedStage, digest_planned_stages
 from agent_sparring.push_gate import (
     PushAuthorization,
     PushError,
@@ -249,7 +250,7 @@ from agent_sparring.review import (
     enter_review,
     run_independent_review,
 )
-from agent_sparring.human_gate import HumanCheck, HumanGate
+from agent_sparring.human_gate import HumanCheck, HumanGate, new_gate_instance_id
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import RecordedOutcome, read_recorded_outcome
 from agent_sparring.stage import (
@@ -1742,6 +1743,21 @@ def resume_plan(
     for role in fresh_roles:
         if role not in (ROLE_STAGE, ROLE_SPARRING):
             raise PlanError(f"unknown fresh-session role {role!r}")
+    if (
+        evidence is not None
+        and evidence.strip()
+        and isinstance(state.awaiting, DeferredVerificationRequired)
+        and state.awaiting.reason == DeferredVerificationRequired.BEFORE_STAGE
+    ):
+        # The run is stopped between two stages on a plan-declared gate: no
+        # stage review is waiting for evidence, and free-text evidence must
+        # never be read as the gate's answer.
+        raise PlanError(
+            f"plan run {owner.key} is stopped on a plan-declared gate before the next stage; "
+            "--evidence answers a stage's review, not a gate. Answer the gate with "
+            "--deferred-result <instance>:<gate id>=pass once it is actually satisfied "
+            f"(gate instances: {', '.join(state.awaiting.instance_ids)})"
+        )
 
     if next_turn is not None:
         # Validated before any plan-level or stage state changes, so a refused
@@ -3018,7 +3034,9 @@ def _carry_to_plan(
     carried = tuple(
         entry
         for entry in state.unresolved_deferred
-        if entry.checkpoint == CHECKPOINT_PLAN_COMPLETION and not entry.promoted
+        if entry.checkpoint == CHECKPOINT_PLAN_COMPLETION
+        and not entry.promoted
+        and not entry.manifest_gate
     )
     if not carried:
         return
@@ -3080,6 +3098,81 @@ def _claim_from_plan(
             f"{entry.origin_slice} ({entry.obligation.stage_id}) is due now: this is the plan's "
             f"last slice"
         )
+
+
+def _manifest_gate_category(gate: ManifestGate) -> str:
+    return "EXTERNAL_CONDITION" if gate.kind == "external" else "OTHER"
+
+
+def _owe_manifest_gates(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter,
+    stage_id: str,
+    gates: tuple[ManifestGate, ...],
+    *,
+    checkpoint: str,
+    report: Reporter,
+) -> tuple[DeferredObligation, ...]:
+    """Mint one engine-owned obligation per plan-declared ``gates`` entry
+    owed by ``checkpoint``, and return the ones still unresolved.
+
+    Idempotent by (checkpoint, gate id): a resume that reaches the same
+    gate again finds the obligation it minted -- and any answer recorded to
+    it -- instead of asking anew. ``stage_id`` is the accepted stage the gate
+    follows; the answer is written to its ``notes.md``. Every gate kind is
+    owed the same way: nothing about a gate is ever taken as satisfied.
+    """
+
+    owed: list[DeferredObligation] = []
+    minted = False
+    for gate in gates:
+        existing = next(
+            (
+                entry
+                for entry in state.deferred_human_checks
+                if entry.manifest_gate
+                and entry.checkpoint == checkpoint
+                and any(check.id == gate.id for check in entry.gate.checks)
+            ),
+            None,
+        )
+        if existing is None:
+            existing = DeferredObligation(
+                stage_id=stage_id,
+                gate=HumanGate(
+                    category=_manifest_gate_category(gate),
+                    title=gate.title,
+                    checks=(
+                        HumanCheck(
+                            id=gate.id,
+                            instruction=(
+                                f"Confirm the plan-declared {gate.kind} gate {gate.title!r} is "
+                                f"satisfied. Why it exists: {gate.reason}"
+                            ),
+                            pass_criteria=(
+                                "The gate is actually satisfied. Reaching this point in the run "
+                                "does not satisfy it."
+                            ),
+                        ),
+                    ),
+                ).asked_again(new_gate_instance_id()),
+                rationale=gate.reason,
+                checkpoint=checkpoint,
+                manifest_gate=True,
+            )
+            state.record_deferred(existing)
+            minted = True
+            activity.emit("plan.gate_owed", summary=f"{gate.title} ({gate.kind}) at {checkpoint}")
+            report(
+                f"plan-declared {gate.kind} gate {gate.title!r} ({gate.id}) is owed at {checkpoint}: "
+                f"gate instance {existing.instance_id}"
+            )
+        if not existing.resolved:
+            owed.append(existing)
+    if minted:
+        state.save(state_path)
+    return tuple(owed)
 
 
 def _stop_for_deferred(
@@ -4039,6 +4132,32 @@ def _drive(
                 report=report,
             )
 
+        # A plan-declared gate stands between this stage and the next: the
+        # run stops before the next stage is created, and only an explicit
+        # pass answer lets it continue. Reaching the gate satisfies nothing.
+        if state.current_stage_index + 1 < total:
+            upcoming = stages[state.current_stage_index + 1]
+            gated = _owe_manifest_gates(
+                state,
+                state_path,
+                activity,
+                stage.stage_id,
+                upcoming.gates_before,
+                checkpoint=before_stage_checkpoint(upcoming.stage_id),
+                report=report,
+            )
+            if gated:
+                return _stop_for_deferred(
+                    state,
+                    state_path,
+                    activity,
+                    gated,
+                    reason=DeferredVerificationRequired.BEFORE_STAGE,
+                    stage_id=stage.stage_id,
+                    accepted=accepted,
+                    report=report,
+                )
+
         if state.current_stage_index + 1 >= total:
             # The run's last stage is finished. For a slice of an intake that
             # is not the plan's end: obligations owed by plan completion are
@@ -4059,6 +4178,18 @@ def _drive(
             # covering everything that accumulated, and completes only once
             # those are answered -- without re-running anything that is
             # already accepted, because this loop skips accepted stages.
+            # The manifest's closeout gates are minted after the carry
+            # above, so they stay this run's: a slice does not complete
+            # past its own closeout gate.
+            _owe_manifest_gates(
+                state,
+                state_path,
+                activity,
+                stage.stage_id,
+                tuple(getattr(source, "completion_gates", ())),
+                checkpoint=CHECKPOINT_PLAN_COMPLETION,
+                report=report,
+            )
             owed = state.unresolved_deferred
             if owed:
                 return _stop_for_deferred(

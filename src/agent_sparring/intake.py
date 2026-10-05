@@ -135,7 +135,13 @@ from agent_sparring.intake_approval import (
     write_exclusive,
 )
 from agent_sparring.intake_prompt import MODE_COMPILE, MODE_FAITHFUL, MODE_REFINE, assemble_intake_prompt
-from agent_sparring.manifest import MANIFEST_VERSION, ManifestError, manifest_digest, parse_manifest
+from agent_sparring.manifest import (
+    MANIFEST_VERSION,
+    MANIFEST_VERSION_GATES,
+    ManifestError,
+    manifest_digest,
+    parse_manifest,
+)
 from agent_sparring.plan import (
     PlanError,
     PlanRunState,
@@ -544,6 +550,9 @@ class Interpretation:
     excluded: tuple[Exclusion, ...]
     findings: tuple[Finding, ...]
     amended_plan: str | None
+    #: Read in compile mode, where a gate inside a run slice is rendered into
+    #: that slice's manifest (:func:`slice_manifest_gates`) instead of refused.
+    compiled: bool = False
 
     def stages(self) -> Iterable[tuple[int, int, RunSlice, IntakeStage]]:
         """Every stage with its (run index, stage index) coordinates."""
@@ -613,6 +622,7 @@ def _interpretation(payload: Mapping[str, Any], mode: str | None = None) -> Inte
         ),
         findings=tuple(_finding(item, mode) for item in _list(payload, "findings", "interpretation")),
         amended_plan=_optional_str(payload, "amended_plan", "interpretation", strip=False),
+        compiled=mode == MODE_COMPILE,
     )
 
 
@@ -1066,7 +1076,9 @@ def check_interpretation(
             add("unknown_reference", f"{owner} follows unknown stage {gate.after_stage!r}")
         if after is not None:
             slice_ = interpretation.runs[after[0]]
-            if after[1] != len(slice_.stages) - 1:
+            # Compile mode renders such a gate into the slice's manifest
+            # (gates_before), and the runtime stops for it.
+            if after[1] != len(slice_.stages) - 1 and mode != MODE_COMPILE:
                 following = slice_.stages[after[1] + 1].label
                 add(
                     "gate_inside_run",
@@ -1082,7 +1094,8 @@ def check_interpretation(
             if where is None:
                 add("unknown_reference", f"{owner} blocks unknown stage {blocked!r}")
                 continue
-            if after is not None and where[0] <= after[0]:
+            same_slice_later = after is not None and where[0] == after[0] and where[1] > after[1]
+            if after is not None and where[0] <= after[0] and not (mode == MODE_COMPILE and same_slice_later):
                 add(
                     "dependency_not_satisfied",
                     f"{owner} follows stage {gate.after_stage} but blocks stage {blocked}, which "
@@ -1090,7 +1103,7 @@ def check_interpretation(
                     stages=[gate.after_stage or "", blocked],
                     ranges=good,
                 )
-            elif where[1] != 0:
+            elif where[1] != 0 and mode != MODE_COMPILE:
                 first = interpretation.runs[where[0]].stages[0].label
                 add(
                     "gate_inside_run",
@@ -1538,18 +1551,58 @@ def all_findings(
     return tuple(sorted(ordered, key=lambda f: SEVERITIES.index(f.severity)))
 
 
+def slice_manifest_gates(
+    interpretation: Interpretation, run_id: str
+) -> tuple[dict[str, tuple[Gate, ...]], tuple[Gate, ...]]:
+    """``(gates_before by stage label, completion gates)`` that run slice
+    ``run_id``'s manifest carries, so the runtime stops for them.
+
+    Compile mode only; empty otherwise. A gate lands before the earliest
+    stage of this slice it must precede: the stage after its ``after_stage``
+    when that is inside this slice, or a stage it blocks that is not the
+    slice's first. A gate after this slice's last stage that blocks nothing
+    is the slice's closeout gate. A gate blocking the slice's *first* stage
+    stays a prerequisite confirmed at approval: nothing in the run precedes
+    that stage to wait after.
+    """
+
+    before: dict[str, list[Gate]] = {}
+    completion: list[Gate] = []
+    if not interpretation.compiled:
+        return {}, ()
+    run = next((run for run in interpretation.runs if run.id == run_id), None)
+    if run is None:
+        return {}, ()
+    index = {stage.label: position for position, stage in enumerate(run.stages)}
+    last = len(run.stages) - 1
+    for gate in interpretation.gates:
+        candidates = [index[b] for b in gate.blocks_stages if index.get(b, 0) > 0]
+        after = index.get(gate.after_stage) if gate.after_stage else None
+        if after is not None and after < last:
+            candidates.append(after + 1)
+        if candidates:
+            before.setdefault(run.stages[min(candidates)].label, []).append(gate)
+        elif after == last and not gate.blocks_stages:
+            completion.append(gate)
+    return {label: tuple(gates) for label, gates in before.items()}, tuple(completion)
+
+
 def run_prerequisites(interpretation: Interpretation, run_id: str) -> tuple[str, ...]:
     """What a person must confirm before approving run slice ``run_id``:
     every gate that blocks one of its stages, and every earlier run slice
-    one of its stages depends on. Sorted, for a stable record."""
+    one of its stages depends on. Sorted, for a stable record. A gate the
+    slice's own manifest carries (:func:`slice_manifest_gates`) is not one:
+    the run stops for it instead."""
 
     run_of: dict[str, str] = {
         stage.label: run.id for _, _, run, stage in interpretation.stages()
     }
     labels = {stage.label for _, _, run, stage in interpretation.stages() if run.id == run_id}
+    before, completion = slice_manifest_gates(interpretation, run_id)
+    in_manifest = {gate.id for gates in before.values() for gate in gates} | {gate.id for gate in completion}
     required: set[str] = set()
     for gate in interpretation.gates:
-        if labels.intersection(gate.blocks_stages):
+        if gate.id not in in_manifest and labels.intersection(gate.blocks_stages):
             required.add(gate.id)
     for _, _, run, stage in interpretation.stages():
         if run.id != run_id:
@@ -2255,6 +2308,20 @@ def _ranges_text(ranges: Sequence[LineRange]) -> str:
     return ", ".join(str(r) for r in ranges) or "—"
 
 
+def _manifest_gate_lines(interpretation: Interpretation, run: RunSlice) -> list[str]:
+    before, completion = slice_manifest_gates(interpretation, run.id)
+    lines = [
+        f"- The run stops before stage {label} for: {', '.join('`' + g.id + '`' for g in gates)}"
+        for label, gates in before.items()
+    ]
+    if completion:
+        lines.append(
+            "- The run stops before reporting complete for: "
+            + ", ".join("`" + g.id + "`" for g in completion)
+        )
+    return lines
+
+
 def render_report(
     source: SourcePlan,
     interpretation: Interpretation,
@@ -2324,6 +2391,7 @@ def render_report(
             else f"- Expected branch: **cannot be approved**: {problem}",
             f"- Run key: `{run_keys.get(run.id, '?')}`",
             f"- Gates a person confirms at approval: {', '.join('`' + g + '`' for g in gates) or 'none'}",
+            *_manifest_gate_lines(interpretation, run),
             "- Earlier run slices that must be approved and complete first: "
             + (', '.join('`' + e + '`' for e in earlier) or 'none'),
         ]
@@ -2555,6 +2623,10 @@ def _completed_slice(intake_dir: Path, run_id: str) -> _CompletedSlice:
     )
 
 
+def _manifest_gate(gate: Gate) -> dict[str, str]:
+    return {"id": gate.id, "title": gate.title or gate.id, "kind": gate.kind, "reason": gate.reason or gate.title or gate.id}
+
+
 def approve_plan(
     intake_dir: Path,
     *,
@@ -2770,6 +2842,7 @@ def approve_plan(
             )
 
     run_key = run_keys[run_id]
+    gates_before, completion_gates = slice_manifest_gates(interpretation, run_id)
     stages = []
     recorded_briefs = record.get("briefs") or {}
     for stage in run.stages:
@@ -2797,14 +2870,21 @@ def approve_plan(
                 }
                 for name in stage.repositories
             ]
+        if gates_before.get(stage.label):
+            entry["gates_before"] = [_manifest_gate(gate) for gate in gates_before[stage.label]]
         stages.append(entry)
 
-    manifest_payload = {
-        "version": MANIFEST_VERSION,
+    # v1 whenever no gate is carried, so such a manifest (and its digest) is
+    # exactly what it was before v2 existed.
+    gated = bool(gates_before or completion_gates)
+    manifest_payload: dict[str, Any] = {
+        "version": MANIFEST_VERSION_GATES if gated else MANIFEST_VERSION,
         "plan_label": source.label,
         "source_digest": f"sha256:{source.digest}",
         "stages": stages,
     }
+    if completion_gates:
+        manifest_payload["completion_gates"] = [_manifest_gate(gate) for gate in completion_gates]
     try:
         manifest = parse_manifest(json.dumps(manifest_payload))
     except (ManifestError, StageError) as exc:
@@ -3010,6 +3090,7 @@ __all__ = [
     "repository_snapshot",
     "require_intake_ignored",
     "run_prerequisites",
+    "slice_manifest_gates",
     "feature_branch_needed",
     "slice_branch",
     "slice_runs_agent",

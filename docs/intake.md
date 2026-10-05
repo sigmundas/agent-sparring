@@ -141,8 +141,13 @@ complete"), else `gate_unenforced` refuses; a moved gate's text must evidence it
 `needs_decision`; a named one that was not inspected refuses with the
 `--context-repository` to add. `intake.json` records the repository names
 these were checked against, so approval recomputes the same findings.
-`gate_at_boundary` is validated but not yet rendered: a gate inside a slice
-is still the blocking `gate_inside_run`. Answering decisions is not
+In compile mode a gate inside a slice is not `gate_inside_run`: it lands in
+that slice's manifest as `gates_before` of the earliest stage it must
+precede, and a gate after the slice's last stage that blocks nothing becomes
+its `completion_gates` (manifest version 2; see [plans.md](plans.md)). Such a
+gate is not a `--confirm-prerequisite`; the run stops for it instead. A gate
+blocking a slice's first stage is still confirmed at approval. A slice with
+no such gate still gets a version-1 manifest. Answering decisions is not
 implemented yet; approval goes through the same `approve-plan` path.
 
 **What `run-plan --manifest` verifies.** An intake envelope runs only with

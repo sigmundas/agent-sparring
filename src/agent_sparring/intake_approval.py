@@ -78,7 +78,7 @@ from agent_sparring.manifest import (
     manifest_digest,
     manifest_from_payload,
 )
-from agent_sparring.plan_model import PlannedStage, digest_planned_stages
+from agent_sparring.plan_model import ManifestGate, PlannedStage, digest_planned_stages
 
 INTAKE_DIRNAME = "intake"
 RECORD_FILENAME = "intake.json"
@@ -337,6 +337,10 @@ class IntakeManifestSource:
 
     def stages(self) -> tuple[PlannedStage, ...]:
         return self.manifest.stages
+
+    @property
+    def completion_gates(self) -> tuple[ManifestGate, ...]:
+        return self.manifest.completion_gates
 
     def reload(self) -> "IntakeManifestSource":
         return load_intake_manifest(self.path)

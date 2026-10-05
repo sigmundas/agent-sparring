@@ -344,6 +344,19 @@ a manifest from an edited plan refuses to continue an existing run — the same
 protection the Markdown path gets. Re-emitting an unchanged one is stable, so
 a tool may regenerate the file on every invocation.
 
+**Version 2: plan-declared gates.** A `"version": 2` manifest is version 1
+plus `gates_before: [{"id", "title", "kind", "reason"}]` on any stage but the
+first, and/or top-level `completion_gates` of the same shape; it must use at
+least one, and gate ids are unique. After the preceding stage is accepted the
+run mints one obligation per gate (checkpoint `before_stage:<stage id>`, or
+`before_plan_completion` for completion gates) and stops with
+`deferred_verification_required` (reason `before_stage` or `plan_completion`)
+before the gated stage is created or before reporting COMPLETE. Only
+`resume-plan --deferred-result <instance>:<gate id>=pass` releases it;
+`fail`/`blocked` keep the run stopped, reaching a gate never satisfies it, and
+`--evidence` is refused at a `before_stage` stop. The v2 digest covers every
+gate field and its position; version-1 digests are unchanged.
+
 `repositories` is for a stage whose reviewed candidate spans more than one
 repository; see [Cross-repository candidates](reference.md#cross-repository-candidates). `mode` is for a stage
 that is a review and nothing else; see [Review-only stages](reference.md#review-only-stages).
