@@ -363,6 +363,40 @@ class CloudSyncFixtureTests(unittest.TestCase):
         payload["findings"] = [f for f in payload["findings"] if f["transform"] != "gate_at_boundary"]
         self.assertNotIn("gate_unenforced", [f.code for f in compile_check(payload, text=text)])
 
+    def _post_run_gate(self, sentence, **gate):
+        text = CLOUD.replace(
+            "If Stage 2's sync metrics regress, run a canary on 5% of devices before\nStage 3A starts.", sentence
+        )
+        payload = cloud_interpretation()  # same line numbers
+        payload["gates"][0].update(gate)
+        payload["findings"] = [f for f in payload["findings"] if f["transform"] != "gate_at_boundary"]
+        return compile_check(payload, text=text), payload, text
+
+    def test_until_a_stage_completes_is_a_post_run_gate_that_follows_it(self):
+        findings, _, _ = self._post_run_gate(
+            "Do not deploy the release until Stage 5 is complete.\nThat closes the plan.",
+            after_stage="5", blocks_stages=[], kind="production",
+        )
+        self.assertEqual([f.code for f in findings if f.blocking], [])
+
+    def test_until_a_stage_still_requires_the_gate_to_follow_it(self):
+        findings, _, _ = self._post_run_gate(
+            "Do not deploy the release until Stage 5 is complete.\nThat closes the plan.",
+            after_stage=None, blocks_stages=[], kind="production",
+        )
+        unenforced = [f for f in findings if f.code == "gate_unenforced"]
+        self.assertEqual(len(unenforced), 1)
+        self.assertIn("follows stage 5", unenforced[0].message)
+
+    def test_a_start_prohibition_blocks_its_stage(self):
+        findings, _, _ = self._post_run_gate(
+            "Do not start Stage 3A without the owner's go-ahead.\nThat is final.",
+            after_stage="5", blocks_stages=[],
+        )
+        unenforced = [f for f in findings if f.code == "gate_unenforced"]
+        self.assertEqual(len(unenforced), 1)
+        self.assertIn("blocks stage 3A", unenforced[0].message)
+
     def test_ordinary_work_mentioning_a_deployment_is_not_a_gate(self):
         text = CLOUD.replace(
             "Add the sync columns and the server row id.", "Add unit tests for the deployment configuration parser."

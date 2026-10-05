@@ -258,23 +258,28 @@ _GATE_TEXT_RE = re.compile(
 )
 _NEGATED_GATE_RE = re.compile(r"\bnot\s+(yet\s+)?(approved|authori[sz]ed|signed[- ]off|gated)\b", re.IGNORECASE)
 _STAGE_REF = r"stages?\s+[A-Za-z]*\d\w*"
+_START_PROHIBITION = r"(do\s+not|don\'t|never|cannot|can\'t|must\s+not|may\s+not)\s+(start|begin|run)\s+(the\s+)?"
 _STAGE_AS_PREREQUISITE_RE = re.compile(
     rf"\b(before|after|until|once|prior\s+to)\s+(the\s+)?{_STAGE_REF}"
+    rf"|\b{_START_PROHIBITION}{_STAGE_REF}"
     rf"|\b{_STAGE_REF}(\'s)?\s+(\w+\s+)?(requires?|needs?|must\s+wait|waits?|cannot\s+start|can\'t\s+start"
     r"|may\s+not\s+start|must\s+not\s+start|is\s+(gated|blocked)|depends)\b",
     re.IGNORECASE,
 )
 #: Within a gate sentence, which stage the gate blocks ("before Stage 3A",
-#: "Stage 3A requires ...") and which it follows ("after Stage 1A"). The
-#: declared gate carrying the sentence must keep exactly these relations.
+#: "Stage 3A requires ...", "do not start Stage 3A ...") and which it
+#: follows ("after Stage 1A", "until Stage 5 is complete" -- the gated
+#: action waits for that stage). The declared gate carrying the sentence
+#: must keep exactly these relations.
 _LABEL = r"stages?\s+(?P<{}>[A-Za-z]*\d\w*)"
 _GATE_BLOCKS_RE = re.compile(
-    rf"\b(before|until|prior\s+to)\s+(the\s+)?{_LABEL.format('label')}"
+    rf"\b(before|prior\s+to)\s+(the\s+)?{_LABEL.format('label')}"
+    rf"|\b{_START_PROHIBITION}{_LABEL.format('object')}"
     rf"|\b{_LABEL.format('subject')}(\'s)?\s+(\w+\s+)?(requires?|needs?|must\s+wait|waits?|cannot\s+start|can\'t\s+start"
     r"|may\s+not\s+start|must\s+not\s+start|is\s+(gated|blocked)|depends)\b",
     re.IGNORECASE,
 )
-_GATE_FOLLOWS_RE = re.compile(rf"\b(after|once)\s+(the\s+)?{_LABEL.format('label')}", re.IGNORECASE)
+_GATE_FOLLOWS_RE = re.compile(rf"\b(after|once|until)\s+(the\s+)?{_LABEL.format('label')}", re.IGNORECASE)
 _INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 #: Evidence, in a gate's own source text, of each gate kind -- what
@@ -1219,7 +1224,7 @@ def gate_relation_problems(
         blocked = {
             labels[k]
             for m in _GATE_BLOCKS_RE.finditer(text)
-            if (k := _slug(m.group("label") or m.group("subject"))) in labels
+            if (k := _slug(m.group("label") or m.group("subject") or m.group("object"))) in labels
         }
         follows = {labels[k] for m in _GATE_FOLLOWS_RE.finditer(text) if (k := _slug(m.group("label"))) in labels}
         enforced = {label for g in covering for label in g.blocks_stages}
