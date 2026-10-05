@@ -241,7 +241,9 @@ gate), `source_digest`, `expected_branch`, `repositories` (`name`, `path`,
 sibling), `models` (`{stage|sparring: {provider, model, effort}}`) and
 `allow_push_for_run`. For the direct route: `route`, `plan_label`,
 `plan_digest` (the digest a run records), `source_digest` (the file's
-text), `expected_branch`, the primary repository, `models` and
+text), `expected_branch`, the primary repository and every
+`--context-repository` supplied (a Markdown plan declares no siblings, so
+`--repository-branch` is refused on this route), `models` and
 `allow_push_for_run`. Any change — a moved sibling HEAD, another answer,
 another report, a gate — is another token.
 
@@ -280,6 +282,10 @@ another report, a gate — is another token.
   origin, message, stages}`.
 - `confirm_token`: only when `ready`; `error`: only when `refused`.
 
+A refusal of the arguments themselves (a malformed `--answer`, an invalid
+configuration) is reported in the same full shape. The printed answer and
+confirm commands repeat every input, including the executables,
+`--permission-mode` and `--max-send-back-cycles`.
 With `--confirm`, a refusal is reported in the same shape; once it runs,
 the output is `run-plan`'s.
 

@@ -130,22 +130,29 @@ def repository_fingerprint(name: str, path: Path) -> dict[str, str]:
 
 
 def _base(request: StartRequest) -> dict[str, Any]:
+    return refused_payload(request.plan_path, request.repo_root, request.expected_branch, None)
+
+
+def refused_payload(plan_path: Path, repo_root: Path, expected_branch: str, error: str | None) -> dict[str, Any]:
+    """A status with every schema key present: ``refused`` with ``error``.
+    Also what the CLI reports when its arguments refuse before evaluating."""
+
     return {
         "schema_version": STATUS_VERSION,
         "status": STATUS_REFUSED,
         "route": None,
         "plan": {
-            "path": str(Path(request.plan_path).resolve()),
-            "label": plan_label(Path(request.plan_path), Path(request.repo_root)),
+            "path": str(Path(plan_path).resolve()),
+            "label": plan_label(Path(plan_path), Path(repo_root)),
         },
-        "expected_branch": request.expected_branch,
+        "expected_branch": expected_branch,
         "intake": None,
         "slice": None,
         "later_slices": [],
         "decisions": [],
         "findings": [],
         "confirm_token": None,
-        "error": None,
+        "error": error,
     }
 
 
@@ -163,6 +170,11 @@ def evaluate(request: StartRequest, *, prepare: Prepare | None) -> StartStatus:
         if direct is not None:
             if request.answers:
                 raise StartPlanError("--answer: this plan runs directly, and asks no decisions")
+            if request.repository_branches:
+                raise StartPlanError(
+                    "--repository-branch: this plan runs directly, and a Markdown plan declares no "
+                    "sibling repositories to put on a branch"
+                )
             return _direct_status(request, payload, direct)
         require_intake_ignored(Path(request.repo_root), Path(request.sparring_dir))
         intake_dir, reused = locate_intake(request, label=payload["plan"]["label"], prepare=prepare)
@@ -238,7 +250,15 @@ def _direct_status(request: StartRequest, payload: dict[str, Any], source) -> St
             "plan_digest": source.digest(),
             "source_digest": sha256_text(text),
             "expected_branch": request.expected_branch,
-            "repositories": [repository_fingerprint(request.primary_repository, Path(request.repo_root))],
+            # The primary and every repository supplied with the request:
+            # whatever was given is bound, never silently ignored.
+            "repositories": [
+                repository_fingerprint(request.primary_repository, Path(request.repo_root)),
+                *(
+                    repository_fingerprint(name, Path(path))
+                    for name, path in sorted(request.context_repositories.items())
+                ),
+            ],
             "models": dict(request.models),
             "allow_push_for_run": bool(request.allow_push_for_run),
         }
@@ -500,4 +520,5 @@ __all__ = [
     "evaluate",
     "locate_intake",
     "preflight",
+    "refused_payload",
 ]

@@ -2504,6 +2504,14 @@ def _start_plan_command(args: argparse.Namespace, repo_root: Path, *, answers: d
     for flag, attr in _START_OVERRIDES:
         if getattr(args, attr, None):
             parts += [flag, str(getattr(args, attr))]
+    # Execution inputs the run would use: always carried, so following the
+    # printed command runs the same executables, mode and limit.
+    parts += [
+        "--claude-executable", str(args.claude_executable),
+        "--codex-executable", str(args.codex_executable),
+        "--permission-mode", str(args.permission_mode),
+        "--max-send-back-cycles", str(args.max_send_back_cycles),
+    ]
     for decision_id, option_id in answers.items():
         parts += ["--answer", f"{decision_id}={option_id}"]
     if args.allow_push_for_run:
@@ -2594,7 +2602,9 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
     if error or not args.confirm:
         if args.json:
             if payload is None:
-                payload = {"schema_version": 1, "status": "refused", "error": error}
+                from agent_sparring.plan_start import refused_payload
+
+                payload = refused_payload(Path(args.plan_path), repo_root, args.expected_branch, error)
             json.dump(payload, sys.stdout, indent=2)
             print()
         else:

@@ -137,6 +137,56 @@ class DirectRouteTests(_Start):
         run.assert_not_called()
 
 
+    def test_a_supplied_sibling_is_bound_into_the_direct_token(self):
+        _, alone, _ = self.start(plan=self.direct)
+        _, with_web, _ = self.start("--context-repository", f"web={self.web}", plan=self.direct)
+        self.assertNotEqual(alone["confirm_token"], with_web["confirm_token"])
+        (self.web / "more.txt").write_text("x\n", encoding="utf-8")
+        _git(self.web, "add", ".")
+        _git(self.web, "commit", "-q", "-m", "move")
+        _, moved, _ = self.start("--context-repository", f"web={self.web}", plan=self.direct)
+        self.assertNotEqual(moved["confirm_token"], with_web["confirm_token"])
+        with self.ran() as run:
+            code, refused, _ = self.start(
+                "--context-repository", f"web={self.web}", plan=self.direct, confirm=with_web["confirm_token"]
+            )
+        self.assertEqual((code, refused["status"]), (1, "refused"))
+        run.assert_not_called()
+
+    def test_a_sibling_branch_is_refused_on_the_direct_route(self):
+        code, status, _ = self.start("--repository-branch", "web=feature/web", plan=self.direct)
+        self.assertEqual((code, status["status"]), (1, "refused"))
+        self.assertIn("--repository-branch", status["error"])
+
+
+class CommandAndSchemaTests(_Start):
+    def test_an_argument_refusal_still_reports_every_schema_key(self):
+        code, status, _ = self.start(answers=["malformed"])
+        self.assertEqual(code, 1)
+        self.assertEqual(status["status"], "refused")
+        self.assertIn("--answer expects NAME=VALUE", status["error"])
+        self.assertEqual(
+            set(status),
+            {"schema_version", "status", "route", "plan", "expected_branch", "intake", "slice",
+             "later_slices", "decisions", "findings", "confirm_token", "error"},
+        )
+        self.assertEqual(status["plan"]["label"], "docs/plan.md")
+        self.assertEqual(status["expected_branch"], "feature/widgets")
+
+    def test_printed_commands_keep_the_execution_inputs(self):
+        (self.repo / "docs" / "direct.md").write_text(DIRECT, encoding="utf-8")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-q", "-m", "direct")
+        flags = ["--claude-executable", "/opt/claude", "--codex-executable", "/opt/codex",
+                 "--permission-mode", "acceptEdits", "--max-send-back-cycles", "7"]
+        code, _, out = self.start(*flags, plan=self.repo / "docs" / "direct.md", json_out=False)
+        self.assertEqual(code, 0, out)
+        printed = out.splitlines()[out.splitlines().index("start the run with:") + 1]
+        for flag, value in zip(flags[::2], flags[1::2]):
+            self.assertIn(f"{flag} {value}", printed)
+        self.assertIn("--confirm ", printed)
+
+
 class PreflightTests(_Start):
     def test_a_dirty_tree_refuses_before_any_provider_turn(self):
         (self.repo / "stray.txt").write_text("x\n", encoding="utf-8")
