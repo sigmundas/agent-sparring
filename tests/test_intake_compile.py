@@ -326,6 +326,43 @@ class CloudSyncFixtureTests(unittest.TestCase):
         self.assertEqual(len(dropped), 1)
         self.assertTrue(dropped[0].blocking)
 
+    def _go_ahead_moved_after_the_run(self, *, keep_claim):
+        text = CLOUD.replace(
+            "If Stage 2's sync metrics regress, run a canary on 5% of devices before\nStage 3A starts.",
+            "Stage 3A requires the owner's go-ahead.\nDo not start without it.",
+        )
+        payload = cloud_interpretation()  # same line numbers
+        payload["gates"][0].update(after_stage="5", blocks_stages=[])
+        if keep_claim:
+            next(f for f in payload["findings"] if f["transform"] == "gate_at_boundary")["stages"] = ["5"]
+        else:
+            payload["findings"] = [f for f in payload["findings"] if f["transform"] != "gate_at_boundary"]
+        return compile_check(payload, text=text)
+
+    def test_a_go_ahead_turned_into_a_post_run_gate_refuses_and_is_not_auto_resolved(self):
+        findings = self._go_ahead_moved_after_the_run(keep_claim=True)
+        unenforced = [f for f in findings if f.code == "gate_unenforced"]
+        self.assertEqual(len(unenforced), 1)
+        self.assertTrue(unenforced[0].blocking)
+        self.assertIn("blocks stage 3A", unenforced[0].message)
+        claim = next(f for f in findings if f.transform == "gate_at_boundary")
+        self.assertEqual(claim.disposition, "needs_decision")
+        self.assertIn("blocks stage 3A", claim.downgraded)
+
+    def test_a_go_ahead_gate_that_blocks_nothing_refuses_without_any_claim(self):
+        findings = self._go_ahead_moved_after_the_run(keep_claim=False)
+        self.assertEqual([f.code for f in findings if f.code == "gate_unenforced"], ["gate_unenforced"])
+
+    def test_a_post_run_gate_with_no_stated_blocked_stage_may_block_nothing(self):
+        text = CLOUD.replace(
+            "If Stage 2's sync metrics regress, run a canary on 5% of devices before\nStage 3A starts.",
+            "After Stage 5, deploy the release with the owner's go-ahead.\nThat closes the plan.",
+        )
+        payload = cloud_interpretation()
+        payload["gates"][0].update(after_stage="5", blocks_stages=[], kind="production")
+        payload["findings"] = [f for f in payload["findings"] if f["transform"] != "gate_at_boundary"]
+        self.assertNotIn("gate_unenforced", [f.code for f in compile_check(payload, text=text)])
+
     def test_ordinary_work_mentioning_a_deployment_is_not_a_gate(self):
         text = CLOUD.replace(
             "Add the sync columns and the server row id.", "Add unit tests for the deployment configuration parser."

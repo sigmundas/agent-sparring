@@ -134,7 +134,9 @@ in `report.md`. Every check above still applies, plus: a source line
 stating an independent review must reach a node; a paragraph that states a
 gate (a stage reference with an approval word such as "go-ahead", or with
 a gate-like event and a prerequisite word such as "before" or "requires") must be carried by a declared gate, not by a brief or an
-exclusion; a moved gate's text must evidence its kind and no other; a repository neither the plan nor `PROJECT.md` names is
+exclusion, and that gate must still block the stage the sentence says it
+blocks ("before Stage 3A", "Stage 3A requires …") and follow the one it
+follows ("after Stage 1A"), else `gate_unenforced` refuses; a moved gate's text must evidence its kind and no other; a repository neither the plan nor `PROJECT.md` names is
 `needs_decision`; a named one that was not inspected refuses with the
 `--context-repository` to add. `intake.json` records the repository names
 these were checked against, so approval recomputes the same findings.

@@ -264,6 +264,17 @@ _STAGE_AS_PREREQUISITE_RE = re.compile(
     r"|may\s+not\s+start|must\s+not\s+start|is\s+(gated|blocked)|depends)\b",
     re.IGNORECASE,
 )
+#: Within a gate sentence, which stage the gate blocks ("before Stage 3A",
+#: "Stage 3A requires ...") and which it follows ("after Stage 1A"). The
+#: declared gate carrying the sentence must keep exactly these relations.
+_LABEL = r"stages?\s+(?P<{}>[A-Za-z]*\d\w*)"
+_GATE_BLOCKS_RE = re.compile(
+    rf"\b(before|until|prior\s+to)\s+(the\s+)?{_LABEL.format('label')}"
+    rf"|\b{_LABEL.format('subject')}(\'s)?\s+(\w+\s+)?(requires?|needs?|must\s+wait|waits?|cannot\s+start|can\'t\s+start"
+    r"|may\s+not\s+start|must\s+not\s+start|is\s+(gated|blocked)|depends)\b",
+    re.IGNORECASE,
+)
+_GATE_FOLLOWS_RE = re.compile(rf"\b(after|once)\s+(the\s+)?{_LABEL.format('label')}", re.IGNORECASE)
 _INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 #: Evidence, in a gate's own source text, of each gate kind -- what
@@ -1185,6 +1196,42 @@ def states_gate(sentence: str) -> bool:
     return bool(_GATE_TEXT_RE.search(text) and _STAGE_AS_PREREQUISITE_RE.search(text))
 
 
+def gate_relation_problems(
+    interpretation: Interpretation, source: SourcePlan
+) -> list[tuple[list[int], str]]:
+    """``(lines, why)`` for every gate sentence whose declared gate lost the
+    stage relation the source states: a gate sentence blocking Stage X
+    must be carried by a gate that blocks X; one following Stage Y by a gate
+    whose ``after_stage`` is Y. Labels that name no stage of the
+    interpretation are not checked. Whether the text is covered at all is
+    ``gate_dropped``'s."""
+
+    labels = {_slug(stage.label): stage.label for _, _, _, stage in interpretation.stages()}
+    total = len(source.lines)
+    problems: list[tuple[list[int], str]] = []
+    for lines, sentence in _sentences(source):
+        if not states_gate(sentence):
+            continue
+        text = _NEGATED_GATE_RE.sub(" ", sentence)
+        covering = [g for g in interpretation.gates if set(lines) & _lines(g.ranges, total)]
+        if not covering:
+            continue
+        blocked = {
+            labels[k]
+            for m in _GATE_BLOCKS_RE.finditer(text)
+            if (k := _slug(m.group("label") or m.group("subject"))) in labels
+        }
+        follows = {labels[k] for m in _GATE_FOLLOWS_RE.finditer(text) if (k := _slug(m.group("label"))) in labels}
+        enforced = {label for g in covering for label in g.blocks_stages}
+        after = {g.after_stage for g in covering if g.after_stage}
+        ids = ", ".join(repr(g.id) for g in covering)
+        for label in sorted(blocked - enforced):
+            problems.append((lines, f"the source gate blocks stage {label}, but gate {ids} does not block it"))
+        for label in sorted(follows - after):
+            problems.append((lines, f"the source gate follows stage {label}, but gate {ids} does not follow it"))
+    return problems
+
+
 def _compile_checks(
     interpretation: Interpretation,
     source: SourcePlan,
@@ -1235,6 +1282,15 @@ def _compile_checks(
                 f"carries them ({text.strip()[:80]!r}); a gate in a brief or an exclusion is not enforced",
                 ranges=_group(missing, source),
             )
+
+    for lines, why in gate_relation_problems(interpretation, source):
+        ranges = _group(lines, source)
+        add(
+            "gate_unenforced",
+            f"lines {_ranges_text(ranges)}: {why}; a gate that no longer blocks what the plan says it "
+            "blocks is not enforced",
+            ranges=ranges,
+        )
 
     used: dict[str, list[str]] = {}
     for _, _, run, stage in interpretation.stages():
@@ -1407,6 +1463,9 @@ def _transform_problem(
                     f"gate {gate.id!r}'s source text does not establish its kind {gate.kind!r} "
                     f"unambiguously (evidence for: {found})"
                 )
+        for lines, why in gate_relation_problems(interpretation, source):
+            if cited & set(lines):
+                return why
         return None
 
     if transform == "reorder_within_candidate":
