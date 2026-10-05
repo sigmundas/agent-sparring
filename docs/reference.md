@@ -348,9 +348,13 @@ SEND_BACK goes back to the stage agent, READY to push and acceptance.
 
 **The provider is unavailable** (quota, rate limit, overloaded). The pause
 records `provider-unavailable`. Either wait and run the printed plain retry,
-which continues the same conversation, or continue in a fresh session on
-another provider: the printed fresh alternative plus, for example,
-`--sparring-provider codex-cli`.
+which continues the same conversation, or run the printed fresh alternative
+to start a new conversation for that role (a different model or effort may
+be chosen for it). A fresh session cannot switch provider today: each role
+supports exactly one (`claude-cli` for the stage agent, `codex-cli` for the
+reviewer), and any other `--stage-provider` / `--sparring-provider` is
+refused. Moving to another backend or account is configured outside the
+engine, in the provider CLI itself; the engine neither does nor sees it.
 
 **A legacy run is stuck and HEAD moved outside the loop.** A stage recorded
 before `next_turn` existed, whose handoff's candidate is no longer HEAD, is
