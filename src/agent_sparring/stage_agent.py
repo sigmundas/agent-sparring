@@ -310,6 +310,12 @@ def run_stage_agent(
             # state.base_sha was already persisted above (before the provider
             # ran) if this was the first run; it is never moved forward here.
             record_session_id(state, ROLE_STAGE, result.session_id)
+            # The exact untracked files this turn left behind, file by file:
+            # what a later reviewer-start check may treat as produced here.
+            try:
+                state.untracked_produced = untracked_candidate_paths(repo_root, stage)
+            except NextTurnError as exc:
+                raise StageAgentRunError(str(exc)) from exc
             stage.write_state(state)
             activity.emit(
                 "turn.finished",

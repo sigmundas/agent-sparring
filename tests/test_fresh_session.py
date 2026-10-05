@@ -167,7 +167,12 @@ class StuckRunTests(_Stuck):
                 sparring = _SparringAdapter([READY])
                 with self.assertRaises(PlanRunError) as ctx:
                     self._resume(stage_adapter, sparring, stop_after_stage=S1)
-                self.assertIn("waiting for review of", str(ctx.exception))
+                # An untracked drift file is refused by name, before the
+                # candidate comparison would report it as drift.
+                self.assertIn(
+                    "waiting for review of" if drift == "commit" else "drift.txt",
+                    str(ctx.exception),
+                )
                 self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
                 self.assertEqual(
                     len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 2

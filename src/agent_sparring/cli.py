@@ -1248,7 +1248,14 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
 
         _refuse_obsolete_settings(sparring_dir)
         # Before anything is recorded (agent pins included).
-        check_untracked_before_review(repo_root, stage)
+        check_untracked_before_review(
+            repo_root,
+            stage,
+            next_command=(
+                f"'sparring run-sparring {stage.stage_id} --expected-branch "
+                f"{args.expected_branch}'"
+            ),
+        )
         effective = _stage_agents(
             stage,
             resolve_agent_configs(

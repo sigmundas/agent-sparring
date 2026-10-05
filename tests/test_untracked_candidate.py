@@ -13,8 +13,15 @@ from unittest import mock
 
 import conftest_path  # noqa: F401
 
+from agent_sparring.cli import main
 from agent_sparring.loop import LoopError, run_unattended_loop
-from agent_sparring.next_turn import AmbiguousNextTurn, resolve_finalization
+from agent_sparring.next_turn import (
+    AmbiguousNextTurn,
+    NextTurnError,
+    check_untracked_before_review,
+    resolve_finalization,
+)
+from agent_sparring.providers import StageAgentResult
 from agent_sparring.plan import PlanRunError
 from agent_sparring.sparring_exchange import read_recorded_outcome
 from agent_sparring.stage import StageStatus
@@ -31,6 +38,16 @@ from test_plan import (
 )
 
 
+class _NewDirStageAdapter(_StageAdapter):
+    """Creates a brand-new directory, which plain git status collapses."""
+
+    def _turn(self, session_id):
+        self._calls += 1
+        (self.repo / "new-dir").mkdir(exist_ok=True)
+        (self.repo / "new-dir" / "legit.txt").write_text("mine\n")
+        return StageAgentResult(session_id=session_id, text="claims", is_error=False)
+
+
 class ReviewerStartGuardTests(_LoopRepo):
     def test_an_unrelated_untracked_file_refuses_the_reviewer(self):
         (self.repo / "stray.txt").write_text("not mine\n")
@@ -44,10 +61,60 @@ class ReviewerStartGuardTests(_LoopRepo):
 
         message = str(ctx.exception)
         self.assertIn("stray.txt", message)
-        self.assertIn("Remove them, commit them, or ignore them", message)
+        self.assertIn("Remove them, or ignore them", message)
+        self.assertIn("'sparring run-loop s1'", message)
         self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
         self.assertIsNone(read_recorded_outcome(self.stage))
-        self.assertEqual(self.stage.read_state().untracked_baseline, ("stray.txt",))
+        state = self.stage.read_state()
+        self.assertEqual(state.untracked_baseline, ("stray.txt",))
+        # The pinned candidate leaves the refused file out.
+        self.assertEqual(state.next_turn, "sparring")
+        self.assertEqual(state.next_turn_candidate.kind, "commit")
+        self.assertEqual(state.next_turn_candidate.untracked, ())
+
+    def test_a_file_added_under_an_implementation_directory_is_refused(self):
+        sparring = _SparringAdapter([NEEDS_YOU])
+        run_unattended_loop(
+            self.stage, self.sparring_dir, self.repo, _NewDirStageAdapter(self.repo), sparring,
+            expected_branch="feature/x",
+        )
+        self.assertEqual(len(sparring.start_calls), 1)
+        (self.repo / "new-dir" / "stray.txt").write_text("later\n")
+
+        with self.assertRaises(NextTurnError) as ctx:
+            check_untracked_before_review(self.repo, self.stage)
+        message = str(ctx.exception)
+        self.assertIn("new-dir/stray.txt", message)
+        self.assertNotIn("new-dir/legit.txt", message)
+
+    def test_a_legacy_collapsed_handoff_entry_vouches_for_nothing(self):
+        run_unattended_loop(
+            self.stage, self.sparring_dir, self.repo, _NewDirStageAdapter(self.repo),
+            _SparringAdapter([NEEDS_YOU]), expected_branch="feature/x",
+        )
+        self.assertIn("- new-dir/\n", self.stage.read_handoff())
+        path = self.stage.directory / "state.json"
+        raw = json.loads(path.read_text())
+        raw.pop("untracked_produced")
+        path.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+        with self.assertRaises(NextTurnError) as ctx:
+            check_untracked_before_review(self.repo, self.stage)
+        self.assertIn("new-dir/legit.txt", str(ctx.exception))
+
+    def test_standalone_run_sparring_names_its_own_command(self):
+        (self.repo / "stray.txt").write_text("not mine\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = main([
+                "--sparring-dir", str(self.sparring_dir), "run-sparring", "s1",
+                "--repo-root", str(self.repo), "--expected-branch", "feature/x",
+                "--codex-executable", "/nonexistent/codex",
+            ])
+        self.assertEqual(code, 1)
+        self.assertIn("stray.txt", err.getvalue())
+        self.assertIn("'sparring run-sparring s1 --expected-branch feature/x'", err.getvalue())
+        self.assertNotIn("agents", self.stage.read_state().to_dict())
 
     def test_an_untracked_file_the_implementation_created_is_reviewed(self):
         sparring = _SparringAdapter([NEEDS_YOU])
@@ -59,6 +126,35 @@ class ReviewerStartGuardTests(_LoopRepo):
         self.assertEqual(self.stage.read_state().untracked_baseline, ())
 
 
+class PreventionResumeTests(_PlanRepoTestCase):
+    def test_cleanup_after_a_refusal_resumes_into_review_without_another_turn(self):
+        (self.repo / ".DS_Store").write_text("finder\n")
+        stage_adapter, sparring = _StageAdapter(self.repo, commit=True), _SparringAdapter([READY])
+        with self.assertRaises(PlanRunError) as ctx:
+            self._start(stage_adapter, sparring, stop_after_stage=S1)
+        self.assertIn(".DS_Store", str(ctx.exception))
+        stage = self._stage(S1)
+        self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
+        self.assertIsNone(read_recorded_outcome(stage))
+        state = stage.read_state()
+        self.assertEqual(state.next_turn, "sparring")
+        self.assertEqual(state.next_turn_candidate.untracked, ())
+        pinned = state.next_turn_candidate
+
+        # Resuming without cleanup refuses again and changes nothing.
+        before = (stage.directory / "state.json").read_bytes()
+        with self.assertRaises(PlanRunError):
+            self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
+        self.assertEqual((stage.directory / "state.json").read_bytes(), before)
+
+        (self.repo / ".DS_Store").unlink()
+        sparring = _SparringAdapter([READY])
+        result = self._resume(stage_adapter, sparring, stop_after_stage=S1)
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 1)
+        self.assertEqual(len(sparring.start_calls + sparring.resume_calls), 1)
+        self.assertEqual(dict(result.accepted)[S1], pinned.head_sha)
+
+
 class UntrackedRemovalRecoveryTests(_PlanRepoTestCase):
     def leave_ready_over_stray_files(self):
         """Reproduce the incident as an older engine recorded it: READY over
@@ -67,7 +163,9 @@ class UntrackedRemovalRecoveryTests(_PlanRepoTestCase):
 
         (self.repo / ".DS_Store").write_text("finder\n")
         stage_adapter = _StageAdapter(self.repo, commit=True, fail_at=2)
-        with mock.patch("agent_sparring.loop.check_untracked_before_review"):
+        with mock.patch("agent_sparring.loop.check_untracked_before_review"), mock.patch(
+            "agent_sparring.loop.unrelated_untracked_paths", return_value=()
+        ):
             with self.assertRaises(PlanRunError):
                 self._start(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1)
         stage = self._stage(S1)
@@ -97,14 +195,15 @@ class UntrackedRemovalRecoveryTests(_PlanRepoTestCase):
             resolve_finalization(self.repo, stage, stage.read_state())
         for text in expected:
             self.assertIn(text, str(ctx.exception))
-        self.assertIn("reset-stage", str(ctx.exception))
+        self.assertIn(f"'sparring reset-stage {stage.stage_id} <plan> --expected-branch feature/x'", str(ctx.exception))
+        self.assertIn("rerun 'sparring resume-plan'", str(ctx.exception))
         self.assertEqual((stage.directory / "state.json").read_bytes(), before)
 
     def test_a_tracked_change_is_refused(self):
         stage = self.leave_ready_over_stray_files()
         (self.repo / ".DS_Store").unlink()
         (self.repo / "impl-1.txt").write_text("edited\n")
-        self.assert_refused(stage)
+        self.assert_refused(stage, "uncommitted tracked changes: impl-1.txt")
 
     def test_a_different_head_is_refused(self):
         stage = self.leave_ready_over_stray_files()
@@ -112,7 +211,7 @@ class UntrackedRemovalRecoveryTests(_PlanRepoTestCase):
         (self.repo / "later.txt").write_text("later\n")
         _run_git(self.repo, "add", "later.txt")
         _run_git(self.repo, "commit", "-q", "-m", "moved on")
-        self.assert_refused(stage, "HEAD moved")
+        self.assert_refused(stage, "HEAD moved", "(changing later.txt)")
 
     def test_a_new_untracked_file_is_refused(self):
         stage = self.leave_ready_over_stray_files()

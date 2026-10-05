@@ -37,11 +37,17 @@ from agent_sparring.acceptance import sibling_root
 from agent_sparring.finalization import (
     CandidateContent,
     FinalizationError,
+    _git,
     _is_stage_artifact,
     _uncommitted_content_paths,
     read_worktree_content,
 )
-from agent_sparring.git_context import GitContextError, dirty_entries, resolve_commit
+from agent_sparring.git_context import (
+    GitContextError,
+    current_branch,
+    dirty_entries,
+    resolve_commit,
+)
 from agent_sparring.handoff import _previous_sparring_section, extract_section
 from agent_sparring.prompt_capture import INDEX_FILENAME, prompts_dir
 from agent_sparring.routing import RoutingAction
@@ -93,52 +99,78 @@ def untracked_candidate_paths(repo_root: Path, stage: Stage) -> tuple[str, ...]:
     )
 
 
-def _covered(path: str, listed: frozenset[str]) -> bool:
-    """Is ``path`` one of ``listed``, or inside a listed collapsed directory
-    entry (``dir/``, as plain ``git status`` reports a new directory)?"""
+def unrelated_untracked_paths(repo_root: Path, stage: Stage) -> tuple[str, ...]:
+    """Untracked candidate paths the stage's implementation did not produce.
 
-    if path in listed:
-        return True
-    return any(entry.endswith("/") and path.startswith(entry) for entry in listed)
-
-
-def check_untracked_before_review(repo_root: Path, stage: Stage) -> None:
-    """Refuse a reviewer turn while untracked files the implementation did
-    not produce would become part of the candidate.
-
-    Decided from engine-owned records only: an untracked path is unrelated
-    when it was already present before the stage's first implementation
-    turn (``untracked_baseline``), or when the handoff of the last completed
-    implementation turn does not list it. Untracked files that turn
-    created stay part of the candidate. Checks only; records nothing.
+    Decided from engine-owned records only: a path is unrelated when it was
+    present before the stage's first implementation turn
+    (``untracked_baseline``) or is not among the exact untracked paths the
+    last implementation turn left (``untracked_produced``). For a turn
+    recorded before ``untracked_produced`` existed, the handoff's
+    working-tree list stands in, matched exactly: a collapsed ``dir/`` entry
+    does not say which files existed under it, so it vouches for none.
     """
 
     untracked = untracked_candidate_paths(repo_root, stage)
     if not untracked:
-        return
+        return ()
     state = stage.read_state()
     baseline = frozenset(state.untracked_baseline or ())
-    handoff = _read_handoff(stage)
-    produced = handoff.dirty_paths if handoff is not None else frozenset()
-    unrelated = [
-        path for path in untracked if path in baseline or not _covered(path, produced)
-    ]
+    if state.untracked_produced is not None:
+        produced = frozenset(state.untracked_produced)
+    else:
+        handoff = _read_handoff(stage)
+        produced = handoff.dirty_paths if handoff is not None else frozenset()
+    return tuple(path for path in untracked if path in baseline or path not in produced)
+
+
+def check_untracked_before_review(
+    repo_root: Path, stage: Stage, *, next_command: str | None = None
+) -> None:
+    """Refuse a reviewer turn while untracked files the implementation did
+    not produce would become part of the candidate (see
+    :func:`unrelated_untracked_paths`). Checks only; records nothing.
+
+    A candidate pinned while such files were present was captured without
+    them (``capture_candidate(exclude=...)``), so removing or ignoring them
+    restores exactly the pinned candidate and the same resume reaches review.
+    """
+
+    unrelated = unrelated_untracked_paths(repo_root, stage)
     if not unrelated:
         return
+    command = next_command or (
+        f"'sparring resume-plan' for a managed run, or 'sparring run-loop {stage.stage_id}' "
+        "for a standalone one"
+    )
     raise NextTurnError(
         f"refusing to start the reviewer for stage {stage.stage_id!r}: the working tree holds "
         "untracked files the stage's implementation did not produce, and they would become "
         "part of the reviewed candidate: "
         + ", ".join(unrelated)
-        + ". Nothing was recorded. Remove them, commit them, or ignore them (.gitignore or "
-        ".git/info/exclude), then resume the same command."
+        + ". No verdict was recorded and the candidate owed a review was pinned without them. "
+        "Remove them, or ignore them (.gitignore or .git/info/exclude), then rerun "
+        f"{command}. (Committing them instead changes HEAD, so the pinned candidate would no "
+        "longer match.)"
     )
 
 
-def capture_candidate(repo_root: Path, stage: Stage, state: StageState) -> TurnCandidate:
+def capture_candidate(
+    repo_root: Path,
+    stage: Stage,
+    state: StageState,
+    *,
+    exclude: tuple[str, ...] = (),
+) -> TurnCandidate:
     """The current candidate identity: HEAD, whether all candidate content is
     committed, the content digest, and every declared sibling's HEAD -- plus
-    the tracked-content digest and the untracked paths with their blobs."""
+    the tracked-content digest and the untracked paths with their blobs.
+
+    ``exclude`` names untracked paths to leave out: the identity is the one
+    the repository will have once they are removed or ignored. Only for
+    unrelated untracked files a reviewer start refuses, so that following
+    that refusal's advice leads back to exactly the pinned candidate.
+    """
 
     try:
         head = resolve_commit(repo_root, "HEAD", label="HEAD")
@@ -147,6 +179,13 @@ def capture_candidate(repo_root: Path, stage: Stage, state: StageState) -> TurnC
     except (GitContextError, FinalizationError) as exc:
         raise NextTurnError(f"could not read the candidate identity: {exc}") from exc
     untracked_paths = set(untracked_candidate_paths(repo_root, stage))
+    excluded = set(exclude) & untracked_paths
+    if excluded:
+        uncommitted = tuple(path for path in uncommitted if path not in excluded)
+        content = CandidateContent(
+            entries=tuple(entry for entry in content.entries if entry[0] not in excluded)
+        )
+        untracked_paths -= excluded
     untracked = tuple(entry for entry in content.entries if entry[0] in untracked_paths)
     tracked_digest = CandidateContent(
         entries=tuple(entry for entry in content.entries if entry[0] not in untracked_paths)
@@ -456,7 +495,11 @@ def resolve_resume_turn(
         ambiguity = check_next_turn_choice(repo_root, stage, choice)
         state = stage.read_state()
         candidate = (
-            capture_candidate(repo_root, stage, state) if choice == NEXT_TURN_SPARRING else None
+            capture_candidate(
+                repo_root, stage, state, exclude=unrelated_untracked_paths(repo_root, stage)
+            )
+            if choice == NEXT_TURN_SPARRING
+            else None
         )
         record_next_turn(stage, choice, candidate=candidate, source="manual")
         record_resolution(stage, choice, source="manual", reason=ambiguity)
@@ -472,7 +515,11 @@ def resolve_resume_turn(
         # Gate state decides; never mapped to an implementation turn.
         return NO_TURN_OWED
     candidate = (
-        capture_candidate(repo_root, stage, state) if derived == NEXT_TURN_SPARRING else None
+        capture_candidate(
+            repo_root, stage, state, exclude=unrelated_untracked_paths(repo_root, stage)
+        )
+        if derived == NEXT_TURN_SPARRING
+        else None
     )
     record_next_turn(stage, derived, candidate=candidate, source="derived")
     record_resolution(
@@ -515,7 +562,9 @@ def resolve_legacy_ready(repo_root: Path, stage: Stage) -> str:
     record_next_turn(
         stage,
         NEXT_TURN_SPARRING,
-        candidate=capture_candidate(repo_root, stage, state),
+        candidate=capture_candidate(
+            repo_root, stage, state, exclude=unrelated_untracked_paths(repo_root, stage)
+        ),
         source="derived",
     )
     record_resolution(
@@ -602,10 +651,20 @@ def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> st
         "commit, a commit of exactly the reviewed content, nor the reviewed HEAD with only "
         "previously reviewed untracked files removed, so the engine will not commit it, "
         "review it or implement on it by itself."
-        + _drift_detail(reviewed, current)
-        + " Restore the reviewed candidate, or deliberately choose how to continue (for "
-        "example 'sparring reset-stage')."
+        + _drift_detail(repo_root, stage, reviewed, current)
+        + " Restore the reviewed candidate and rerun 'sparring resume-plan', or deliberately "
+        "discard this attempt with "
+        + _reset_command(repo_root, stage)
+        + "."
     )
+
+
+def _reset_command(repo_root: Path, stage: Stage) -> str:
+    try:
+        branch = current_branch(repo_root)
+    except GitContextError:
+        branch = "<branch>"
+    return f"'sparring reset-stage {stage.stage_id} <plan> --expected-branch {branch}'"
 
 
 def _removed_untracked_only(reviewed: TurnCandidate, current: TurnCandidate) -> str | None:
@@ -640,15 +699,37 @@ def _removed_untracked_only(reviewed: TurnCandidate, current: TurnCandidate) -> 
     ) + ") and nothing else changed"
 
 
-def _drift_detail(reviewed: TurnCandidate, current: TurnCandidate) -> str:
-    """Name what blocks the untracked-removal recovery, where recorded."""
+def _drift_detail(
+    repo_root: Path, stage: Stage, reviewed: TurnCandidate, current: TurnCandidate
+) -> str:
+    """Name what blocks the untracked-removal recovery, with paths where the
+    repository can supply them."""
 
     if reviewed.kind != "worktree":
         return ""
     if current.head_sha != reviewed.head_sha:
-        return f" HEAD moved from {reviewed.head_sha} to {current.head_sha}."
+        try:
+            changed = [
+                line
+                for line in _git(
+                    repo_root, "diff", "--name-only", reviewed.head_sha, current.head_sha
+                ).splitlines()
+                if line
+            ]
+        except FinalizationError:
+            changed = []
+        return (
+            f" HEAD moved from {reviewed.head_sha} to {current.head_sha}"
+            + (" (changing " + ", ".join(changed) + ")" if changed else "")
+            + "."
+        )
     if current.repositories != reviewed.repositories:
-        return " A declared sibling repository's HEAD changed."
+        moved = [
+            f"{after.name} {before.head_sha} -> {after.head_sha}"
+            for before, after in zip(reviewed.repositories, current.repositories)
+            if before != after
+        ]
+        return " Declared sibling HEADs changed: " + (", ".join(moved) or "pins differ") + "."
     if reviewed.untracked is None or current.untracked is None:
         return ""
     before = dict(reviewed.untracked)
@@ -661,7 +742,16 @@ def _drift_detail(reviewed: TurnCandidate, current: TurnCandidate) -> str:
     if modified:
         parts.append("modified previously reviewed untracked files: " + ", ".join(modified))
     if current.tracked_digest is not None and current.tracked_digest != reviewed.tracked_digest:
-        parts.append("tracked content changed")
+        try:
+            tracked = sorted(
+                set(_uncommitted_content_paths(repo_root, stage)) - set(after)
+            )
+        except FinalizationError:
+            tracked = []
+        parts.append(
+            "tracked content changed"
+            + (" (uncommitted tracked changes: " + ", ".join(tracked) + ")" if tracked else "")
+        )
     return (" Found " + "; ".join(parts) + ".") if parts else ""
 
 
@@ -727,6 +817,8 @@ __all__ = [
     "capture_candidate",
     "check_next_turn_choice",
     "check_untracked_before_review",
+    "unrelated_untracked_paths",
+    "untracked_candidate_paths",
     "derive_next_turn",
     "record_next_turn",
     "record_resolution",

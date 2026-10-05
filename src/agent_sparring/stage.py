@@ -558,6 +558,10 @@ class StageState:
     # implementation demonstrably did not produce. ``None`` -- absent from
     # state.json -- for stages that started before it was recorded.
     untracked_baseline: tuple[str, ...] | None = None
+    # The exact untracked candidate paths present when the last
+    # implementation turn finished (file by file). ``None`` -- absent -- for
+    # turns recorded before it existed; the handoff's list is used then.
+    untracked_produced: tuple[str, ...] | None = None
     # Provider conversations per role (see agent_sparring.sessions),
     # ``{role: [SessionGeneration, ...]}``. Empty and absent from state.json
     # until a fresh session is first started; until then the recorded
@@ -582,6 +586,10 @@ class StageState:
             payload.pop("untracked_baseline", None)
         else:
             payload["untracked_baseline"] = list(self.untracked_baseline)
+        if self.untracked_produced is None:
+            payload.pop("untracked_produced", None)
+        else:
+            payload["untracked_produced"] = list(self.untracked_produced)
         if not self.sessions:
             payload.pop("sessions", None)
         else:
@@ -653,11 +661,12 @@ class StageState:
         raw_candidate = payload.get("next_turn_candidate")
         raw_resolution = payload.get("next_turn_resolution")
         raw_baseline = payload.get("untracked_baseline")
-        if raw_baseline is not None and (
-            not isinstance(raw_baseline, list)
-            or not all(isinstance(path, str) for path in raw_baseline)
-        ):
-            raise StageError("state.json field 'untracked_baseline' must be a list of paths")
+        raw_produced = payload.get("untracked_produced")
+        for name, raw in (("untracked_baseline", raw_baseline), ("untracked_produced", raw_produced)):
+            if raw is not None and (
+                not isinstance(raw, list) or not all(isinstance(path, str) for path in raw)
+            ):
+                raise StageError(f"state.json field {name!r} must be a list of paths")
         raw_sessions = payload.get("sessions")
         if raw_sessions is None:
             sessions: dict[str, list[SessionGeneration]] = {}
@@ -684,6 +693,7 @@ class StageState:
                 else None
             ),
             untracked_baseline=tuple(raw_baseline) if raw_baseline is not None else None,
+            untracked_produced=tuple(raw_produced) if raw_produced is not None else None,
             sessions=sessions,
             agents=agents,
             status=status,

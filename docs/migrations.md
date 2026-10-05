@@ -198,7 +198,8 @@ adds:
 | `next_turn`, `next_turn_candidate`, `next_turn_source` | state from before the marker; the first resume derives it once from engine records, or refuses as ambiguous and takes an explicit choice (`manual`) | the loop advances the marker, a verdict is recorded, or a derived/manual marker is persisted |
 | `next_turn_candidate.tracked_digest`, `next_turn_candidate.untracked` | a candidate recorded before the split; a `finalization` resume over it allows the untracked-removal recovery only on same HEAD, same sibling HEADs and a clean worktree, and says so | a candidate is captured |
 | `next_turn_resolution` | no ambiguous legacy state was resolved (or it was resolved before this record existed) | a derived or manual marker is first persisted; never rewritten |
-| `untracked_baseline` | a stage started before it was recorded; the reviewer-start check then relies on the handoff's listed paths alone | the stage's first implementation turn records `base_sha` |
+| `untracked_produced` | the last implementation turn was recorded before it; the reviewer-start check uses the handoff's list, exactly (a collapsed `dir/` entry covers nothing) | each implementation turn finishes |
+| `untracked_baseline` | a stage started before it was recorded; only the last turn's produced paths count | the stage's first implementation turn records `base_sha` |
 | `sessions` | the recorded session ids and `agents` pins are generation 1 (`started_at` unknown) | a role's configuration is pinned or its session id is recorded, or a fresh session is started |
 
 The plan-run state (`.sparring/plans/<run>.json`) likewise gains one

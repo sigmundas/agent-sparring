@@ -960,7 +960,10 @@ class EvidenceRetryTests(_PlanRepoTestCase):
         reviewer = _SparringAdapter([READY])
         code, _, err = self.cli(commands[0], stage_adapter, reviewer)
         self.assertEqual(code, 1)
-        self.assertIn("waiting for review of", err)
+        # An unrelated untracked file is refused by name before the
+        # candidate comparison would report it as drift.
+        self.assertIn("untracked files the stage's implementation did not produce", err)
+        self.assertIn("drift.txt", err)
         self.assertEqual(reviewer.start_calls + reviewer.resume_calls, [])
 
     def test_a_new_verdict_retires_the_pending_evidence(self):
