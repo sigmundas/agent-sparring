@@ -312,10 +312,13 @@ def run_stage_agent(
             record_session_id(state, ROLE_STAGE, result.session_id)
             # The exact untracked files this turn left behind, file by file:
             # what a later reviewer-start check may treat as produced here.
-            try:
-                state.untracked_produced = untracked_candidate_paths(repo_root, stage)
-            except NextTurnError as exc:
-                raise StageAgentRunError(str(exc)) from exc
+            # Only a turn the provider reported as successful: a failed turn
+            # is never owed a review (see next_turn.implementation_awaiting_review).
+            if not result.is_error:
+                try:
+                    state.untracked_produced = untracked_candidate_paths(repo_root, stage)
+                except NextTurnError as exc:
+                    raise StageAgentRunError(str(exc)) from exc
             stage.write_state(state)
             activity.emit(
                 "turn.finished",

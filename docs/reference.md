@@ -149,30 +149,37 @@ repository's HEAD; a declared sibling that cannot be read refuses the
 capture instead of being pinned as unknown. It also records, separately,
 the digest of the tracked content alone (`tracked_digest`) and each
 untracked candidate path with its blob (`untracked`); these refine the
-identity for recovery and take no part in matching it.
+identity for recovery and take no part in matching it. Before such a review
+starts the engine re-reads all of them, and any difference is refused with both identities named; it never
+falls back to running the other agent. A failed provider turn never advances
+the marker, and NEEDS_YOU / ESCALATE leave it where it is -- the recorded
+gate decides what happens next.
 
 Untracked, non-ignored files are part of the candidate exactly as the
-reviewer sees them; they are never silently excluded. So before any reviewer
-turn (`resume-plan`, `run-plan`, `run-loop` and standalone `run-sparring`)
-the engine refuses while the worktree holds untracked paths the stage's
-implementation did not produce, naming them and saying to remove, commit or
-ignore them and naming the command to rerun; no verdict is recorded.
-"Did not produce" is decided from engine records only: present before the
-stage's first implementation turn (`untracked_baseline`, recorded with
-`base_sha`), or not among the exact untracked paths the last implementation
+reviewer sees them; they are never excluded from candidate identity. So
+before any reviewer turn (`run-plan`, `resume-plan`, `run-loop` and
+standalone `run-sparring`) the engine refuses while the worktree holds
+untracked paths the stage's implementation did not produce, naming them and
+saying to remove, commit or ignore them. The check runs before any review
+marker, pinned candidate or `next_turn_resolution` is written (including a
+derived or `--next-turn sparring` resolution), so a refusal records nothing
+for the review; the CLI prints the exact command to rerun. "Did not
+produce" is decided from engine records only: present before the stage's
+first implementation turn (`untracked_baseline`, recorded with `base_sha`),
+or not among the exact untracked paths the last successful implementation
 turn left (`untracked_produced`, file by file). For a turn recorded before
 `untracked_produced` existed the handoff's working-tree list stands in, but
 a collapsed `dir/` entry vouches for no file under it. Untracked files the
-implementation created stay part of the candidate. A `sparring` marker
-pinned while such files are present (after an implementation turn, or by a
-derived or `--next-turn sparring` resolution) is pinned *without* them, so
-removing or ignoring them restores exactly the pinned candidate and the same
-resume reaches review with no further implementation turn. Committing them
-instead moves HEAD and is refused as drift. Before such a review starts the engine re-reads all of
-them, and any difference is refused with both identities named; it never
-falls back to running the other agent. A failed provider turn never advances
-the marker, and NEEDS_YOU / ESCALATE leave it where it is -- the recorded
-gate decides what happens next. A `finalization` marker is matched against the candidate READY was given
+implementation created stay part of the candidate.
+
+When the refusal follows a completed implementation turn, `next_turn` stays
+`stage`, but that turn's own record (`untracked_produced`, which the loop
+clears whenever it starts an implementation turn and only a successful turn
+writes) says a review is owed. Once the files are removed, committed or
+ignored, the same resume therefore goes straight to the reviewer, which
+pins whatever the candidate then is -- no further implementation turn.
+
+A `finalization` marker is matched against the candidate READY was given
 over, by both `resume-plan` and `run-loop`: the same uncommitted candidate
 gets the bounded commit/push turn; that exact content already committed (by
 an interrupted commit turn, or by hand) and nothing uncommitted is re-marked
@@ -185,8 +192,9 @@ before `tracked_digest`/`untracked` existed qualifies on same HEAD, same
 sibling HEADs and a clean worktree alone, and the resume says so); anything
 else is refused, naming what changed (HEAD and the paths it changed,
 sibling HEADs, new or modified untracked paths, uncommitted tracked paths)
-and the commands to continue (`resume-plan` after restoring, or
-`reset-stage <stage> <plan> --expected-branch <branch>`). READY over a candidate that was already a commit needs no commit
+and, from the CLI, the exact commands to continue (the same resume after
+restoring, or `reset-stage` with the run's plan input, repository and
+branch). READY over a candidate that was already a commit needs no commit
 turn: if that exact commit (HEAD, content, sibling HEADs) is still the
 candidate, `resume-plan` runs only the push and acceptance gates for it, with
 no agent turn; if it has moved, the resume is refused. `run-loop`, which

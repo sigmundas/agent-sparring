@@ -123,7 +123,6 @@ from agent_sparring.next_turn import (
     capture_candidate,
     check_untracked_before_review,
     record_next_turn,
-    unrelated_untracked_paths,
     verify_candidate,
 )
 from agent_sparring.providers import (
@@ -404,6 +403,12 @@ def run_unattended_loop(
                 # Implementation work is owed from here until this turn and
                 # all of its records succeed.
                 record_next_turn(stage, NEXT_TURN_STAGE)
+                # Until this turn succeeds, no implementation turn is
+                # awaiting review (next_turn.implementation_awaiting_review).
+                state = stage.read_state()
+                if state.untracked_produced is not None:
+                    state.untracked_produced = None
+                    stage.write_state(state)
             try:
                 stage_run = run_stage_agent(
                     stage,
@@ -493,22 +498,29 @@ def run_unattended_loop(
             )
             pending = None
 
-        if stage_run is not None:
+        # Untracked files the implementation did not produce must never
+        # silently become part of the reviewed candidate. Checked before the
+        # review marker is written, so a refusal records nothing for the
+        # review; the completed implementation turn's own records (its
+        # handoff, session and ``untracked_produced``) make the same resume
+        # owe this review once the files are removed, committed or ignored.
+        try:
+            check_untracked_before_review(repo_root, stage)
+        except NextTurnError as exc:
+            activity.emit("loop.stopped", cycle=cycle, summary="unrelated untracked files")
+            if cycle == 1 and stage_run is None:
+                raise CandidateRefused(str(exc)) from exc
+            raise LoopError(str(exc)) from exc
+
+        if stage_run is not None or stage.read_state().next_turn == NEXT_TURN_STAGE:
             # The implementation turn, its handoff and its session are all
-            # recorded (run_stage_agent returned; a finalization commit was
+            # recorded (run_stage_agent returned -- in this process, or in
+            # one whose review was refused above; a finalization commit was
             # verified above): the candidate it produced is what the
             # reviewer owes a verdict on. Pinned now, before the reviewer
             # starts, so a reviewer that fails leaves exactly this behind.
             try:
-                # Unrelated untracked files are left out of the pin: the
-                # reviewer start below refuses while they are there, and
-                # removing or ignoring them restores exactly this candidate.
-                candidate = capture_candidate(
-                    repo_root,
-                    stage,
-                    stage.read_state(),
-                    exclude=unrelated_untracked_paths(repo_root, stage),
-                )
+                candidate = capture_candidate(repo_root, stage, stage.read_state())
                 record_next_turn(stage, NEXT_TURN_SPARRING, candidate=candidate)
             except NextTurnError as exc:
                 activity.emit("loop.stopped", cycle=cycle, summary="candidate identity unreadable")
@@ -522,16 +534,6 @@ def run_unattended_loop(
         # question about exactly that content, and a reviewer must never
         # judge it against anything else. (Legacy state with no marker keeps
         # its existing evidence semantics.)
-        # Untracked files the implementation did not produce must never
-        # silently become part of the reviewed candidate. Checked first, so
-        # their presence is reported as such rather than as drift.
-        try:
-            check_untracked_before_review(repo_root, stage)
-        except NextTurnError as exc:
-            activity.emit("loop.stopped", cycle=cycle, summary="unrelated untracked files")
-            if cycle == 1 and stage_run is None:
-                raise CandidateRefused(str(exc)) from exc
-            raise LoopError(str(exc)) from exc
         current = stage.read_state()
         if current.next_turn == NEXT_TURN_SPARRING:
             try:

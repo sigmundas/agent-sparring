@@ -98,7 +98,9 @@ from agent_sparring.providers.codex_cli import PROVIDER_ID as CODEX_PROVIDER_ID,
 from agent_sparring.recovery import RecoveryError, reopen_for_failed_check, reset_stage
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
 from agent_sparring.next_turn import (
+    FinalizationDrift,
     NextTurnError,
+    UntrackedRefusal,
     check_untracked_before_review,
     standalone_start_with,
 )
@@ -1248,14 +1250,7 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
 
         _refuse_obsolete_settings(sparring_dir)
         # Before anything is recorded (agent pins included).
-        check_untracked_before_review(
-            repo_root,
-            stage,
-            next_command=(
-                f"'sparring run-sparring {stage.stage_id} --expected-branch "
-                f"{args.expected_branch}'"
-            ),
-        )
+        check_untracked_before_review(repo_root, stage)
         effective = _stage_agents(
             stage,
             resolve_agent_configs(
@@ -1288,6 +1283,18 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
         NextTurnError,
     ) as exc:
         print(f"could not run sparring agent: {exc}", file=sys.stderr)
+        if _refusal_cause(exc) is not None:
+            _print_next_commands(
+                exc,
+                shlex.join(
+                    [
+                        "sparring", "--sparring-dir", str(Path(sparring_dir).resolve()),
+                        "run-sparring", args.stage_id,
+                        "--repo-root", str(Path(repo_root).resolve()),
+                        "--expected-branch", args.expected_branch,
+                    ]
+                ),
+            )
         return 1
 
     print(run_result.sparring)
@@ -1591,6 +1598,10 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
         failure = recoverable_provider_failure(exc)
         if failure is None:
             print(f"could not run unattended loop: {exc}", file=sys.stderr)
+            if _refusal_cause(exc) is not None:
+                _print_next_commands(
+                    exc, _retry_command(args, sparring_dir, repo_root, ["run-loop", args.stage_id])
+                )
             return 1
         role = _loop_failed_role(exc)
         state = stage.read_state()
@@ -1618,6 +1629,10 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
         ProviderError,
     ) as exc:
         print(f"could not run unattended loop: {exc}", file=sys.stderr)
+        if _refusal_cause(exc) is not None:
+            _print_next_commands(
+                exc, _retry_command(args, sparring_dir, repo_root, ["run-loop", args.stage_id])
+            )
         return 1
 
     print(loop_result.routing.summary)
@@ -1638,6 +1653,46 @@ def _loop_failed_role(exc: BaseException) -> str:
             return ROLE_STAGE
         current = current.__cause__
     return ROLE_STAGE
+
+
+def _refusal_cause(exc: BaseException) -> NextTurnError | None:
+    """The untracked-file or finalization-drift refusal behind ``exc``, if
+    any, following the exception chain the loop and plan layers wrap it in."""
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, (UntrackedRefusal, FinalizationDrift)):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _print_next_commands(exc: BaseException, rerun: str, reset: str | None = None) -> None:
+    """For the refusals whose next step is a command, print it exactly."""
+
+    cause = _refusal_cause(exc)
+    if cause is None:
+        return
+    if isinstance(cause, UntrackedRefusal):
+        print(
+            "Remove, commit or ignore: " + ", ".join(cause.paths) + "; then rerun:",
+            file=sys.stderr,
+        )
+        print(f"  {rerun}", file=sys.stderr)
+        return
+    print("After restoring the reviewed candidate, rerun:", file=sys.stderr)
+    print(f"  {rerun}", file=sys.stderr)
+    if reset is not None:
+        print("Or deliberately discard this attempt:", file=sys.stderr)
+        print(f"  {reset}", file=sys.stderr)
+
+
+def _plan_command_parts(args: argparse.Namespace) -> list[str]:
+    if args.manifest:
+        return ["--manifest", str(Path(args.manifest).resolve())]
+    return [str(Path(args.plan_path).resolve())]
 
 
 def _plan_input_args(args: argparse.Namespace, run: str = "") -> str:
@@ -1957,6 +2012,34 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
         DeferredGateError,
     ) as exc:
         print(f"could not {'resume' if resume else 'run'} plan: {exc}", file=sys.stderr)
+        cause = _refusal_cause(exc)
+        run_key = getattr(args, "run_key", None)
+        if cause is not None:
+            _print_next_commands(
+                exc,
+                _retry_command(
+                    args,
+                    sparring_dir,
+                    repo_root,
+                    [
+                        "resume-plan",
+                        *_plan_command_parts(args),
+                        *(["--run-key", run_key] if run_key else []),
+                    ],
+                ),
+                reset=(
+                    shlex.join(
+                        [
+                            "sparring", "--sparring-dir", str(Path(sparring_dir).resolve()),
+                            "reset-stage", cause.stage_id, *_plan_command_parts(args),
+                            "--repo-root", str(Path(repo_root).resolve()),
+                            "--expected-branch", args.expected_branch,
+                        ]
+                    )
+                    if isinstance(cause, FinalizationDrift)
+                    else None
+                ),
+            )
         return 1
 
     _report_plan_result(result, args, sparring_dir)

@@ -18,8 +18,11 @@ from agent_sparring.loop import LoopError, run_unattended_loop
 from agent_sparring.next_turn import (
     AmbiguousNextTurn,
     NextTurnError,
+    UntrackedRefusal,
     check_untracked_before_review,
+    implementation_awaiting_review,
     resolve_finalization,
+    resolve_resume_turn,
 )
 from agent_sparring.providers import StageAgentResult
 from agent_sparring.plan import PlanRunError
@@ -27,6 +30,7 @@ from agent_sparring.sparring_exchange import read_recorded_outcome
 from agent_sparring.stage import StageStatus
 
 from test_fresh_session import _DirtyStageAdapter, _LoopRepo, _head, _strip_marker
+from test_session_recovery import _printed_commands
 from test_plan import (
     NEEDS_YOU,
     READY,
@@ -61,16 +65,18 @@ class ReviewerStartGuardTests(_LoopRepo):
 
         message = str(ctx.exception)
         self.assertIn("stray.txt", message)
-        self.assertIn("Remove them, or ignore them", message)
-        self.assertIn("'sparring run-loop s1'", message)
+        self.assertIn("Remove them, commit them, or ignore them", message)
+        self.assertIn("Nothing was recorded for the review", message)
         self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
         self.assertIsNone(read_recorded_outcome(self.stage))
         state = self.stage.read_state()
         self.assertEqual(state.untracked_baseline, ("stray.txt",))
-        # The pinned candidate leaves the refused file out.
-        self.assertEqual(state.next_turn, "sparring")
-        self.assertEqual(state.next_turn_candidate.kind, "commit")
-        self.assertEqual(state.next_turn_candidate.untracked, ())
+        # No review marker and no candidate were written; the completed
+        # implementation turn's own record is what makes a review owed.
+        self.assertEqual(state.next_turn, "stage")
+        self.assertIsNone(state.next_turn_candidate)
+        self.assertEqual(state.untracked_produced, ("stray.txt",))
+        self.assertTrue(implementation_awaiting_review(self.stage, state))
 
     def test_a_file_added_under_an_implementation_directory_is_refused(self):
         sparring = _SparringAdapter([NEEDS_YOU])
@@ -113,7 +119,13 @@ class ReviewerStartGuardTests(_LoopRepo):
             ])
         self.assertEqual(code, 1)
         self.assertIn("stray.txt", err.getvalue())
-        self.assertIn("'sparring run-sparring s1 --expected-branch feature/x'", err.getvalue())
+        self.assertEqual(
+            _printed_commands(err.getvalue()),
+            [[
+                "--sparring-dir", str(self.sparring_dir.resolve()), "run-sparring", "s1",
+                "--repo-root", str(self.repo.resolve()), "--expected-branch", "feature/x",
+            ]],
+        )
         self.assertNotIn("agents", self.stage.read_state().to_dict())
 
     def test_an_untracked_file_the_implementation_created_is_reviewed(self):
@@ -127,7 +139,15 @@ class ReviewerStartGuardTests(_LoopRepo):
 
 
 class PreventionResumeTests(_PlanRepoTestCase):
-    def test_cleanup_after_a_refusal_resumes_into_review_without_another_turn(self):
+    def cli(self, argv, stage_adapter, sparring):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch(
+            "agent_sparring.cli._build_loop_adapters", return_value=(stage_adapter, sparring)
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(argv)
+        return code, err.getvalue()
+
+    def refuse(self):
         (self.repo / ".DS_Store").write_text("finder\n")
         stage_adapter, sparring = _StageAdapter(self.repo, commit=True), _SparringAdapter([READY])
         with self.assertRaises(PlanRunError) as ctx:
@@ -137,22 +157,71 @@ class PreventionResumeTests(_PlanRepoTestCase):
         self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
         self.assertIsNone(read_recorded_outcome(stage))
         state = stage.read_state()
-        self.assertEqual(state.next_turn, "sparring")
-        self.assertEqual(state.next_turn_candidate.untracked, ())
-        pinned = state.next_turn_candidate
+        self.assertEqual(state.next_turn, "stage")
+        self.assertIsNone(state.next_turn_candidate)
 
-        # Resuming without cleanup refuses again and changes nothing.
+        # Resuming without cleanup refuses again, changes nothing, and
+        # prints the exact command to rerun.
         before = (stage.directory / "state.json").read_bytes()
-        with self.assertRaises(PlanRunError):
-            self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
+        code, err = self.cli(
+            ["--sparring-dir", str(self.sparring_dir), "resume-plan", str(self.plan_path),
+             "--repo-root", str(self.repo), "--expected-branch", "feature/x",
+             "--stop-after-stage", S1],
+            stage_adapter, _SparringAdapter([]),
+        )
+        self.assertEqual(code, 1, err)
+        self.assertIn("Remove, commit or ignore: .DS_Store", err)
         self.assertEqual((stage.directory / "state.json").read_bytes(), before)
+        (command,) = _printed_commands(err)
+        self.assertIn("resume-plan", command)
+        self.assertIn(str(self.plan_path.resolve()), command)
+        return stage, stage_adapter, command
 
-        (self.repo / ".DS_Store").unlink()
-        sparring = _SparringAdapter([READY])
-        result = self._resume(stage_adapter, sparring, stop_after_stage=S1)
-        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 1)
-        self.assertEqual(len(sparring.start_calls + sparring.resume_calls), 1)
-        self.assertEqual(dict(result.accepted)[S1], pinned.head_sha)
+    def test_each_remedy_resumes_into_review_without_another_turn(self):
+        remedies = {
+            "remove": lambda: (self.repo / ".DS_Store").unlink(),
+            "ignore": lambda: (self.repo / ".git" / "info" / "exclude").write_text(".DS_Store\n"),
+            "commit": lambda: (
+                _run_git(self.repo, "add", ".DS_Store"),
+                _run_git(self.repo, "commit", "-q", "-m", "keep it"),
+                _run_git(self.repo, "push", "-q", "origin", "feature/x"),
+            ),
+        }
+        for name, remedy in remedies.items():
+            with self.subTest(remedy=name):
+                self.setUp()
+                stage, stage_adapter, command = self.refuse()
+                remedy()
+                sparring = _SparringAdapter([READY])
+                code, err = self.cli(command, stage_adapter, sparring)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(
+                    len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 1
+                )
+                self.assertEqual(len(sparring.start_calls + sparring.resume_calls), 1)
+                state = stage.read_state()
+                self.assertIs(state.status, StageStatus.ACCEPTED)
+                self.assertEqual(state.candidate_sha, _head(self.repo))
+
+    def test_a_manual_sparring_choice_is_refused_before_anything_is_recorded(self):
+        from test_fresh_session import _FailingSparringAdapter, FAIL, SEND_BACK
+
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        with self.assertRaises(PlanRunError):
+            self._start(stage_adapter, _FailingSparringAdapter([SEND_BACK, FAIL]))
+        stage = self._stage(S1)
+        _strip_marker(stage)
+        (self.repo / "later.txt").write_text("later\n")
+        _run_git(self.repo, "add", "later.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "moved on")
+        (self.repo / "stray.txt").write_text("not mine\n")
+        before = (stage.directory / "state.json").read_bytes()
+
+        with self.assertRaises(UntrackedRefusal) as ctx:
+            resolve_resume_turn(self.repo, stage, choice="sparring")
+        self.assertEqual(ctx.exception.paths, ("stray.txt",))
+        self.assertEqual((stage.directory / "state.json").read_bytes(), before)
+        self.assertIsNone(stage.read_state().next_turn_resolution)
 
 
 class UntrackedRemovalRecoveryTests(_PlanRepoTestCase):
@@ -163,9 +232,7 @@ class UntrackedRemovalRecoveryTests(_PlanRepoTestCase):
 
         (self.repo / ".DS_Store").write_text("finder\n")
         stage_adapter = _StageAdapter(self.repo, commit=True, fail_at=2)
-        with mock.patch("agent_sparring.loop.check_untracked_before_review"), mock.patch(
-            "agent_sparring.loop.unrelated_untracked_paths", return_value=()
-        ):
+        with mock.patch("agent_sparring.loop.check_untracked_before_review"):
             with self.assertRaises(PlanRunError):
                 self._start(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1)
         stage = self._stage(S1)
@@ -195,8 +262,8 @@ class UntrackedRemovalRecoveryTests(_PlanRepoTestCase):
             resolve_finalization(self.repo, stage, stage.read_state())
         for text in expected:
             self.assertIn(text, str(ctx.exception))
-        self.assertIn(f"'sparring reset-stage {stage.stage_id} <plan> --expected-branch feature/x'", str(ctx.exception))
-        self.assertIn("rerun 'sparring resume-plan'", str(ctx.exception))
+        self.assertIn("rerun the same resume", str(ctx.exception))
+        self.assertIn("'sparring reset-stage'", str(ctx.exception))
         self.assertEqual((stage.directory / "state.json").read_bytes(), before)
 
     def test_a_tracked_change_is_refused(self):
@@ -239,6 +306,32 @@ class UntrackedRemovalRecoveryTests(_PlanRepoTestCase):
         self.assertIn("without its untracked-file detail", err.getvalue())
         state = stage.read_state()
         self.assertEqual((state.next_turn, state.next_turn_candidate.kind), ("sparring", "commit"))
+
+
+class FinalizationDriftCommandTests(_PlanRepoTestCase):
+    def test_the_cli_prints_runnable_resume_and_reset_commands(self):
+        stage = UntrackedRemovalRecoveryTests.leave_ready_over_stray_files(self)
+        (self.repo / ".DS_Store").unlink()
+        (self.repo / "later.txt").write_text("later\n")
+        _run_git(self.repo, "add", "later.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "moved on")
+        cli = PreventionResumeTests.cli
+        argv = ["--sparring-dir", str(self.sparring_dir), "resume-plan", str(self.plan_path),
+                "--repo-root", str(self.repo), "--expected-branch", "feature/x"]
+        code, err = cli(self, argv, _StageAdapter(self.repo), _SparringAdapter([]))
+        self.assertEqual(code, 1, err)
+        resume, reset = _printed_commands(err)
+        self.assertEqual(resume[2], "resume-plan")
+        self.assertEqual(
+            reset,
+            ["--sparring-dir", str(self.sparring_dir.resolve()), "reset-stage", stage.stage_id,
+             str(self.plan_path.resolve()), "--repo-root", str(self.repo.resolve()),
+             "--expected-branch", "feature/x"],
+        )
+        # The printed resume is runnable: it parses and repeats the refusal.
+        code, again = cli(self, resume, _StageAdapter(self.repo), _SparringAdapter([]))
+        self.assertEqual(code, 1, again)
+        self.assertIn("HEAD moved", again)
 
 
 class ManualResolutionProvenanceTests(_PlanRepoTestCase):

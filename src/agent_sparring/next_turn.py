@@ -44,7 +44,6 @@ from agent_sparring.finalization import (
 )
 from agent_sparring.git_context import (
     GitContextError,
-    current_branch,
     dirty_entries,
     resolve_commit,
 )
@@ -80,6 +79,15 @@ class NextTurnError(RuntimeError):
 class AmbiguousNextTurn(NextTurnError):
     """Legacy state does not say unambiguously whose turn it is; the caller
     must choose explicitly (``next_turn`` = ``stage`` | ``sparring``)."""
+
+
+class FinalizationDrift(AmbiguousNextTurn):
+    """A ``finalization`` marker no longer matches the repository. Callers
+    that know their own command line add the exact commands to continue."""
+
+    def __init__(self, message: str, *, stage_id: str):
+        super().__init__(message)
+        self.stage_id = stage_id
 
 
 def untracked_candidate_paths(repo_root: Path, stage: Stage) -> tuple[str, ...]:
@@ -124,53 +132,69 @@ def unrelated_untracked_paths(repo_root: Path, stage: Stage) -> tuple[str, ...]:
     return tuple(path for path in untracked if path in baseline or path not in produced)
 
 
-def check_untracked_before_review(
-    repo_root: Path, stage: Stage, *, next_command: str | None = None
-) -> None:
+class UntrackedRefusal(NextTurnError):
+    """A reviewer start refused for untracked files the implementation did
+    not produce. ``paths`` names them; callers that know their own command
+    line add the exact command to rerun."""
+
+    def __init__(self, message: str, paths: tuple[str, ...]):
+        super().__init__(message)
+        self.paths = paths
+
+
+def implementation_awaiting_review(stage: Stage, state: StageState) -> bool:
+    """A completed implementation turn whose review was never pinned.
+
+    The loop clears ``untracked_produced`` when it writes ``next_turn =
+    stage`` at a cycle start, and a successful (not ``is_error``)
+    implementation turn records it again. Both still standing together means
+    that turn completed and the reviewer-start check refused before the
+    review marker was written: the turn owed is that review, not another
+    implementation turn.
+    """
+
+    if state.next_turn != NEXT_TURN_STAGE or state.untracked_produced is None:
+        return False
+    # A verdict (SEND_BACK) or a reopen recorded since that turn also leaves
+    # next_turn = stage: the turn is only still unreviewed while its handoff
+    # embeds the review record that is on disk now.
+    handoff = _read_handoff(stage)
+    return (
+        handoff is not None
+        and handoff.previous_sparring == _previous_sparring_section(stage).strip()
+    )
+
+
+def check_untracked_before_review(repo_root: Path, stage: Stage) -> None:
     """Refuse a reviewer turn while untracked files the implementation did
     not produce would become part of the candidate (see
     :func:`unrelated_untracked_paths`). Checks only; records nothing.
 
-    A candidate pinned while such files were present was captured without
-    them (``capture_candidate(exclude=...)``), so removing or ignoring them
-    restores exactly the pinned candidate and the same resume reaches review.
+    Every caller runs it before writing a review marker or a resolution, so
+    a refusal leaves the stage exactly as it was. Once the files are
+    removed, committed or ignored, the same resume reaches review: a
+    completed implementation turn with no review marker after it is owed a
+    review (see :func:`implementation_awaiting_review`).
     """
 
     unrelated = unrelated_untracked_paths(repo_root, stage)
     if not unrelated:
         return
-    command = next_command or (
-        f"'sparring resume-plan' for a managed run, or 'sparring run-loop {stage.stage_id}' "
-        "for a standalone one"
-    )
-    raise NextTurnError(
+    raise UntrackedRefusal(
         f"refusing to start the reviewer for stage {stage.stage_id!r}: the working tree holds "
         "untracked files the stage's implementation did not produce, and they would become "
         "part of the reviewed candidate: "
         + ", ".join(unrelated)
-        + ". No verdict was recorded and the candidate owed a review was pinned without them. "
-        "Remove them, or ignore them (.gitignore or .git/info/exclude), then rerun "
-        f"{command}. (Committing them instead changes HEAD, so the pinned candidate would no "
-        "longer match.)"
+        + ". Nothing was recorded for the review. Remove them, commit them, or ignore them "
+        "(.gitignore or .git/info/exclude), then rerun the same command.",
+        unrelated,
     )
 
 
-def capture_candidate(
-    repo_root: Path,
-    stage: Stage,
-    state: StageState,
-    *,
-    exclude: tuple[str, ...] = (),
-) -> TurnCandidate:
+def capture_candidate(repo_root: Path, stage: Stage, state: StageState) -> TurnCandidate:
     """The current candidate identity: HEAD, whether all candidate content is
     committed, the content digest, and every declared sibling's HEAD -- plus
-    the tracked-content digest and the untracked paths with their blobs.
-
-    ``exclude`` names untracked paths to leave out: the identity is the one
-    the repository will have once they are removed or ignored. Only for
-    unrelated untracked files a reviewer start refuses, so that following
-    that refusal's advice leads back to exactly the pinned candidate.
-    """
+    the tracked-content digest and the untracked paths with their blobs."""
 
     try:
         head = resolve_commit(repo_root, "HEAD", label="HEAD")
@@ -179,13 +203,6 @@ def capture_candidate(
     except (GitContextError, FinalizationError) as exc:
         raise NextTurnError(f"could not read the candidate identity: {exc}") from exc
     untracked_paths = set(untracked_candidate_paths(repo_root, stage))
-    excluded = set(exclude) & untracked_paths
-    if excluded:
-        uncommitted = tuple(path for path in uncommitted if path not in excluded)
-        content = CandidateContent(
-            entries=tuple(entry for entry in content.entries if entry[0] not in excluded)
-        )
-        untracked_paths -= excluded
     untracked = tuple(entry for entry in content.entries if entry[0] in untracked_paths)
     tracked_digest = CandidateContent(
         entries=tuple(entry for entry in content.entries if entry[0] not in untracked_paths)
@@ -493,11 +510,12 @@ def resolve_resume_turn(
 
     if choice is not None:
         ambiguity = check_next_turn_choice(repo_root, stage, choice)
+        if choice == NEXT_TURN_SPARRING:
+            # Before the marker or the resolution is written.
+            check_untracked_before_review(repo_root, stage)
         state = stage.read_state()
         candidate = (
-            capture_candidate(
-                repo_root, stage, state, exclude=unrelated_untracked_paths(repo_root, stage)
-            )
+            capture_candidate(repo_root, stage, state)
             if choice == NEXT_TURN_SPARRING
             else None
         )
@@ -505,6 +523,10 @@ def resolve_resume_turn(
         record_resolution(stage, choice, source="manual", reason=ambiguity)
         return choice
     state = stage.read_state()
+    if implementation_awaiting_review(stage, state):
+        # Nothing is recorded here: the loop pins the candidate once the
+        # reviewer-start check passes.
+        return NEXT_TURN_SPARRING
     if state.next_turn is not None:
         return state.next_turn
     if _untouched(stage, state):
@@ -514,10 +536,10 @@ def resolve_resume_turn(
     if derived == NO_TURN_OWED:
         # Gate state decides; never mapped to an implementation turn.
         return NO_TURN_OWED
+    if derived == NEXT_TURN_SPARRING:
+        check_untracked_before_review(repo_root, stage)
     candidate = (
-        capture_candidate(
-            repo_root, stage, state, exclude=unrelated_untracked_paths(repo_root, stage)
-        )
+        capture_candidate(repo_root, stage, state)
         if derived == NEXT_TURN_SPARRING
         else None
     )
@@ -558,13 +580,12 @@ def resolve_legacy_ready(repo_root: Path, stage: Stage) -> str:
         raise NextTurnError(f"could not read the candidate content: {exc}") from exc
     if uncommitted:
         return NEXT_TURN_FINALIZATION
+    check_untracked_before_review(repo_root, stage)
     state = stage.read_state()
     record_next_turn(
         stage,
         NEXT_TURN_SPARRING,
-        candidate=capture_candidate(
-            repo_root, stage, state, exclude=unrelated_untracked_paths(repo_root, stage)
-        ),
+        candidate=capture_candidate(repo_root, stage, state),
         source="derived",
     )
     record_resolution(
@@ -645,26 +666,17 @@ def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> st
             file=sys.stderr,
         )
         return NEXT_TURN_SPARRING
-    raise AmbiguousNextTurn(
+    raise FinalizationDrift(
         f"stage {stage.stage_id!r} was READY over {reviewed.describe()}, but the repository "
         f"now holds {current.describe()}. That is neither the reviewed candidate awaiting its "
         "commit, a commit of exactly the reviewed content, nor the reviewed HEAD with only "
         "previously reviewed untracked files removed, so the engine will not commit it, "
         "review it or implement on it by itself."
         + _drift_detail(repo_root, stage, reviewed, current)
-        + " Restore the reviewed candidate and rerun 'sparring resume-plan', or deliberately "
-        "discard this attempt with "
-        + _reset_command(repo_root, stage)
-        + "."
+        + " Restore the reviewed candidate and rerun the same resume, or deliberately "
+        "discard this attempt with 'sparring reset-stage'.",
+        stage_id=stage.stage_id,
     )
-
-
-def _reset_command(repo_root: Path, stage: Stage) -> str:
-    try:
-        branch = current_branch(repo_root)
-    except GitContextError:
-        branch = "<branch>"
-    return f"'sparring reset-stage {stage.stage_id} <plan> --expected-branch {branch}'"
 
 
 def _removed_untracked_only(reviewed: TurnCandidate, current: TurnCandidate) -> str | None:
@@ -811,12 +823,15 @@ def standalone_start_with(
 
 __all__ = [
     "AmbiguousNextTurn",
+    "FinalizationDrift",
     "NO_TURN_OWED",
     "NextTurnError",
     "RESUME_ACCEPT",
     "capture_candidate",
     "check_next_turn_choice",
     "check_untracked_before_review",
+    "implementation_awaiting_review",
+    "UntrackedRefusal",
     "unrelated_untracked_paths",
     "untracked_candidate_paths",
     "derive_next_turn",
