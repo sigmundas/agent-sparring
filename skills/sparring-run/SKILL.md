@@ -1,6 +1,6 @@
 ---
 name: sparring-run
-description: Start or resume an agent-sparring plan run for a reviewed plan - verify config, branch and worktree through the engine, then dry-run start-plan, ask its decision questions and launch it with one confirmation (or resume-plan; prepare-plan/approve-plan as an advanced path). Invoke explicitly; asks for confirmation before any agent turn starts.
+description: Start or resume an agent-sparring plan run for a reviewed plan - verify config, branch and worktree through the engine, then dry-run start-plan, ask its decision questions and launch it with one confirmation (or resume-plan; prepare-plan/approve-plan as an advanced path). Invoke explicitly; says before the dry run that it may spend one read-only preparation turn, and asks one confirmation before the run starts.
 argument-hint: "<plan path> [resume] [evidence…]"
 disable-model-invocation: true
 allowed-tools: Read Grep Glob AskUserQuestion Bash(sparring:*) Bash(git status:*) Bash(git branch:*) Bash(git rev-parse:*) Bash(git log:*) Bash(git switch -c:*) Bash(git ls-files:*)
