@@ -82,6 +82,9 @@ from agent_sparring.plan_model import ManifestGate, PlannedStage, digest_planned
 
 INTAKE_DIRNAME = "intake"
 RECORD_FILENAME = "intake.json"
+#: A compile intake's answered decisions, written once by prepare-plan (see
+#: :func:`agent_sparring.intake.answered_decisions`).
+DECISIONS_FILENAME = "decisions.json"
 MANIFEST_FILENAME = "manifest.json"
 APPROVAL_FILENAME = "approval.json"
 #: The engine's record that a slice approved on a protected branch was moved,
@@ -514,6 +517,20 @@ def verify_approved_inputs(approval: IntakeApproval, intake_dir: Path) -> None:
             f"{intake_dir / 'interpretation.json'} changed after run slice "
             f"{approval.field('run_id')!r} was approved; the approval no longer describes it"
         )
+    # Answered decisions are part of the write-once intake: intake.json
+    # (sealed above) records their digest, and the file must still match it.
+    try:
+        record = json.loads(_read_bytes(intake_dir / RECORD_FILENAME, "intake record").decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntakeApprovalError(f"{intake_dir / RECORD_FILENAME} is not valid JSON: {exc}") from exc
+    decisions = record.get("decisions") if isinstance(record, dict) else None
+    if decisions is not None:
+        digest = decisions.get("digest") if isinstance(decisions, dict) else None
+        if _read_text_digest(intake_dir / DECISIONS_FILENAME, "decisions") != digest:
+            raise IntakeApprovalError(
+                f"{intake_dir / DECISIONS_FILENAME} changed after run slice "
+                f"{approval.field('run_id')!r} was approved; the approval no longer describes it"
+            )
     source = approval.field("source")
     if _read_text_digest(intake_dir / "source.md", "source snapshot") != source["digest"]:
         raise IntakeApprovalError(f"{intake_dir / 'source.md'} changed after approval")

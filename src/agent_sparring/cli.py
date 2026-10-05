@@ -2349,26 +2349,38 @@ def _project_repository_name(args: argparse.Namespace, sparring_dir: Path, repo_
     return repo_root.resolve().name
 
 
+def _intake_adapter(args: argparse.Namespace, sparring_dir: Path, repo_root: Path) -> tuple[CodexCliAdapter, dict]:
+    """The read-only intake turn's adapter, and the provider record intake
+    stores, from the sparring role's resolution."""
+
+    effective = _resolve_agents(args, sparring_dir).sparring
+    if effective.provider != CODEX_PROVIDER_ID:
+        # Intake is a read-only turn, and codex-cli is the provider whose
+        # read-only sandbox is enforced by the OS rather than by a prompt.
+        raise IntakeError(
+            f"plan intake runs on {CODEX_PROVIDER_ID} (an OS-enforced read-only sandbox); "
+            f"the sparring role resolves to {effective.provider!r}"
+        )
+    adapter = CodexCliAdapter(
+        repo_root=repo_root,
+        executable=args.codex_executable,
+        model=effective.model,
+        effort=effective.effort,
+    )
+    return adapter, {"provider": effective.provider, "model": effective.model, "effort": effective.effort}
+
+
+def _project_context(sparring_dir: Path) -> str | None:
+    project_md = sparring_dir / "PROJECT.md"
+    return project_md.read_text(encoding="utf-8") if project_md.is_file() else None
+
+
 def _cmd_prepare_plan(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
     try:
         repo_root = _resolve_repo_root(args, sparring_dir)
-        effective = _resolve_agents(args, sparring_dir).sparring
-        if effective.provider != CODEX_PROVIDER_ID:
-            # Intake is a read-only turn, and codex-cli is the provider whose
-            # read-only sandbox is enforced by the OS rather than by a prompt.
-            raise IntakeError(
-                f"plan intake runs on {CODEX_PROVIDER_ID} (an OS-enforced read-only sandbox); "
-                f"the sparring role resolves to {effective.provider!r}"
-            )
-        adapter = CodexCliAdapter(
-            repo_root=repo_root,
-            executable=args.codex_executable,
-            model=effective.model,
-            effort=effective.effort,
-        )
-        project_md = sparring_dir / "PROJECT.md"
-        project_context = project_md.read_text(encoding="utf-8") if project_md.is_file() else None
+        adapter, provider = _intake_adapter(args, sparring_dir, repo_root)
+        project_context = _project_context(sparring_dir)
         context_repositories = {
             name: Path(path) for name, path in _pairs(args.context_repository, "--context-repository").items()
         }
@@ -2381,11 +2393,7 @@ def _cmd_prepare_plan(args: argparse.Namespace) -> int:
             primary_repository=_project_repository_name(args, sparring_dir, repo_root),
             context_repositories=context_repositories,
             project_context=project_context,
-            provider={
-                "provider": effective.provider,
-                "model": effective.model,
-                "effort": effective.effort,
-            },
+            provider=provider,
         )
     except (IntakeError, ProjectConfigError, AgentConfigError, OSError) as exc:
         print(f"could not prepare plan: {exc}", file=sys.stderr)
@@ -2467,6 +2475,192 @@ def _cmd_slice_branch(args: argparse.Namespace) -> int:
     else:
         print(f"{status.stages} runs on {status.approved_branch or status.current_branch}; no branch change is needed")
     return 0
+
+
+_START_OVERRIDES = (
+    ("--stage-provider", "stage_provider"),
+    ("--sparring-provider", "sparring_provider"),
+    ("--stage-model", "stage_model"),
+    ("--sparring-model", "sparring_model"),
+    ("--stage-effort", "stage_effort"),
+    ("--sparring-effort", "sparring_effort"),
+    ("--repository-name", "repository_name"),
+)
+
+
+def _start_plan_command(args: argparse.Namespace, repo_root: Path, *, answers: dict, token: str | None) -> list[str]:
+    """The copyable start-plan command for a next step: these same inputs,
+    plus ``answers`` and, when given, ``--confirm token``."""
+
+    parts = [
+        "sparring", "--sparring-dir", str(Path(args.sparring_dir).resolve()), "start-plan",
+        str(Path(args.plan_path).resolve()), "--repo-root", str(Path(repo_root).resolve()),
+        "--expected-branch", args.expected_branch,
+    ]
+    for value in args.context_repository or []:
+        parts += ["--context-repository", value]
+    for value in args.repository_branch or []:
+        parts += ["--repository-branch", value]
+    for flag, attr in _START_OVERRIDES:
+        if getattr(args, attr, None):
+            parts += [flag, str(getattr(args, attr))]
+    for decision_id, option_id in answers.items():
+        parts += ["--answer", f"{decision_id}={option_id}"]
+    if args.allow_push_for_run:
+        parts.append("--allow-push-for-run")
+    if token:
+        parts += ["--confirm", token]
+    return parts
+
+
+def _cmd_start_plan(args: argparse.Namespace) -> int:
+    """One confirmation from a human plan to a managed run (see
+    :mod:`agent_sparring.plan_start`). Without ``--confirm``: report
+    ``refused | needs_decision | ready`` and a confirm token, writing
+    nothing beyond a prepare's own intake. With it: recompute, refuse any
+    difference, seal (intake route) and run exactly as run-plan does."""
+
+    from agent_sparring.intake import seal_approval
+    from agent_sparring.plan_start import (
+        ROUTE_DIRECT,
+        STATUS_NEEDS_DECISION,
+        STATUS_READY,
+        StartRequest,
+        evaluate,
+    )
+
+    sparring_dir = Path(args.sparring_dir)
+    repo_root = Path(args.repo_root or ".")
+    status = None
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        context_repositories = {
+            name: Path(path) for name, path in _pairs(args.context_repository, "--context-repository").items()
+        }
+        answers = _pairs(args.answer, "--answer")
+        effective = _resolve_agents(args, sparring_dir)
+        models = {
+            resolved.role: {"provider": resolved.provider, "model": resolved.model, "effort": resolved.effort}
+            for resolved in (effective.stage, effective.sparring)
+        }
+        primary = _project_repository_name(args, sparring_dir, repo_root)
+        request = StartRequest(
+            plan_path=Path(args.plan_path),
+            repo_root=repo_root,
+            sparring_dir=sparring_dir,
+            expected_branch=args.expected_branch,
+            primary_repository=primary,
+            context_repositories=context_repositories,
+            repository_branches=_pairs(args.repository_branch, "--repository-branch"),
+            answers=answers,
+            models=models,
+            allow_push_for_run=args.allow_push_for_run,
+        )
+
+        def prepare(parent: Path | None, given: dict) -> Path:
+            adapter, provider = _intake_adapter(args, sparring_dir, repo_root)
+            print("preparing the plan: one read-only provider turn…", file=sys.stderr)
+            return prepare_plan(
+                Path(args.plan_path),
+                repo_root,
+                sparring_dir,
+                adapter,
+                mode="compile",
+                primary_repository=primary,
+                context_repositories=context_repositories,
+                project_context=_project_context(sparring_dir),
+                provider=provider,
+                answer_parent=parent,
+                answers=given,
+            ).directory
+
+        status = evaluate(request, prepare=None if args.confirm else prepare)
+    except (IntakeError, ProjectConfigError, AgentConfigError, OSError) as exc:
+        error = str(exc)
+    else:
+        error = status.payload["error"]
+    if status is not None and args.confirm and status.status == STATUS_READY and status.token != args.confirm:
+        error = (
+            "the confirm token does not match what start-plan computes now: the plan, its "
+            "preparation, the repositories, the models or the push choice changed since it was "
+            "shown. Nothing was approved or run. Run start-plan again and confirm the new token"
+        )
+    elif status is not None and args.confirm and status.status == STATUS_NEEDS_DECISION:
+        error = "the plan still needs decisions; answer them with --answer and confirm the new token"
+    payload = dict(status.payload) if status is not None else None
+    if payload is not None and error and args.confirm:
+        payload.update(status="refused", confirm_token=None, error=error)
+
+    if error or not args.confirm:
+        if args.json:
+            if payload is None:
+                payload = {"schema_version": 1, "status": "refused", "error": error}
+            json.dump(payload, sys.stdout, indent=2)
+            print()
+        else:
+            _print_start_status(payload, args, repo_root, error)
+        if error:
+            return 1
+        return 2 if payload["status"] == STATUS_NEEDS_DECISION else 0
+
+    # Confirmed: what the person saw is what runs.
+    assert status is not None
+    run_args = argparse.Namespace(**vars(args))
+    run_args.run_key = None
+    run_args.adopt = False
+    run_args.stop_after_stage = None
+    if status.route == ROUTE_DIRECT:
+        run_args.manifest = None
+        return _run_plan_command(run_args, resume=False)
+    try:
+        approval = seal_approval(status.pending, approved_via="start-plan")
+    except (IntakeError, OSError) as exc:
+        print(f"could not approve the plan: {exc}", file=sys.stderr)
+        return 1
+    verb = "approved" if approval.created else "already approved (identical)"
+    print(f"{verb}: {approval.manifest_path}", file=sys.stderr)
+    run_args.plan_path = None
+    run_args.manifest = str(approval.manifest_path)
+    run_args.run_key = approval.run_key
+    run_args.expected_branch = approval.expected_branch
+    return _run_plan_command(run_args, resume=False)
+
+
+def _print_start_status(payload: dict | None, args: argparse.Namespace, repo_root: Path, error: str | None) -> None:
+    if payload is None or payload.get("status") == "refused":
+        print(f"start-plan refused: {error}", file=sys.stderr)
+        return
+    intake = payload.get("intake")
+    if intake:
+        how = "reused" if intake["reused"] else "prepared"
+        print(f"{how} intake {intake['id']}; details: {intake['report']}")
+    if payload["status"] == "needs_decision":
+        print("needs decision:")
+        for decision in payload["decisions"]:
+            print(f"- {decision['id']}: {decision['question']} {decision['why']}".rstrip())
+            for option in decision["options"]:
+                print(f"    {option['id']}: {option['label']} -- {option['consequence']}")
+        answers = dict(intake["answers"] if intake else {})
+        for decision in payload["decisions"]:
+            answers[decision["id"]] = "<option>"
+        print("answer them with:")
+        print("  " + shlex.join(_start_plan_command(args, repo_root, answers=answers, token=None)))
+        return
+    run = payload["slice"]
+    print(f"ready: {payload['plan']['label']} ({payload['route']} route) on {payload['expected_branch']}")
+    if run.get("run_id"):
+        print(f"run slice {run['run_id']} (run key {run['run_key']}):")
+    for stage in run["stages"]:
+        for gate in stage["gates_before"]:
+            print(f"  pause for {gate['kind']} gate {gate['id']}: {gate['title']}")
+        print(f"  {stage['label']} — {stage['title']}" + ("" if stage["mode"] == "implementation" else f" ({stage['mode']})"))
+    for gate in run["completion_gates"]:
+        print(f"  pause before completion for {gate['kind']} gate {gate['id']}: {gate['title']}")
+    for later in payload["later_slices"]:
+        print(f"later slice {later['run_id']} ({later['primary_repository']}): {', '.join(later['stages'])}; start it separately")
+    answers = dict(intake["answers"]) if intake else {}
+    print("start the run with:")
+    print("  " + shlex.join(_start_plan_command(args, repo_root, answers=answers, token=payload["confirm_token"])))
 
 
 def _cmd_approve_plan(args: argparse.Namespace) -> int:
@@ -3289,6 +3483,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     approve.add_argument("--repo-root", default=None, help=repo_root_help)
     approve.set_defaults(func=_cmd_approve_plan)
+
+    start = subparsers.add_parser(
+        "start-plan",
+        help=(
+            "the normal way to start a human plan: route it directly (a '## Stage <n>' plan) or "
+            "through a compile-mode intake (one read-only provider turn, reused when it still "
+            "matches), and report refused / needs_decision / ready with a confirm token; "
+            "--confirm TOKEN approves exactly that and runs it. Never checks out a branch"
+        ),
+    )
+    start.add_argument("plan_path", help="path to the human plan document (never modified)")
+    start.add_argument("--json", action="store_true", help="report the status as JSON (schema in docs/intake.md)")
+    start.add_argument(
+        "--context-repository",
+        action="append",
+        metavar="NAME=PATH",
+        help="another repository the plan touches, inspected read-only and used as a declared sibling; repeatable",
+    )
+    start.add_argument(
+        "--repository-branch",
+        action="append",
+        metavar="NAME=BRANCH",
+        help="branch of a declared sibling (default: the branch intake saw it on); repeatable",
+    )
+    start.add_argument(
+        "--answer",
+        action="append",
+        metavar="DECISION=OPTION",
+        help="answer a decision the preparation asked; prepares again with the answers, never editing the plan; repeatable",
+    )
+    start.add_argument(
+        "--confirm",
+        default=None,
+        metavar="TOKEN",
+        help="the confirm token start-plan printed: recompute, refuse any difference, approve and run. Never prepares",
+    )
+    start.add_argument(
+        "--repository-name",
+        default=None,
+        help="this project's repository name (default: project.toml's project, else the directory name)",
+    )
+    _add_loop_arguments(
+        start,
+        repo_root_help,
+        branch_help="the branch checked out now, which the run uses; required. start-plan never switches branches",
+    )
+    start.add_argument("--allow-push-for-run", action="store_true", help=_ALLOW_RUN_HELP)
+    start.set_defaults(func=_cmd_start_plan)
 
     slice_branch = subparsers.add_parser(
         "slice-branch",

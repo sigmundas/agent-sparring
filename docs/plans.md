@@ -20,6 +20,28 @@ you do the checks
     -> Stage 4 … until the next human gate or the end of the plan
 ```
 
+**The normal way to start a plan is `sparring start-plan`**, for any
+human plan, staged with `## Stage <n> — <title>` or not:
+
+```sh
+sparring start-plan docs/plans/foo.md --expected-branch feature/x [--json]
+# ready: prints the stages, any pauses for gates, and the command to confirm:
+sparring start-plan docs/plans/foo.md --expected-branch feature/x --confirm <token>
+```
+
+A plan this page's Markdown convention parses runs directly, exactly as
+`run-plan` below. Any other plan is prepared once in compile mode (one
+read-only provider turn, reused while it still matches) and, if it needs
+your choice, the dry run says `needs_decision` and lists the questions:
+answer with `--answer <decision>=<option>` and run it again. The confirm
+token binds exactly what was shown — plan, preparation, this slice's
+stages and gates, repository commits, models, push choice — so a confirm
+after anything changed refuses. start-plan never switches or creates a
+branch and refuses a dirty tree. See [start-plan in the intake
+reference](intake.md#one-command-start-sparring-start-plan) for routes,
+the token and the `--json` schema; `run-plan`, `prepare-plan` and
+`approve-plan` stay available as the step-by-step path.
+
 `run-plan` takes the same provider flags as `run-loop`. It stops for
 `NEEDS_YOU`, `ESCALATE`, a provider/integrity failure, a freeze or accept
 refusal, the SEND_BACK runaway limit, and the end of the plan; ordinary

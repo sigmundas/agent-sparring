@@ -8,7 +8,10 @@
 > -- approval binds execution -- is implemented and described here; Stages B
 > and C (source ownership, gate topology, review usability) are not, so their
 > integrity claims do not hold yet. A plain Markdown plan
-> ([Run a whole plan](plans.md)) needs none of this.
+> ([Run a whole plan](plans.md)) needs none of this. The normal way in is
+> [`sparring start-plan`](#one-command-start-sparring-start-plan), which
+> prepares, reuses and approves an intake for you; `prepare-plan` and
+> `approve-plan` below remain as the advanced, step-by-step path.
 
 A plan that is useful to a person is often not executable as written:
 stages labelled `0`, `1A`, `1B`; constraints that live above the stage
@@ -148,8 +151,137 @@ its `completion_gates` (manifest version 2; see [plans.md](plans.md)). Such a
 gate is not a `--confirm-prerequisite`; the run stops for it instead,
 including a gate blocking the slice's first stage (the run stops before
 creating anything). A slice with
-no such gate still gets a version-1 manifest. Answering decisions is not
-implemented yet; approval goes through the same `approve-plan` path.
+no such gate still gets a version-1 manifest.
+
+**Intake modes, side by side.** `faithful` interprets the staging as
+written; `refine` may also propose different boundaries and an amendment
+(shown as a diff, never applied); `compile` (the mode `start-plan` uses)
+may normalize the topology through the transforms above, never amends, and
+gives each finding one of four dispositions:
+
+| disposition | severity | what happens |
+| --- | --- | --- |
+| `auto_resolved` | info | applied; only with a guarded `transform` |
+| `plan_note` | recommendation | shown; does not block |
+| `needs_decision` | blocking | a person answers its `decision` (below) |
+| `refuse` | blocking | the plan must change |
+
+**Answering decisions.** Answering never writes into the intake that asked
+(an intake directory is written once). `start-plan --answer D=O` (or
+`prepare_plan` with an answered parent) runs a **new** compile prepare. It
+refuses, before any provider turn, unless the asking intake is a finished
+compile intake, the source plan still has that intake's source digest, and
+every answer names a decision its interpretation asks and one of that
+decision's option ids. The new intake writes `decisions.json` — the parent
+intake id and interpretation digest, the source digest, and per answer the
+question, `why`, option id, label and consequence copied verbatim, the
+stages its finding named and the intake that asked it — and records its
+digest in `intake.json`, so the approval's `intake_record_sha256` seals it;
+`run-plan --manifest` also re-checks the file's digest before every run.
+An answered intake's own answers are carried forward when it is answered in
+turn. The agent is given the answers; each answer renders into the briefs
+of the stages its finding named (every stage when it named none) under
+`# Preparation decision (not plan text)`, and `report.md` lists them. The
+source plan is never edited. Reproducibility means these recorded inputs
+plus the sealed resulting interpretation, not an identical re-run of the
+agent turn.
+
+## One-command start: `sparring start-plan`
+
+```sh
+sparring start-plan <plan.md> --expected-branch B [--json] \
+    [--context-repository NAME=PATH ...] [--repository-branch NAME=BRANCH ...] \
+    [--answer DECISION=OPTION ...] [--confirm TOKEN] [--allow-push-for-run]
+```
+
+It takes the same provider, model and executable flags as `run-plan`.
+
+1. **Preflight**, before any provider turn: the checked-out branch must be
+   `--expected-branch` and not protected (start-plan never checks out or
+   creates a branch — use `git switch -c`, or `slice-branch --create` for an
+   approved slice), the tree must be clean, no run of the plan may be open,
+   and both roles' provider/model/effort must resolve.
+2. **Route.** A plan `plan.py` parses (`## Stage <n> — <title>`) takes the
+   **direct** route: no intake, no approval file, and `--confirm` runs
+   exactly `run-plan <plan.md>`. Anything else takes the **intake** route:
+   the newest finished compile intake of the plan whose source digest,
+   primary and context repositories and answers match — and that still
+   describes the repositories (each inspected one where it saw it, or a
+   slice of it already approved) — is reused; otherwise a compile prepare
+   runs (one read-only provider turn). With `--answer`, the prepare answers
+   the newest matching intake that asks the remaining decisions.
+3. **Without `--confirm`** it writes nothing beyond a prepare's own intake.
+   For the intake route it chooses the first run slice of this project that
+   is not proven complete, and computes its manifest and approval with
+   `build_approval` — the pure half of `approve-plan`, which writes nothing —
+   so every approval refusal is reported now. Declared siblings come from
+   `--context-repository`, on the branch intake saw unless
+   `--repository-branch` says otherwise.
+4. **With `--confirm TOKEN`** it never prepares (no matching intake
+   refuses), recomputes the status and token from disk, and refuses any
+   difference. Then it seals through `seal_approval` (the same write
+   `approve-plan` makes), recording `approved_via: "start-plan"` outside the
+   idempotence decision — so a slice already approved by `approve-plan` is
+   the same approval, not a conflict — and runs the sealed manifest through
+   the same in-process entry as `run-plan --manifest`. If the run refuses
+   after sealing, retrying the same `--confirm` reuses the identical approval.
+
+Exit status: 0 `ready` (or the run's own status after `--confirm`),
+2 `needs_decision`, 1 `refused`. Multi-repository plans: start-plan handles
+this project's first unfinished slice and lists the later ones; each is
+started from the project of its own repository.
+
+**The confirm token** is the SHA-256 of canonical JSON (sorted keys, no
+whitespace) of `token_version` (1) and, for the intake route: `route`,
+`intake_id`, `intake_record_sha256` (of `intake.json`'s bytes),
+`report_digest`, `interpretation_digest`, `decisions_digest` (or null),
+`run_id`, `run_key`, `manifest_digest` (this slice only, so it covers every
+gate), `source_digest`, `expected_branch`, `repositories` (`name`, `path`,
+`git_common_dir`, `branch`, `head` — now — of the primary and every declared
+sibling), `models` (`{stage|sparring: {provider, model, effort}}`) and
+`allow_push_for_run`. For the direct route: `route`, `plan_label`,
+`plan_digest` (the digest a run records), `source_digest` (the file's
+text), `expected_branch`, the primary repository, `models` and
+`allow_push_for_run`. Any change — a moved sibling HEAD, another answer,
+another report, a gate — is another token.
+
+**`--json` status** (schema version 1). Every key is always present:
+
+```json
+{
+  "schema_version": 1,
+  "status": "refused | needs_decision | ready",
+  "route": "direct | intake | null",
+  "plan": {"path": "/abs/plan.md", "label": "docs/plans/foo.md"},
+  "expected_branch": "feature/x",
+  "intake": null,
+  "slice": null,
+  "later_slices": [],
+  "decisions": [],
+  "findings": [],
+  "confirm_token": null,
+  "error": null
+}
+```
+
+- `intake` (intake route): `{id, directory, report, mode, reused, answers}`
+  — `report` is the `report.md` to link as preparation details; `answers`
+  maps decision id to option id.
+- `slice` (ready): `{run_id, run_key, manifest_version, stages,
+  completion_gates}`; each stage is `{stage_id, label, title, mode,
+  plan_stage_label, gates_before}`, gates are `{id, title, kind, reason}`.
+  `plan_stage_label` is the human plan's stage label the node maps to (a
+  display mapping, not a manifest field). The direct route has `run_id`,
+  `run_key`, `manifest_version` and each `stage_id` null (a run mints them).
+- `later_slices`: `[{run_id, primary_repository, stages: [label]}]`.
+- `decisions` (needs_decision): `[{id, question, why, options: [{id, label,
+  consequence}], stages, finding}]`, answered with `--answer id=option`.
+- `findings` (intake route): every finding as `{code, severity, disposition,
+  origin, message, stages}`.
+- `confirm_token`: only when `ready`; `error`: only when `refused`.
+
+With `--confirm`, a refusal is reported in the same shape; once it runs,
+the output is `run-plan`'s.
 
 **What `run-plan --manifest` verifies.** An intake envelope runs only with
 the `approval.json` beside it, and before anything is recorded or any

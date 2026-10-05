@@ -121,6 +121,7 @@ from agent_sparring.git_context import GitContextError, current_branch, is_ignor
 from agent_sparring.intake_approval import (
     APPROVAL_FILENAME,
     APPROVAL_VERSION,
+    DECISIONS_FILENAME,
     INTAKE_DIRNAME,
     MANIFEST_FILENAME,
     REGISTRY_DIRNAME,
@@ -1769,6 +1770,7 @@ def render_brief(
     stage_id: str,
     position: int,
     include_goal: bool = True,
+    decisions: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     """The exact ``brief.md`` for one stage, assembled from source text.
 
@@ -1787,6 +1789,10 @@ def render_brief(
     plan-context boilerplate below. ``include_goal=False`` reproduces the
     ``1`` brief format (see ``BRIEF_FORMAT_VERSION``), byte for byte, so a
     legacy intake's recorded digests still match at approval.
+
+    ``decisions`` are the answered decisions of ``decisions.json`` (see
+    :func:`answered_decisions`); each that applies to this stage is appended
+    under its own labelled heading, after everything quoted from the plan.
     """
 
     blocks = {block.id: block for block in interpretation.context}
@@ -1825,7 +1831,33 @@ def render_brief(
     ]
     if stage.intake_scope:
         out += ["", "# Intake scoping", "", _SCOPE_PREAMBLE, "", stage.intake_scope.strip()]
+    for answer in decisions_for_stage(decisions, stage.label):
+        option = answer["option"]
+        out += [
+            "",
+            "# Preparation decision (not plan text)",
+            "",
+            _DECISION_PREAMBLE,
+            "",
+            f"Decision `{answer['id']}`: {answer['question']}",
+            "",
+            f"Answer `{option['id']}`: {option['label']}. Consequence: {option['consequence']}",
+        ]
     return "\n".join(out).rstrip() + "\n"
+
+
+_DECISION_PREAMBLE = (
+    "A person answered this question when the plan was prepared; it is recorded in the "
+    "intake's decisions.json, verbatim. It is not text from the source plan, which was "
+    "not edited."
+)
+
+
+def decisions_for_stage(decisions: Sequence[Mapping[str, Any]], label: str) -> list[Mapping[str, Any]]:
+    """The answered decisions that apply to stage ``label``: those whose
+    finding named it, and those whose finding named no stage at all."""
+
+    return [answer for answer in decisions if not answer.get("stages") or label in answer["stages"]]
 
 
 def amendment_diff(source: SourcePlan, amended: str) -> str:
@@ -1896,6 +1928,137 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# -- answered decisions -------------------------------------------------------------
+
+DECISIONS_VERSION = 1
+
+
+def read_decisions(intake_dir: Path, record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The answered decisions an intake was prepared with, verified against
+    the digest ``intake.json`` records for them, or ``[]`` for an intake
+    prepared without answers. Refuses a ``decisions.json`` that is missing,
+    edited, or present without being recorded."""
+
+    recorded = record.get("decisions")
+    path = Path(intake_dir) / DECISIONS_FILENAME
+    if recorded is None:
+        if path.exists():
+            raise IntakeError(f"{path} exists but intake.json records no decisions; run prepare-plan again")
+        return []
+    if not isinstance(recorded, Mapping) or not isinstance(recorded.get("digest"), str):
+        raise IntakeError(f"{Path(intake_dir) / 'intake.json'} records malformed decisions; run prepare-plan again")
+    text = _read_text(path)
+    if sha256_text(text) != recorded["digest"]:
+        raise IntakeError(f"{path} changed after the intake was prepared; run prepare-plan again")
+    payload = json.loads(text)
+    return list(payload.get("answers") or [])
+
+
+def recorded_answers(record: Mapping[str, Any]) -> dict[str, str]:
+    """``{decision id: option id}`` an intake was prepared with (display copy
+    in ``intake.json``, sealed with it)."""
+
+    recorded = record.get("decisions")
+    return dict(recorded.get("answers") or {}) if isinstance(recorded, Mapping) else {}
+
+
+def posed_decisions(interpretation: Interpretation) -> dict[str, Finding]:
+    """Every decision a ``needs_decision`` finding of this interpretation asks."""
+
+    return {
+        f.decision.id: f
+        for f in interpretation.findings
+        if f.decision is not None and f.disposition == DISPOSITION_NEEDS_DECISION
+    }
+
+
+def answered_decisions(parent_dir: Path, answers: Mapping[str, str], source_text: str) -> dict[str, Any]:
+    """``decisions.json`` for a compile prepare that answers ``parent_dir``'s
+    decisions, or refuse (:class:`IntakeError`, before any provider turn).
+
+    Refuses unless the parent is a finished compile intake, the source plan
+    still has the parent's source digest, and every answer names a decision
+    the parent's interpretation asks (or one the parent itself was prepared
+    with, given the same option) and one of that decision's options. The
+    parent's own answers are carried forward, so answers accumulate. The
+    question, option label and consequence are copied verbatim.
+    """
+
+    parent_dir = Path(parent_dir)
+    record = _read_json(parent_dir / "intake.json")
+    problem = completion_marker_problem(parent_dir, record)
+    if problem:
+        raise IntakeError(problem)
+    if record.get("mode") != MODE_COMPILE:
+        raise IntakeError(f"{parent_dir} is a {record.get('mode')!r} intake; only compile intakes ask decisions")
+    if sha256_text(source_text) != record.get("source_digest"):
+        raise IntakeError(
+            f"the source plan changed since {parent_dir.name} asked its questions; its decisions no "
+            "longer describe it. Prepare it again without answers"
+        )
+    interpretation_text = _read_text(parent_dir / "interpretation.json")
+    if sha256_text(interpretation_text) != record.get("interpretation_digest"):
+        raise IntakeError(f"{parent_dir / 'interpretation.json'} was modified after intake")
+    posed = posed_decisions(parse_interpretation(interpretation_text, mode=MODE_COMPILE))
+    entries = {entry["id"]: entry for entry in read_decisions(parent_dir, record)}
+    parent_id = str(record.get("intake_id") or parent_dir.name)
+    for decision_id, option_id in answers.items():
+        if decision_id in entries:
+            if entries[decision_id]["option"]["id"] != option_id:
+                raise IntakeError(
+                    f"decision {decision_id!r} was already answered {entries[decision_id]['option']['id']!r}; "
+                    "an answer is not changed by answering again. Prepare without answers to start over"
+                )
+            continue
+        finding = posed.get(decision_id)
+        if finding is None:
+            raise IntakeError(
+                f"--answer {decision_id}=…: {parent_id} asks no decision {decision_id!r}; it asks "
+                f"{sorted(posed) or 'none'}"
+            )
+        decision = finding.decision
+        assert decision is not None
+        option = next((o for o in decision.options if o.id == option_id), None)
+        if option is None:
+            raise IntakeError(
+                f"--answer {decision_id}={option_id}: decision {decision_id!r} offers "
+                f"{[o.id for o in decision.options]}"
+            )
+        entries[decision_id] = {
+            "id": decision.id,
+            "question": decision.question,
+            "why": decision.why,
+            "option": {"id": option.id, "label": option.label, "consequence": option.consequence},
+            "stages": [s for s in finding.stages if s],
+            "posed_by": parent_id,
+        }
+    return {
+        "version": DECISIONS_VERSION,
+        "parent": {"intake_id": parent_id, "interpretation_digest": record.get("interpretation_digest")},
+        "source_digest": record.get("source_digest"),
+        "answers": [entries[key] for key in sorted(entries)],
+    }
+
+
+def _decisions_note(decisions: Mapping[str, Any]) -> str:
+    lines = [
+        "## Preparation decisions (a person's answers)",
+        "",
+        "An earlier intake of this plan asked these questions and a person answered them. "
+        "Interpret the plan with these answers applied: do not ask them again, and do not "
+        "treat them as plan text or edit the plan for them.",
+    ]
+    for answer in decisions["answers"]:
+        option = answer["option"]
+        stages = ", ".join(answer.get("stages") or []) or "every stage"
+        lines += [
+            "",
+            f"- `{answer['id']}` ({stages}): {answer['question']}",
+            f"  Answer `{option['id']}`: {option['label']}. Consequence: {option['consequence']}",
+        ]
+    return "\n".join(lines)
+
+
 def prepare_plan(
     plan_path: Path,
     repo_root: Path,
@@ -1909,8 +2072,16 @@ def prepare_plan(
     provider: Mapping[str, Any] | None = None,
     now: Callable[[], datetime] = _utc_now,
     mint_run_key: Callable[[str], str] = new_run_key,
+    answer_parent: Path | None = None,
+    answers: Mapping[str, str] | None = None,
 ) -> IntakeResult:
     """Run one intake turn and write a reviewable proposal. Executes nothing.
+
+    ``answer_parent`` and ``answers`` (compile mode only) answer the
+    decisions an earlier intake of the same plan asked: they are checked
+    (:func:`answered_decisions`) before any provider turn, given to the
+    agent, written to this intake's ``decisions.json`` and rendered into the
+    affected briefs. The answered intake itself is never written.
 
     Refuses (:class:`IntakeError`) when the mode is unknown, intake
     artifacts would be visible to git, the provider fails, any repository
@@ -1938,6 +2109,15 @@ def prepare_plan(
     label = plan_label(Path(plan_path), repo_root)
     source = SourcePlan(label=label, text=text)
 
+    decisions: dict[str, Any] | None = None
+    if answer_parent is not None:
+        if mode != MODE_COMPILE:
+            raise IntakeError("only a compile prepare answers decisions")
+        decisions = answered_decisions(answer_parent, dict(answers or {}), text)
+    elif answers:
+        raise IntakeError("answers need the intake that asked them")
+    answered = list(decisions["answers"]) if decisions else []
+
     prompt = assemble_intake_prompt(
         plan_label=label,
         source_text=text,
@@ -1946,6 +2126,7 @@ def prepare_plan(
         primary_repository=primary_repository,
         repo_root=repo_root.resolve(),
         context_repositories={name: Path(path).resolve() for name, path in context_repositories.items()},
+        extra_notes=[_decisions_note(decisions)] if decisions else (),
     )
 
     named = [(primary_repository, repo_root), *sorted(context_repositories.items())]
@@ -1991,7 +2172,7 @@ def prepare_plan(
     findings = all_findings(interpretation, source, mode=mode, compile_context=compile_context)
 
     run_keys = {run.id: mint_run_key(label) for run in interpretation.runs}
-    briefs = _render_briefs(source, interpretation, run_keys)
+    briefs = _render_briefs(source, interpretation, run_keys, decisions=answered)
     duplicate_ids = _duplicates([stage_id for stage_id, _, _ in briefs.values()])
     if duplicate_ids:
         raise IntakeError(f"derived stage ids collide: {duplicate_ids}; labels must slug uniquely")
@@ -2022,6 +2203,10 @@ def prepare_plan(
         _write(path, content)
         brief_digests[stage_id] = sha256_text(content)
 
+    decisions_text = json.dumps(decisions, indent=2, ensure_ascii=False) + "\n" if decisions else None
+    if decisions_text is not None:
+        _write(directory / DECISIONS_FILENAME, decisions_text)
+
     amendment = None
     if mode != MODE_COMPILE and interpretation.amended_plan is not None and interpretation.amended_plan != text:
         amendment = amendment_diff(source, interpretation.amended_plan)
@@ -2051,6 +2236,21 @@ def prepare_plan(
         # Compile mode only: what its repository guards were checked
         # against. Sealed with intake.json; approval recomputes from it.
         **({"compile": compile_context.as_dict()} if compile_context is not None else {}),
+        # The recorded decision inputs: sealed with intake.json, and the
+        # digest is re-checked at approval and before every run.
+        **(
+            {
+                "decisions": {
+                    "file": DECISIONS_FILENAME,
+                    "digest": sha256_text(decisions_text),
+                    "parent_intake_id": decisions["parent"]["intake_id"],
+                    "parent_interpretation_digest": decisions["parent"]["interpretation_digest"],
+                    "answers": {entry["id"]: entry["option"]["id"] for entry in answered},
+                }
+            }
+            if decisions is not None and decisions_text is not None
+            else {}
+        ),
         # Display metadata only (see approval_requirements): approval never
         # reads these two, it recomputes and enforces everything.
         "findings": findings_summary(findings, interpretation.verdict),
@@ -2069,6 +2269,7 @@ def prepare_plan(
         amendment=amendment is not None,
         provider=record["provider"],
         repositories=snapshots,
+        decisions=answered,
     )
     record["repositories"] = snapshots
     record["report_intake_dir"] = str(directory)
@@ -2271,6 +2472,7 @@ def _render_briefs(
     run_keys: Mapping[str, str],
     *,
     include_goal: bool = True,
+    decisions: Sequence[Mapping[str, Any]] = (),
 ) -> dict[tuple[str, str], tuple[str, str, str]]:
     """``{(run id, label): (stage id, relative path, content)}``."""
 
@@ -2286,6 +2488,7 @@ def _render_briefs(
                 stage_id=stage_id,
                 position=index,
                 include_goal=include_goal,
+                decisions=decisions,
             )
             relative = f"briefs/{_slug(run.id) or 'run'}/{index:02d}-{_slug(stage.label) or 'stage'}.md"
             briefs[(run.id, stage.label)] = (stage_id, relative, content)
@@ -2333,6 +2536,7 @@ def render_report(
     amendment: bool,
     provider: Mapping[str, Any],
     repositories: Mapping[str, Any],
+    decisions: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     """``report.md``: everything a person needs to decide on approval."""
 
@@ -2351,6 +2555,20 @@ def render_report(
     )
     if interpretation.summary:
         out += ["", interpretation.summary]
+
+    if decisions:
+        out += ["", "## Preparation decisions", ""]
+        out.append(
+            "A person's answers to earlier intakes' questions (`decisions.json`). They render "
+            "into the affected briefs as preparation decisions; the source plan is not edited."
+        )
+        for answer in decisions:
+            option = answer["option"]
+            stages = ", ".join(answer.get("stages") or []) or "every stage"
+            out.append(
+                f"- `{answer['id']}` (asked by `{answer['posed_by']}`; {stages}): {answer['question']} "
+                f"→ `{option['id']}` {option['label']}: {option['consequence']}"
+            )
 
     out += ["", "## Findings", ""]
     if not findings:
@@ -2662,6 +2880,156 @@ def approve_plan(
     conflicting one refuses.
     """
 
+    return seal_approval(
+        build_approval(
+            intake_dir,
+            run_id=run_id,
+            repo_root=repo_root,
+            sparring_dir=sparring_dir,
+            primary_repository=primary_repository,
+            expected_branch=expected_branch,
+            repositories=repositories,
+            repository_branches=repository_branches,
+            confirmed_prerequisites=confirmed_prerequisites,
+            without_amendment=without_amendment,
+        ),
+        now=now,
+    )
+
+
+@dataclass(frozen=True)
+class PendingApproval:
+    """What :func:`seal_approval` would write for one run slice, decided by
+    :func:`build_approval` from the verified intake and the repositories as
+    they are now. Holding one writes nothing."""
+
+    intake_dir: Path
+    run_id: str
+    run_key: str
+    expected_branch: str
+    manifest_path: Path
+    approval_path: Path
+    manifest_text: str
+    manifest_digest: str
+    #: The idempotence decision an existing approval must agree with.
+    decision: Mapping[str, Any]
+    sparring_dir: Path
+    #: ``approval.json`` without its ``approved_at``; ``None`` when an
+    #: identical approval already exists, which sealing returns.
+    payload: Mapping[str, Any] | None
+    #: The parsed intake record and interpretation it was decided on.
+    record: Mapping[str, Any]
+    interpretation: "Interpretation"
+    stages: tuple[Mapping[str, Any], ...]
+
+    def result(self, created: bool) -> Approval:
+        return Approval(
+            manifest_path=self.manifest_path,
+            approval_path=self.approval_path,
+            run_key=self.run_key,
+            expected_branch=self.expected_branch,
+            manifest_digest=self.manifest_digest,
+            created=created,
+        )
+
+
+def _existing_approval(pending: PendingApproval) -> Approval:
+    """The approval already on disk for this slice, if it is the one
+    ``pending`` would write, or refuse: an approval is never rewritten."""
+
+    run_id, manifest_path = pending.run_id, pending.manifest_path
+    try:
+        previous = read_approval(pending.approval_path)
+    except IntakeApprovalError as exc:
+        raise IntakeError(f"run slice {run_id!r} has an approval that cannot be used: {exc}") from exc
+    decision = dict(pending.decision)
+    recorded = {key: previous.payload.get(key) for key in decision}
+    # A recorded branch move is part of the approval's decision.
+    recorded["expected_branch"] = previous.expected_branch
+    if recorded != decision:
+        raise IntakeError(
+            f"run slice {run_id!r} was already approved with {recorded}; an approval is not "
+            f"rewritten, and this one would record {decision}"
+        )
+    on_disk = manifest_path.read_bytes() if manifest_path.is_file() else b""
+    if sha256_bytes(on_disk) != previous.field("manifest_sha256"):
+        raise IntakeError(
+            f"{manifest_path} changed after run slice {run_id!r} was approved; it will not "
+            "run. Run prepare-plan and approve-plan again"
+        )
+    if on_disk != pending.manifest_text.encode("utf-8"):
+        raise IntakeError(
+            f"run slice {run_id!r} was already approved with a different manifest "
+            f"({manifest_path}); an approval is not rewritten. Run prepare-plan again"
+        )
+    return pending.result(created=False)
+
+
+def seal_approval(
+    pending: PendingApproval,
+    *,
+    now: Callable[[], datetime] = _utc_now,
+    approved_via: str | None = None,
+) -> Approval:
+    """Write what :func:`build_approval` decided: the manifest envelope, the
+    registry entry and, exactly once, ``approval.json``.
+
+    ``approved_via`` names the command a person approved through (recorded
+    as ``approved_via`` when given). It is not part of the idempotence
+    decision, so the same slice approved by ``approve-plan`` and confirmed
+    by ``start-plan`` is one approval, not a conflict.
+    """
+
+    if pending.payload is None:
+        return _existing_approval(pending)
+    approval = {
+        "version": APPROVAL_VERSION,
+        "decision": "approved",
+        "approved_at": now().isoformat(),
+        **pending.payload,
+        **({"approved_via": approved_via} if approved_via else {}),
+    }
+    # The manifest may be replaced until an approval exists for it; the
+    # approval is created exactly once, and it is what makes the manifest
+    # runnable. A crash between the two leaves an unapproved manifest that
+    # run-plan refuses and a repeat of this approval completes.
+    write_atomic(pending.manifest_path, pending.manifest_text)
+    registry = intake_root(pending.sparring_dir) / REGISTRY_DIRNAME / f"{pending.run_key}.json"
+    write_atomic(
+        registry,
+        json.dumps(
+            {
+                "run_key": pending.run_key,
+                "intake_dir": str(pending.intake_dir.resolve()),
+                "run_id": pending.run_id,
+                "stage_ids": approval["stage_ids"],
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    if not write_exclusive(pending.approval_path, json.dumps(approval, indent=2) + "\n"):
+        # Another approval won the race; it decides, and this one must agree.
+        return _existing_approval(pending)
+    return pending.result(created=True)
+
+
+def build_approval(
+    intake_dir: Path,
+    *,
+    run_id: str,
+    repo_root: Path,
+    sparring_dir: Path,
+    primary_repository: str,
+    expected_branch: str | None = None,
+    repositories: Mapping[str, str] | None = None,
+    repository_branches: Mapping[str, str] | None = None,
+    confirmed_prerequisites: Sequence[str] = (),
+    without_amendment: bool = False,
+) -> PendingApproval:
+    """Every check :func:`approve_plan` makes, and the approval it would
+    write, without writing anything. Refuses exactly as it does."""
+
     intake_dir = Path(intake_dir)
     repo_root = Path(repo_root)
     record_raw = _read_bytes(intake_dir / "intake.json")
@@ -2747,7 +3115,8 @@ def approve_plan(
     ):
         raise IntakeError("intake.json does not record a run key for every run slice; run prepare-plan again")
     inspected = _recorded_repositories(record)
-    briefs = _render_briefs(source, interpretation, run_keys, include_goal=include_goal)
+    decisions = read_decisions(intake_dir, record)
+    briefs = _render_briefs(source, interpretation, run_keys, include_goal=include_goal, decisions=decisions)
 
     # The person reviewed report.md. Approving is only meaningful if it is
     # the report this intake renders, so a stale or edited one refuses.
@@ -2764,6 +3133,7 @@ def approve_plan(
         amendment=amendment_proposed,
         provider=record.get("provider") or {},
         repositories=inspected,
+        decisions=decisions,
     )
     if not isinstance(report_dir, str) or rendered != report_text or sha256_text(report_text) != record.get("report_digest"):
         raise IntakeError(
@@ -2900,45 +3270,26 @@ def approve_plan(
         "confirmed_gates": sorted(confirmed),
         "without_amendment": bool(without_amendment and amendment_proposed),
     }
-
-    def result(created: bool) -> Approval:
-        return Approval(
-            manifest_path=manifest_path,
-            approval_path=approval_path,
-            run_key=run_key,
-            expected_branch=branch,
-            manifest_digest=digest,
-            created=created,
-        )
-
-    def existing() -> Approval:
-        try:
-            previous = read_approval(approval_path)
-        except IntakeApprovalError as exc:
-            raise IntakeError(f"run slice {run_id!r} has an approval that cannot be used: {exc}") from exc
-        recorded = {key: previous.payload.get(key) for key in decision}
-        # A recorded branch move is part of the approval's decision.
-        recorded["expected_branch"] = previous.expected_branch
-        if recorded != decision:
-            raise IntakeError(
-                f"run slice {run_id!r} was already approved with {recorded}; an approval is not "
-                f"rewritten, and this one would record {decision}"
-            )
-        on_disk = manifest_path.read_bytes() if manifest_path.is_file() else b""
-        if sha256_bytes(on_disk) != previous.field("manifest_sha256"):
-            raise IntakeError(
-                f"{manifest_path} changed after run slice {run_id!r} was approved; it will not "
-                "run. Run prepare-plan and approve-plan again"
-            )
-        if on_disk != manifest_text.encode("utf-8"):
-            raise IntakeError(
-                f"run slice {run_id!r} was already approved with a different manifest "
-                f"({manifest_path}); an approval is not rewritten. Run prepare-plan again"
-            )
-        return result(created=False)
+    pending = PendingApproval(
+        intake_dir=intake_dir,
+        run_id=run_id,
+        run_key=run_key,
+        expected_branch=branch,
+        manifest_path=manifest_path,
+        approval_path=approval_path,
+        manifest_text=manifest_text,
+        manifest_digest=digest,
+        decision=decision,
+        sparring_dir=Path(sparring_dir),
+        payload=None,
+        record=record,
+        interpretation=interpretation,
+        stages=tuple(stages),
+    )
 
     if approval_path.exists():
-        return existing()
+        _existing_approval(pending)
+        return pending
 
     # A new decision: the repositories must still be where intake saw them.
     require_intake_ignored(repo_root, sparring_dir)
@@ -3005,10 +3356,7 @@ def approve_plan(
         )
 
     starting = now_seen[primary_repository]
-    approval = {
-        "version": APPROVAL_VERSION,
-        "decision": "approved",
-        "approved_at": now().isoformat(),
+    payload = {
         "intake_id": intake_id,
         "intake_dir": str(intake_dir.resolve()),
         "run_id": run_id,
@@ -3034,29 +3382,7 @@ def approve_plan(
         },
         **decision,
     }
-    # The manifest may be replaced until an approval exists for it; the
-    # approval is created exactly once, and it is what makes the manifest
-    # runnable. A crash between the two leaves an unapproved manifest that
-    # run-plan refuses and a repeat of this approval completes.
-    write_atomic(manifest_path, manifest_text)
-    registry = intake_root(sparring_dir) / REGISTRY_DIRNAME / f"{run_key}.json"
-    write_atomic(
-        registry,
-        json.dumps(
-            {
-                "run_key": run_key,
-                "intake_dir": str(intake_dir.resolve()),
-                "run_id": run_id,
-                "stage_ids": approval["stage_ids"],
-            },
-            indent=2,
-        )
-        + "\n",
-    )
-    if not write_exclusive(approval_path, json.dumps(approval, indent=2) + "\n"):
-        # Another approval won the race; it decides, and this one must agree.
-        return existing()
-    return result(created=True)
+    return replace(pending, payload=payload)
 
 
 __all__ = [
@@ -3077,7 +3403,14 @@ __all__ = [
     "SourcePlan",
     "TRANSFORMS",
     "all_findings",
+    "PendingApproval",
+    "answered_decisions",
     "approve_plan",
+    "build_approval",
+    "posed_decisions",
+    "read_decisions",
+    "recorded_answers",
+    "seal_approval",
     "check_interpretation",
     "compile_context_for",
     "guard_compile_findings",
