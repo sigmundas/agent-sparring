@@ -1559,11 +1559,10 @@ def slice_manifest_gates(
 
     Compile mode only; empty otherwise. A gate lands before the earliest
     stage of this slice it must precede: the stage after its ``after_stage``
-    when that is inside this slice, or a stage it blocks that is not the
-    slice's first. A gate after this slice's last stage that blocks nothing
-    is the slice's closeout gate. A gate blocking the slice's *first* stage
-    stays a prerequisite confirmed at approval: nothing in the run precedes
-    that stage to wait after.
+    when that is inside this slice, or any stage of this slice it blocks --
+    including the first, before which the run stops before creating
+    anything. A gate after this slice's last stage that blocks nothing is
+    the slice's closeout gate.
     """
 
     before: dict[str, list[Gate]] = {}
@@ -1576,7 +1575,7 @@ def slice_manifest_gates(
     index = {stage.label: position for position, stage in enumerate(run.stages)}
     last = len(run.stages) - 1
     for gate in interpretation.gates:
-        candidates = [index[b] for b in gate.blocks_stages if index.get(b, 0) > 0]
+        candidates = [index[b] for b in gate.blocks_stages if b in index]
         after = index.get(gate.after_stage) if gate.after_stage else None
         if after is not None and after < last:
             candidates.append(after + 1)

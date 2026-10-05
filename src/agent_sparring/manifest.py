@@ -194,12 +194,6 @@ def manifest_from_payload(payload: Any) -> ExecutionManifest:
 
     completion_gates = _gates(payload.get("completion_gates"), "manifest completion_gates") if gated else ()
     if gated:
-        if stages[0].gates_before:
-            raise ManifestError(
-                f"manifest stage 1 ({stages[0].stage_id}) declares gates_before, but no stage "
-                "precedes it to wait after; a gate before a run's first stage is a "
-                "prerequisite confirmed at approval, not a manifest gate"
-            )
         gate_ids = [gate.id for stage in stages for gate in stage.gates_before]
         gate_ids += [gate.id for gate in completion_gates]
         if not gate_ids:

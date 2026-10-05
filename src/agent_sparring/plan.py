@@ -3107,7 +3107,7 @@ def _manifest_gate_category(gate: ManifestGate) -> str:
 def _owe_manifest_gates(
     state: PlanRunState,
     state_path: Path,
-    activity: ActivityEmitter,
+    activity: ActivityEmitter | None,
     stage_id: str,
     gates: tuple[ManifestGate, ...],
     *,
@@ -3120,7 +3120,9 @@ def _owe_manifest_gates(
     Idempotent by (checkpoint, gate id): a resume that reaches the same
     gate again finds the obligation it minted -- and any answer recorded to
     it -- instead of asking anew. ``stage_id`` is the accepted stage the gate
-    follows; the answer is written to its ``notes.md``. Every gate kind is
+    follows (or, before the run's first stage, the gated stage itself, whose
+    answer then lives only in the run ledger); the answer is written to its
+    ``notes.md`` when that exists. Every gate kind is
     owed the same way: nothing about a gate is ever taken as satisfied.
     """
 
@@ -3163,7 +3165,8 @@ def _owe_manifest_gates(
             )
             state.record_deferred(existing)
             minted = True
-            activity.emit("plan.gate_owed", summary=f"{gate.title} ({gate.kind}) at {checkpoint}")
+            if activity is not None:
+                activity.emit("plan.gate_owed", summary=f"{gate.title} ({gate.kind}) at {checkpoint}")
             report(
                 f"plan-declared {gate.kind} gate {gate.title!r} ({gate.id}) is owed at {checkpoint}: "
                 f"gate instance {existing.instance_id}"
@@ -3178,7 +3181,7 @@ def _owe_manifest_gates(
 def _stop_for_deferred(
     state: PlanRunState,
     state_path: Path,
-    activity: ActivityEmitter,
+    activity: ActivityEmitter | None,
     obligations: tuple[DeferredObligation, ...],
     *,
     reason: str,
@@ -3197,7 +3200,8 @@ def _stop_for_deferred(
 
     state.awaiting = DeferredVerificationRequired.for_obligations(obligations, reason=reason)
     _pause(state, state_path)
-    activity.emit("plan.paused", summary=state.awaiting.describe)
+    if activity is not None:
+        activity.emit("plan.paused", summary=state.awaiting.describe)
     failed = [entry for entry in obligations if entry.failed]
     report(f"plan {state.plan}: {state.awaiting.describe}.")
     for obligation in obligations:
@@ -3543,6 +3547,31 @@ def _drive(
                 stage_id=plan_stage.stage_id,
                 accepted=tuple(accepted),
             )
+        if state.current_stage_index == 0 and plan_stage.gates_before:
+            # Gates before the run's first stage: nothing precedes it to
+            # wait after, so the run stops before creating anything. The
+            # obligation names the gated stage; its answer lives in the run
+            # ledger (the stage has no notes.md yet).
+            gated = _owe_manifest_gates(
+                state,
+                state_path,
+                last_activity,
+                plan_stage.stage_id,
+                plan_stage.gates_before,
+                checkpoint=before_stage_checkpoint(plan_stage.stage_id),
+                report=report,
+            )
+            if gated:
+                return _stop_for_deferred(
+                    state,
+                    state_path,
+                    last_activity,
+                    gated,
+                    reason=DeferredVerificationRequired.BEFORE_STAGE,
+                    stage_id=plan_stage.stage_id,
+                    accepted=accepted,
+                    report=report,
+                )
         try:
             stage = _ensure_stage(
                 sparring_dir, plan_stage, owner=_RunOwner.of(state), report=report

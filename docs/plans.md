@@ -345,13 +345,15 @@ protection the Markdown path gets. Re-emitting an unchanged one is stable, so
 a tool may regenerate the file on every invocation.
 
 **Version 2: plan-declared gates.** A `"version": 2` manifest is version 1
-plus `gates_before: [{"id", "title", "kind", "reason"}]` on any stage but the
-first, and/or top-level `completion_gates` of the same shape; it must use at
+plus `gates_before: [{"id", "title", "kind", "reason"}]` on any stage,
+and/or top-level `completion_gates` of the same shape; it must use at
 least one, and gate ids are unique. After the preceding stage is accepted the
 run mints one obligation per gate (checkpoint `before_stage:<stage id>`, or
 `before_plan_completion` for completion gates) and stops with
 `deferred_verification_required` (reason `before_stage` or `plan_completion`)
-before the gated stage is created or before reporting COMPLETE. Only
+before the gated stage is created or before reporting COMPLETE. A gate on the
+first stage stops a new run before anything is created; its answer is kept in
+the run ledger. Only
 `resume-plan --deferred-result <instance>:<gate id>=pass` releases it;
 `fail`/`blocked` keep the run stopped, reaching a gate never satisfies it, and
 `--evidence` is refused at a `before_stage` stop. The v2 digest covers every

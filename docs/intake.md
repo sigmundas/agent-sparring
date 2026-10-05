@@ -145,8 +145,9 @@ In compile mode a gate inside a slice is not `gate_inside_run`: it lands in
 that slice's manifest as `gates_before` of the earliest stage it must
 precede, and a gate after the slice's last stage that blocks nothing becomes
 its `completion_gates` (manifest version 2; see [plans.md](plans.md)). Such a
-gate is not a `--confirm-prerequisite`; the run stops for it instead. A gate
-blocking a slice's first stage is still confirmed at approval. A slice with
+gate is not a `--confirm-prerequisite`; the run stops for it instead,
+including a gate blocking the slice's first stage (the run stops before
+creating anything). A slice with
 no such gate still gets a version-1 manifest. Answering decisions is not
 implemented yet; approval goes through the same `approve-plan` path.
 

@@ -80,6 +80,12 @@ class ManifestV2ParsingTests(unittest.TestCase):
         self.assertEqual(manifest.stages[0].gates_before, ())
         self.assertEqual([g.id for g in manifest.completion_gates], ["closeout"])
 
+    def test_v2_accepts_a_gate_before_the_first_stage(self):
+        payload = gated_payload(before=())
+        payload["stages"][0]["gates_before"] = [CANARY]
+        manifest = parse_manifest(json.dumps(payload))
+        self.assertEqual([g.id for g in manifest.stages[0].gates_before], ["canary"])
+
     def test_v2_must_use_a_gate(self):
         payload = manifest_payload()
         payload["version"] = 2
@@ -88,7 +94,6 @@ class ManifestV2ParsingTests(unittest.TestCase):
 
     def test_v2_refuses_malformed_gates(self):
         for mutate, message in (
-            (lambda p: p["stages"][0].__setitem__("gates_before", [CANARY]), "no stage precedes"),
             (lambda p: p.__setitem__("completion_gates", [CANARY]), "repeated"),
             (lambda p: p["stages"][1]["gates_before"][0].pop("reason"), "reason"),
             (lambda p: p["stages"][1]["gates_before"][0].__setitem__("extra", 1), "unknown field"),
@@ -210,6 +215,43 @@ class GateRunTests(_ManifestRepoTestCase):
             self._resume(self.stage_adapter, _SparringAdapter([]), evidence="the canary looked fine")
         self.assertEqual(self._plan_state().to_dict(), before)
         self.assertNotIn("the canary looked fine", self._stage(S3C).read_notes())
+
+    def test_a_first_stage_gate_pauses_before_anything_is_created(self):
+        payload = gated_payload(before=())
+        payload["stages"][0]["gates_before"] = [CANARY]
+        payload["completion_gates"] = [CLOSEOUT]  # keep it a valid v2 with one extra gate
+        self.write_manifest(payload)
+        result = self._start(self.stage_adapter, _SparringAdapter([]))
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.awaiting.reason, DeferredVerificationRequired.BEFORE_STAGE)
+        self.assertEqual(result.accepted, ())
+        self.assertFalse(self._stage(S3C).directory.exists())
+        self.assertEqual(self._turns(), 0)
+        (owed,) = self._plan_state().deferred_human_checks
+        self.assertEqual(owed.checkpoint, before_stage_checkpoint(S3C))
+        self.assertEqual(owed.stage_id, S3C)
+
+        with self.assertRaisesRegex(PlanError, "--deferred-result"):
+            self._resume(self.stage_adapter, _SparringAdapter([]), evidence="looks fine")
+        for outcome in ("blocked", "fail"):
+            again = self._resume(
+                self.stage_adapter, _SparringAdapter([]),
+                deferred_results=(DeferredAnswer.parse(f"canary={outcome}"),),
+            )
+            self.assertIs(again.status, PlanRunStatus.PAUSED)
+            self.assertFalse(self._stage(S3C).directory.exists())
+
+        result = self._resume(
+            self.stage_adapter, _SparringAdapter([READY, READY]),
+            deferred_results=(DeferredAnswer.parse("canary=pass=green"),),
+        )
+        # The answer is durable in the run ledger without any stage notes.
+        state = self._plan_state()
+        self.assertTrue(state.obligation(owed.instance_id).resolved)
+        self.assertEqual(state.obligation(owed.instance_id).results[0].note, "green")
+        # Ran both stages, then stopped at the closeout gate.
+        self.assertEqual([sid for sid, _ in result.accepted], [S3C, S3D])
+        self.assertEqual(result.awaiting.reason, DeferredVerificationRequired.PLAN_COMPLETION)
 
     def test_closeout_gate_blocks_complete_until_pass(self):
         self._gated(before=(), completion=(CLOSEOUT,))
@@ -357,6 +399,27 @@ class IntakeGateRenderingTests(unittest.TestCase):
         before, completion = slice_manifest_gates(interpretation, "app")
         self.assertEqual({label: [g.id for g in gates] for label, gates in before.items()}, {"2": ["canary"]})
         self.assertEqual(completion, ())
+        self.assertEqual(run_prerequisites(interpretation, "app"), ())
+
+    def test_a_gate_blocking_the_first_and_a_later_stage_lands_before_the_first(self):
+        payload = _gated_interpretation()
+        payload["gates"][0]["after_stage"] = None
+        payload["gates"][0]["blocks_stages"] = ["1", "2"]
+        interpretation = parse_interpretation(json.dumps(payload), mode="compile")
+        before, completion = slice_manifest_gates(interpretation, "app")
+        self.assertEqual({label: [g.id for g in gates] for label, gates in before.items()}, {"1": ["canary"]})
+        self.assertEqual(completion, ())
+        # Carried by the manifest, so not an approval prerequisite -- and the
+        # run stops before Stage 1, so nothing executes unauthorized.
+        self.assertEqual(run_prerequisites(interpretation, "app"), ())
+
+    def test_a_gate_blocking_only_the_first_stage_is_a_manifest_gate(self):
+        payload = _gated_interpretation()
+        payload["gates"][0]["after_stage"] = None
+        payload["gates"][0]["blocks_stages"] = ["1"]
+        interpretation = parse_interpretation(json.dumps(payload), mode="compile")
+        before, _ = slice_manifest_gates(interpretation, "app")
+        self.assertEqual(list(before), ["1"])
         self.assertEqual(run_prerequisites(interpretation, "app"), ())
 
     def _prepare_and_approve(self, payload):
