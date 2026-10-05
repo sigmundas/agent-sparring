@@ -97,7 +97,11 @@ from agent_sparring.providers import ProviderError
 from agent_sparring.providers.codex_cli import PROVIDER_ID as CODEX_PROVIDER_ID, CodexCliAdapter
 from agent_sparring.recovery import RecoveryError, reopen_for_failed_check, reset_stage
 from agent_sparring.routing import RoutingAction, RoutingResult, RoutingResultError
-from agent_sparring.next_turn import NextTurnError, standalone_start_with
+from agent_sparring.next_turn import (
+    NextTurnError,
+    check_untracked_before_review,
+    standalone_start_with,
+)
 from agent_sparring.sessions import (
     SessionError,
     current_session_id,
@@ -1243,6 +1247,8 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
             return 0
 
         _refuse_obsolete_settings(sparring_dir)
+        # Before anything is recorded (agent pins included).
+        check_untracked_before_review(repo_root, stage)
         effective = _stage_agents(
             stage,
             resolve_agent_configs(
@@ -1272,6 +1278,7 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
         ProjectConfigError,
         GitContextError,
         ProviderError,
+        NextTurnError,
     ) as exc:
         print(f"could not run sparring agent: {exc}", file=sys.stderr)
         return 1

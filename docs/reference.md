@@ -146,7 +146,21 @@ engine and only after the preceding operation fully succeeded:
 the candidate is a `commit` or still partly in the `worktree`, a digest of
 the candidate content (stage artifacts excluded), and every declared sibling
 repository's HEAD; a declared sibling that cannot be read refuses the
-capture instead of being pinned as unknown. Before such a review starts the engine re-reads all of
+capture instead of being pinned as unknown. It also records, separately,
+the digest of the tracked content alone (`tracked_digest`) and each
+untracked candidate path with its blob (`untracked`); these refine the
+identity for recovery and take no part in matching it.
+
+Untracked, non-ignored files are part of the candidate exactly as the
+reviewer sees them; they are never silently excluded. So before any reviewer
+turn (`resume-plan`, `run-plan`, `run-loop` and standalone `run-sparring`)
+the engine refuses while the worktree holds untracked paths the stage's
+implementation did not produce, naming them and saying to remove, commit or
+ignore them; nothing is recorded. "Did not produce" is decided from engine
+records only: present before the stage's first implementation turn
+(`untracked_baseline`, recorded with `base_sha`), or not listed in the last
+handoff's working-tree status. Untracked files the implementation created
+stay part of the candidate. Before such a review starts the engine re-reads all of
 them, and any difference is refused with both identities named; it never
 falls back to running the other agent. A failed provider turn never advances
 the marker, and NEEDS_YOU / ESCALATE leave it where it is -- the recorded
@@ -154,8 +168,15 @@ gate decides what happens next. A `finalization` marker is matched against the c
 over, by both `resume-plan` and `run-loop`: the same uncommitted candidate
 gets the bounded commit/push turn; that exact content already committed (by
 an interrupted commit turn, or by hand) and nothing uncommitted is re-marked
-`sparring` and reviewed at that commit before acceptance; anything else is
-refused. READY over a candidate that was already a commit needs no commit
+`sparring` and reviewed at that commit before acceptance; READY over a
+`worktree` whose only difference from the current clean commit is that
+previously reviewed untracked files were removed -- same HEAD, same sibling
+HEADs, tracked content unchanged, no new untracked path, none modified -- is
+likewise re-marked `sparring` and reviewed at that commit (a marker recorded
+before `tracked_digest`/`untracked` existed qualifies on same HEAD, same
+sibling HEADs and a clean worktree alone, and the resume says so); anything
+else is refused, naming what changed (HEAD, new or modified untracked
+paths, tracked content). READY over a candidate that was already a commit needs no commit
 turn: if that exact commit (HEAD, content, sibling HEADs) is still the
 candidate, `resume-plan` runs only the push and acceptance gates for it, with
 no agent turn; if it has moved, the resume is refused. `run-loop`, which
@@ -194,7 +215,12 @@ value), when derivation gives an unambiguous answer (even the chosen one),
 or while a recorded NEEDS_YOU / ESCALATE is waiting -- a choice never
 overrides or re-pins the engine's record or answers a person.
 The result is recorded with `next_turn_source` = `derived` or `manual` and
-is never derived again.
+is never derived again. `next_turn_source` always means "who wrote the
+current marker", so the next routine transition sets it back to `engine`.
+How the legacy state was resolved is kept separately and immutably in
+`next_turn_resolution`: `{turn, source (manual | derived), recorded_at,
+reason}`, where `reason` is the refusal or derivation it answered. It is
+written once and no later marker write alters or drops it.
 
 ## Resume, fresh session, reset
 
@@ -376,8 +402,9 @@ always hold the *current* generation's values.
 
 ### Compatibility of existing `state.json` files
 
-`next_turn`, `next_turn_candidate`, `next_turn_source` and `sessions` are
-all optional and absent until first written: an existing file reads back
+`next_turn`, `next_turn_candidate` (and its `tracked_digest` / `untracked`),
+`next_turn_source`, `next_turn_resolution`, `untracked_baseline` and
+`sessions` are all optional and absent until first written: an existing file reads back
 unchanged and stays byte-identical until the engine writes the marker or
 records a session. New stages record generation 1 (with `started_at`) at its
 first pin or session id; a recorded session id with no `sessions` list is

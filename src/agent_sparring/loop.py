@@ -121,6 +121,7 @@ from agent_sparring.finalization import (
 from agent_sparring.next_turn import (
     NextTurnError,
     capture_candidate,
+    check_untracked_before_review,
     record_next_turn,
     verify_candidate,
 )
@@ -521,6 +522,15 @@ def run_unattended_loop(
                 if cycle == 1 and stage_run is None:
                     raise CandidateRefused(str(exc)) from exc
                 raise LoopError(str(exc)) from exc
+        # Untracked files the implementation did not produce must never
+        # silently become part of the reviewed candidate.
+        try:
+            check_untracked_before_review(repo_root, stage)
+        except NextTurnError as exc:
+            activity.emit("loop.stopped", cycle=cycle, summary="unrelated untracked files")
+            if cycle == 1 and stage_run is None:
+                raise CandidateRefused(str(exc)) from exc
+            raise LoopError(str(exc)) from exc
 
         try:
             sparring_run = run_sparring_agent(

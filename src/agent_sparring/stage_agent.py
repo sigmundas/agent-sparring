@@ -22,6 +22,7 @@ from agent_sparring.branch_guard import BranchGuardError, ensure_branch_for_unat
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import GitContextError, resolve_commit
 from agent_sparring.handoff import generate_handoff
+from agent_sparring.next_turn import NextTurnError, untracked_candidate_paths
 from agent_sparring.providers import ProviderError, StageAgentAdapter, StageAgentResult
 from agent_sparring.stage import Stage, StageState, StageStatus
 from agent_sparring.prompt_capture import capture_prompt
@@ -221,6 +222,13 @@ def run_stage_agent(
                 # the true stage baseline (where implementation began) must
                 # not be lost.
                 state.base_sha = base_sha
+                # Untracked files already present now are, by construction,
+                # not something this stage's implementation produced.
+                if state.untracked_baseline is None and not finalize_only:
+                    try:
+                        state.untracked_baseline = untracked_candidate_paths(repo_root, stage)
+                    except NextTurnError as exc:
+                        raise StageAgentRunError(str(exc)) from exc
                 stage.write_state(state)
 
             assembled = assemble_stage_prompt(
