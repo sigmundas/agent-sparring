@@ -35,23 +35,27 @@ overwrote `next_turn_source` with `engine`, losing the provenance.
    any untracked non-ignored path that is not in the handoff's changed
    paths. Untracked files the implementation legitimately created remain
    part of the candidate as today.
-2. **Narrow recovery.** In `resolve_finalization`, when the recorded
-   reviewed candidate is `kind: worktree`, the current HEAD equals the
-   reviewed `head_sha`, sibling pins are unchanged, nothing tracked is
-   modified, and the only difference from the reviewed content is that
-   untracked paths are gone (the current state is a clean commit), re-record
-   `next_turn = sparring` over that clean commit so the reviewer rules on
-   exactly it before acceptance. Never route to implementation, never
-   accept directly. Requires recording enough in the candidate to tell
-   "untracked paths removed" from any other change (e.g. tracked-content
-   digest separately from the untracked set); keep older markers without
-   that detail working: for them, accept this recovery only when HEAD
-   matches and the worktree is now clean, and say so in the message.
-3. **Provenance.** A manual `next_turn` choice keeps `manual` provenance
-   (for example `next_turn_source` plus a persisted record of the manual
-   choice and when it was made) through the loop's routine marker writes in
-   the same cycle; later engine transitions may set `engine`, but the
-   manual choice must remain inspectable in state.
+   Do not silently exclude untracked files from candidate identity: the
+   reviewer must see exactly what the identity says it sees.
+2. **Narrow recovery.** In `resolve_finalization`, re-record
+   `next_turn = sparring` over the clean commit only when ALL hold:
+   the reviewed candidate was `kind: worktree`; current HEAD is exactly the
+   reviewed `head_sha`; sibling pins are unchanged; tracked content is
+   unchanged; the only difference is the disappearance of previously
+   reviewed untracked paths; no new untracked paths appeared; the current
+   state is a clean commit. The reviewer then rules on exactly that commit
+   before acceptance. Never route to implementation, never accept directly.
+   Record enough in the candidate to decide this (e.g. tracked-content
+   digest separately from the set of untracked paths and their digests).
+   Older markers without that detail: allow this recovery only when HEAD
+   matches the reviewed `head_sha`, siblings match, and the worktree is now
+   clean; say so in the message.
+3. **Provenance.** Keep the live `next_turn_source` meaning "who wrote the
+   current marker" (routine transitions may set `engine`), and persist a
+   separate immutable record of how an ambiguous legacy state was resolved
+   (`next_turn_resolution`: chosen turn, source `manual` | `derived`,
+   recorded_at, and the reason/refusal it answered). Routine marker writes
+   never alter or drop it; it stays inspectable for history and clients.
 4. Error messages for both refusals name the concrete paths and the next
    command.
 
@@ -63,8 +67,13 @@ overwrote `next_turn_source` with `engine`, losing the provenance.
   uncommitted content is unrelated untracked files → files removed →
   resume re-records `sparring` over the clean commit → reviewer READY →
   normal acceptance; no implementation turn, no direct acceptance.
-- The same with any tracked modification or moved HEAD → still refused.
-- Manual `--next-turn stage` provenance survives the cycle-start write.
+- Still refused: any tracked change, a different HEAD, a new untracked
+  file, or a modified (not removed) previously reviewed untracked file.
+- Manual `--next-turn stage` resolution record survives the cycle-start
+  write and later transitions; `next_turn_source` still reflects the
+  current marker's writer.
+
+Keep it small: no unrelated cleanup.
 - Existing finalization, committed-READY, legacy and fresh-session tests
   keep passing.
 
