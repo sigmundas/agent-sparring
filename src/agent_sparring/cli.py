@@ -88,6 +88,7 @@ from agent_sparring.deferred_gate import (
     DeferredGateError,
     DeferredVerificationRequired,
 )
+from agent_sparring.plan_model import PlanSource
 from agent_sparring.push_gate import PUSH_AUTHORIZATION_REQUIRED
 from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
@@ -1966,11 +1967,15 @@ def _plan_source(args: argparse.Namespace, repo_root: Path):
     return load_plan_source(path, repo_root, manifest=bool(args.manifest))
 
 
-def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
+def _run_plan_command(args: argparse.Namespace, *, resume: bool, source: PlanSource | None = None) -> int:
+    """``source``, when given, is the plan already read and checked (by
+    start-plan's confirmation), run as is rather than read again."""
+
     sparring_dir = Path(args.sparring_dir)
     try:
         repo_root = _resolve_repo_root(args, sparring_dir)
-        source = _plan_source(args, repo_root)
+        if source is None:
+            source = _plan_source(args, repo_root)
         self_check = _resolve_self_check(sparring_dir)
         # Provider selection is checked once, before any run state exists;
         # the adapters themselves are built per planned stage (below) so
@@ -2521,6 +2526,20 @@ def _start_plan_command(args: argparse.Namespace, repo_root: Path, *, answers: d
     return parts
 
 
+def _start_execution(args: argparse.Namespace) -> dict:
+    """The start-plan options, besides models, branch, repositories and
+    the push choice, that change what runs -- as given."""
+
+    return {
+        # Where project configuration, self-check and agent instructions come from.
+        "sparring_dir": str(Path(args.sparring_dir).resolve()),
+        "permission_mode": str(args.permission_mode),
+        "claude_executable": str(args.claude_executable),
+        "codex_executable": str(args.codex_executable),
+        "max_send_back_cycles": args.max_send_back_cycles,
+    }
+
+
 def _cmd_start_plan(args: argparse.Namespace) -> int:
     """One confirmation from a human plan to a managed run (see
     :mod:`agent_sparring.plan_start`). Without ``--confirm``: report
@@ -2563,6 +2582,7 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
             answers=answers,
             models=models,
             allow_push_for_run=args.allow_push_for_run,
+            execution=_start_execution(args),
         )
 
         def prepare(parent: Path | None, given: dict) -> Path:
@@ -2590,8 +2610,8 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
     if status is not None and args.confirm and status.status == STATUS_READY and status.token != args.confirm:
         error = (
             "the confirm token does not match what start-plan computes now: the plan, its "
-            "preparation, the repositories, the models or the push choice changed since it was "
-            "shown. Nothing was approved or run. Run start-plan again and confirm the new token"
+            "preparation, the repositories, the models, the execution options (sparring dir, "
+            "permission mode, executables, send-back limit) or the push choice changed since it was shown. Nothing was approved or run. Run start-plan again and confirm the new token"
         )
     elif status is not None and args.confirm and status.status == STATUS_NEEDS_DECISION:
         error = "the plan still needs decisions; answer them with --answer and confirm the new token"
@@ -2604,7 +2624,9 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
             if payload is None:
                 from agent_sparring.plan_start import refused_payload
 
-                payload = refused_payload(Path(args.plan_path), repo_root, args.expected_branch, error)
+                payload = refused_payload(
+                    Path(args.plan_path), repo_root, args.expected_branch, error, execution=_start_execution(args)
+                )
             json.dump(payload, sys.stdout, indent=2)
             print()
         else:
@@ -2621,7 +2643,8 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
     run_args.stop_after_stage = None
     if status.route == ROUTE_DIRECT:
         run_args.manifest = None
-        return _run_plan_command(run_args, resume=False)
+        # The source the token was computed over, never the file read again.
+        return _run_plan_command(run_args, resume=False, source=status.source)
     try:
         approval = seal_approval(status.pending, approved_via="start-plan")
     except (IntakeError, OSError) as exc:
@@ -2658,6 +2681,12 @@ def _print_start_status(payload: dict | None, args: argparse.Namespace, repo_roo
         return
     run = payload["slice"]
     print(f"ready: {payload['plan']['label']} ({payload['route']} route) on {payload['expected_branch']}")
+    execution = payload.get("execution") or {}
+    print(
+        f"  sparring dir {execution.get('sparring_dir')}, permission mode {execution.get('permission_mode')}, claude executable "
+        f"{execution.get('claude_executable')}, codex executable {execution.get('codex_executable')}, "
+        f"max send-back cycles {execution.get('max_send_back_cycles')}"
+    )
     if run.get("run_id"):
         print(f"run slice {run['run_id']} (run key {run['run_key']}):")
     for stage in run["stages"]:

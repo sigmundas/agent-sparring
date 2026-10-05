@@ -944,6 +944,15 @@ def load_markdown_source(
         text = Path(plan_path).read_text(encoding="utf-8")
     except OSError as exc:
         raise PlanError(f"cannot read plan {plan_path}: {exc}") from exc
+    return markdown_source_from_text(plan_path, label, text, namespace=namespace)
+
+
+def markdown_source_from_text(
+    plan_path: Path, label: str, text: str, *, namespace: str | None = None
+) -> MarkdownPlanSource:
+    """:func:`load_markdown_source` over ``text`` already read from
+    ``plan_path``, so a caller that checked that text runs exactly it."""
+
     prefix = namespace if namespace is not None else legacy_run_key(label)
     return MarkdownPlanSource(
         path=Path(plan_path),

@@ -232,19 +232,22 @@ this project's first unfinished slice and lists the later ones; each is
 started from the project of its own repository.
 
 **The confirm token** is the SHA-256 of canonical JSON (sorted keys, no
-whitespace) of `token_version` (1) and, for the intake route: `route`,
+whitespace) of `token_version` (2) and, for the intake route: `route`,
 `intake_id`, `intake_record_sha256` (of `intake.json`'s bytes),
 `report_digest`, `interpretation_digest`, `decisions_digest` (or null),
 `run_id`, `run_key`, `manifest_digest` (this slice only, so it covers every
 gate), `source_digest`, `expected_branch`, `repositories` (`name`, `path`,
 `git_common_dir`, `branch`, `head` — now — of the primary and every declared
-sibling), `models` (`{stage|sparring: {provider, model, effort}}`) and
-`allow_push_for_run`. For the direct route: `route`, `plan_label`,
+sibling), `models` (`{stage|sparring: {provider, model, effort}}`),
+`allow_push_for_run` and `execution` (below). For the direct route: `route`, `plan_label`,
 `plan_digest` (the digest a run records), `source_digest` (the file's
 text), `expected_branch`, the primary repository and every
 `--context-repository` supplied (a Markdown plan declares no siblings, so
-`--repository-branch` is refused on this route), `models` and
-`allow_push_for_run`. Any change — a moved sibling HEAD, another answer,
+`--repository-branch` is refused on this route), `models`,
+`allow_push_for_run` and `execution`. On the intake route a
+`--repository-branch` naming a repository the slice does not declare is
+refused -- before any preparation when it names no `--context-repository`. Confirming the direct route runs the plan text the token was
+computed over, never the file read again. Any change — a moved sibling HEAD, another answer,
 another report, a gate — is another token.
 
 **`--json` status** (schema version 1). Every key is always present:
@@ -256,6 +259,8 @@ another report, a gate — is another token.
   "route": "direct | intake | null",
   "plan": {"path": "/abs/plan.md", "label": "docs/plans/foo.md"},
   "expected_branch": "feature/x",
+  "execution": {"sparring_dir": "/abs/.sparring", "permission_mode": "acceptEdits", "claude_executable": "claude",
+                "codex_executable": "codex", "max_send_back_cycles": 5},
   "intake": null,
   "slice": null,
   "later_slices": [],
@@ -275,6 +280,11 @@ another report, a gate — is another token.
   `plan_stage_label` is the human plan's stage label the node maps to (a
   display mapping, not a manifest field). The direct route has `run_id`,
   `run_key`, `manifest_version` and each `stage_id` null (a run mints them).
+- `execution`: the options, as given, that change what runs besides the
+  models, repositories and push choice: the resolved `--sparring-dir`
+  (project configuration, self-check, agent instructions), `--permission-mode`,
+  `--claude-executable`, `--codex-executable`, `--max-send-back-cycles`.
+  Bound into the token on both routes.
 - `later_slices`: `[{run_id, primary_repository, stages: [label]}]`.
 - `decisions` (needs_decision): `[{id, question, why, options: [{id, label,
   consequence}], stages, finding}]`, answered with `--answer id=option`.

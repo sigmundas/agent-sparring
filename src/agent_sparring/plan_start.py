@@ -55,13 +55,13 @@ from agent_sparring.intake import (
     sha256_text,
 )
 from agent_sparring.intake_approval import APPROVAL_FILENAME, RUNS_DIRNAME, sha256_bytes
-from agent_sparring.plan import PlanError, find_runs, load_markdown_source, plan_label
+from agent_sparring.plan import PlanError, find_runs, markdown_source_from_text, plan_label
 from agent_sparring.sparring_agent import repo_fingerprint
 
 #: The ``start-plan --json`` status shape (documented in docs/intake.md).
 STATUS_VERSION = 1
 #: Bumped whenever the token's inputs change meaning.
-TOKEN_VERSION = 1
+TOKEN_VERSION = 2
 
 STATUS_REFUSED = "refused"
 STATUS_NEEDS_DECISION = "needs_decision"
@@ -91,14 +91,20 @@ class StartRequest:
     #: ``{role: {provider, model, effort}}`` as the run would resolve them.
     models: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     allow_push_for_run: bool = False
+    #: Every other option that changes what runs (permission mode, provider
+    #: executables as given, the send-back limit): shown and bound as given.
+    execution: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class StartStatus:
-    """The JSON status, plus what confirming needs (never serialized)."""
+    """The JSON status, plus what confirming needs (never serialized):
+    the sealable approval (intake route) or the exact checked plan source
+    (direct route), so what was checked is what runs."""
 
     payload: dict[str, Any]
     pending: PendingApproval | None = None
+    source: Any = None
 
     @property
     def status(self) -> str:
@@ -130,10 +136,19 @@ def repository_fingerprint(name: str, path: Path) -> dict[str, str]:
 
 
 def _base(request: StartRequest) -> dict[str, Any]:
-    return refused_payload(request.plan_path, request.repo_root, request.expected_branch, None)
+    return refused_payload(
+        request.plan_path, request.repo_root, request.expected_branch, None, execution=request.execution
+    )
 
 
-def refused_payload(plan_path: Path, repo_root: Path, expected_branch: str, error: str | None) -> dict[str, Any]:
+def refused_payload(
+    plan_path: Path,
+    repo_root: Path,
+    expected_branch: str,
+    error: str | None,
+    *,
+    execution: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """A status with every schema key present: ``refused`` with ``error``.
     Also what the CLI reports when its arguments refuse before evaluating."""
 
@@ -146,6 +161,7 @@ def refused_payload(plan_path: Path, repo_root: Path, expected_branch: str, erro
             "label": plan_label(Path(plan_path), Path(repo_root)),
         },
         "expected_branch": expected_branch,
+        "execution": dict(execution) if execution is not None else None,
         "intake": None,
         "slice": None,
         "later_slices": [],
@@ -164,7 +180,11 @@ def evaluate(request: StartRequest, *, prepare: Prepare | None) -> StartStatus:
     try:
         preflight(request, label=payload["plan"]["label"])
         try:
-            direct = load_markdown_source(Path(request.plan_path), payload["plan"]["label"])
+            text = Path(request.plan_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise StartPlanError(f"cannot read plan {request.plan_path}: {exc}") from exc
+        try:
+            direct = markdown_source_from_text(Path(request.plan_path), payload["plan"]["label"], text)
         except PlanError:
             direct = None
         if direct is not None:
@@ -175,7 +195,15 @@ def evaluate(request: StartRequest, *, prepare: Prepare | None) -> StartStatus:
                     "--repository-branch: this plan runs directly, and a Markdown plan declares no "
                     "sibling repositories to put on a branch"
                 )
-            return _direct_status(request, payload, direct)
+            return _direct_status(request, payload, direct, text)
+        # A slice declares only repositories given with --context-repository:
+        # any other branch name is refused before a preparation writes anything.
+        unknown = sorted(set(request.repository_branches) - set(request.context_repositories))
+        if unknown:
+            raise StartPlanError(
+                f"--repository-branch names {unknown}, which is not a declared sibling repository; "
+                f"the repositories given are {sorted(request.context_repositories) or 'none'}"
+            )
         require_intake_ignored(Path(request.repo_root), Path(request.sparring_dir))
         intake_dir, reused = locate_intake(request, label=payload["plan"]["label"], prepare=prepare)
         return _intake_status(request, payload, intake_dir, reused=reused)
@@ -219,8 +247,8 @@ def preflight(request: StartRequest, *, label: str) -> None:
 # -- direct route -----------------------------------------------------------------
 
 
-def _direct_status(request: StartRequest, payload: dict[str, Any], source) -> StartStatus:
-    text = Path(request.plan_path).read_text(encoding="utf-8")
+def _direct_status(request: StartRequest, payload: dict[str, Any], source, text: str) -> StartStatus:
+    # ``source`` was parsed from ``text``: the digests below are of what runs.
     stages = source.stages()
     payload.update(
         route=ROUTE_DIRECT,
@@ -261,9 +289,10 @@ def _direct_status(request: StartRequest, payload: dict[str, Any], source) -> St
             ],
             "models": dict(request.models),
             "allow_push_for_run": bool(request.allow_push_for_run),
+            "execution": dict(request.execution),
         }
     )
-    return StartStatus(payload=payload)
+    return StartStatus(payload=payload, source=source)
 
 
 # -- intake route -----------------------------------------------------------------
@@ -412,11 +441,16 @@ def _intake_status(request: StartRequest, payload: dict[str, Any], intake_dir: P
             f"run slice {run.id!r} declares sibling repositories {missing}; give each with "
             "--context-repository NAME=PATH"
         )
+    undeclared = sorted(set(request.repository_branches) - set(siblings))
+    if undeclared:
+        raise StartPlanError(
+            f"--repository-branch names {undeclared}, which run slice {run.id!r} does not declare; "
+            f"its declared sibling repositories are {siblings or 'none'}"
+        )
     branches = {
         name: request.repository_branches.get(name) or str((inspected.get(name) or {}).get("branch") or "")
         for name in siblings
     }
-    branches.update({k: v for k, v in request.repository_branches.items() if k not in branches})
     pending = build_approval(
         intake_dir,
         run_id=run.id,
@@ -482,6 +516,7 @@ def _intake_status(request: StartRequest, payload: dict[str, Any], intake_dir: P
             ],
             "models": dict(request.models),
             "allow_push_for_run": bool(request.allow_push_for_run),
+            "execution": dict(request.execution),
         }
     )
     return StartStatus(payload=payload, pending=pending)

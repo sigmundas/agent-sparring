@@ -17,9 +17,13 @@ from unittest import mock
 
 import conftest_path  # noqa: F401
 
+from agent_sparring import plan_start
 from agent_sparring.cli import main
 from agent_sparring.intake import IntakeError, answered_decisions, build_approval, prepare_plan
 from agent_sparring.intake_approval import IntakeApprovalError, load_intake_manifest
+from agent_sparring.loop import DEFAULT_MAX_SEND_BACK_CYCLES
+from agent_sparring.plan import load_markdown_source
+from agent_sparring.providers.claude_cli import DEFAULT_PERMISSION_MODE
 from agent_sparring.plan_start import confirm_token
 from agent_sparring.providers import SparringAgentResult
 from test_intake import PLAN, FakeAdapter, _git, _Repo, make_repo
@@ -125,8 +129,61 @@ class DirectRouteTests(_Start):
         self.assertEqual(code, 0, out)
         args = run.call_args.args[0]
         self.assertEqual((args.plan_path, args.manifest, args.run_key), (str(self.direct), None, None))
-        self.assertEqual(run.call_args.kwargs, {"resume": False})
+        self.assertEqual(set(run.call_args.kwargs), {"resume", "source"})
+        self.assertFalse(run.call_args.kwargs["resume"])
+        self.assertEqual(run.call_args.kwargs["source"].digest(), load_markdown_source(self.direct, "docs/direct.md").digest())
         self.assertEqual(self.intakes(), [])
+
+    def test_a_plan_edited_after_the_token_check_is_not_run(self):
+        _, status, _ = self.start(plan=self.direct)
+        checked = load_markdown_source(self.direct, "docs/direct.md").digest()
+        real = plan_start.evaluate
+
+        def check_then_edit(*args, **kwargs):
+            result = real(*args, **kwargs)
+            # The file changes after the token check, before the run.
+            self.direct.write_text(DIRECT.replace("Build it.", "Delete everything."), encoding="utf-8")
+            return result
+
+        with mock.patch.object(plan_start, "evaluate", side_effect=check_then_edit), self.ran() as run:
+            code, _, out = self.start(plan=self.direct, confirm=status["confirm_token"], json_out=False)
+        self.assertEqual(code, 0, out)
+        source = run.call_args.kwargs["source"]
+        self.assertEqual(source.digest(), checked)
+        self.assertNotIn("Delete everything", "".join(stage.brief for stage in source.stages()))
+
+    def test_another_sparring_dir_refuses_the_token_and_writes_nothing(self):
+        _, status, _ = self.start(plan=self.direct)
+        self.sparring_dir = self.root / "other-sparring"
+        _, other, _ = self.start(plan=self.direct)
+        self.assertEqual(other["execution"]["sparring_dir"], str(self.sparring_dir.resolve()))
+        self.assertNotEqual(other["confirm_token"], status["confirm_token"])
+        with self.ran() as run:
+            code, refused, _ = self.start(plan=self.direct, confirm=status["confirm_token"])
+        self.assertEqual((code, refused["status"]), (1, "refused"))
+        run.assert_not_called()
+        self.assertFalse(self.sparring_dir.exists())
+
+    def test_every_execution_input_is_shown_and_bound(self):
+        _, status, _ = self.start(plan=self.direct)
+        self.assertEqual(
+            status["execution"],
+            {"sparring_dir": str(self.sparring_dir.resolve()), "permission_mode": DEFAULT_PERMISSION_MODE, "claude_executable": "claude", "codex_executable": "codex",
+             "max_send_back_cycles": DEFAULT_MAX_SEND_BACK_CYCLES},
+        )
+        for flag, value in EXECUTION_CHANGES:
+            with self.subTest(flag):
+                _, changed, _ = self.start(flag, value, plan=self.direct)
+                self.assertNotEqual(changed["confirm_token"], status["confirm_token"])
+                with self.ran() as run:
+                    code, refused, _ = self.start(flag, value, plan=self.direct, confirm=status["confirm_token"])
+                self.assertEqual((code, refused["status"]), (1, "refused"))
+                self.assertIn("execution options", refused["error"])
+                run.assert_not_called()
+        code, _, out = self.start("--permission-mode", "bypassPermissions", plan=self.direct, json_out=False)
+        self.assertEqual(code, 0, out)
+        self.assertIn("permission mode bypassPermissions", out)
+        self.assertIn(f"sparring dir {self.sparring_dir.resolve()}", out)
 
     def test_a_changed_plan_or_push_choice_refuses_the_token(self):
         _, status, _ = self.start(plan=self.direct)
@@ -168,8 +225,9 @@ class CommandAndSchemaTests(_Start):
         self.assertEqual(
             set(status),
             {"schema_version", "status", "route", "plan", "expected_branch", "intake", "slice",
-             "later_slices", "decisions", "findings", "confirm_token", "error"},
+             "later_slices", "decisions", "findings", "confirm_token", "error", "execution"},
         )
+        self.assertEqual(status["execution"]["permission_mode"], DEFAULT_PERMISSION_MODE)
         self.assertEqual(status["plan"]["label"], "docs/plan.md")
         self.assertEqual(status["expected_branch"], "feature/widgets")
 
@@ -353,6 +411,78 @@ class IntakeRouteTests(_Start):
         with self.assertRaisesRegex(IntakeError, "source plan changed"):
             answered_decisions(result.directory, {"audit-depth": "all"}, PLAN + "\nmore\n")
 
+    def test_every_execution_input_is_bound_on_the_intake_route(self):
+        with self.agent(compile_widget_interpretation()):
+            _, status, _ = self.start(*self.ctx)
+        self.assertEqual(status["execution"]["codex_executable"], "codex")
+        for flag, value in EXECUTION_CHANGES:
+            with self.subTest(flag), self.agent() as agent:
+                _, changed, _ = self.start(*self.ctx, flag, value)
+                self.assertEqual(changed["execution"][flag[2:].replace("-", "_")], int(value) if value.isdigit() else value)
+                self.assertNotEqual(changed["confirm_token"], status["confirm_token"])
+                with self.ran() as run:
+                    code, refused, _ = self.start(*self.ctx, flag, value, confirm=status["confirm_token"])
+                self.assertEqual((code, refused["status"]), (1, "refused"))
+                run.assert_not_called()
+                agent.assert_not_called()
+        (intake,) = self.intakes()
+        self.assertFalse((intake / "runs").exists())
+
+    def test_a_branch_for_a_repository_not_given_refuses_before_any_preparation(self):
+        before = tree(self.repo)
+        with self.agent() as agent:
+            code, refused, _ = self.start(*self.ctx, "--repository-branch", "ghost=feature/x")
+        self.assertEqual((code, refused["status"]), (1, "refused"))
+        self.assertIn("['ghost']", refused["error"])
+        self.assertIn("['web']", refused["error"])
+        agent.assert_not_called()
+        self.assertEqual(self.intakes(), [])
+        self.assertEqual(tree(self.repo), before)
+
+    def test_an_undeclared_repository_branch_is_refused_and_nothing_is_approved(self):
+        with self.agent(compile_widget_interpretation()):
+            _, status, _ = self.start(*self.ctx)
+        (intake,) = self.intakes()
+        before = tree(self.sparring_dir)
+        for confirm in (None, status["confirm_token"]):
+            with self.subTest(confirm=confirm), self.ran() as run:
+                # web is given but slice "app" declares no siblings.
+                code, refused, _ = self.start(*self.ctx, "--repository-branch", "web=feature/x", confirm=confirm)
+                self.assertEqual((code, refused["status"]), (1, "refused"))
+                self.assertIn("['web']", refused["error"])
+                self.assertIn("does not declare", refused["error"])
+                self.assertIsNone(refused["confirm_token"])
+                run.assert_not_called()
+        self.assertEqual(tree(self.sparring_dir), before)
+        self.assertFalse((intake / "runs").exists())
+
+    def test_the_token_changes_when_the_report_or_a_gate_changes(self):
+        repo = self.root / "cloud"
+        self.repo = make_repo(repo, "feature/cloud", {"docs/cloud.md": CLOUD})
+        self.plan, self.sparring_dir = repo / "docs" / "cloud.md", repo / ".sparring"
+        ctx = ["--repository-name", "app", "--context-repository", f"web={self.web}"]
+        with self.agent(cloud_interpretation()):
+            _, first, _ = self.start(*ctx)
+        tokens = {first["confirm_token"]}
+        regated = cloud_interpretation()
+        regated["gates"][0]["reason"] = "only if Stage 2's metrics regress badly"
+        resummarized = cloud_interpretation()
+        resummarized["summary"] = "Another summary, so another report."
+        for interpretation in (regated, resummarized):
+            # A newer intake of the same plan and repositories: the one start-plan reuses.
+            self.prepare(interpretation, mode="compile", context={"web": self.web})
+            with self.agent() as agent:
+                _, status, _ = self.start(*ctx)
+            agent.assert_not_called()
+            self.assertTrue(status["intake"]["reused"])
+            self.assertEqual(status["status"], "ready")
+            self.assertNotIn(status["confirm_token"], tokens)
+            tokens.add(status["confirm_token"])
+            with self.ran() as run:
+                code, _, _ = self.start(*ctx, confirm=first["confirm_token"])
+            self.assertEqual(code, 1)
+            run.assert_not_called()
+
     def test_the_token_changes_when_a_sibling_head_moves(self):
         repo = self.root / "cloud"
         self.repo = make_repo(repo, "feature/cloud", {"docs/cloud.md": CLOUD})
@@ -389,6 +519,14 @@ class IntakeRouteTests(_Start):
         run.assert_not_called()
 
 
+EXECUTION_CHANGES = (
+    ("--permission-mode", "bypassPermissions"),
+    ("--claude-executable", "/opt/other/claude"),
+    ("--codex-executable", "/opt/other/codex"),
+    ("--max-send-back-cycles", "9"),
+)
+
+
 class TokenTests(unittest.TestCase):
     base = {
         "route": "intake", "intake_id": "i", "intake_record_sha256": "r", "report_digest": "p",
@@ -397,6 +535,8 @@ class TokenTests(unittest.TestCase):
         "repositories": [{"name": "app", "path": "/a", "git_common_dir": "/a/.git", "branch": "b", "head": "h"}],
         "models": {"stage": {"provider": "claude-cli", "model": None, "effort": None}},
         "allow_push_for_run": False,
+        "execution": {"permission_mode": "default", "claude_executable": "claude", "codex_executable": "codex",
+                      "max_send_back_cycles": 3},
     }
 
     def test_every_bound_input_changes_the_token(self):
@@ -407,6 +547,10 @@ class TokenTests(unittest.TestCase):
             ("intake_record_sha256", "r2"), ("allow_push_for_run", True),
             ("repositories", [{**self.base["repositories"][0], "head": "h2"}]),
             ("models", {"stage": {"provider": "claude-cli", "model": "x", "effort": None}}),
+            *(("execution", {**self.base["execution"], key: value}) for key, value in (
+                ("permission_mode", "bypassPermissions"), ("claude_executable", "/x/claude"),
+                ("codex_executable", "/x/codex"), ("max_send_back_cycles", 4),
+            )),
         ):
             with self.subTest(key):
                 self.assertNotEqual(confirm_token({**self.base, key: value}), token)
