@@ -199,7 +199,7 @@ adds:
 | `next_turn_candidate.tracked_digest`, `next_turn_candidate.untracked` | a candidate recorded before the split; a `finalization` resume over it allows the untracked-removal recovery only on same HEAD, same sibling HEADs and a clean worktree, and says so | a candidate is captured |
 | `next_turn_resolution` | no ambiguous legacy state was resolved (or it was resolved before this record existed) | a derived or manual marker is first persisted; never rewritten |
 | `untracked_produced` | no successful implementation turn recorded it yet (or one recorded before the field existed: the reviewer-start check then uses the handoff's list, exactly -- a collapsed `dir/` entry covers nothing) | a successful implementation turn finishes |
-| `implementation_unreviewed` | false: no successful implementation turn is waiting for its review to be pinned | `true` when a successful implementation turn finishes; removed by the next marker write (review pin, verdict, reopen, cycle start). With `next_turn = stage` it means that turn's review is owed |
+| `implementation_unreviewed` | false: no successful implementation turn is waiting for its review to be pinned | `true` once a successful implementation turn and its handoff are both recorded; removed by the next marker write (review pin, verdict, reopen, cycle start). With `next_turn = stage` it means that turn's review is owed |
 | `untracked_baseline` | a stage started before it was recorded; only the last turn's produced paths count | the stage's first implementation turn records `base_sha` |
 | `sessions` | the recorded session ids and `agents` pins are generation 1 (`started_at` unknown) | a role's configuration is pinned or its session id is recorded, or a fresh session is started |
 

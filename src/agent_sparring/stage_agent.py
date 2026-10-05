@@ -319,7 +319,6 @@ def run_stage_agent(
                     state.untracked_produced = untracked_candidate_paths(repo_root, stage)
                 except NextTurnError as exc:
                     raise StageAgentRunError(str(exc)) from exc
-                state.implementation_unreviewed = True
             stage.write_state(state)
             activity.emit(
                 "turn.finished",
@@ -340,6 +339,12 @@ def run_stage_agent(
                 )
             except GitContextError as exc:
                 raise StageAgentRunError(str(exc)) from exc
+            if not result.is_error:
+                # Only now -- turn, session and handoff all recorded -- is
+                # this turn owed a review (next_turn.implementation_awaiting_review).
+                state = stage.read_state()
+                state.implementation_unreviewed = True
+                stage.write_state(state)
             activity.emit("handoff.ready", session_id=result.session_id)
     except WorktreeLockError as exc:
         raise StageAgentRunError(str(exc)) from exc

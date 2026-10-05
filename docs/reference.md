@@ -176,7 +176,8 @@ implementation created stay part of the candidate.
 
 When the refusal follows a completed implementation turn, `next_turn` stays
 `stage`, but that turn's own structured record says a review is owed:
-`implementation_unreviewed`, set by a successful implementation turn and
+`implementation_unreviewed`, set once a successful implementation turn and
+its handoff are both recorded, and
 cleared by every later marker write (the review pin, a SEND_BACK or READY
 verdict, a reopen, the next cycle start). A SEND_BACK therefore always owes
 an implementation turn, however its prose reads. Once the files are removed, committed or

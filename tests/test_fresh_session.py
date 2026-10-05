@@ -476,6 +476,18 @@ class TransactionalTests(_LoopRepo):
                 )
         self.assertEqual(self.stage.read_state().next_turn, "stage")
         self.assertEqual(sparring.start_calls, [])
+        # Not owed a review: a resume runs the implementation turn again
+        # rather than reviewing over a stale or template handoff.
+        self.assertFalse(self.stage.read_state().implementation_unreviewed)
+        from agent_sparring.next_turn import standalone_start_with
+
+        self.assertEqual(standalone_start_with(self.repo, self.stage), "stage")
+        run_unattended_loop(
+            self.stage, self.sparring_dir, self.repo, stage_adapter,
+            _SparringAdapter([NEEDS_YOU]), expected_branch="feature/x",
+            start_with=standalone_start_with(self.repo, self.stage),
+        )
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 2)
 
     def test_a_failure_capturing_the_candidate_leaves_next_turn_at_stage(self):
         stage_adapter = _StageAdapter(self.repo)
