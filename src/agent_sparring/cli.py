@@ -2585,7 +2585,7 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
             execution=_start_execution(args),
         )
 
-        def prepare(parent: Path | None, given: dict) -> Path:
+        def prepare(parent: Path | None, given: dict, validate) -> Path:
             adapter, provider = _intake_adapter(args, sparring_dir, repo_root)
             print("preparing the plan: one read-only provider turn…", file=sys.stderr)
             return prepare_plan(
@@ -2600,6 +2600,7 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
                 provider=provider,
                 answer_parent=parent,
                 answers=given,
+                validate=validate,
             ).directory
 
         status = evaluate(request, prepare=None if args.confirm else prepare)

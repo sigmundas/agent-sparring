@@ -439,6 +439,17 @@ class IntakeRouteTests(_Start):
         self.assertEqual(self.intakes(), [])
         self.assertEqual(tree(self.repo), before)
 
+    def test_a_given_but_undeclared_repository_branch_refuses_a_first_preparation_writing_nothing(self):
+        before = tree(self.repo)
+        with self.agent(compile_widget_interpretation()) as agent:
+            code, refused, _ = self.start(*self.ctx, "--repository-branch", "web=feature/x")
+        self.assertEqual((code, refused["status"]), (1, "refused"))
+        self.assertIn("['web']", refused["error"])
+        self.assertIn("does not declare", refused["error"])
+        self.assertEqual(agent.call_count, 1)
+        self.assertEqual(self.intakes(), [])
+        self.assertEqual(tree(self.repo), before)
+
     def test_an_undeclared_repository_branch_is_refused_and_nothing_is_approved(self):
         with self.agent(compile_widget_interpretation()):
             _, status, _ = self.start(*self.ctx)

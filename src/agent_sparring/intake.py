@@ -2074,6 +2074,7 @@ def prepare_plan(
     mint_run_key: Callable[[str], str] = new_run_key,
     answer_parent: Path | None = None,
     answers: Mapping[str, str] | None = None,
+    validate: Callable[[Interpretation, list[Finding]], None] | None = None,
 ) -> IntakeResult:
     """Run one intake turn and write a reviewable proposal. Executes nothing.
 
@@ -2082,6 +2083,9 @@ def prepare_plan(
     (:func:`answered_decisions`) before any provider turn, given to the
     agent, written to this intake's ``decisions.json`` and rendered into the
     affected briefs. The answered intake itself is never written.
+
+    ``validate(interpretation, findings)`` runs after the turn and before
+    anything is written; whatever it raises refuses with nothing persisted.
 
     Refuses (:class:`IntakeError`) when the mode is unknown, intake
     artifacts would be visible to git, the provider fails, any repository
@@ -2170,6 +2174,8 @@ def prepare_plan(
         else None
     )
     findings = all_findings(interpretation, source, mode=mode, compile_context=compile_context)
+    if validate is not None:
+        validate(interpretation, findings)
 
     run_keys = {run.id: mint_run_key(label) for run in interpretation.runs}
     briefs = _render_briefs(source, interpretation, run_keys, decisions=answered)

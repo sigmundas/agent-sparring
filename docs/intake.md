@@ -246,7 +246,8 @@ text), `expected_branch`, the primary repository and every
 `--repository-branch` is refused on this route), `models`,
 `allow_push_for_run` and `execution`. On the intake route a
 `--repository-branch` naming a repository the slice does not declare is
-refused -- before any preparation when it names no `--context-repository`. Confirming the direct route runs the plan text the token was
+refused, and nothing is written: before any preparation when it names no
+`--context-repository`, and otherwise before a preparation writes its intake. Confirming the direct route runs the plan text the token was
 computed over, never the file read again. Any change — a moved sibling HEAD, another answer,
 another report, a gate — is another token.
 

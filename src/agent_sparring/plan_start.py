@@ -70,8 +70,9 @@ STATUS_READY = "ready"
 ROUTE_DIRECT = "direct"
 ROUTE_INTAKE = "intake"
 
-#: ``prepare(parent intake dir or None, answers) -> new intake dir``.
-Prepare = Callable[["Path | None", Mapping[str, str]], Path]
+#: ``prepare(parent intake dir or None, answers, validate) -> new intake dir``;
+#: ``validate(interpretation, findings)`` must run before anything is written.
+Prepare = Callable[["Path | None", Mapping[str, str], Callable[[Any, Any], None]], Path]
 
 
 class StartPlanError(RuntimeError):
@@ -346,6 +347,15 @@ def locate_intake(request: StartRequest, *, label: str, prepare: Prepare | None)
     for prior in candidates:
         if recorded_answers(prior.record) == answers and _still_current(prior.directory, prior.record):
             return prior.directory, True
+
+    def validate(interpretation, findings) -> None:
+        # A refusal the prepared intake would end in is made before it is written.
+        if interpretation.verdict == VERDICT_CANNOT_INTERPRET or any(f.blocking for f in findings):
+            return  # needs_decision or refused on its own, never reaching the slice
+        ours = [run for run in interpretation.runs if run.primary_repository == request.primary_repository]
+        if ours:
+            _check_repository_branches(request, ours[0])
+
     if prepare is None:
         raise StartPlanError(
             "--confirm never prepares, and no finished compile intake of this plan matches its "
@@ -353,7 +363,7 @@ def locate_intake(request: StartRequest, *, label: str, prepare: Prepare | None)
             "confirm the token it prints"
         )
     if not answers:
-        return prepare(None, {}), False
+        return prepare(None, {}, validate), False
     for prior in candidates:
         given = recorded_answers(prior.record)
         if any(answers.get(key) != value for key, value in given.items()):
@@ -366,7 +376,7 @@ def locate_intake(request: StartRequest, *, label: str, prepare: Prepare | None)
         except IntakeError:
             continue
         if remaining <= set(posed_decisions(interpretation)):
-            return prepare(prior.directory, answers), False
+            return prepare(prior.directory, answers, validate), False
     raise StartPlanError(
         f"--answer {sorted(answers)}: no prepared intake of this plan asks these decisions. Run "
         "start-plan without --answer to see the questions it asks"
@@ -441,12 +451,7 @@ def _intake_status(request: StartRequest, payload: dict[str, Any], intake_dir: P
             f"run slice {run.id!r} declares sibling repositories {missing}; give each with "
             "--context-repository NAME=PATH"
         )
-    undeclared = sorted(set(request.repository_branches) - set(siblings))
-    if undeclared:
-        raise StartPlanError(
-            f"--repository-branch names {undeclared}, which run slice {run.id!r} does not declare; "
-            f"its declared sibling repositories are {siblings or 'none'}"
-        )
+    _check_repository_branches(request, run)
     branches = {
         name: request.repository_branches.get(name) or str((inspected.get(name) or {}).get("branch") or "")
         for name in siblings
@@ -520,6 +525,18 @@ def _intake_status(request: StartRequest, payload: dict[str, Any], intake_dir: P
         }
     )
     return StartStatus(payload=payload, pending=pending)
+
+
+def _check_repository_branches(request: StartRequest, run) -> None:
+    """Refuses a ``--repository-branch`` for a repository ``run`` does not declare."""
+
+    siblings = sorted({name for stage in run.stages for name in stage.repositories})
+    undeclared = sorted(set(request.repository_branches) - set(siblings))
+    if undeclared:
+        raise StartPlanError(
+            f"--repository-branch names {undeclared}, which run slice {run.id!r} does not declare; "
+            f"its declared sibling repositories are {siblings or 'none'}"
+        )
 
 
 def _first_unfinished_slice(interpretation, intake_dir: Path, primary_repository: str):
