@@ -163,7 +163,9 @@ untracked paths the stage's implementation did not produce, naming them and
 saying to remove, commit or ignore them. The check runs before any review
 marker, pinned candidate or `next_turn_resolution` is written (including a
 derived or `--next-turn sparring` resolution), so a refusal records nothing
-for the review; the CLI prints the exact command to rerun. "Did not
+for the review; the CLI prints the exact command to rerun, repeating an
+explicit `--next-turn sparring` that was refused before it was recorded and,
+for `run-sparring`, the reviewer options given. "Did not
 produce" is decided from engine records only: present before the stage's
 first implementation turn (`untracked_baseline`, recorded with `base_sha`),
 or not among the exact untracked paths the last successful implementation
@@ -173,9 +175,11 @@ a collapsed `dir/` entry vouches for no file under it. Untracked files the
 implementation created stay part of the candidate.
 
 When the refusal follows a completed implementation turn, `next_turn` stays
-`stage`, but that turn's own record (`untracked_produced`, which the loop
-clears whenever it starts an implementation turn and only a successful turn
-writes) says a review is owed. Once the files are removed, committed or
+`stage`, but that turn's own structured record says a review is owed:
+`implementation_unreviewed`, set by a successful implementation turn and
+cleared by every later marker write (the review pin, a SEND_BACK or READY
+verdict, a reopen, the next cycle start). A SEND_BACK therefore always owes
+an implementation turn, however its prose reads. Once the files are removed, committed or
 ignored, the same resume therefore goes straight to the reviewer, which
 pins whatever the candidate then is -- no further implementation turn.
 
@@ -421,7 +425,7 @@ always hold the *current* generation's values.
 ### Compatibility of existing `state.json` files
 
 `next_turn`, `next_turn_candidate` (and its `tracked_digest` / `untracked`),
-`next_turn_source`, `next_turn_resolution`, `untracked_baseline`, `untracked_produced` and
+`next_turn_source`, `next_turn_resolution`, `untracked_baseline`, `untracked_produced`, `implementation_unreviewed` and
 `sessions` are all optional and absent until first written: an existing file reads back
 unchanged and stays byte-identical until the engine writes the marker or
 records a session. New stages record generation 1 (with `started_at`) at its

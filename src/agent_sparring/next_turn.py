@@ -140,29 +140,23 @@ class UntrackedRefusal(NextTurnError):
     def __init__(self, message: str, paths: tuple[str, ...]):
         super().__init__(message)
         self.paths = paths
+        # Set when an explicit --next-turn choice was refused before it was
+        # recorded: a retry must pass it again.
+        self.unapplied_next_turn: str | None = None
 
 
 def implementation_awaiting_review(stage: Stage, state: StageState) -> bool:
     """A completed implementation turn whose review was never pinned.
 
-    The loop clears ``untracked_produced`` when it writes ``next_turn =
-    stage`` at a cycle start, and a successful (not ``is_error``)
-    implementation turn records it again. Both still standing together means
-    that turn completed and the reviewer-start check refused before the
-    review marker was written: the turn owed is that review, not another
-    implementation turn.
+    ``implementation_unreviewed`` is set by a successful implementation turn
+    and cleared by every later marker write -- the review pin, a verdict
+    (SEND_BACK or READY), a reopen, the next cycle start. Still standing
+    with ``next_turn = stage`` means the reviewer-start check refused before
+    the review marker was written: the turn owed is that review, not
+    another implementation turn. Structured state only; no prose is read.
     """
 
-    if state.next_turn != NEXT_TURN_STAGE or state.untracked_produced is None:
-        return False
-    # A verdict (SEND_BACK) or a reopen recorded since that turn also leaves
-    # next_turn = stage: the turn is only still unreviewed while its handoff
-    # embeds the review record that is on disk now.
-    handoff = _read_handoff(stage)
-    return (
-        handoff is not None
-        and handoff.previous_sparring == _previous_sparring_section(stage).strip()
-    )
+    return state.next_turn == NEXT_TURN_STAGE and state.implementation_unreviewed
 
 
 def check_untracked_before_review(repo_root: Path, stage: Stage) -> None:
@@ -264,6 +258,7 @@ def record_next_turn(
     state.next_turn = next_turn
     state.next_turn_candidate = candidate if next_turn != NEXT_TURN_STAGE else None
     state.next_turn_source = source
+    state.implementation_unreviewed = False
     stage.write_state(state)
 
 
@@ -511,8 +506,13 @@ def resolve_resume_turn(
     if choice is not None:
         ambiguity = check_next_turn_choice(repo_root, stage, choice)
         if choice == NEXT_TURN_SPARRING:
-            # Before the marker or the resolution is written.
-            check_untracked_before_review(repo_root, stage)
+            # Before the marker or the resolution is written; the choice is
+            # then still unapplied, so a retry must repeat it.
+            try:
+                check_untracked_before_review(repo_root, stage)
+            except UntrackedRefusal as exc:
+                exc.unapplied_next_turn = choice
+                raise
         state = stage.read_state()
         candidate = (
             capture_candidate(repo_root, stage, state)

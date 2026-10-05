@@ -282,6 +282,7 @@ def _discharge_review_turn(stage: Stage, action: RoutingAction) -> None:
     else:
         state.next_turn = "finalization"
     state.next_turn_source = "engine"
+    state.implementation_unreviewed = False
     stage.write_state(state)
 
 

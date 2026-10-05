@@ -322,6 +322,7 @@ def reopen_for_failed_check(
         reopened.next_turn = "stage"
         reopened.next_turn_candidate = None
         reopened.next_turn_source = "engine"
+    reopened.implementation_unreviewed = False
     stage.write_state(reopened)
     report(
         f"stage {obligation.stage_id}: ACCEPTED -> WORKING; its candidate "

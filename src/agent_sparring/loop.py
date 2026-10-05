@@ -403,12 +403,6 @@ def run_unattended_loop(
                 # Implementation work is owed from here until this turn and
                 # all of its records succeed.
                 record_next_turn(stage, NEXT_TURN_STAGE)
-                # Until this turn succeeds, no implementation turn is
-                # awaiting review (next_turn.implementation_awaiting_review).
-                state = stage.read_state()
-                if state.untracked_produced is not None:
-                    state.untracked_produced = None
-                    stage.write_state(state)
             try:
                 stage_run = run_stage_agent(
                     stage,
@@ -501,9 +495,9 @@ def run_unattended_loop(
         # Untracked files the implementation did not produce must never
         # silently become part of the reviewed candidate. Checked before the
         # review marker is written, so a refusal records nothing for the
-        # review; the completed implementation turn's own records (its
-        # handoff, session and ``untracked_produced``) make the same resume
-        # owe this review once the files are removed, committed or ignored.
+        # review; the completed implementation turn's own record
+        # (``implementation_unreviewed``) makes the same resume owe this
+        # review once the files are removed, committed or ignored.
         try:
             check_untracked_before_review(repo_root, stage)
         except NextTurnError as exc:

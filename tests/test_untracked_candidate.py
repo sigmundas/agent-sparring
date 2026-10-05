@@ -124,6 +124,7 @@ class ReviewerStartGuardTests(_LoopRepo):
             [[
                 "--sparring-dir", str(self.sparring_dir.resolve()), "run-sparring", "s1",
                 "--repo-root", str(self.repo.resolve()), "--expected-branch", "feature/x",
+                "--codex-executable", "/nonexistent/codex",
             ]],
         )
         self.assertNotIn("agents", self.stage.read_state().to_dict())
@@ -222,6 +223,67 @@ class PreventionResumeTests(_PlanRepoTestCase):
         self.assertEqual(ctx.exception.paths, ("stray.txt",))
         self.assertEqual((stage.directory / "state.json").read_bytes(), before)
         self.assertIsNone(stage.read_state().next_turn_resolution)
+
+
+class ReviewOwedRoutingTests(_PlanRepoTestCase):
+    cli = PreventionResumeTests.cli
+
+    def test_a_repeated_send_back_still_owes_implementation_after_a_stop(self):
+        from test_fresh_session import SEND_BACK
+
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        with self.assertRaises(PlanRunError):
+            self._start(
+                stage_adapter, _SparringAdapter([SEND_BACK, SEND_BACK]),
+                stop_after_stage=S1, max_send_back_cycles=1,
+            )
+        stage = self._stage(S1)
+        state = stage.read_state()
+        self.assertEqual(state.next_turn, "stage")
+        self.assertFalse(state.implementation_unreviewed)
+        self.assertFalse(implementation_awaiting_review(stage, state))
+
+        sparring = _SparringAdapter([READY])
+        self._resume(stage_adapter, sparring, stop_after_stage=S1)
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 3)
+        self.assertIs(stage.read_state().status, StageStatus.ACCEPTED)
+
+    def test_a_refused_manual_choice_is_repeated_by_the_printed_retry(self):
+        from test_fresh_session import _FailingSparringAdapter, FAIL, SEND_BACK
+
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        with self.assertRaises(PlanRunError):
+            self._start(stage_adapter, _FailingSparringAdapter([SEND_BACK, FAIL]))
+        stage = self._stage(S1)
+        _strip_marker(stage)
+        (self.repo / "later.txt").write_text("later\n")
+        _run_git(self.repo, "add", "later.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "moved on")
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        (self.repo / "stray.txt").write_text("not mine\n")
+
+        code, err = self.cli(
+            ["--sparring-dir", str(self.sparring_dir), "resume-plan", str(self.plan_path),
+             "--repo-root", str(self.repo), "--expected-branch", "feature/x",
+             "--stop-after-stage", S1, "--next-turn", "sparring"],
+            stage_adapter, _SparringAdapter([]),
+        )
+        self.assertEqual(code, 1, err)
+        (command,) = _printed_commands(err)
+        self.assertEqual(command[command.index("--next-turn") + 1], "sparring")
+        self.assertIsNone(stage.read_state().next_turn)
+
+        (self.repo / "stray.txt").unlink()
+        sparring = _SparringAdapter([READY])
+        code, err = self.cli(command, stage_adapter, sparring)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), 2)
+        state = stage.read_state()
+        self.assertIs(state.status, StageStatus.ACCEPTED)
+        self.assertEqual(
+            (state.next_turn_resolution.turn, state.next_turn_resolution.source),
+            ("sparring", "manual"),
+        )
 
 
 class UntrackedRemovalRecoveryTests(_PlanRepoTestCase):

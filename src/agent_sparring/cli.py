@@ -1292,6 +1292,11 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
                         "run-sparring", args.stage_id,
                         "--repo-root", str(Path(repo_root).resolve()),
                         "--expected-branch", args.expected_branch,
+                        # Refused before anything was pinned: every reviewer
+                        # option given still has to be repeated.
+                        *_given_options(
+                            args, ("provider", "model", "effort"), codex_executable="codex"
+                        ),
                     ]
                 ),
             )
@@ -1600,7 +1605,13 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             print(f"could not run unattended loop: {exc}", file=sys.stderr)
             if _refusal_cause(exc) is not None:
                 _print_next_commands(
-                    exc, _retry_command(args, sparring_dir, repo_root, ["run-loop", args.stage_id])
+                    exc,
+                    _retry_command(
+                        args,
+                        sparring_dir,
+                        repo_root,
+                        ["run-loop", args.stage_id, *_unapplied_next_turn(exc)],
+                    ),
                 )
             return 1
         role = _loop_failed_role(exc)
@@ -1631,7 +1642,13 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
         print(f"could not run unattended loop: {exc}", file=sys.stderr)
         if _refusal_cause(exc) is not None:
             _print_next_commands(
-                exc, _retry_command(args, sparring_dir, repo_root, ["run-loop", args.stage_id])
+                exc,
+                    _retry_command(
+                        args,
+                        sparring_dir,
+                        repo_root,
+                        ["run-loop", args.stage_id, *_unapplied_next_turn(exc)],
+                    ),
             )
         return 1
 
@@ -1687,6 +1704,32 @@ def _print_next_commands(exc: BaseException, rerun: str, reset: str | None = Non
     if reset is not None:
         print("Or deliberately discard this attempt:", file=sys.stderr)
         print(f"  {reset}", file=sys.stderr)
+
+
+def _given_options(
+    args: argparse.Namespace, options: tuple[str, ...], **defaults: str
+) -> list[str]:
+    """``--option value`` for each option this invocation was given."""
+
+    parts: list[str] = []
+    for option in options:
+        value = getattr(args, option, None)
+        if value is not None:
+            parts += [f"--{option.replace('_', '-')}", str(value)]
+    for option, default in defaults.items():
+        value = getattr(args, option, default)
+        if value != default:
+            parts += [f"--{option.replace('_', '-')}", str(value)]
+    return parts
+
+
+def _unapplied_next_turn(exc: BaseException) -> list[str]:
+    """``--next-turn <choice>`` when the refusal came before that explicit
+    choice was recorded, so the retry must make it again."""
+
+    cause = _refusal_cause(exc)
+    choice = getattr(cause, "unapplied_next_turn", None)
+    return ["--next-turn", choice] if choice else []
 
 
 def _plan_command_parts(args: argparse.Namespace) -> list[str]:
@@ -2025,6 +2068,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool) -> int:
                         "resume-plan",
                         *_plan_command_parts(args),
                         *(["--run-key", run_key] if run_key else []),
+                        *_unapplied_next_turn(exc),
                     ],
                 ),
                 reset=(

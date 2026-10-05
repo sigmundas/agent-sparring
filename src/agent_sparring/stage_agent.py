@@ -319,6 +319,7 @@ def run_stage_agent(
                     state.untracked_produced = untracked_candidate_paths(repo_root, stage)
                 except NextTurnError as exc:
                     raise StageAgentRunError(str(exc)) from exc
+                state.implementation_unreviewed = True
             stage.write_state(state)
             activity.emit(
                 "turn.finished",

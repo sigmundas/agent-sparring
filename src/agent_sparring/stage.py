@@ -562,6 +562,11 @@ class StageState:
     # implementation turn finished (file by file). ``None`` -- absent -- for
     # turns recorded before it existed; the handoff's list is used then.
     untracked_produced: tuple[str, ...] | None = None
+    # True from a successful implementation turn until the next write of
+    # the marker (a pinned review, a verdict, a reopen, a cycle start):
+    # structured evidence that the turn completed and no review has been
+    # pinned for it since. Absent from state.json while false.
+    implementation_unreviewed: bool = False
     # Provider conversations per role (see agent_sparring.sessions),
     # ``{role: [SessionGeneration, ...]}``. Empty and absent from state.json
     # until a fresh session is first started; until then the recorded
@@ -586,6 +591,8 @@ class StageState:
             payload.pop("untracked_baseline", None)
         else:
             payload["untracked_baseline"] = list(self.untracked_baseline)
+        if not self.implementation_unreviewed:
+            payload.pop("implementation_unreviewed", None)
         if self.untracked_produced is None:
             payload.pop("untracked_produced", None)
         else:
@@ -694,6 +701,7 @@ class StageState:
             ),
             untracked_baseline=tuple(raw_baseline) if raw_baseline is not None else None,
             untracked_produced=tuple(raw_produced) if raw_produced is not None else None,
+            implementation_unreviewed=payload.get("implementation_unreviewed") is True,
             sessions=sessions,
             agents=agents,
             status=status,
