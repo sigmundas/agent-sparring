@@ -1029,21 +1029,38 @@ class NoTurnOwedTests(_PlanRepoTestCase):
                     self.assertEqual(len(prompts), 1)
                     self.assertIn("## Finalize this candidate", prompts[0])
 
+    def test_a_fresh_stage_agent_on_committed_legacy_ready_is_routed_to_review(self):
+        stage = self.leave_legacy_ready(committed=True)
+        stage_adapter, sparring = _StageAdapter(self.repo, commit=True), _SparringAdapter([READY])
+        result = self._resume(stage_adapter, sparring, stop_after_stage=S1,
+                              fresh_roles=("stage",), fresh_reason="context full")
+        # The reviewer rules on the commit; the fresh stage agent is owed no turn.
+        self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
+        self.assertEqual(len(sparring.start_calls + sparring.resume_calls), 1)
+        self.assertEqual(dict(result.accepted)[S1], _head(self.repo))
+        self.assertIs(stage.read_state().status, StageStatus.ACCEPTED)
+
     def test_standalone_legacy_ready_never_starts_an_implementation_turn(self):
         from agent_sparring.next_turn import standalone_start_with
 
-        for committed, entry in ((False, "finalization"), (True, "sparring")):
+        for committed in (False, True):
             with self.subTest(committed=committed):
                 self.setUp()
                 stage = self.leave_legacy_ready(committed=committed)
-                self.assertEqual(standalone_start_with(self.repo, stage), entry)
+                if not committed:
+                    # No pinned candidate to finalize against: run-loop
+                    # refuses; the managed resume owns that path.
+                    before = (stage.directory / "state.json").read_bytes()
+                    with self.assertRaises(NextTurnError) as ctx:
+                        standalone_start_with(self.repo, stage)
+                    self.assertIn("resume-plan", str(ctx.exception))
+                    self.assertEqual((stage.directory / "state.json").read_bytes(), before)
+                    continue
+                self.assertEqual(standalone_start_with(self.repo, stage), "sparring")
                 state = stage.read_state()
-                if committed:
-                    self.assertEqual((state.next_turn, state.next_turn_source),
-                                     ("sparring", "derived"))
-                    self.assertEqual(state.next_turn_candidate.head_sha, _head(self.repo))
-                else:
-                    self.assertIsNone(state.next_turn)
+                self.assertEqual((state.next_turn, state.next_turn_source),
+                                 ("sparring", "derived"))
+                self.assertEqual(state.next_turn_candidate.head_sha, _head(self.repo))
 
     def test_escalate_refuses_choices_and_keeps_the_pause(self):
         self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([ESCALATE]),

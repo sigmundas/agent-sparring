@@ -200,6 +200,12 @@ is never derived again.
 
 Three different things, from least to most disruptive:
 
+| | Stage attempt | Candidate | Provider conversation | History and verdicts | Configuration |
+| --- | --- | --- | --- | --- | --- |
+| Resume | same | same | same, for both roles | kept | as locked at each conversation's first turn |
+| Fresh session | same | same | new for the one role asked | kept; the new conversation is told where the stage stands | resolved anew for that role and recorded with its generation |
+| `reset-stage` | new; the old one archived | starts over | new for both | archived with the old attempt | resolved anew |
+
 - **Resume** (`resume-plan`, `run-loop`) continues the same stage in the
   same provider conversations, with the configuration locked at each
   conversation's first turn. It obeys `next_turn`.
@@ -253,7 +259,20 @@ their sources, which conversation and generation it continues (or that a new
 or fresh one starts), the model the provider last reported for that
 conversation (`not reported` if none; read from `activity.jsonl`, display
 only), and the backend/account, which no adapter can read safely today and
-is always `not reported`.
+is always `not reported`. Those two appear as the "provider-reported model"
+and "backend/account not reported" lines. A model name says nothing about
+routing: a `gpt-*` model does not mean the turn went through OpenAI or Azure,
+nor a `claude-*` one through Anthropic -- the backend is whatever the
+provider CLI is configured to use, which the engine cannot see.
+
+`sparring usage` reports each role's
+[session generations](stages.md) separately, so the cost of a replaced
+conversation and of its fresh successor stay distinguishable.
+
+**Known gap:** an ACCEPTED stage cannot be reopened. Findings from a review
+after acceptance (an independent review-only stage, or a person) are fixed
+by a follow-up plan, not by a fresh session or `--next-turn` on the
+accepted stage; both are refused there.
 
 ### Pausing on provider session failures
 
@@ -310,12 +329,39 @@ pause), removed when the run next starts running (plain resume or
 `--fresh-*`), and left untouched by a refused resume -- one that stops
 before any provider turn at the stage it describes (an inapplicable or
 refused fresh session or next-turn choice, a moved or unreadable candidate,
-a mode mismatch, an unusable review subject, unbuildable adapters). The
+a mode mismatch, an unusable review subject, unbuildable adapters) or that
+adopts a recorded human gate without evidence. The
 field is absent
 otherwise. It is descriptive only: resume never reads it, and `next_turn`,
 gates and candidate checks remain the only authority over what runs next.
 Standalone `run-loop` has no plan-run state and records nothing; its printed
 retry is the whole report.
+
+### Recovery walkthrough
+
+**The reviewer's conversation cannot be resumed.** `resume-plan` pauses with
+`provider_pause.kind = session-unresumable`, `role = sparring`, and prints a
+retry ending `--fresh-sparrer --fresh-reason session-unresumable`. Run it: a
+new reviewer conversation (generation 2) reviews the same candidate, with
+the earlier exchange as history, and the loop carries on as normal --
+SEND_BACK goes back to the stage agent, READY to push and acceptance.
+
+**The provider is unavailable** (quota, rate limit, overloaded). The pause
+records `provider-unavailable`. Either wait and run the printed plain retry,
+which continues the same conversation, or continue in a fresh session on
+another provider: the printed fresh alternative plus, for example,
+`--sparring-provider codex-cli`.
+
+**A legacy run is stuck and HEAD moved outside the loop.** A stage recorded
+before `next_turn` existed, whose handoff's candidate is no longer HEAD, is
+refused on resume with what was found. Nothing has
+changed. Decide yourself: `--next-turn sparring` to review the current
+commit, or `--next-turn stage` for another implementation turn. The choice
+is recorded as `manual` and never asked again.
+
+A standalone `run-loop` refuses a legacy READY whose reviewed content is
+still uncommitted: there is no pinned candidate to hold a commit turn to, so
+resume it as a managed run (`resume-plan`), which finalizes it.
 
 Generations are recorded as `sessions: {role: [...]}` in `state.json`, each
 with its `generation`, `session_id` (null until the provider reports one),

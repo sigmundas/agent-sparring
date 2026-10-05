@@ -391,8 +391,9 @@ def resolve_legacy_ready(repo_root: Path, stage: Stage) -> str:
     """Where a resume enters a READY recorded before the next_turn marker
     existed, with nothing after it: never an implementation turn.
 
-    - reviewed content still uncommitted -> ``finalization`` (the bounded
-      commit turn, held to the uncommitted content);
+    - reviewed content still uncommitted -> ``finalization`` (the managed
+      resume's bounded commit turn, held to the uncommitted content;
+      :func:`standalone_start_with` refuses this case for ``run-loop``);
     - a clean committed candidate -> ``sparring``, recorded as a derived
       marker over the current commit: which commit READY was given over is
       not recorded, so the reviewer rules on this one before acceptance.
@@ -513,7 +514,16 @@ def standalone_start_with(
         )
     marker = resolve_resume_turn(repo_root, stage, choice=choice)
     if marker == NO_TURN_OWED:
-        return resolve_legacy_ready(repo_root, stage)
+        resolved = resolve_legacy_ready(repo_root, stage)
+        if resolved == NEXT_TURN_FINALIZATION:
+            # A legacy READY over uncommitted content has no pinned candidate
+            # to hold a commit turn to; only the managed resume finalizes it.
+            raise NextTurnError(
+                f"stage {stage.stage_id!r} records a legacy READY over uncommitted content with "
+                "no pinned candidate; run-loop does not finalize it. Resume it as a managed run "
+                "(resume-plan)."
+            )
+        return resolved
     if marker == NEXT_TURN_FINALIZATION:
         resolved = resolve_finalization(repo_root, stage, stage.read_state())
         if resolved == RESUME_ACCEPT:

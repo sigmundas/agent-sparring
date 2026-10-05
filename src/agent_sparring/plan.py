@@ -3550,8 +3550,9 @@ def _drive(
                 # gate a second time. So the run adopts the pause exactly as
                 # it stands -- same sessions, same candidate, same
                 # sparring.md -- and the way out is the way it always was:
-                # answer it, with `resume-plan --evidence`.
-                _pause(state, state_path)
+                # answer it, with `resume-plan --evidence`. No provider turn
+                # ran, so a recorded provider pause reason is kept too.
+                _pause(state, state_path, provider_pause=_kept_provider_pause(state))
                 activity.emit(
                     "plan.stage.entered",
                     summary=f"{plan_stage.display} ({position}); already awaiting a human",

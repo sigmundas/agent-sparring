@@ -403,7 +403,15 @@ Where inside the current stage it continues is the engine's own record,
 implementation turn completed and the reviewer then failed before a verdict,
 resuming reviews that exact candidate directly; it does not spend another
 implementation turn. Evidence, a recorded human gate and a pending
-finalization keep their existing precedence.
+finalization keep their existing precedence. `--next-turn stage|sparring`
+exists only for legacy state the engine refuses to read; it is refused
+whenever the engine already knows.
+
+A plain resume continues the same conversations; `--fresh-sparrer` /
+`--fresh-stage-agent` continue the same stage and candidate in a new
+conversation for one role; `sparring reset-stage` starts a new attempt. See
+[resume, fresh session, reset](reference.md#resume-fresh-session-reset) and
+its [recovery walkthrough](reference.md#recovery-walkthrough).
 
 #### Run instances: a plan document is an input, not a run
 

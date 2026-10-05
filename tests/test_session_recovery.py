@@ -317,6 +317,24 @@ class ProviderPauseRecordTests(_Stuck):
         self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
         self.assertNotIn("provider_pause", json.loads(self.state_path.read_text()))
 
+    def test_adopting_a_human_pause_without_evidence_keeps_it(self):
+        _, stage_adapter = self.leave_stuck()
+        self._resume(stage_adapter, _SparringAdapter([NEEDS_YOU]))
+        record = {"kind": PAUSE_SESSION_UNRESUMABLE, "role": "sparring", "stage_id": S1,
+                  "has_session": True, "recorded_at": "2026-01-01T00:00:00Z"}
+        payload = json.loads(self.state_path.read_text())
+        payload["provider_pause"] = record
+        self.state_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        turns = len(stage_adapter.start_calls) + len(stage_adapter.resume_calls)
+        sparring = _SparringAdapter([READY])
+
+        result = self._resume(stage_adapter, sparring)
+
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), turns)
+        self.assertEqual(self._plan_state().provider_pause, record)
+
     def test_a_refused_fresh_session_keeps_it(self):
         with self.assertRaises(ProviderPause):
             self._start(_UnavailableBeforeSession(self.repo, commit=True), _SparringAdapter([READY]))
@@ -392,6 +410,32 @@ class ProviderPauseRecordTests(_Stuck):
         result = self._resume(_StageAdapter(self.repo), _SparringAdapter([]))
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
         self.assertNotIn("provider_pause", json.loads(self.state_path.read_text()))
+
+    def test_next_turn_on_an_accepted_stage_is_refused_byte_identically(self):
+        class _SecondDown(_StageAdapter):
+            def start(self, prompt):
+                if self.start_calls:
+                    self.start_calls.append(prompt)
+                    raise ProviderUnavailable("usage limit reached")
+                return super().start(prompt)
+
+        with self.assertRaises(ProviderPause):
+            self._start(_SecondDown(self.repo), _SparringAdapter([READY]))
+        from agent_sparring.acceptance import accept_candidate, freeze_candidate
+
+        stage2 = self._stage(S2)
+        freeze_candidate(stage2, self.sparring_dir, self.repo, expected_branch="feature/x")
+        accept_candidate(stage2, self.repo, expected_branch="feature/x")
+        files = (self.state_path, stage2.directory / "state.json")
+        before = [path.read_bytes() for path in files]
+        for choice in ("stage", "sparring"):
+            with self.subTest(choice=choice):
+                stage_adapter, sparring = _StageAdapter(self.repo), _SparringAdapter([READY])
+                with self.assertRaises(PlanError) as ctx:
+                    self._resume(stage_adapter, sparring, next_turn=choice)
+                self.assertIn("already ACCEPTED", str(ctx.exception))
+                self.assertEqual([path.read_bytes() for path in files], before)
+                self.assertEqual(stage_adapter.start_calls + sparring.start_calls, [])
 
     def test_absent_field_round_trips_byte_identically(self):
         self.leave_stuck()
@@ -961,6 +1005,32 @@ class ReviewOnlyProviderPauseRecordTests(_ReviewRepoTestCase):
         self.assertIn("not at the accepted candidate", str(ctx.exception))
         self.assertEqual(reviewer.start_calls + reviewer.resume_calls, [])
         self.assertEqual(self.plan_state().provider_pause, before)
+
+    def test_next_turn_on_a_review_only_stage_is_refused_byte_identically(self):
+        class _ReadyThenDown(_SparringAdapter):
+            def start(self, prompt):
+                if self.start_calls:
+                    self.start_calls.append(prompt)
+                    raise ProviderUnavailable("usage limit reached")
+                return super().start(prompt)
+
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        with self.assertRaises(ProviderPause):
+            self.start(stage_adapter, _ReadyThenDown([READY]))
+        files = (self.state_path, self.stage(REVIEW_STAGE).directory / "state.json")
+        before = [path.read_bytes() if path.exists() else None for path in files]
+        turns = len(stage_adapter.start_calls) + len(stage_adapter.resume_calls)
+        for choice in ("stage", "sparring"):
+            with self.subTest(choice=choice):
+                reviewer = _SparringAdapter([READY])
+                with self.assertRaises(PlanError) as ctx:
+                    self.resume(stage_adapter, reviewer, next_turn=choice)
+                self.assertIn("review-only", str(ctx.exception))
+                self.assertEqual(
+                    [path.read_bytes() if path.exists() else None for path in files], before
+                )
+                self.assertEqual(reviewer.start_calls + reviewer.resume_calls, [])
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), turns)
 
 
 class ReviewOnlyEvidenceRetryTests(_ReviewRepoTestCase):
