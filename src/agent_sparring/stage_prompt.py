@@ -98,6 +98,7 @@ def assemble_stage_prompt(
     expected_branch: str,
     self_check: bool = False,
     finalize_only: bool = False,
+    fresh: bool = False,
 ) -> AssembledPrompt:
     """Assemble the bounded prompt for one stage-agent turn.
 
@@ -120,6 +121,11 @@ def assemble_stage_prompt(
     incoherent. Like ``self_check`` it is never recorded as machine state;
     :mod:`agent_sparring.loop` decides when a turn is one of these, and
     :mod:`agent_sparring.finalization` is what actually holds the turn to it.
+
+    ``fresh`` marks the first turn of a fresh stage-agent session (see
+    :mod:`agent_sparring.sessions`): the full prompt, plus the latest
+    sparring exchange and a notice that this new conversation continues the
+    same stage. Its captured turn kind is ``fresh``.
 
     Returns the prompt as ordered, sourced sections (see
     :mod:`agent_sparring.prompt_sections`);
@@ -165,7 +171,23 @@ def assemble_stage_prompt(
     # attributes it to this engine rather than to a file on disk.
     parts.append(section("Agent Sparring artifacts", ownership_section(ROLE_STAGE)))
 
-    if resume:
+    if fresh:
+        parts.append(
+            section(
+                "Fresh session",
+                [
+                    "## Fresh session",
+                    "",
+                    "This is a new conversation continuing the same stage; an earlier "
+                    "implementation conversation for it was closed. Do not redo earlier "
+                    "accepted stages or work this stage has already completed. The latest "
+                    "sparring exchange below is the authoritative record of where review "
+                    "stands: if it is a SEND_BACK, its findings are the work to address.",
+                ],
+            )
+        )
+
+    if resume or fresh:
         try:
             sparring_text = stage.read_sparring().strip()
         except StageError:
@@ -265,7 +287,7 @@ def assemble_stage_prompt(
     return AssembledPrompt(
         role=ROLE_STAGE,
         stage_id=stage.stage_id,
-        turn_kind=stage_turn_kind(resume=resume, finalize_only=finalize_only),
+        turn_kind=stage_turn_kind(resume=resume, finalize_only=finalize_only, fresh=fresh),
         resumed=resume,
         expected_branch=expected_branch,
         sections=tuple(parts),

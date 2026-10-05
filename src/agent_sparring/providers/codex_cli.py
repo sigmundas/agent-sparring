@@ -94,12 +94,17 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
 from agent_sparring.deferred_gate import CHECKPOINTS
 from agent_sparring.human_gate import HUMAN_GATE_CATEGORIES
-from agent_sparring.providers import ProviderError, Runner, SparringAgentResult
+from agent_sparring.providers import (
+    ProviderError,
+    Runner,
+    SparringAgentResult,
+    classify_provider_error,
+)
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 
 DEFAULT_EXECUTABLE = "codex"
@@ -133,6 +138,13 @@ EFFORT_LEVELS: tuple[str, ...] = (
 # cache); :func:`list_models` reads the entries it marks for listing.
 MODEL_LIST_TIMEOUT_SECONDS = 15
 
+
+
+def _error_data(stderr: str, error_payloads: list[str]) -> str | None:
+    """Codex's provider error data: process stderr and its ``turn.failed`` /
+    ``error`` event payloads -- never the rest of the stdout stream."""
+
+    return "\n".join(part for part in (stderr, *error_payloads) if part) or None
 
 @dataclass(frozen=True)
 class CatalogModel:
@@ -488,8 +500,11 @@ class _CodexStreamTranslator:
         emitter: ActivityEmitter | None,
         repo_root: Path,
         codex_home: Path | None = None,
+        on_session: "Callable[[str], None] | None" = None,
     ) -> None:
         self._emitter = emitter
+        self._on_session = on_session
+        self._session_announced = False
         self._repo_root = repo_root
         self._started_items: set[str] = set()
         self._last_usage: dict[str, Any] = {}
@@ -499,7 +514,7 @@ class _CodexStreamTranslator:
         self._thread_id: str | None = None
 
     def feed(self, line: str) -> None:
-        if self._emitter is None:
+        if self._emitter is None and self._on_session is None:
             return
         line = line.strip()
         if not line:
@@ -509,6 +524,13 @@ class _CodexStreamTranslator:
         except json.JSONDecodeError:
             return
         if not isinstance(event, dict):
+            return
+        if event.get("type") == "thread.started" and self._on_session is not None:
+            thread_id = _str_or_none(event.get("thread_id"))
+            if thread_id and not self._session_announced:
+                self._session_announced = True
+                self._on_session(thread_id)
+        if self._emitter is None:
             return
         # Budget first, and on *every* event: which event type carries the
         # numbers is the provider's business and has changed between
@@ -688,6 +710,11 @@ class CodexCliAdapter:
     # CODEX_HOME; this exists so tests can point at a fixture. Telemetry
     # only -- nothing about the verdict depends on it.
     codex_home: Path | None = None
+    # Called with the thread id as soon as Codex announces it, while the
+    # turn is still running, so the orchestrator can record a fresh
+    # reviewer session before the turn can fail or be killed (see
+    # agent_sparring.sparring_agent). Unset, nothing changes.
+    on_session_observed: "Callable[[str], None] | None" = None
 
     provider_id: str = PROVIDER_ID
 
@@ -823,7 +850,10 @@ class CodexCliAdapter:
 
             args = self._build_args(prompt, resume_session_id, schema_path, output_path)
             translator = _CodexStreamTranslator(
-                self.activity, self.repo_root, self.codex_home
+                self.activity,
+                self.repo_root,
+                self.codex_home,
+                on_session=self.on_session_observed if resume_session_id is None else None,
             )
             try:
                 result = self.runner(
@@ -835,7 +865,17 @@ class CodexCliAdapter:
                 raise ProviderError(
                     f"{self.executable} timed out after {self.timeout_seconds}s"
                 ) from exc
-            return self._parse(result, output_path)
+            try:
+                return self._parse(result, output_path)
+            except ProviderError as exc:
+                # The same failure, typed when its text says it is one a
+                # person can recover from (see agent_sparring.providers).
+                classified = classify_provider_error(
+                    exc, resuming=resume_session_id is not None
+                )
+                if classified is exc:
+                    raise
+                raise classified from exc
 
     def _parse(
         self, result: "subprocess.CompletedProcess[str]", output_path: Path
@@ -843,6 +883,8 @@ class CodexCliAdapter:
         stdout = result.stdout or ""
         thread_id: str | None = None
         turn_failed_message: str | None = None
+        # Provider error data: turn.failed and error event payloads only.
+        error_payloads: list[str] = []
         events: list[dict[str, Any]] = []
 
         for line in stdout.splitlines():
@@ -867,24 +909,39 @@ class CodexCliAdapter:
                     turn_failed_message = str(error.get("message") or error)
                 else:
                     turn_failed_message = str(error)
+                error_payloads.append(json.dumps(error, sort_keys=True, default=str))
+            elif event_type == "error":
+                error_payloads.append(
+                    json.dumps(
+                        {k: v for k, v in event.items() if k != "type"},
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
 
         if thread_id is None:
             # Verified above: e.g. resuming an unknown thread id prints a
             # plain-text error to stderr and no JSONL at all.
-            detail = (result.stderr or "").strip() or stdout.strip() or "(no output)"
+            stderr = (result.stderr or "").strip()
+            detail = stderr or stdout.strip() or "(no output)"
             raise ProviderError(
                 f"{self.executable} exec produced no thread.started event with a "
-                f"usable thread_id (exit {result.returncode}): {detail}"
+                f"usable thread_id (exit {result.returncode}): {detail}",
+                error_data=_error_data(stderr, error_payloads),
             )
 
         if turn_failed_message is not None:
-            raise ProviderError(f"{self.executable} exec turn failed: {turn_failed_message}")
+            raise ProviderError(
+                f"{self.executable} exec turn failed: {turn_failed_message}",
+                error_data=_error_data((result.stderr or "").strip(), error_payloads),
+            )
 
         if result.returncode != 0:
             detail = (result.stderr or "").strip() or "(no stderr)"
             raise ProviderError(
                 f"{self.executable} exec exited {result.returncode} without a "
-                f"turn.failed event: {detail}"
+                f"turn.failed event: {detail}",
+                error_data=_error_data((result.stderr or "").strip(), error_payloads),
             )
 
         try:

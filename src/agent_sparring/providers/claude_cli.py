@@ -43,7 +43,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
-from agent_sparring.providers import ProviderError, Runner, StageAgentResult
+from agent_sparring.providers import (
+    ProviderError,
+    Runner,
+    StageAgentResult,
+    classify_failure_text,
+    classify_provider_error,
+    structured_error_data,
+)
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
 
 DEFAULT_EXECUTABLE = "claude"
@@ -490,7 +497,15 @@ class ClaudeCliAdapter:
             raise ProviderError(
                 f"{self.executable} timed out after {self.timeout_seconds}s"
             ) from exc
-        return self._parse(result)
+        try:
+            return self._parse(result, resuming=resume_session_id is not None)
+        except ProviderError as exc:
+            # The same failure, typed when its text says it is one a
+            # person can recover from (see agent_sparring.providers).
+            classified = classify_provider_error(exc, resuming=resume_session_id is not None)
+            if classified is exc:
+                raise
+            raise classified from exc
 
     def _final_payload(self, stdout: str) -> dict[str, Any] | None:
         """The final result object: the last ``type == "result"`` line of a
@@ -521,25 +536,54 @@ class ClaudeCliAdapter:
                 final = message
         return final
 
-    def _parse(self, result: "subprocess.CompletedProcess[str]") -> StageAgentResult:
+    def _parse(
+        self, result: "subprocess.CompletedProcess[str]", *, resuming: bool = False
+    ) -> StageAgentResult:
         stdout = result.stdout or ""
         payload = self._final_payload(stdout)
         if payload is None:
-            detail = stdout.strip() or (result.stderr or "").strip() or "(no output)"
+            stderr = (result.stderr or "").strip()
+            detail = stdout.strip() or stderr or "(no output)"
+            # Only stderr is provider error data; stdout is the transcript.
             raise ProviderError(
                 f"{self.executable} did not return a JSON result (exit "
-                f"{result.returncode}): {detail}"
+                f"{result.returncode}): {detail}",
+                error_data=stderr or None,
             )
+
+        # Provider error data: the result's errors / subtype and process
+        # stderr -- never its result text or the stdout transcript.
+        error_data = "\n".join(
+            part
+            for part in (structured_error_data(payload), (result.stderr or "").strip())
+            if part
+        ) or None
 
         session_id = payload.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             raise ProviderError(
-                f"{self.executable} JSON output has no usable session_id: {payload!r}"
+                f"{self.executable} JSON output has no usable session_id: {payload!r}",
+                error_data=error_data,
             )
 
         text = payload.get("result")
         if not isinstance(text, str):
             text = ""
+
+        if payload.get("is_error"):
+            # An error result may carry its reason only in the structured
+            # ``errors`` list (e.g. "429 Too Many Requests"), with no result
+            # text at all. A recoverable reason is raised as its typed
+            # failure; anything else stays an is_error result as before.
+            # Only ``errors`` / ``subtype`` and stderr are classified, never
+            # the result text, which is the agent's own words.
+            kind = classify_failure_text(error_data or "", resuming=resuming)
+            if kind is not None:
+                detail = "; ".join(part for part in (text, error_data) if part)
+                raise kind(
+                    f"{self.executable} reported is_error=true (session {session_id}): {detail}",
+                    error_data=error_data,
+                )
 
         return StageAgentResult(
             session_id=session_id,

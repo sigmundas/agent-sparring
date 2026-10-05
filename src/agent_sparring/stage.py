@@ -232,13 +232,14 @@ def _optional_str_field(payload: dict[str, Any], key: str) -> str | None:
 
 @dataclass(frozen=True)
 class PinnedAgent:
-    """What one role runs with for the whole of one stage.
+    """What one role runs with for the whole of one provider session.
 
-    Written once, immediately before the stage's first provider turn, and
-    read back by every later turn of the same stage -- SEND_BACK cycles,
+    Written once, immediately before the session's first provider turn, and
+    read back by every later turn of the same session -- SEND_BACK cycles,
     resumes in a new process, the finalization turn -- so a preference
-    changed while the stage is under way applies from the *next* stage and
-    never switches the model under an existing provider session.
+    changed while the stage is under way applies from the *next* stage (or
+    a fresh session, see :mod:`agent_sparring.sessions`) and never switches
+    the model under an existing provider session.
     """
 
     provider: str
@@ -263,6 +264,220 @@ class PinnedAgent:
             model_source=_optional_str_field(payload, "model_source") or "unknown",
             effort=_optional_str_field(payload, "effort"),
             effort_source=_optional_str_field(payload, "effort_source") or "unknown",
+        )
+
+
+NEXT_TURN_STAGE = "stage"
+NEXT_TURN_SPARRING = "sparring"
+NEXT_TURN_FINALIZATION = "finalization"
+NEXT_TURNS = (NEXT_TURN_STAGE, NEXT_TURN_SPARRING, NEXT_TURN_FINALIZATION)
+
+# Where a recorded ``next_turn`` came from. ``engine`` is the loop writing it
+# after an authoritative operation; ``derived`` and ``manual`` are the one-off
+# legacy reconstruction (see agent_sparring.next_turn).
+NEXT_TURN_SOURCES = ("engine", "derived", "manual")
+# How an ambiguous legacy state was resolved (``next_turn_resolution``).
+NEXT_TURN_RESOLUTION_SOURCES = ("derived", "manual")
+
+
+@dataclass(frozen=True)
+class SiblingPin:
+    """A declared sibling repository's HEAD at the moment a candidate was
+    recorded for review."""
+
+    name: str
+    head_sha: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "head_sha": self.head_sha}
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "SiblingPin":
+        if not isinstance(payload, dict) or not isinstance(payload.get("name"), str):
+            raise StageError("next_turn_candidate.repositories entries need a string 'name'")
+        return cls(name=payload["name"], head_sha=_optional_str_field(payload, "head_sha"))
+
+
+@dataclass(frozen=True)
+class TurnCandidate:
+    """The exact candidate a ``next_turn = sparring`` marker refers to.
+
+    ``kind`` is ``commit`` when HEAD holds all candidate content and
+    ``worktree`` when some of it is still uncommitted; ``content_digest`` is
+    the candidate content digest :mod:`agent_sparring.finalization` already
+    computes (stage artifacts excluded), so an uncommitted candidate is
+    identified by content rather than only by its HEAD.
+
+    ``tracked_digest`` (the content digest without untracked files) and
+    ``untracked`` (each untracked candidate path with its ``"<mode> <blob>"``)
+    split that identity so a later resume can tell "previously reviewed
+    untracked files were removed, nothing else changed" from any other
+    drift. Both derive from ``content_digest``'s inputs, so they take no part
+    in equality, and both are ``None`` for markers recorded before they
+    existed.
+    """
+
+    head_sha: str
+    kind: str
+    content_digest: str
+    repositories: tuple[SiblingPin, ...] = ()
+    tracked_digest: str | None = field(default=None, compare=False)
+    untracked: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "head_sha": self.head_sha,
+            "kind": self.kind,
+            "content_digest": self.content_digest,
+        }
+        if self.repositories:
+            payload["repositories"] = [repo.to_dict() for repo in self.repositories]
+        if self.tracked_digest is not None:
+            payload["tracked_digest"] = self.tracked_digest
+        if self.untracked is not None:
+            payload["untracked"] = [{"path": path, "blob": blob} for path, blob in self.untracked]
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "TurnCandidate":
+        if not isinstance(payload, dict):
+            raise StageError("state.json field 'next_turn_candidate' must be an object or null")
+        head = _optional_str_field(payload, "head_sha")
+        kind = _optional_str_field(payload, "kind")
+        digest = _optional_str_field(payload, "content_digest")
+        if not head or kind not in ("commit", "worktree") or not digest:
+            raise StageError(
+                "state.json field 'next_turn_candidate' needs head_sha, kind "
+                "(commit|worktree) and content_digest"
+            )
+        raw = payload.get("repositories") or []
+        if not isinstance(raw, list):
+            raise StageError("next_turn_candidate.repositories must be a list")
+        raw_untracked = payload.get("untracked")
+        untracked: tuple[tuple[str, str], ...] | None = None
+        if raw_untracked is not None:
+            if not isinstance(raw_untracked, list) or not all(
+                isinstance(entry, dict)
+                and isinstance(entry.get("path"), str)
+                and isinstance(entry.get("blob"), str)
+                for entry in raw_untracked
+            ):
+                raise StageError(
+                    "next_turn_candidate.untracked must be a list of {path, blob} objects"
+                )
+            untracked = tuple((entry["path"], entry["blob"]) for entry in raw_untracked)
+        return cls(
+            head_sha=head,
+            kind=kind,
+            content_digest=digest,
+            repositories=tuple(SiblingPin.from_dict(entry) for entry in raw),
+            tracked_digest=_optional_str_field(payload, "tracked_digest"),
+            untracked=untracked,
+        )
+
+    def describe(self) -> str:
+        text = f"HEAD {self.head_sha} ({self.kind}, content {self.content_digest[:12]})"
+        for repo in self.repositories:
+            text += f", sibling {repo.name} at {repo.head_sha or 'unresolved'}"
+        return text
+
+
+@dataclass(frozen=True)
+class NextTurnResolution:
+    """The immutable record of how an ambiguous legacy state was resolved:
+    the turn chosen, whether a person chose it (``manual``) or the engine
+    derived it (``derived``), when, and the refusal or reason it answered.
+
+    Unlike ``next_turn_source`` -- who wrote the *current* marker, which
+    routine transitions overwrite -- this is history: written once, never
+    altered or dropped by later marker writes.
+    """
+
+    turn: str
+    source: str
+    recorded_at: str
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "turn": self.turn,
+            "source": self.source,
+            "recorded_at": self.recorded_at,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "NextTurnResolution":
+        if not isinstance(payload, dict):
+            raise StageError("state.json field 'next_turn_resolution' must be an object or null")
+        turn = _optional_str_field(payload, "turn")
+        source = _optional_str_field(payload, "source")
+        recorded_at = _optional_str_field(payload, "recorded_at")
+        if turn not in NEXT_TURNS or source not in NEXT_TURN_RESOLUTION_SOURCES or not recorded_at:
+            raise StageError(
+                "state.json field 'next_turn_resolution' needs turn, source "
+                f"({'|'.join(NEXT_TURN_RESOLUTION_SOURCES)}) and recorded_at"
+            )
+        return cls(
+            turn=turn,
+            source=source,
+            recorded_at=recorded_at,
+            reason=_optional_str_field(payload, "reason") or "",
+        )
+
+
+@dataclass
+class SessionGeneration:
+    """One provider conversation for one role of one stage.
+
+    A role starts at generation 1 and only ever gains a new generation
+    through :func:`agent_sparring.sessions.start_fresh_session`. ``agent`` is
+    the configuration pinned for this generation (``None`` while a fresh
+    generation is pending its first turn); ``session_id`` is ``None`` until
+    the provider reports one.
+    """
+
+    generation: int
+    session_id: str | None = None
+    agent: "PinnedAgent | None" = None
+    started_at: str | None = None
+    start_reason: str = "initial"
+    ended_at: str | None = None
+    end_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "generation": self.generation,
+            "session_id": self.session_id,
+            "agent": self.agent.to_dict() if self.agent is not None else None,
+            "started_at": self.started_at,
+            "start_reason": self.start_reason,
+        }
+        if self.ended_at is not None or self.end_reason is not None:
+            payload["ended_at"] = self.ended_at
+            payload["end_reason"] = self.end_reason
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Any, *, where: str) -> "SessionGeneration":
+        if not isinstance(payload, dict):
+            raise StageError(f"state.json field {where!r} must be an object")
+        generation = payload.get("generation")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+            raise StageError(f"state.json field '{where}.generation' must be a positive integer")
+        raw_agent = payload.get("agent")
+        return cls(
+            generation=generation,
+            session_id=_optional_str_field(payload, "session_id"),
+            agent=(
+                PinnedAgent.from_dict(raw_agent, where=f"{where}.agent")
+                if raw_agent is not None
+                else None
+            ),
+            started_at=_optional_str_field(payload, "started_at"),
+            start_reason=_optional_str_field(payload, "start_reason") or "initial",
+            ended_at=_optional_str_field(payload, "ended_at"),
+            end_reason=_optional_str_field(payload, "end_reason"),
         )
 
 
@@ -325,9 +540,70 @@ class StageState:
     # (see :class:`PinnedAgent`). ``None`` until the first turn, and absent
     # from state.json then, so existing files stay byte-identical.
     agents: dict[str, PinnedAgent] | None = None
+    # Whose turn it is, owned by the loop (see agent_sparring.next_turn):
+    # ``stage``, ``sparring`` or ``finalization``. ``next_turn_candidate``
+    # pins the exact candidate a ``sparring`` marker refers to, and
+    # ``next_turn_source`` says whether the engine wrote it or it was
+    # reconstructed once for legacy state (``derived`` / ``manual``). All
+    # three are absent from state.json until the engine first writes the
+    # marker, so existing files stay byte-identical.
+    next_turn: str | None = None
+    next_turn_candidate: TurnCandidate | None = None
+    next_turn_source: str | None = None
+    # How an ambiguous legacy state was resolved (see NextTurnResolution);
+    # written once and kept through every later marker write.
+    next_turn_resolution: NextTurnResolution | None = None
+    # Untracked, non-ignored candidate paths present before the stage's
+    # first implementation turn (recorded with ``base_sha``): what the
+    # implementation demonstrably did not produce. ``None`` -- absent from
+    # state.json -- for stages that started before it was recorded.
+    untracked_baseline: tuple[str, ...] | None = None
+    # The exact untracked candidate paths present when the last
+    # implementation turn finished (file by file). ``None`` -- absent -- for
+    # turns recorded before it existed; the handoff's list is used then.
+    untracked_produced: tuple[str, ...] | None = None
+    # True from a successful implementation turn until the next write of
+    # the marker (a pinned review, a verdict, a reopen, a cycle start):
+    # structured evidence that the turn completed and no review has been
+    # pinned for it since. Absent from state.json while false.
+    implementation_unreviewed: bool = False
+    # Provider conversations per role (see agent_sparring.sessions),
+    # ``{role: [SessionGeneration, ...]}``. Empty and absent from state.json
+    # until a fresh session is first started; until then the recorded
+    # session ids above *are* generation 1.
+    sessions: dict[str, list[SessionGeneration]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        if self.next_turn is None:
+            payload.pop("next_turn", None)
+        if self.next_turn_candidate is None:
+            payload.pop("next_turn_candidate", None)
+        else:
+            payload["next_turn_candidate"] = self.next_turn_candidate.to_dict()
+        if self.next_turn_source is None:
+            payload.pop("next_turn_source", None)
+        if self.next_turn_resolution is None:
+            payload.pop("next_turn_resolution", None)
+        else:
+            payload["next_turn_resolution"] = self.next_turn_resolution.to_dict()
+        if self.untracked_baseline is None:
+            payload.pop("untracked_baseline", None)
+        else:
+            payload["untracked_baseline"] = list(self.untracked_baseline)
+        if not self.implementation_unreviewed:
+            payload.pop("implementation_unreviewed", None)
+        if self.untracked_produced is None:
+            payload.pop("untracked_produced", None)
+        else:
+            payload["untracked_produced"] = list(self.untracked_produced)
+        if not self.sessions:
+            payload.pop("sessions", None)
+        else:
+            payload["sessions"] = {
+                role: [generation.to_dict() for generation in generations]
+                for role, generations in self.sessions.items()
+            }
         if self.agents is None:
             payload.pop("agents", None)
         else:
@@ -379,7 +655,54 @@ class StageState:
             }
         else:
             raise StageError("state.json field 'agents' must be an object or null")
+        next_turn = _optional_str_field(payload, "next_turn")
+        if next_turn is not None and next_turn not in NEXT_TURNS:
+            raise StageError(
+                f"state.json field 'next_turn' must be one of {list(NEXT_TURNS)}, got {next_turn!r}"
+            )
+        next_turn_source = _optional_str_field(payload, "next_turn_source")
+        if next_turn_source is not None and next_turn_source not in NEXT_TURN_SOURCES:
+            raise StageError(
+                f"state.json field 'next_turn_source' must be one of {list(NEXT_TURN_SOURCES)}"
+            )
+        raw_candidate = payload.get("next_turn_candidate")
+        raw_resolution = payload.get("next_turn_resolution")
+        raw_baseline = payload.get("untracked_baseline")
+        raw_produced = payload.get("untracked_produced")
+        for name, raw in (("untracked_baseline", raw_baseline), ("untracked_produced", raw_produced)):
+            if raw is not None and (
+                not isinstance(raw, list) or not all(isinstance(path, str) for path in raw)
+            ):
+                raise StageError(f"state.json field {name!r} must be a list of paths")
+        raw_sessions = payload.get("sessions")
+        if raw_sessions is None:
+            sessions: dict[str, list[SessionGeneration]] = {}
+        elif isinstance(raw_sessions, dict):
+            sessions = {}
+            for role, entries in raw_sessions.items():
+                if not isinstance(entries, list):
+                    raise StageError(f"state.json field 'sessions.{role}' must be a list")
+                sessions[str(role)] = [
+                    SessionGeneration.from_dict(entry, where=f"sessions.{role}[{index}]")
+                    for index, entry in enumerate(entries)
+                ]
+        else:
+            raise StageError("state.json field 'sessions' must be an object or null")
         return cls(
+            next_turn=next_turn,
+            next_turn_candidate=(
+                TurnCandidate.from_dict(raw_candidate) if raw_candidate is not None else None
+            ),
+            next_turn_source=next_turn_source,
+            next_turn_resolution=(
+                NextTurnResolution.from_dict(raw_resolution)
+                if raw_resolution is not None
+                else None
+            ),
+            untracked_baseline=tuple(raw_baseline) if raw_baseline is not None else None,
+            untracked_produced=tuple(raw_produced) if raw_produced is not None else None,
+            implementation_unreviewed=payload.get("implementation_unreviewed") is True,
+            sessions=sessions,
             agents=agents,
             status=status,
             implementation_session_id=_optional_str_field(

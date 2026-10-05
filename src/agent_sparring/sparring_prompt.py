@@ -412,6 +412,13 @@ verification only a person can perform, not for work you happened to be
 unable to run."""
 
 
+FRESH_REVIEWER_NOTICE = (
+    "You are a fresh reviewer replacing an earlier reviewer conversation. Prior findings are "
+    "historical evidence, not conclusions you must blindly accept. Re-check the candidate "
+    "independently, but do not lose unresolved findings without explicitly resolving them."
+)
+
+
 def assemble_sparring_prompt(
     stage: Stage,
     sparring_dir: Path,
@@ -421,6 +428,7 @@ def assemble_sparring_prompt(
     finalization: str | None = None,
     evidence_first: bool = False,
     pending_deferred: tuple[DeferredObligation, ...] = (),
+    fresh: bool = False,
 ) -> AssembledPrompt:
     """Assemble the bounded prompt for one sparring-agent turn.
 
@@ -457,6 +465,11 @@ def assemble_sparring_prompt(
     It changes no text -- the human-evidence section below is already driven
     by notes.md -- and exists only so the captured turn is labelled with
     what the caller knew and this module could not infer.
+
+    ``fresh`` marks the first turn of a fresh reviewer session (see
+    :mod:`agent_sparring.sessions`): the full prompt, plus the previous
+    sparring exchange as historical evidence and a notice that this reviewer
+    replaces an earlier conversation. Its captured turn kind is ``fresh``.
 
     Returns the prompt as ordered, sourced sections (see
     :mod:`agent_sparring.prompt_sections`);
@@ -552,7 +565,33 @@ def assemble_sparring_prompt(
             section("Finalization", ["## Finalization", "", finalization.strip()])
         )
 
-    if resume:
+    if fresh:
+        try:
+            sparring_text = stage.read_sparring().strip()
+        except StageError:
+            sparring_text = ""
+        parts.append(
+            section(
+                "Fresh reviewer",
+                [
+                    "## Fresh reviewer",
+                    "",
+                    FRESH_REVIEWER_NOTICE,
+                ],
+            )
+        )
+        parts.append(
+            section(
+                "Previous sparring exchange (historical evidence)",
+                [
+                    "## Previous sparring exchange (historical evidence)",
+                    "",
+                    sparring_text or "(no sparring.md available)",
+                ],
+                source=_stage_file(stage, SPARRING_FILENAME),
+            )
+        )
+    elif resume:
         try:
             sparring_text = stage.read_sparring().strip()
         except StageError:
@@ -578,6 +617,7 @@ def assemble_sparring_prompt(
             resume=resume,
             evidence_first=evidence_first,
             finalization=bool(finalization and finalization.strip()),
+            fresh=fresh,
         ),
         resumed=resume,
         expected_branch=expected_branch,

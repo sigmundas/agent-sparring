@@ -514,6 +514,11 @@ class CliRunSparringTests(unittest.TestCase):
         (self.sparring_dir / "project.toml").write_text(
             'project = "x"\n\n[agents.sparring]\nprovider = "codex-cli"\n', encoding="utf-8"
         )
+        # Not implementation output: ignored, so the reviewer's
+        # unrelated-untracked-file refusal does not apply.
+        (self.repo / ".git" / "info" / "exclude").write_text(
+            ".sparring/project.toml\n", encoding="utf-8"
+        )
 
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

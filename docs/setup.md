@@ -100,17 +100,19 @@ model / effort:  explicit CLI flag  >  SPARRING_* environment  >  your saved pre
 `--sparring-model` / `--sparring-effort`. The independent reviewer is the
 sparring role, so it uses your sparring preference.
 
-**A stage keeps one configuration from its first turn to its last.** Before
-a stage's first provider turn the engine records what each role resolved to
-(provider, model, effort and where each came from) in the stage's
-`state.json`, under `agents`. Every later turn of that stage reuses it:
-SEND_BACK cycles, a `resume-plan` in a new process, the finalization turn. A
-preference changed while a stage is under way therefore **applies from the
-next stage**, and never switches the model under an existing provider
-session. A command-line or environment override that contradicts the
-recorded value mid-stage is refused, not ignored; drop it to continue the
-stage, or let it take effect on the next one. Resetting a stage starts it
-fresh, configuration included.
+**A provider session keeps one configuration from its first turn to its
+last.** Before a role's first provider turn the engine records what it
+resolved to (provider, model, effort and where each came from) in the
+stage's `state.json`, under `agents`. Every later turn of that session
+reuses it: SEND_BACK cycles, a `resume-plan` in a new process, the
+finalization turn. A preference changed while a stage is under way therefore
+**applies from the next stage** -- or from a *fresh session* for that role
+(see [Resume, fresh session, reset](reference.md#resume-fresh-session-reset))
+-- and never switches the model under an existing provider session. A
+command-line or environment override that contradicts the recorded value
+mid-session is refused, not ignored; drop it to continue, or start a fresh
+session for that role. Resetting a stage starts it fresh, configuration
+included.
 
 To see what a turn would actually run with, and where each value came from:
 

@@ -78,14 +78,21 @@ class TurnRecord:
     session_id: str | None = None
     action: str | None = None
     summary: str | None = None
+    #: The role's session generation this turn ran in (see
+    #: :mod:`agent_sparring.sessions`).
+    generation: int = 1
 
 
 @dataclass
 class RoleUsage:
-    """One role's configuration and its latest reported budget."""
+    """One role's configuration and its latest reported budget, for one
+    session generation."""
 
     role: str
     actor: str
+    generation: int = 1
+    #: ``initial`` or ``fresh:<reason>``.
+    start_reason: str = "initial"
     provider: str | None = None
     provider_source: str | None = None
     requested_model: str | None = None
@@ -111,7 +118,10 @@ class StageUsage:
     stage_id: str
     log_path: Path
     log_present: bool = False
+    #: The *current* generation of each role.
     roles: dict[str, RoleUsage] = field(default_factory=dict)
+    #: Every generation of each role, oldest first; the last is ``roles[role]``.
+    generations: dict[str, list[RoleUsage]] = field(default_factory=dict)
     turns: list[TurnRecord] = field(default_factory=list)
     #: Lines that were not valid JSON objects. Reported as a count so a
     #: damaged log is visible without the report pretending to repair it.
@@ -130,8 +140,30 @@ class StageUsage:
                 }
                 for role, usage in self.roles.items()
             },
+            "generations": {
+                role: [
+                    {key: value for key, value in vars(entry).items() if key not in ("role", "actor")}
+                    for entry in entries
+                ]
+                for role, entries in self.generations.items()
+            },
             "turns": [vars(turn) for turn in self.turns],
         }
+
+    def role_totals(self, role: str) -> dict[str, int | None]:
+        """Token counters summed over a role's generations.
+
+        Providers report cumulative counters *per session*, so the latest
+        figure of each generation is its total and generations add up. A
+        counter no generation reported stays ``None`` rather than zero.
+        """
+
+        totals: dict[str, int | None] = {}
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            values = [getattr(entry, key) for entry in self.generations.get(role, [])]
+            known = [value for value in values if value is not None]
+            totals[key] = sum(known) if known else None
+        return totals
 
 
 def _records(path: Path) -> Iterator[tuple[dict[str, Any] | None, None]]:
@@ -170,6 +202,7 @@ def collect_stage_usage(stage: Stage) -> StageUsage:
             role: RoleUsage(role=role, actor=actor) for role, actor in ROLE_ACTORS
         },
     )
+    usage.generations = {role: [entry] for role, entry in usage.roles.items()}
     if not usage.log_present:
         return usage
 
@@ -187,6 +220,22 @@ def collect_stage_usage(stage: Stage) -> StageUsage:
             continue
         role_name = by_actor.get(actor)
         role = usage.roles.get(role_name) if role_name else None
+
+        if event == "session.fresh" and role is not None:
+            # The boundary start_fresh_session draws: everything after it
+            # belongs to a new conversation with its own configuration and
+            # its own cumulative counters.
+            reason = record.get("summary")
+            role = RoleUsage(
+                role=role.role,
+                actor=role.actor,
+                generation=role.generation + 1,
+                start_reason=reason if isinstance(reason, str) and reason else "fresh",
+            )
+            usage.roles[role.role] = role
+            usage.generations[role.role].append(role)
+            open_turn.pop(actor, None)
+            continue
 
         if role is not None:
             if role.reported_model is None:
@@ -239,6 +288,7 @@ def collect_stage_usage(stage: Stage) -> StageUsage:
                 started=record.get("ts"),
                 resumed=record.get("resumed"),
                 session_id=record.get("session_id"),
+                generation=role.generation if role is not None else 1,
             )
             open_turn[actor] = turn
             usage.turns.append(turn)
@@ -250,7 +300,9 @@ def collect_stage_usage(stage: Stage) -> StageUsage:
                 # An end without a start: a log that begins mid-turn, or one
                 # whose opening line was lost. Recorded as its own turn
                 # rather than dropped, so the count stays honest.
-                turn = TurnRecord(actor=actor)
+                turn = TurnRecord(
+                    actor=actor, generation=role.generation if role is not None else 1
+                )
                 usage.turns.append(turn)
             turn.ended = record.get("ts")
             turn.outcome = _TURN_ENDED[event]
@@ -333,36 +385,78 @@ def render_stage_usage(usage: StageUsage) -> str:
         return "\n".join(lines)
 
     for role, _ in ROLE_ACTORS:
-        entry = usage.roles[role]
-        provider = entry.provider or "-"
-        if entry.provider_source:
-            provider = f"{provider} ({entry.provider_source})"
-        lines.append(f"  {role + ' agent':<15} provider {provider}")
-        lines.append(
-            f"  {'':<15} model    "
-            f"{_sourced(entry.requested_model, entry.model_source, seen=entry.resolved_seen)}"
-        )
-        lines.append(
-            f"  {'':<15} effort   "
-            f"{_sourced(entry.requested_effort, entry.effort_source, seen=entry.resolved_seen)}"
-        )
-        if entry.reported_model and entry.reported_model != entry.requested_model:
-            # Worth its own line: the provider ran something other than what
-            # the engine named, which no other artifact would reveal.
+        entries = usage.generations.get(role) or [usage.roles[role]]
+        for entry in entries:
+            if len(entries) > 1:
+                lines.append(_generation_boundary(entry))
+            _render_role(lines, role, entry)
+        if len(entries) > 1:
+            totals = usage.role_totals(role)
             lines.append(
-                f"  {'':<15} provider reported model {entry.reported_model}"
+                f"  {'':<15} all {len(entries)} generations: tokens   "
+                f"in {_thousands(totals['input_tokens'])}"
+                f"  out {_thousands(totals['output_tokens'])}"
+                f"  total {_thousands(totals['total_tokens'])}"
             )
-        lines.append(
-            f"  {'':<15} tokens   in {_thousands(entry.input_tokens)}"
-            f"  out {_thousands(entry.output_tokens)}"
-            f"  total {_thousands(entry.total_tokens)}"
-        )
-        if entry.context_used_tokens is not None or entry.context_window is not None:
-            lines.append(
-                f"  {'':<15} context  {_thousands(entry.context_used_tokens)}"
-                f" of {_thousands(entry.context_window)}"
-            )
+    _render_turns(lines, usage)
+    return "\n".join(lines)
 
+
+def _generation_boundary(entry: RoleUsage) -> str:
+    """The visible line that separates one session generation from the
+    next: its number, why it started and what it was configured with."""
+
+    model = entry.requested_model if entry.resolved_seen else None
+    configuration = ", ".join(
+        part
+        for part in (
+            entry.provider or "provider unknown",
+            f"model {model or 'provider default'}" if entry.resolved_seen else None,
+            f"effort {entry.requested_effort or 'provider default'}"
+            if entry.resolved_seen
+            else None,
+        )
+        if part
+    )
+    return (
+        f"  ---- {entry.role} session generation {entry.generation} "
+        f"({entry.start_reason}; {configuration}) ----"
+    )
+
+
+def _render_role(lines: list[str], role: str, entry: RoleUsage) -> None:
+    provider = entry.provider or "-"
+    if entry.provider_source:
+        provider = f"{provider} ({entry.provider_source})"
+    lines.append(f"  {role + ' agent':<15} provider {provider}")
+    lines.append(
+        f"  {'':<15} model    "
+        f"{_sourced(entry.requested_model, entry.model_source, seen=entry.resolved_seen)}"
+    )
+    lines.append(
+        f"  {'':<15} effort   "
+        f"{_sourced(entry.requested_effort, entry.effort_source, seen=entry.resolved_seen)}"
+    )
+    if entry.reported_model and entry.reported_model != entry.requested_model:
+        # Worth its own line: the provider ran something other than what
+        # the engine named, which no other artifact would reveal.
+        lines.append(
+            f"  {'':<15} provider reported model {entry.reported_model}"
+        )
+    lines.append(
+        f"  {'':<15} tokens   in {_thousands(entry.input_tokens)}"
+        f"  out {_thousands(entry.output_tokens)}"
+        f"  total {_thousands(entry.total_tokens)}"
+    )
+    if entry.context_used_tokens is not None or entry.context_window is not None:
+        lines.append(
+            f"  {'':<15} context  {_thousands(entry.context_used_tokens)}"
+            f" of {_thousands(entry.context_window)}"
+        )
+
+
+def _render_turns(lines: list[str], usage: StageUsage) -> None:
+    generational = any(len(entries) > 1 for entries in usage.generations.values())
     if usage.turns:
         lines.append("")
         lines.append(
@@ -377,8 +471,9 @@ def render_stage_usage(usage: StageUsage) -> str:
             shown = format_duration(turn.duration_ms)
             if turn.duration_derived:
                 shown = "~" + shown
+            actor = f"{turn.actor}#{turn.generation}" if generational else turn.actor
             lines.append(
-                f"  {index:>2}  {turn.actor:<8} {_timestamp(turn.started):<17} "
+                f"  {index:>2}  {actor:<8} {_timestamp(turn.started):<17} "
                 f"{shown:>9}  {resumed:<7} {outcome}"
             )
         total = sum(turn.duration_ms or 0 for turn in usage.turns)
@@ -396,7 +491,6 @@ def render_stage_usage(usage: StageUsage) -> str:
         lines.append(
             f"  note: {usage.unreadable_lines} unreadable log line(s) were skipped"
         )
-    return "\n".join(lines)
 
 
 def render_report(usages: Sequence[StageUsage]) -> str:

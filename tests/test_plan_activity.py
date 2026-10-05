@@ -60,6 +60,8 @@ from test_plan import (
 )
 
 _SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
+# Session generation timestamps are wall-clock bookkeeping, not decisions.
+_TS_RE = re.compile(r'"(started|ended)_at": "[^"]*"')
 
 
 def _events(stage: Stage) -> list[dict]:
@@ -99,7 +101,7 @@ class _PlanActivityCase(_PlanRepoTestCase):
                 snapshot[stage_id] = (stage.directory / "state.json").read_text(encoding="utf-8")
             else:
                 snapshot[stage_id] = "<absent>"
-        return {key: _SHA_RE.sub("<sha>", value) for key, value in snapshot.items()}
+        return {key: _TS_RE.sub(r'"\1_at": "<ts>"', _SHA_RE.sub("<sha>", value)) for key, value in snapshot.items()}
 
 
 # -- per-stage provider binding, end to end ---------------------------------
@@ -605,7 +607,7 @@ class _Env:
                 if stage.exists()
                 else "<absent>"
             )
-        return {key: _SHA_RE.sub("<sha>", value) for key, value in snapshot.items()}
+        return {key: _TS_RE.sub(r'"\1_at": "<ts>"', _SHA_RE.sub("<sha>", value)) for key, value in snapshot.items()}
 
 
 class NonAuthorityTests(_PlanActivityCase):

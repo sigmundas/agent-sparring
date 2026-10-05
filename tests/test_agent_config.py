@@ -729,6 +729,11 @@ class SingleRoleCommandResolutionTests(unittest.TestCase):
         self.assertEqual(recorder.stage_kwargs[0]["effort"], "max")
 
     def test_run_sparring_uses_the_user_sparring_model_and_effort(self):
+        # The untracked project.toml is not implementation output; ignore it
+        # so the reviewer's unrelated-untracked-file refusal does not apply.
+        (self.repo / ".git" / "info" / "exclude").write_text(
+            ".sparring/project.toml\n", encoding="utf-8"
+        )
         recorder = self._run(
             "run-sparring", "stage-1", "--repo-root", str(self.repo),
             "--expected-branch", "feature/x",

@@ -173,6 +173,7 @@ def declare_stage_mode(stage: Stage, planned: PlannedStage) -> None:
             state.sparring_session_id,
             state.candidate_sha,
             state.base_sha,
+            state.sessions,
         )
     )
     if has_history:

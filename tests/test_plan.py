@@ -639,9 +639,18 @@ class PlanRunTests(_PlanRepoTestCase):
         _run_git(self.repo, "commit", "-q", "-am", "typo fix outside any stage")
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
 
-        result = self._resume(stage_adapter, sparring_adapter, evidence="done")
-
-        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        # The commit moved the candidate the NEEDS_YOU was raised over, so
+        # evidence alone is refused (the reviewer must not judge different
+        # content), and --next-turn cannot re-pin the recorded marker either.
+        # The refusal is about the moved candidate, not the prose edit.
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(stage_adapter, sparring_adapter, evidence="done")
+        self.assertIn("refusing to record evidence", str(ctx.exception))
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(
+                stage_adapter, sparring_adapter, evidence="done", next_turn="sparring"
+            )
+        self.assertIn("already records next_turn = sparring", str(ctx.exception))
 
     def test_start_refuses_when_a_run_is_already_recorded(self):
         stage_adapter = _StageAdapter(self.repo)

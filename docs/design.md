@@ -389,11 +389,14 @@ injection with a schema, and it would let a project reach past the
 invariants an adapter exists to hold (the sparrer's read-only sandbox, most
 of all).
 
-Resolution happens before a stage's first provider turn and is then pinned
-for the whole stage in its `state.json` (`agents`): SEND_BACK cycles,
-resumes in a new process and the finalization turn reuse it, so a changed
-preference applies from the next stage and can never reconfigure a stage, or
-a provider session, already under way. Provider session resume is untouched by any of this:
+Resolution happens before a role's first provider turn and is then pinned
+for that provider session in the stage's `state.json` (`agents`, and the
+current entry of `sessions`): SEND_BACK cycles, resumes in a new process and
+the finalization turn reuse it, so a changed preference applies from the
+next stage, or from a deliberately started fresh session for that role, and
+can never reconfigure a provider session already under way. Only the roles
+about to run are pinned: `run-stage` does not lock the reviewer's
+configuration. Provider session resume is untouched by any of this:
 the session id is the provider's own, recorded in stage state, and never
 carried on an adapter object.
 

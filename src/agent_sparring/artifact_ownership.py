@@ -119,7 +119,10 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
         owner="engine",
         provider_writable=False,
         lifetime="rewritten on every position/status change",
-        purpose="the run's position, expected branch and plan digest",
+        purpose=(
+            "the run's position, expected branch and plan digest, plus the descriptive "
+            "provider_pause record of a classified provider failure"
+        ),
     ),
     ArtifactOwnership(
         path="intake/<intake>/",
@@ -201,7 +204,10 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
         owner="engine",
         provider_writable=False,
         lifetime="rewritten on every lifecycle change",
-        purpose="stage status, candidate identity and provider session ids",
+        purpose=(
+            "stage status, candidate identity, whose turn it is and provider "
+            "session generations"
+        ),
     ),
     ArtifactOwnership(
         path="stages/<stage>/dialogue.jsonl",

@@ -184,3 +184,35 @@ With `--json`, an exit-`1` result is `{"version": 1, "configured": ...,
 is not configured. For a project without `[migrations]`, both migration
 commands exit `1` with that message and write nothing. Every other command's
 output is unchanged.
+
+## Not a database migration: stage `state.json` format changes
+
+Everything above is about *database* migrations. The engine's own stage
+`state.json` also gains fields over time, and needs no migration step: new
+fields are optional, so an existing file reads back unchanged and stays
+byte-identical until the engine next writes it. The fresh-agent-session work
+adds:
+
+| Field | Absent means | Written when |
+| --- | --- | --- |
+| `next_turn`, `next_turn_candidate`, `next_turn_source` | state from before the marker; the first resume derives it once from engine records, or refuses as ambiguous and takes an explicit choice (`manual`) | the loop advances the marker, a verdict is recorded, or a derived/manual marker is persisted |
+| `next_turn_candidate.tracked_digest`, `next_turn_candidate.untracked` | a candidate recorded before the split; a `finalization` resume over it allows the untracked-removal recovery only on same HEAD, same sibling HEADs and a clean worktree, and says so | a candidate is captured |
+| `next_turn_resolution` | no ambiguous legacy state was resolved (or it was resolved before this record existed) | a derived or manual marker is first persisted; never rewritten |
+| `untracked_produced` | no successful implementation turn recorded it yet (or one recorded before the field existed: the reviewer-start check then uses the handoff's list, exactly -- a collapsed `dir/` entry covers nothing) | a successful implementation turn finishes |
+| `implementation_unreviewed` | false: no successful implementation turn is waiting for its review to be pinned | `true` once a successful implementation turn and its handoff are both recorded; removed by the next marker write (review pin, verdict, reopen, cycle start). With `next_turn = stage` it means that turn's review is owed |
+| `untracked_baseline` | a stage started before it was recorded; only the last turn's produced paths count | the stage's first implementation turn records `base_sha` |
+| `sessions` | the recorded session ids and `agents` pins are generation 1 (`started_at` unknown) | a role's configuration is pinned or its session id is recorded, or a fresh session is started |
+
+The plan-run state (`.sparring/plans/<run>.json`) likewise gains one
+optional, engine-written field; a file without it reads back and is rewritten
+byte-identically:
+
+| Field | Absent means | Written when |
+| --- | --- | --- |
+| `provider_pause` | the run is not paused by a classified provider failure | a provider failure pauses the run: `{kind, role, stage_id, has_session, recorded_at}`, `kind` ∈ `session-unresumable` \| `provider-unavailable`, `role` ∈ `stage` \| `sparring`; removed when the run next starts running or pauses/fails for another reason (client contract and semantics: [reference](reference.md#resume-fresh-session-reset)) |
+
+It is descriptive only; resume routing never reads it. Standalone `run-loop`
+has no plan-run state and is unchanged.
+
+Resume, fresh session and `reset-stage` are different operations; see
+[Resume, fresh session, reset](reference.md#resume-fresh-session-reset).

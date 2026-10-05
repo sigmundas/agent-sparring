@@ -118,10 +118,27 @@ from agent_sparring.finalization import (
     record_refusal,
     verify_finalized,
 )
-from agent_sparring.providers import SparringAgentAdapter, StageAgentAdapter
+from agent_sparring.next_turn import (
+    NextTurnError,
+    capture_candidate,
+    check_untracked_before_review,
+    record_next_turn,
+    verify_candidate,
+)
+from agent_sparring.providers import (
+    SparringAgentAdapter,
+    StageAgentAdapter,
+    classify_failure_text,
+    structured_error_data,
+)
 from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_agent import SparringAgentRunError, run_sparring_agent
-from agent_sparring.stage import Stage
+from agent_sparring.stage import (
+    NEXT_TURN_FINALIZATION,
+    NEXT_TURN_SPARRING,
+    NEXT_TURN_STAGE,
+    Stage,
+)
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 
 # A small, deliberately conservative default: enough headroom for a normal
@@ -157,6 +174,12 @@ class LoopError(RuntimeError):
 class LoopRunawayError(LoopError):
     """Raised when the configured SEND_BACK runaway limit is exceeded
     without the sparring agent reaching READY, NEEDS_YOU, or ESCALATE."""
+
+
+class CandidateRefused(LoopError):
+    """Raised when the recorded candidate no longer matches before the first
+    review of this invocation, with no agent turn run yet: the resume was
+    refused, nothing was executed."""
 
 
 class FinalizationRefused(LoopError):
@@ -227,6 +250,7 @@ def run_unattended_loop(
     self_check: bool = False,
     start_with: str = "stage",
     pending_deferred: tuple[DeferredObligation, ...] = (),
+    sparring_first_reason: str = "evidence",
 ) -> LoopResult:
     """Drive the stage<->sparring loop until a terminal routing action.
 
@@ -252,6 +276,24 @@ def run_unattended_loop(
     candidate. If that sparring turn says SEND_BACK there *is* implementation
     work, and the loop continues normally from the stage agent; every later
     cycle is an ordinary full cycle regardless.
+
+    ``sparring_first_reason`` qualifies ``start_with="sparring"``:
+    ``"evidence"`` (the default) is the human-answer turn described above;
+    ``"next_turn"`` is an ordinary resume obeying a recorded
+    ``next_turn = sparring`` marker -- an implementation turn completed and
+    its candidate still awaits review -- so the sparring turn is an ordinary
+    (or fresh) review rather than an evidence review.
+
+    The loop advances ``state.json``'s ``next_turn`` marker (see
+    :mod:`agent_sparring.next_turn`): ``stage`` when a full cycle begins,
+    ``sparring`` with the exact candidate once an implementation turn and
+    its records fully succeeded, ``finalization`` when READY leaves the
+    reviewed candidate uncommitted. Recording a SEND_BACK or READY verdict
+    moves it back to ``stage`` where every verdict is written
+    (:func:`~agent_sparring.sparring_exchange.record_sparring_result`). A failed turn
+    never advances it. Whenever the marker says ``sparring``, the recorded
+    candidate is verified against the repository before the reviewer
+    starts, and any mismatch is refused.
 
     ``start_with="finalization"`` makes that first cycle the bounded
     commit/push cycle, for a stage already stopped at exactly that point
@@ -294,6 +336,11 @@ def run_unattended_loop(
     if max_send_back_cycles < 1:
         raise LoopError(
             f"max_send_back_cycles must be at least 1, got {max_send_back_cycles!r}"
+        )
+    if sparring_first_reason not in ("evidence", "next_turn"):
+        raise LoopError(
+            f"sparring_first_reason must be 'evidence' or 'next_turn', got "
+            f"{sparring_first_reason!r}"
         )
     if start_with not in ("stage", "sparring", "finalization"):
         raise LoopError(
@@ -342,7 +389,7 @@ def run_unattended_loop(
         # Only the first cycle of an evidence resume is the turn that
         # answers a human; every later cycle is ordinary. Recorded for the
         # captured prompt's turn kind and nothing else.
-        evidence_first = skip_stage_turn
+        evidence_first = skip_stage_turn and sparring_first_reason == "evidence"
         if skip_stage_turn:
             skip_stage_turn = False
             stage_run = None
@@ -352,6 +399,10 @@ def run_unattended_loop(
                 summary="resuming the sparrer against the unchanged candidate",
             )
         else:
+            if not finalizing:
+                # Implementation work is owed from here until this turn and
+                # all of its records succeed.
+                record_next_turn(stage, NEXT_TURN_STAGE)
             try:
                 stage_run = run_stage_agent(
                     stage,
@@ -380,11 +431,22 @@ def run_unattended_loop(
             activity.emit(
                 "loop.stopped", cycle=cycle, summary="stage-agent turn reported is_error"
             )
+            # A turn the provider ended for capacity (quota, usage or rate
+            # limit) is typed as such, so a managed run pauses for a person
+            # instead of failing; its session is resumable, so only that.
+            # Only the provider's structured error fields are read, never
+            # the result text the agent wrote.
+            error_data = structured_error_data(stage_run.result.raw)
+            unavailable = classify_failure_text(error_data or "", resuming=False)
             raise LoopError(
                 f"stage-agent turn for stage {stage.stage_id!r} reported "
                 f"is_error=true (session {stage_run.result.session_id!r}); "
                 "refusing to send a failed implementation turn to the "
                 "sparrer"
+            ) from (
+                unavailable(error_data, error_data=error_data)
+                if unavailable is not None
+                else None
             )
 
         if pending is not None:
@@ -429,6 +491,52 @@ def run_unattended_loop(
                 "for this stage therefore still describes exactly this content."
             )
             pending = None
+
+        # Untracked files the implementation did not produce must never
+        # silently become part of the reviewed candidate. Checked before the
+        # review marker is written, so a refusal records nothing for the
+        # review; the completed implementation turn's own record
+        # (``implementation_unreviewed``) makes the same resume owe this
+        # review once the files are removed, committed or ignored.
+        try:
+            check_untracked_before_review(repo_root, stage)
+        except NextTurnError as exc:
+            activity.emit("loop.stopped", cycle=cycle, summary="unrelated untracked files")
+            if cycle == 1 and stage_run is None:
+                raise CandidateRefused(str(exc)) from exc
+            raise LoopError(str(exc)) from exc
+
+        if stage_run is not None or stage.read_state().next_turn == NEXT_TURN_STAGE:
+            # The implementation turn, its handoff and its session are all
+            # recorded (run_stage_agent returned -- in this process, or in
+            # one whose review was refused above; a finalization commit was
+            # verified above): the candidate it produced is what the
+            # reviewer owes a verdict on. Pinned now, before the reviewer
+            # starts, so a reviewer that fails leaves exactly this behind.
+            try:
+                candidate = capture_candidate(repo_root, stage, stage.read_state())
+                record_next_turn(stage, NEXT_TURN_SPARRING, candidate=candidate)
+            except NextTurnError as exc:
+                activity.emit("loop.stopped", cycle=cycle, summary="candidate identity unreadable")
+                raise LoopError(
+                    f"could not record the candidate for review of stage {stage.stage_id!r}: {exc}"
+                ) from exc
+
+        # Every review the marker routes -- an ordinary one, a fresh one,
+        # and a human-evidence turn answering a NEEDS_YOU raised over that
+        # candidate -- is held to the recorded candidate: evidence answers a
+        # question about exactly that content, and a reviewer must never
+        # judge it against anything else. (Legacy state with no marker keeps
+        # its existing evidence semantics.)
+        current = stage.read_state()
+        if current.next_turn == NEXT_TURN_SPARRING:
+            try:
+                verify_candidate(repo_root, stage, current)
+            except NextTurnError as exc:
+                activity.emit("loop.stopped", cycle=cycle, summary="candidate drifted before review")
+                if cycle == 1 and stage_run is None:
+                    raise CandidateRefused(str(exc)) from exc
+                raise LoopError(str(exc)) from exc
 
         try:
             sparring_run = run_sparring_agent(
@@ -489,6 +597,21 @@ def run_unattended_loop(
                     f"stage {stage.stage_id!r} reached READY but its candidate content "
                     f"could not be read: {exc}"
                 ) from exc
+            # The candidate READY was given over, read before anything else
+            # can touch it: an interrupted run is matched against exactly
+            # this (agent_sparring.next_turn.resolve_finalization) instead of
+            # being routed to an implementation turn.
+            try:
+                reviewed = capture_candidate(repo_root, stage, stage.read_state())
+            except NextTurnError as exc:
+                activity.emit(
+                    "loop.stopped", cycle=cycle, summary="candidate identity unreadable"
+                )
+                raise LoopError(
+                    f"stage {stage.stage_id!r} reached READY but its candidate identity "
+                    f"could not be recorded: {exc}"
+                ) from exc
+            record_next_turn(stage, NEXT_TURN_FINALIZATION, candidate=reviewed)
             if pending is not None:
                 if finalization_count >= _MAX_FINALIZATION_CYCLES:
                     activity.emit(

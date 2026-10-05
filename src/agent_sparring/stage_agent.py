@@ -22,9 +22,16 @@ from agent_sparring.branch_guard import BranchGuardError, ensure_branch_for_unat
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import GitContextError, resolve_commit
 from agent_sparring.handoff import generate_handoff
+from agent_sparring.next_turn import NextTurnError, untracked_candidate_paths
 from agent_sparring.providers import ProviderError, StageAgentAdapter, StageAgentResult
 from agent_sparring.stage import Stage, StageState, StageStatus
 from agent_sparring.prompt_capture import capture_prompt
+from agent_sparring.sessions import (
+    ROLE_STAGE,
+    is_fresh,
+    pin_pending_generation,
+    record_session_id,
+)
 from agent_sparring.stage_prompt import assemble_stage_prompt
 
 
@@ -93,7 +100,7 @@ def _session_recorded_early(
     def record(session_id: str) -> None:
         if not session_id or state.implementation_session_id == session_id:
             return
-        state.implementation_session_id = session_id
+        record_session_id(state, ROLE_STAGE, session_id)
         stage.write_state(state)
 
     previous = adapter.on_session_observed  # type: ignore[attr-defined]
@@ -195,7 +202,13 @@ def run_stage_agent(
                     "work belongs to a new stage."
                 )
 
+            # The current generation's session (see agent_sparring.sessions):
+            # a fresh generation has none yet, so it starts a new
+            # conversation and is told it is continuing the same stage.
             resume_id = state.implementation_session_id
+            fresh = resume_id is None and is_fresh(state, ROLE_STAGE)
+            if fresh and pin_pending_generation(state, ROLE_STAGE, adapter):
+                stage.write_state(state)
 
             if state.base_sha is not None:
                 base_sha = state.base_sha
@@ -209,6 +222,13 @@ def run_stage_agent(
                 # the true stage baseline (where implementation began) must
                 # not be lost.
                 state.base_sha = base_sha
+                # Untracked files already present now are, by construction,
+                # not something this stage's implementation produced.
+                if state.untracked_baseline is None and not finalize_only:
+                    try:
+                        state.untracked_baseline = untracked_candidate_paths(repo_root, stage)
+                    except NextTurnError as exc:
+                        raise StageAgentRunError(str(exc)) from exc
                 stage.write_state(state)
 
             assembled = assemble_stage_prompt(
@@ -218,6 +238,7 @@ def run_stage_agent(
                 expected_branch=expected_branch,
                 self_check=self_check,
                 finalize_only=finalize_only,
+                fresh=fresh,
             )
             prompt = assembled.text
 
@@ -288,7 +309,16 @@ def run_stage_agent(
 
             # state.base_sha was already persisted above (before the provider
             # ran) if this was the first run; it is never moved forward here.
-            state.implementation_session_id = result.session_id
+            record_session_id(state, ROLE_STAGE, result.session_id)
+            # The exact untracked files this turn left behind, file by file:
+            # what a later reviewer-start check may treat as produced here.
+            # Only a turn the provider reported as successful: a failed turn
+            # is never owed a review (see next_turn.implementation_awaiting_review).
+            if not result.is_error:
+                try:
+                    state.untracked_produced = untracked_candidate_paths(repo_root, stage)
+                except NextTurnError as exc:
+                    raise StageAgentRunError(str(exc)) from exc
             stage.write_state(state)
             activity.emit(
                 "turn.finished",
@@ -309,6 +339,12 @@ def run_stage_agent(
                 )
             except GitContextError as exc:
                 raise StageAgentRunError(str(exc)) from exc
+            if not result.is_error:
+                # Only now -- turn, session and handoff all recorded -- is
+                # this turn owed a review (next_turn.implementation_awaiting_review).
+                state = stage.read_state()
+                state.implementation_unreviewed = True
+                stage.write_state(state)
             activity.emit("handoff.ready", session_id=result.session_id)
     except WorktreeLockError as exc:
         raise StageAgentRunError(str(exc)) from exc

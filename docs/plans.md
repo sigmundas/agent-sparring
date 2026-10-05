@@ -397,6 +397,22 @@ in each stage's own `state.json`.
 open run it continues that one; `--run-key <key>` says which, and is needed
 only for a document with several open runs.
 
+Where inside the current stage it continues is the engine's own record,
+`next_turn` in the stage's `state.json` (see
+[whose turn it is](reference.md#whose-turn-it-is-next_turn)). When an
+implementation turn completed and the reviewer then failed before a verdict,
+resuming reviews that exact candidate directly; it does not spend another
+implementation turn. Evidence, a recorded human gate and a pending
+finalization keep their existing precedence. `--next-turn stage|sparring`
+exists only for legacy state the engine refuses to read; it is refused
+whenever the engine already knows.
+
+A plain resume continues the same conversations; `--fresh-sparrer` /
+`--fresh-stage-agent` continue the same stage and candidate in a new
+conversation for one role; `sparring reset-stage` starts a new attempt. See
+[resume, fresh session, reset](reference.md#resume-fresh-session-reset) and
+its [recovery walkthrough](reference.md#recovery-walkthrough).
+
 #### Run instances: a plan document is an input, not a run
 
 A plan document can be executed more than once. Each execution is a **run

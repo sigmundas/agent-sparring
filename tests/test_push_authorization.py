@@ -654,21 +654,34 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertNotEqual(moved, first)
 
         stage_adapter = self._unpushed()
-        result = self._resume(
-            stage_adapter,
-            _SparringAdapter([READY]),
-            allow_push_candidate=first,
-            stop_after_stage=S1,
-        )
+        # HEAD had moved, so this resume is not the authorized push, and the
+        # stage's next_turn marker records READY over the *first* commit: the
+        # moved candidate is refused outright -- no agent turn, no push.
+        with self.assertRaises(PlanRunError) as ctx:
+            self._resume(
+                stage_adapter,
+                _SparringAdapter([READY]),
+                allow_push_candidate=first,
+                stop_after_stage=S1,
+            )
+        self.assertIn("Only that reviewed commit may be pushed and accepted", str(ctx.exception))
+        self.assertEqual(stage_adapter.turns, 0)
+        self.assertNothingPushed()
 
-        # HEAD had moved, so this resume was not the authorized push: the
-        # ordinary loop ran, and the candidate it produced is a commit nobody
-        # authorized. Nothing reached the remote and nothing was accepted.
-        self.assertEqual(stage_adapter.turns, 1)
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertIsNotNone(result.awaiting)
-        self.assertNotEqual(result.awaiting.candidate_sha, first)
-        self.assertEqual(result.awaiting.candidate_sha, _head_sha(self.repo))
+        # An explicit --next-turn cannot override the recorded finalization
+        # marker either: no unrestricted implementation turn on reviewed
+        # work, and nothing recorded, pushed or accepted. Refused before any
+        # plan-run state changes.
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(
+                stage_adapter,
+                _SparringAdapter([READY]),
+                stop_after_stage=S1,
+                next_turn="stage",
+            )
+        self.assertIn("already records next_turn = finalization", str(ctx.exception))
+        self.assertEqual(stage_adapter.turns, 0)
+        self.assertEqual(self._stage(S1).read_state().next_turn, "finalization")
         self.assertNothingPushed()
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
