@@ -36,9 +36,10 @@ Show which model and effort each role will use (`show-config`). They come
 from the person's own preferences, or the provider's default. Don't change
 them as part of starting a run. A stage keeps the configuration it started
 with until it ends, so a preference changed during a run applies from the
-next stage. Don't pass `--stage-model` or similar flags to a resume to force
-a change: the engine refuses an override that contradicts the stage's
-recorded configuration.
+next stage. Don't pass `--stage-model` or similar flags to an ordinary
+resume to force a change: the engine refuses an override that contradicts
+the stage's recorded configuration. The one exception is a fresh session
+(step 6): the new conversation may be given a different model or effort.
 
 ## 2. Branch and worktree
 
@@ -67,15 +68,19 @@ Take the plan path from `$ARGUMENTS` and ask for it if it's missing.
 
 1. Before the dry run, tell the person it may spend one read-only provider
    turn preparing the plan (a plan without `## Stage <n> — <title>`
-   headings is prepared first; a matching earlier preparation is reused).
-   Then run:
+   headings is prepared first; a matching earlier preparation is reused),
+   and that each rerun with `--answer` may spend a further read-only
+   preparation turn. Then run:
 
    ```sh
    sparring start-plan <plan> --expected-branch <branch> --json
    ```
 
    Add `--context-repository NAME=PATH` for each other repository the person
-   says the plan touches. Add `--allow-push-for-run` only if they asked for
+   says the plan touches, and `--repository-branch NAME=BRANCH` for a
+   declared sibling on a branch other than the one intake saw; the engine
+   refuses a `--repository-branch` for a repository the run does not
+   declare. Add `--allow-push-for-run` only if they asked for
    it. Without `--confirm`, start-plan starts no run.
 2. Read `status`:
    - `refused`: show `error` and the fix it names, then stop.
@@ -96,7 +101,13 @@ Take the plan path from `$ARGUMENTS` and ask for it if it's missing.
    `--confirm <confirm_token>` (drop `--json` if the person runs it in their
    own terminal). The engine recomputes everything and refuses if anything
    changed since the summary; then relay the refusal and start again from
-   the dry run. Never reuse a token across changes.
+   the dry run. The token binds every execution input the summary showed:
+   models, effort, permission mode, executables, max send-back cycles,
+   push, sparring dir, repositories and answers. Changing any of them needs
+   a fresh dry run and a new token; never reuse a token across changes.
+
+Launching does not pass the plan's gates: a gate still pauses the run when
+it is reached, with `NEEDS_YOU`, which you relay as in step 5.
 
 A run can take hours and starts its own agent sessions. In order of
 preference:
@@ -140,3 +151,49 @@ checks, `ESCALATE`, a refusal, or complete. For `NEEDS_YOU`, list each
 check's instruction and pass criteria verbatim, and say that resuming needs
 the person's evidence. Don't merge or push anything. Ask before any push
 authorization (`--allow-push-candidate`).
+
+## 6. Resuming after a pause
+
+There are three ways to continue a stage, and they are not interchangeable:
+
+- **Ordinary resume** — `sparring resume-plan <plan> --expected-branch
+  <branch>`. Continues the same conversations, with the configuration the
+  stage recorded. The default.
+- **Fresh-session resume** — the same command plus `--fresh-sparrer`
+  (reviewer) or `--fresh-stage-agent` (implementation agent), optionally
+  with `--fresh-reason <text>`. Replaces only that role's conversation: same
+  stage, same candidate, earlier exchange kept as history, a new generation
+  recorded. Use it when that conversation cannot or should not continue —
+  the engine said it cannot be resumed, or the person wants a clean context.
+  Role-scoped `--stage-model` / `--stage-effort` or `--sparring-model` /
+  `--sparring-effort` may choose the new conversation's model or effort.
+  Each role supports exactly one provider today, so a different
+  `--stage-provider` / `--sparring-provider` is refused; don't try one.
+- **`sparring reset-stage`** — archives the stage's attempt as history and
+  restarts the stage from the preceding accepted candidate. Only when the
+  person wants the attempt itself discarded, or the engine names it in a
+  refusal. Ask first.
+
+The engine decides whose turn runs next, from its recorded `next_turn`.
+Don't pick one. `--next-turn stage|sparring` exists only for a legacy stage
+whose turn the engine refused to derive, and said so; then the person
+chooses, and the engine records it.
+
+When a provider fails, the engine pauses the run, prints the retry to use
+and records `provider_pause` in the plan-run state. Read it there or in its
+printed output; never edit it, and run the printed commands as printed.
+
+- **`session-unresumable`**: the named role's conversation cannot continue.
+  Run the printed retry, which adds `--fresh-sparrer` or
+  `--fresh-stage-agent` with `--fresh-reason session-unresumable`. If that
+  role has no recorded conversation (`has_session: false`), a plain resume
+  is all there is.
+- **`provider-unavailable`** (quota, rate limit, overloaded): either wait
+  and run the printed plain retry, which continues the same conversation, or
+  run the printed fresh alternative, optionally with a different model or
+  effort. Moving to another backend or account is set up in the provider
+  CLI itself, outside the engine.
+
+In every case the candidate is unchanged. Never edit anything under
+`.sparring/` to get past a pause; if the engine refuses a resume, relay its
+message and stop, as for any refusal.

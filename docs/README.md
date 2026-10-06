@@ -8,7 +8,7 @@ reference it links into.
 | [Set up a project](setup.md) | `project.toml`, `PROJECT.md`, your model and effort preferences, `fix-config`, git hygiene |
 | [Run a stage](stages.md) | one stage by hand: run, review, ask the reviewer, what each agent was told |
 | [Run a whole plan](plans.md) | `run-plan` / `resume-plan`, the Markdown stage convention, manifests, pausing, human checks, pushing |
-| [Plan intake](intake.md) *(experimental)* | `start-plan` (one confirmation from a human plan to a run), and `prepare-plan` / `approve-plan`: turning a human plan into approved run slices |
+| [Plan intake](intake.md) | `start-plan`, the default way to start a run (one confirmation from a human plan to a run), and the advanced `prepare-plan` / `approve-plan`: turning a human plan into approved run slices; the intake integrity revision's Stages B and C are still experimental |
 | [Human gates](gates.md) | how `NEEDS_YOU` asks for a check and how an answer is matched to it |
 | [Migration-order detection](migrations.md) *(Stage A, read-only)* | `[migrations]`, recorded history snapshots, the deferred registry, `check-migrations` |
 | [Reference](reference.md) | cross-repository candidates, review-only stages, `next_turn`, resume vs fresh session vs reset, who owns which artifact |
