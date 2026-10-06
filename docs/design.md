@@ -906,6 +906,129 @@ mirror, never an input.
 
 ---
 
+# Run worktrees (design; not implemented)
+
+The intended flow is *pick a plan → run → watch → merge → clean up*, with
+branches and worktrees as implementation details a person never has to
+manage. This section fixes who owns them and the invariants any
+implementation must keep. Nothing here is implemented yet; the first slices
+are listed at the end.
+
+**Today.** The engine never creates a worktree. People and agents create
+them; the engine only checks that a run is where it was approved — intake
+approval binds a slice to the canonical worktree path and git directory, and
+resume repeats that check — and holds one implementation writer per
+worktree (`concurrency.py`). Nothing records which worktree belongs to which
+run. The VS Code extension finds runs in sibling worktrees by reading `git
+worktree list` (read-only) and shows them; it does not own them either.
+
+## Ownership: the engine creates, records and removes
+
+- Only the engine creates or removes a *managed* worktree, and only through
+  explicit commands. A worktree it did not create is never a cleanup
+  candidate, whatever its name or branch.
+- Every managed worktree has a record in the repository's **git common
+  directory** — `<git-common-dir>/agent-sparring/worktrees/<run-key>.json`,
+  next to the migration history and for the same reason: every worktree of
+  the repository must see it, and no worktree's checkout owns it. The
+  record holds the run key (and intake/slice when there is one), the
+  canonical path, the branch, the base commit, the target branch it will be
+  merged into, `created_at` and `created_by: "engine"`. It is the only
+  association between a run and a worktree; clients read it and never
+  infer one from directory or branch names.
+- A record is written before the worktree is used and updated, never
+  rewritten, as the run finishes and as cleanup runs. A record whose
+  directory has disappeared is reported, never silently dropped.
+
+## Creation: before preparation, because approval binds the path
+
+Intake approval records the primary worktree's canonical path, so isolation
+has to happen **before** `prepare`/`approve`, not by moving an approved run:
+
+- `start-plan` (the normal path) gains an opt-in to run in a new managed
+  worktree. It creates the worktree at the current HEAD on a new branch,
+  writes the record, and then prepares and approves **inside** that
+  worktree, exactly as if the person had run `start-plan` there. The
+  existing approval checks then apply unchanged.
+- Names are automatic and deterministic from the plan and run key: the
+  directory is a sibling of the main worktree, `<repo>-sparring-<run-key>`,
+  and the branch is `sparring/<plan-slug>-<short-run-key>`. A collision is
+  refused, never resolved by reusing or overwriting; a branch name is never
+  reused for a different run.
+- The target branch is recorded at creation: the branch checked out where
+  `start-plan` was invoked. It is not inferred later.
+- First slice: single-repository runs only. A run with declared sibling
+  repositories is refused isolation until sibling worktrees have the same
+  ownership rules.
+
+## Finish: one engine command, dry run first
+
+Merging and cleanup are one explicit engine command over one run, for
+example `sparring finish-run <run-key> [--merge] [--push] [--dry-run] [--json]`.
+`--dry-run --json` reports every check below with pass/fail and the reason;
+without `--dry-run` it performs only what the checks allow, in order, and
+stops at the first refusal. Every check is re-made at execution time; a dry
+run is advice, never a token.
+
+A managed worktree may be removed only when **all** of these hold:
+
+1. the record exists and says the engine created it;
+2. the plan run is `complete` with every stage accepted, nothing in
+   `awaiting`, and no open deferred human verification;
+3. no runner holds the worktree (the concurrency lock is free and no live
+   process is recorded for it);
+4. the worktree is clean: no modified, staged or untracked non-ignored
+   files;
+5. the branch tip is the run's accepted final candidate;
+6. the target branch contains that tip (ancestry, not message or patch
+   matching). With `--merge`, the engine first merges into the target —
+   fast-forward, or a merge commit if the project allows it — from a clean
+   target worktree; it never rebases or rewrites either branch;
+7. when the repository has a remote, the commit the target now points at is
+   reachable on it. With `--push`, the engine pushes the target first,
+   under the existing push rules; it never force-pushes;
+8. no other worktree has the branch checked out.
+
+Removal is then `git worktree remove` without `--force`, followed by
+deleting the branch with `git branch -d` (never `-D`), and marking the
+record finished. A failure part-way leaves everything that was not yet
+removed in place and says what remains.
+
+**Never automatic.** Nothing is removed on completion, on a timer or on
+window close. A dirty, paused, unaccepted, unmerged or unpushed worktree is
+never removed, and no engine path uses `--force`, `-D` or a force push.
+Abandoning a run is a separate, explicitly confirmed action that keeps the
+branch.
+
+## Prunable engine state
+
+Engine-owned state that no run still uses — intake directories of
+superseded or finished intakes, stage directories of runs whose worktree
+was removed, manifest bindings for removed worktrees, worktree records whose
+directory is gone, migration history beyond its retention — is **reported**
+by a read-only `sparring prune --dry-run --json`, each item with why it is
+believed unused. Deleting any of it is a later, separate decision.
+
+## Clients
+
+A client (the VS Code extension) reads the records and the run state, shows
+*Merge & clean up* only when `finish-run --dry-run --json` reports the run
+eligible, shows that report in the confirmation, and runs the command the
+person confirmed. It never runs git itself to merge or remove, never
+decides eligibility, and keeps branch and worktree details under
+diagnostics. Opening a managed worktree in a window is offered, never
+required.
+
+## First slices
+
+1. The worktree record format and `start-plan` isolation for
+   single-repository runs (creation only).
+2. `finish-run --dry-run --json`: every check above, read-only.
+3. `finish-run` execution: merge, push and removal under those checks.
+4. `prune --dry-run --json`.
+
+---
+
 # History
 
 The tool was built in eight bounded stages during September 2026, each one
