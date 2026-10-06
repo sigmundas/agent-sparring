@@ -139,6 +139,20 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
         ),
     ),
     ArtifactOwnership(
+        path="intake/<intake>/decisions.json",
+        owner="engine ('sparring start-plan --answer' / prepare, on a person's answers)",
+        provider_writable=False,
+        lifetime=(
+            "written once, at prepare time, as part of the write-once intake directory; "
+            "the intake it answers is never written"
+        ),
+        purpose=(
+            "the answers a person gave to an earlier intake's decisions -- question, option "
+            "label and consequence verbatim, parent intake and source digest; intake.json "
+            "records its digest, so approval seals it and run-plan re-checks it"
+        ),
+    ),
+    ArtifactOwnership(
         path="intake/<intake>/runs/<run>/",
         owner="engine ('sparring approve-plan', on a person's explicit decision)",
         provider_writable=False,

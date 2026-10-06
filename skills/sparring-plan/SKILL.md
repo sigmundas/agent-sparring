@@ -82,11 +82,11 @@ sparring check-plan docs/plans/<slug>.md
 It lists the stages the engine will see and runs nothing. Fix and re-check
 until it passes.
 
-If the plan spans several repositories, or its structure really can't use
-the heading convention, say so. [Plan intake](../../docs/intake.md)
-(`sparring prepare-plan`, experimental) is the path for that, and
-`/agent-sparring:sparring-run` handles it. Don't run `prepare-plan` from
-this skill, because it starts an agent turn.
+A plan that spans several repositories, or doesn't use the heading
+convention, is fine as it is: `3A`-style headings and free-form structure
+are prepared by `sparring start-plan` through [plan intake](../../docs/intake.md),
+and `/agent-sparring:sparring-run` handles it. Don't run `start-plan` or
+`prepare-plan` from this skill, because they can start an agent turn.
 
 ## 5. Hand over
 

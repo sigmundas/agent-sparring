@@ -20,6 +20,28 @@ you do the checks
     -> Stage 4 … until the next human gate or the end of the plan
 ```
 
+**The normal way to start a plan is `sparring start-plan`**, for any
+human plan, staged with `## Stage <n> — <title>` or not:
+
+```sh
+sparring start-plan docs/plans/foo.md --expected-branch feature/x [--json]
+# ready: prints the stages, any pauses for gates, and the command to confirm:
+sparring start-plan docs/plans/foo.md --expected-branch feature/x --confirm <token>
+```
+
+A plan this page's Markdown convention parses runs directly, exactly as
+`run-plan` below. Any other plan is prepared once in compile mode (one
+read-only provider turn, reused while it still matches) and, if it needs
+your choice, the dry run says `needs_decision` and lists the questions:
+answer with `--answer <decision>=<option>` and run it again. The confirm
+token binds exactly what was shown — plan, preparation, this slice's
+stages and gates, repository commits, models, push choice — so a confirm
+after anything changed refuses. start-plan never switches or creates a
+branch and refuses a dirty tree. See [start-plan in the intake
+reference](intake.md#one-command-start-sparring-start-plan) for routes,
+the token and the `--json` schema; `run-plan`, `prepare-plan` and
+`approve-plan` stay available as the step-by-step path.
+
 `run-plan` takes the same provider flags as `run-loop`. It stops for
 `NEEDS_YOU`, `ESCALATE`, a provider/integrity failure, a freeze or accept
 refusal, the SEND_BACK runaway limit, and the end of the plan; ordinary
@@ -343,6 +365,21 @@ The digest covers everything executable *and* `source_digest`, so re-emitting
 a manifest from an edited plan refuses to continue an existing run — the same
 protection the Markdown path gets. Re-emitting an unchanged one is stable, so
 a tool may regenerate the file on every invocation.
+
+**Version 2: plan-declared gates.** A `"version": 2` manifest is version 1
+plus `gates_before: [{"id", "title", "kind", "reason"}]` on any stage,
+and/or top-level `completion_gates` of the same shape; it must use at
+least one, and gate ids are unique. After the preceding stage is accepted the
+run mints one obligation per gate (checkpoint `before_stage:<stage id>`, or
+`before_plan_completion` for completion gates) and stops with
+`deferred_verification_required` (reason `before_stage` or `plan_completion`)
+before the gated stage is created or before reporting COMPLETE. A gate on the
+first stage stops a new run before anything is created; its answer is kept in
+the run ledger. Only
+`resume-plan --deferred-result <instance>:<gate id>=pass` releases it;
+`fail`/`blocked` keep the run stopped, reaching a gate never satisfies it, and
+`--evidence` is refused at a `before_stage` stop. The v2 digest covers every
+gate field and its position; version-1 digests are unchanged.
 
 `repositories` is for a stage whose reviewed candidate spans more than one
 repository; see [Cross-repository candidates](reference.md#cross-repository-candidates). `mode` is for a stage

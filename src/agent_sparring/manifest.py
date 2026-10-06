@@ -1,4 +1,4 @@
-"""Execution manifest v1: a deterministic plan input for the plan runner.
+"""Execution manifest v1/v2: a deterministic plan input for the plan runner.
 
 A reviewed plan is a human document. Deciding which of its headings are
 canonical stages, how labels like ``3A``/``3B``/``3C`` order, which sections
@@ -79,6 +79,22 @@ existing ``brief.md`` verbatim, and to brief only the stages that do not
 exist yet from the plan's current section. One manifest then describes both
 the preserved history and the future execution, and adopting a sequence
 never requires deleting a stage or rolling the plan document back.
+
+Version 2: plan-declared gates
+------------------------------
+
+v2 is v1 plus two fields, and nothing else:
+
+- per stage, ``gates_before: [{id, title, kind, reason}]`` -- gates owed
+  after the preceding stage is accepted and before this one is created;
+- top level, ``completion_gates`` (same shape) -- gates owed after the last
+  stage is accepted and before the run may report COMPLETE.
+
+A ``version: 2`` manifest must use at least one of them (a manifest that
+needs neither is written as v1), and a v1 manifest carrying either is
+refused as an unknown field. Gate ids are unique across the whole manifest.
+The v2 digest covers every gate field and its position; v1 digests are
+computed exactly as before.
 """
 
 from __future__ import annotations
@@ -88,7 +104,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from agent_sparring.plan_model import PlannedStage, digest_planned_stages
+from agent_sparring.plan_model import ManifestGate, PlannedStage, digest_planned_stages
 from agent_sparring.stage import (
     CandidateRepository,
     StageError,
@@ -97,13 +113,22 @@ from agent_sparring.stage import (
 )
 
 MANIFEST_VERSION = 1
+#: The version that adds plan-declared gates (see the module docstring).
+MANIFEST_VERSION_GATES = 2
+MANIFEST_VERSIONS = (MANIFEST_VERSION, MANIFEST_VERSION_GATES)
 
 _TOP_LEVEL_KEYS = frozenset({"version", "plan_label", "source_digest", "stages"})
+_TOP_LEVEL_KEYS_V2 = _TOP_LEVEL_KEYS | {"completion_gates"}
 #: The top-level key of the envelope plan intake wraps an approved manifest
 #: in (see :mod:`agent_sparring.intake_approval`). Named here only so the
 #: plain reader can refuse one by name instead of as an unknown key.
 INTAKE_ENVELOPE_KEY = "intake_manifest"
 _STAGE_KEYS = frozenset({"stage_id", "label", "title", "brief", "mode", "repositories"})
+_STAGE_KEYS_V2 = _STAGE_KEYS | {"gates_before"}
+_GATE_KEYS = frozenset({"id", "title", "kind", "reason"})
+#: A gate id becomes the id of the check a person answers, so it obeys the
+#: check-id length bound.
+_MAX_GATE_ID_LENGTH = 128
 _REPOSITORY_KEYS = frozenset({"name", "path", "branch", "candidate_sha"})
 
 
@@ -119,6 +144,8 @@ class ExecutionManifest:
     source_digest: str
     stages: tuple[PlannedStage, ...]
     version: int = MANIFEST_VERSION
+    #: Gates owed before the run may report COMPLETE (v2 only).
+    completion_gates: tuple[ManifestGate, ...] = ()
 
 
 def parse_manifest(text: str) -> ExecutionManifest:
@@ -141,14 +168,14 @@ def manifest_from_payload(payload: Any) -> ExecutionManifest:
 
     if not isinstance(payload, Mapping):
         raise ManifestError("a manifest must be a JSON object")
-    _reject_unknown(payload, _TOP_LEVEL_KEYS, "manifest")
-
     version = payload.get("version")
-    if version != MANIFEST_VERSION:
+    if isinstance(version, bool) or version not in MANIFEST_VERSIONS:
         raise ManifestError(
-            f"unsupported manifest version {version!r}; this engine reads version "
-            f"{MANIFEST_VERSION}"
+            f"unsupported manifest version {version!r}; this engine reads versions "
+            f"{', '.join(map(str, MANIFEST_VERSIONS))}"
         )
+    gated = version == MANIFEST_VERSION_GATES
+    _reject_unknown(payload, _TOP_LEVEL_KEYS_V2 if gated else _TOP_LEVEL_KEYS, "manifest")
     plan_label = _text(payload, "plan_label", "manifest")
     source_digest = _text(payload, "source_digest", "manifest")
 
@@ -158,26 +185,40 @@ def manifest_from_payload(payload: Any) -> ExecutionManifest:
 
     stages: list[PlannedStage] = []
     for position, entry in enumerate(raw_stages, start=1):
-        stages.append(_stage(entry, position))
+        stages.append(_stage(entry, position, gated=gated))
 
     ids = [stage.stage_id for stage in stages]
     duplicates = sorted({stage_id for stage_id in ids if ids.count(stage_id) > 1})
     if duplicates:
         raise ManifestError(f"manifest stage ids must be unique; repeated: {duplicates}")
 
+    completion_gates = _gates(payload.get("completion_gates"), "manifest completion_gates") if gated else ()
+    if gated:
+        gate_ids = [gate.id for stage in stages for gate in stage.gates_before]
+        gate_ids += [gate.id for gate in completion_gates]
+        if not gate_ids:
+            raise ManifestError(
+                "a version 2 manifest must declare at least one gate (gates_before or "
+                "completion_gates); a manifest without gates is written as version 1"
+            )
+        repeated = sorted({gate_id for gate_id in gate_ids if gate_ids.count(gate_id) > 1})
+        if repeated:
+            raise ManifestError(f"manifest gate ids must be unique; repeated: {repeated}")
+
     return ExecutionManifest(
         plan_label=plan_label,
         source_digest=source_digest,
         stages=tuple(stages),
-        version=MANIFEST_VERSION,
+        version=int(version),
+        completion_gates=completion_gates,
     )
 
 
-def _stage(entry: Any, position: int) -> PlannedStage:
+def _stage(entry: Any, position: int, *, gated: bool = False) -> PlannedStage:
     where = f"manifest stage {position}"
     if not isinstance(entry, Mapping):
         raise ManifestError(f"{where} must be a JSON object")
-    _reject_unknown(entry, _STAGE_KEYS, where)
+    _reject_unknown(entry, _STAGE_KEYS_V2 if gated else _STAGE_KEYS, where)
 
     stage_id = _text(entry, "stage_id", where)
     try:
@@ -200,7 +241,37 @@ def _stage(entry: Any, position: int) -> PlannedStage:
         brief=brief,
         repositories=_repositories(entry.get("repositories"), where),
         mode=_mode(entry.get("mode"), f"{where} ({stage_id})"),
+        gates_before=_gates(entry.get("gates_before"), f"{where} ({stage_id}) gates_before"),
     )
+
+
+def _gates(raw: Any, where: str) -> tuple[ManifestGate, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ManifestError(f"{where} must be an array or null")
+    gates: list[ManifestGate] = []
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            raise ManifestError(f"{where}: each gate must be a JSON object")
+        _reject_unknown(entry, _GATE_KEYS, f"{where} gate")
+        gate = ManifestGate(
+            id=_text(entry, "id", f"{where} gate"),
+            title=_text(entry, "title", f"{where} gate"),
+            kind=_text(entry, "kind", f"{where} gate"),
+            reason=_text(entry, "reason", f"{where} gate"),
+        )
+        if len(gate.id) > _MAX_GATE_ID_LENGTH:
+            raise ManifestError(f"{where}: gate id is longer than {_MAX_GATE_ID_LENGTH} characters")
+        gates.append(gate)
+    return tuple(gates)
+
+
+def _gate_parts(gates: tuple[ManifestGate, ...], marker: str) -> list[str]:
+    parts = [marker, str(len(gates))]
+    for gate in gates:
+        parts += [gate.id, gate.title, gate.kind, gate.reason]
+    return parts
 
 
 def _mode(raw: Any, where: str) -> StageMode:
@@ -279,6 +350,11 @@ def manifest_digest(manifest: ExecutionManifest) -> str:
     resuming. Declaring a stage ``independent_review`` *does* change the
     digest, in both directions -- so a stage cannot be flipped between the
     two lifecycles under a run that is already under way.
+
+    A v2 manifest additionally digests each stage's ``gates_before`` (marked
+    and counted, so a gate cannot move between stages or into
+    ``completion_gates`` without changing the digest) and the completion
+    gates. A v1 manifest contributes neither, so its digest is unchanged.
     """
 
     parts: list[str] = [str(manifest.version), manifest.plan_label, manifest.source_digest]
@@ -293,6 +369,10 @@ def manifest_digest(manifest: ExecutionManifest) -> str:
                 repository.branch,
                 repository.candidate_sha or "",
             ]
+        if manifest.version == MANIFEST_VERSION_GATES:
+            parts += _gate_parts(stage.gates_before, "gates_before")
+    if manifest.version == MANIFEST_VERSION_GATES:
+        parts += _gate_parts(manifest.completion_gates, "completion_gates")
     return digest_planned_stages(*parts)
 
 
@@ -314,6 +394,10 @@ class ManifestPlanSource:
     def stages(self) -> tuple[PlannedStage, ...]:
         return self.manifest.stages
 
+    @property
+    def completion_gates(self) -> tuple[ManifestGate, ...]:
+        return self.manifest.completion_gates
+
     def reload(self) -> "ManifestPlanSource":
         return load_manifest_source(self.path)
 
@@ -334,6 +418,8 @@ def load_manifest_source(path: Path) -> ManifestPlanSource:
 __all__ = [
     "INTAKE_ENVELOPE_KEY",
     "MANIFEST_VERSION",
+    "MANIFEST_VERSION_GATES",
+    "MANIFEST_VERSIONS",
     "ExecutionManifest",
     "ManifestError",
     "ManifestPlanSource",

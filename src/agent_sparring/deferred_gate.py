@@ -31,9 +31,11 @@ What the engine does enforce
 - a deferred gate carries a reviewer-authored ``rationale``. An agent that
   defers without saying why produces an invalid verdict, because the
   rationale is the only thing that makes the decision auditable later;
-- its checkpoint is a value this version understands. v1 understands exactly
-  one, :data:`CHECKPOINT_PLAN_COMPLETION`. The field is stored rather than
-  implied so a later ``before_stage:<id>`` is a new value, not a new format;
+- its checkpoint is a value this version understands. A reviewer may name
+  exactly one, :data:`CHECKPOINT_PLAN_COMPLETION`. The engine itself also
+  mints ``before_stage:<stage id>`` obligations for plan-declared manifest
+  gates (:func:`before_stage_checkpoint`); that is a new value of the same
+  field, not a new format;
 - every obligation has an engine-minted gate ``instance_id`` (see
   :mod:`agent_sparring.human_gate`), so an answer belongs to *this asking*
   and an answer to an earlier one cannot silently satisfy it;
@@ -77,6 +79,20 @@ CHECKPOINT_PLAN_COMPLETION = "before_plan_completion"
 #: Every checkpoint this version accepts. A reviewer naming anything else
 #: gets a refusal rather than an obligation with a deadline nothing honours.
 CHECKPOINTS = (CHECKPOINT_PLAN_COMPLETION,)
+
+#: Prefix of the checkpoint an engine-minted manifest gate is owed by: the
+#: answer is due before the named stage is created. Never reviewer-authored.
+CHECKPOINT_BEFORE_STAGE_PREFIX = "before_stage:"
+
+
+def before_stage_checkpoint(stage_id: str) -> str:
+    """The checkpoint for a manifest gate owed before ``stage_id``."""
+
+    return f"{CHECKPOINT_BEFORE_STAGE_PREFIX}{stage_id}"
+
+
+def is_before_stage(checkpoint: str) -> bool:
+    return checkpoint.startswith(CHECKPOINT_BEFORE_STAGE_PREFIX)
 
 #: The typed reason a managed run stops for deferred human verification
 #: (mirrors :data:`~agent_sparring.push_gate.PUSH_AUTHORIZATION_REQUIRED`).
@@ -254,6 +270,10 @@ class DeferredObligation:
     checkpoint: str = CHECKPOINT_PLAN_COMPLETION
     promoted: bool = False
     results: tuple[CheckResult, ...] = field(default_factory=tuple)
+    #: The engine minted this for a plan-declared manifest gate (see
+    #: :mod:`agent_sparring.manifest`), not a reviewer's deferral. Such an
+    #: obligation belongs to its run slice and is never carried to the plan.
+    manifest_gate: bool = False
 
     def __post_init__(self) -> None:
         if not self.gate.instance_id:
@@ -336,6 +356,7 @@ class DeferredObligation:
             "checkpoint": self.checkpoint,
             "promoted": self.promoted,
             "results": [result.to_dict() for result in self.results],
+            **({"manifest_gate": True} if self.manifest_gate else {}),
         }
 
     @classmethod
@@ -360,6 +381,7 @@ class DeferredObligation:
             checkpoint=str(payload.get("checkpoint") or CHECKPOINT_PLAN_COMPLETION).strip(),
             promoted=bool(payload.get("promoted")),
             results=tuple(CheckResult.from_dict(entry) for entry in raw_results),
+            manifest_gate=payload.get("manifest_gate") is True,
         )
 
     @classmethod
@@ -453,6 +475,8 @@ class DeferredVerificationRequired:
     #: ``reason`` values. Closed, for the same reason ``kind`` is.
     PLAN_COMPLETION = "plan_completion"
     PROMOTED = "promoted"
+    #: Stopped on a plan-declared gate between two stages of the run.
+    BEFORE_STAGE = "before_stage"
 
     @classmethod
     def for_obligations(
@@ -491,16 +515,16 @@ class DeferredVerificationRequired:
     def describe(self) -> str:
         count = len(self.instance_ids)
         what = "manual check" if count == 1 else "manual checks"
-        when = (
-            "before this plan can complete"
-            if self.reason == self.PLAN_COMPLETION
-            else "before this run goes any further"
-        )
+        when = {
+            self.PLAN_COMPLETION: "before this plan can complete",
+            self.BEFORE_STAGE: "before the next stage may start",
+        }.get(self.reason, "before this run goes any further")
         return f"{count} deferred {what} must be answered {when}"
 
 
 __all__ = [
     "CHECKPOINTS",
+    "CHECKPOINT_BEFORE_STAGE_PREFIX",
     "CHECKPOINT_PLAN_COMPLETION",
     "DEFERRED_GATE_MARKER",
     "DEFERRED_VERIFICATION_REQUIRED",
@@ -513,4 +537,6 @@ __all__ = [
     "DeferredObligation",
     "DeferredVerificationRequired",
     "ObligationStatus",
+    "before_stage_checkpoint",
+    "is_before_stage",
 ]

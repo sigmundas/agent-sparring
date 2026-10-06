@@ -111,7 +111,7 @@ import hashlib
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -121,6 +121,7 @@ from agent_sparring.git_context import GitContextError, current_branch, is_ignor
 from agent_sparring.intake_approval import (
     APPROVAL_FILENAME,
     APPROVAL_VERSION,
+    DECISIONS_FILENAME,
     INTAKE_DIRNAME,
     MANIFEST_FILENAME,
     REGISTRY_DIRNAME,
@@ -134,8 +135,14 @@ from agent_sparring.intake_approval import (
     write_atomic,
     write_exclusive,
 )
-from agent_sparring.intake_prompt import MODE_FAITHFUL, MODE_REFINE, assemble_intake_prompt
-from agent_sparring.manifest import MANIFEST_VERSION, ManifestError, manifest_digest, parse_manifest
+from agent_sparring.intake_prompt import MODE_COMPILE, MODE_FAITHFUL, MODE_REFINE, assemble_intake_prompt
+from agent_sparring.manifest import (
+    MANIFEST_VERSION,
+    MANIFEST_VERSION_GATES,
+    ManifestError,
+    manifest_digest,
+    parse_manifest,
+)
 from agent_sparring.plan import (
     PlanError,
     PlanRunState,
@@ -152,7 +159,7 @@ from agent_sparring.stage import Stage, StageError, StageMode, StageStatus, vali
 #: ``intake.json`` version. ``1`` is an unsealed proposal from before
 #: approvals bound execution: recognised, and refused.
 INTAKE_VERSION = 2
-MODES: tuple[str, ...] = (MODE_FAITHFUL, MODE_REFINE)
+MODES: tuple[str, ...] = (MODE_FAITHFUL, MODE_REFINE, MODE_COMPILE)
 
 #: ``render_brief``'s output format, recorded in ``intake.json`` as
 #: ``brief_format_version`` by every intake prepared from this version on.
@@ -203,10 +210,93 @@ AGENT_FINDING_CODES: tuple[str, ...] = (
     "other",
 )
 
+#: Compile mode's finding dispositions (see :mod:`agent_sparring.intake_prompt`).
+#: Faithful and refine findings carry none; their severity is the agent's.
+DISPOSITION_AUTO_RESOLVED = "auto_resolved"
+DISPOSITION_PLAN_NOTE = "plan_note"
+DISPOSITION_NEEDS_DECISION = "needs_decision"
+DISPOSITION_REFUSE = "refuse"
+DISPOSITIONS: tuple[str, ...] = (
+    DISPOSITION_AUTO_RESOLVED,
+    DISPOSITION_PLAN_NOTE,
+    DISPOSITION_NEEDS_DECISION,
+    DISPOSITION_REFUSE,
+)
+#: A compile finding's severity is derived from its disposition, never stated.
+DISPOSITION_SEVERITY: dict[str, str] = {
+    DISPOSITION_AUTO_RESOLVED: SEVERITY_INFO,
+    DISPOSITION_PLAN_NOTE: SEVERITY_RECOMMENDATION,
+    DISPOSITION_NEEDS_DECISION: SEVERITY_BLOCKING,
+    DISPOSITION_REFUSE: SEVERITY_BLOCKING,
+}
+#: The closed set of normalizations an ``auto_resolved`` finding may claim.
+#: Each has a deterministic guard (:func:`_transform_problem`); any other
+#: auto-resolution, or one whose guard fails, is downgraded to
+#: ``needs_decision``.
+TRANSFORMS: tuple[str, ...] = (
+    "relabel_stage",
+    "attach_context",
+    "split_review_barrier",
+    "gate_at_boundary",
+    "reorder_within_candidate",
+    "conditional_sibling",
+)
+
 GATE_KINDS: tuple[str, ...] = ("production", "manual", "external", "deferred")
 STAGE_MODES: tuple[str, ...] = tuple(mode.value for mode in StageMode)
 
 _HORIZONTAL_RULE_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
+_HEADING_RE = re.compile(r"^(#{1,6})\s+\S")
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+#: Source lines compile mode treats as a review requirement, for the "maps
+#: to a node" guard.
+_REVIEW_REQUIREMENT_RE = re.compile(r"\bindependent(ly)?\s+review", re.IGNORECASE)
+#: The "no gate disappears" guard works per sentence (headings, fenced code and
+#: inline code spans ignored). A sentence states a gate when it names a
+#: gate-like event and a stage is the object of a prerequisite relation:
+#: "run a canary ... before Stage 3A", "Activate the release after Stage 1A,
+#: with explicit go-ahead", "Stage 3A requires the owner's go-ahead". A stage
+#: merely mentioned near such a word ("rendered in Stage 2", "Status: not
+#: approved") is not a gate. A false match is not harmless: it refuses an
+#: honest compile, so these patterns stay specific.
+_GATE_TEXT_RE = re.compile(
+    r"(?<![\w-])(gate[sd]?|canar(y|ies)|deploy\w*|go-ahead|sign-?off|approv(al|e|ed)|authori[sz]\w*|activat\w*)(?![\w-])",
+    re.IGNORECASE,
+)
+_NEGATED_GATE_RE = re.compile(r"\bnot\s+(yet\s+)?(approved|authori[sz]ed|signed[- ]off|gated)\b", re.IGNORECASE)
+_STAGE_REF = r"stages?\s+[A-Za-z]*\d\w*"
+_START_PROHIBITION = r"(do\s+not|don\'t|never|cannot|can\'t|must\s+not|may\s+not)\s+(start|begin|run)\s+(the\s+)?"
+_STAGE_AS_PREREQUISITE_RE = re.compile(
+    rf"\b(before|after|until|once|prior\s+to)\s+(the\s+)?{_STAGE_REF}"
+    rf"|\b{_START_PROHIBITION}{_STAGE_REF}"
+    rf"|\b{_STAGE_REF}(\'s)?\s+(\w+\s+)?(requires?|needs?|must\s+wait|waits?|cannot\s+start|can\'t\s+start"
+    r"|may\s+not\s+start|must\s+not\s+start|is\s+(gated|blocked)|depends)\b",
+    re.IGNORECASE,
+)
+#: Within a gate sentence, which stage the gate blocks ("before Stage 3A",
+#: "Stage 3A requires ...", "do not start Stage 3A ...") and which it
+#: follows ("after Stage 1A", "until Stage 5 is complete" -- the gated
+#: action waits for that stage). The declared gate carrying the sentence
+#: must keep exactly these relations.
+_LABEL = r"stages?\s+(?P<{}>[A-Za-z]*\d\w*)"
+_GATE_BLOCKS_RE = re.compile(
+    rf"\b(before|prior\s+to)\s+(the\s+)?{_LABEL.format('label')}"
+    rf"|\b{_START_PROHIBITION}{_LABEL.format('object')}"
+    rf"|\b{_LABEL.format('subject')}(\'s)?\s+(\w+\s+)?(requires?|needs?|must\s+wait|waits?|cannot\s+start|can\'t\s+start"
+    r"|may\s+not\s+start|must\s+not\s+start|is\s+(gated|blocked)|depends)\b",
+    re.IGNORECASE,
+)
+_GATE_FOLLOWS_RE = re.compile(rf"\b(after|once|until)\s+(the\s+)?{_LABEL.format('label')}", re.IGNORECASE)
+_INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+#: Evidence, in a gate's own source text, of each gate kind -- what
+#: ``gate_at_boundary`` checks so a moved gate cannot silently change kind.
+_GATE_KIND_EVIDENCE: dict[str, re.Pattern[str]] = {
+    "production": re.compile(r"\b(production|deploy\w*|release|activat\w*)\b", re.IGNORECASE),
+    "manual": re.compile(r"\b(manual\w*|canar(y|ies)|owner|go-ahead|sign-?off|approv\w*)\b", re.IGNORECASE),
+    "external": re.compile(r"\b(external|third[- ]party|vendor|upstream)\b", re.IGNORECASE),
+    "deferred": re.compile(r"\b(defer\w*|later|follow-?up)\b", re.IGNORECASE),
+}
 
 
 class IntakeError(RuntimeError):
@@ -238,8 +328,8 @@ def _object(properties: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-INTERPRETATION_SCHEMA: dict[str, Any] = _object(
-    {
+def _interpretation_properties(finding: Mapping[str, Any]) -> dict[str, Any]:
+    return {
         "verdict": {"type": "string", "enum": list(VERDICTS)},
         "summary": {"type": "string"},
         "context": {
@@ -298,21 +388,56 @@ INTERPRETATION_SCHEMA: dict[str, Any] = _object(
             "type": "array",
             "items": _object({"ranges": _RANGES_SCHEMA, "reason": {"type": "string"}}),
         },
-        "findings": {
-            "type": "array",
-            "items": _object(
-                {
-                    "code": {"type": "string", "enum": list(AGENT_FINDING_CODES)},
-                    "severity": {"type": "string", "enum": list(SEVERITIES)},
-                    "stages": _STRINGS_SCHEMA,
-                    "ranges": _RANGES_SCHEMA,
-                    "message": {"type": "string"},
-                }
-            ),
-        },
+        "findings": {"type": "array", "items": finding},
         "amended_plan": {"type": ["string", "null"]},
     }
+
+
+_FINDING_SCHEMA: dict[str, Any] = _object(
+    {
+        "code": {"type": "string", "enum": list(AGENT_FINDING_CODES)},
+        "severity": {"type": "string", "enum": list(SEVERITIES)},
+        "stages": _STRINGS_SCHEMA,
+        "ranges": _RANGES_SCHEMA,
+        "message": {"type": "string"},
+    }
 )
+_DECISION_SCHEMA: dict[str, Any] = {
+    **_object(
+        {
+            "id": {"type": "string"},
+            "question": {"type": "string"},
+            "why": {"type": "string"},
+            "options": {
+                "type": "array",
+                "items": _object(
+                    {"id": {"type": "string"}, "label": {"type": "string"}, "consequence": {"type": "string"}}
+                ),
+            },
+        }
+    ),
+    "type": ["object", "null"],
+}
+_COMPILE_FINDING_SCHEMA: dict[str, Any] = _object(
+    {
+        "code": {"type": "string", "enum": list(AGENT_FINDING_CODES)},
+        "disposition": {"type": "string", "enum": list(DISPOSITIONS)},
+        "transform": {"type": ["string", "null"], "enum": [*TRANSFORMS, None]},
+        "decision": _DECISION_SCHEMA,
+        "stages": _STRINGS_SCHEMA,
+        "ranges": _RANGES_SCHEMA,
+        "message": {"type": "string"},
+    }
+)
+
+INTERPRETATION_SCHEMA: dict[str, Any] = _object(_interpretation_properties(_FINDING_SCHEMA))
+#: Compile mode's answer: the same interpretation, with findings that carry a
+#: ``disposition``, ``transform`` and ``decision`` instead of a severity.
+COMPILE_INTERPRETATION_SCHEMA: dict[str, Any] = _object(_interpretation_properties(_COMPILE_FINDING_SCHEMA))
+
+
+def interpretation_schema(mode: str) -> dict[str, Any]:
+    return COMPILE_INTERPRETATION_SCHEMA if mode == MODE_COMPILE else INTERPRETATION_SCHEMA
 
 
 # -- the parsed interpretation ------------------------------------------------
@@ -375,6 +500,24 @@ class Exclusion:
 
 
 @dataclass(frozen=True)
+class DecisionOption:
+    id: str
+    label: str
+    consequence: str
+
+
+@dataclass(frozen=True)
+class Decision:
+    """What a person must choose for a compile-mode ``needs_decision``
+    finding. Recorded here; answering one is not part of this module yet."""
+
+    id: str
+    question: str
+    why: str
+    options: tuple[DecisionOption, ...]
+
+
+@dataclass(frozen=True)
 class Finding:
     code: str
     severity: str
@@ -384,6 +527,14 @@ class Finding:
     #: ``"agent"`` for the intake agent's plan review, ``"engine"`` for a
     #: deterministic check the engine made of the interpretation.
     origin: str = "agent"
+    #: Compile mode only (``None`` otherwise): see :data:`DISPOSITIONS`.
+    #: ``severity`` is then :data:`DISPOSITION_SEVERITY` of it.
+    disposition: str | None = None
+    transform: str | None = None
+    decision: Decision | None = None
+    #: Why the engine downgraded the agent's ``auto_resolved`` claim to
+    #: ``needs_decision`` (see :func:`guard_compile_findings`), else ``None``.
+    downgraded: str | None = None
 
     @property
     def blocking(self) -> bool:
@@ -400,6 +551,9 @@ class Interpretation:
     excluded: tuple[Exclusion, ...]
     findings: tuple[Finding, ...]
     amended_plan: str | None
+    #: Read in compile mode, where a gate inside a run slice is rendered into
+    #: that slice's manifest (:func:`slice_manifest_gates`) instead of refused.
+    compiled: bool = False
 
     def stages(self) -> Iterable[tuple[int, int, RunSlice, IntakeStage]]:
         """Every stage with its (run index, stage index) coordinates."""
@@ -409,7 +563,7 @@ class Interpretation:
                 yield run_index, stage_index, run, stage
 
 
-def parse_interpretation(text: str) -> Interpretation:
+def parse_interpretation(text: str, *, mode: str | None = None) -> Interpretation:
     """Parse the agent's answer structurally, or raise :class:`IntakeError`.
 
     Only shape is checked here -- the provider already validated the
@@ -417,6 +571,11 @@ def parse_interpretation(text: str) -> Interpretation:
     trusting it. What the answer *means* (ranges in bounds, coverage,
     boundaries, references) is :func:`check_interpretation`'s, which reports
     findings instead of refusing, so a person sees every problem at once.
+
+    ``mode`` selects the finding shape: compile findings carry a disposition
+    (and derive their severity from it); faithful and refine findings carry
+    a severity and must not carry a disposition. ``None`` accepts either
+    shape per finding, for readers that only need the topology.
     """
 
     try:
@@ -425,10 +584,10 @@ def parse_interpretation(text: str) -> Interpretation:
         raise IntakeError(f"the intake agent's answer is not valid JSON: {exc}") from exc
     if not isinstance(payload, Mapping):
         raise IntakeError("the intake agent's answer must be a JSON object")
-    return _interpretation(payload)
+    return _interpretation(payload, mode)
 
 
-def _interpretation(payload: Mapping[str, Any]) -> Interpretation:
+def _interpretation(payload: Mapping[str, Any], mode: str | None = None) -> Interpretation:
     verdict = _enum(payload, "verdict", VERDICTS, "interpretation")
     return Interpretation(
         verdict=verdict,
@@ -462,19 +621,71 @@ def _interpretation(payload: Mapping[str, Any]) -> Interpretation:
             )
             for item in _list(payload, "excluded", "interpretation")
         ),
-        findings=tuple(
-            Finding(
-                code=_enum(item, "code", AGENT_FINDING_CODES, "finding"),
-                severity=_enum(item, "severity", SEVERITIES, "finding"),
-                message=_str(item, "message", "finding"),
-                stages=_strs(item, "stages", "finding"),
-                ranges=_ranges(item, "ranges", "finding"),
-                origin="agent",
-            )
-            for item in _list(payload, "findings", "interpretation")
-        ),
+        findings=tuple(_finding(item, mode) for item in _list(payload, "findings", "interpretation")),
         amended_plan=_optional_str(payload, "amended_plan", "interpretation", strip=False),
+        compiled=mode == MODE_COMPILE,
     )
+
+
+def _finding(item: Any, mode: str | None) -> Finding:
+    where = "finding"
+    if not isinstance(item, Mapping):
+        raise IntakeError(f"each {where} must be a JSON object")
+    compiled = "disposition" in item
+    if mode == MODE_COMPILE and not compiled:
+        raise IntakeError("a compile-mode finding must carry a 'disposition'")
+    if mode is not None and mode != MODE_COMPILE and compiled:
+        raise IntakeError(f"a {mode}-mode finding must not carry a 'disposition'; only compile mode has one")
+    common = dict(
+        code=_enum(item, "code", AGENT_FINDING_CODES, where),
+        message=_str(item, "message", where),
+        stages=_strs(item, "stages", where),
+        ranges=_ranges(item, "ranges", where),
+        origin="agent",
+    )
+    if not compiled:
+        return Finding(severity=_enum(item, "severity", SEVERITIES, where), **common)
+    disposition = _enum(item, "disposition", DISPOSITIONS, where)
+    # An unknown transform is not a parse error: like any auto-resolution
+    # the engine cannot verify, it is downgraded, so a person sees it.
+    transform = _optional_str(item, "transform", where)
+    decision = _decision(item.get("decision"))
+    if decision is not None and disposition != DISPOSITION_NEEDS_DECISION:
+        raise IntakeError(f"a {disposition!r} finding must not carry a decision; only needs_decision does")
+    return Finding(
+        severity=DISPOSITION_SEVERITY[disposition],
+        disposition=disposition,
+        transform=transform,
+        decision=decision,
+        **common,
+    )
+
+
+def _decision(value: Any) -> Decision | None:
+    where = "decision"
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise IntakeError("a finding's 'decision' must be a JSON object or null")
+    options = tuple(
+        DecisionOption(
+            id=_str(option, "id", "decision option", nonempty=True),
+            label=_str(option, "label", "decision option", nonempty=True),
+            consequence=_str(option, "consequence", "decision option", nonempty=True),
+        )
+        for option in _list(value, "options", where)
+    )
+    decision = Decision(
+        id=_str(value, "id", where, nonempty=True),
+        question=_str(value, "question", where, nonempty=True),
+        why=_str(value, "why", where),
+        options=options,
+    )
+    if len(options) < 2:
+        raise IntakeError(f"decision {decision.id!r} must offer at least two options")
+    if len({option.id for option in options}) != len(options):
+        raise IntakeError(f"decision {decision.id!r} repeats an option id")
+    return decision
 
 
 def _run(item: Any) -> RunSlice:
@@ -601,6 +812,26 @@ class SourcePlan:
         parts = ["\n".join(lines[r.start - 1 : r.end]).rstrip() for r in ranges]
         return "\n\n".join(part for part in parts if part.strip())
 
+    def section_at(self, line: int) -> LineRange | None:
+        """The Markdown heading section that starts at ``line`` -- through the
+        line before the next heading of the same or a higher level -- or
+        ``None`` if ``line`` is not a heading. Fenced code is not a heading."""
+
+        level: int | None = None
+        fenced = False
+        for number, text in enumerate(self.lines, start=1):
+            if _FENCE_RE.match(text):
+                fenced = not fenced
+                continue
+            match = None if fenced else _HEADING_RE.match(text)
+            if number == line:
+                if match is None:
+                    return None
+                level = len(match.group(1))
+            elif level is not None and match is not None and len(match.group(1)) <= level:
+                return LineRange(line, number - 1)
+        return LineRange(line, len(self.lines)) if level is not None else None
+
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -609,21 +840,125 @@ def sha256_text(text: str) -> str:
 # -- deterministic checks -------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class CompileContext:
+    """What compile mode's repository guards check against, fixed at prepare
+    and recorded in ``intake.json`` so approval recomputes the same findings.
+
+    ``named``: repository names the source plan or PROJECT.md names (and the
+    preparing project's own). ``inspected``: every repository intake read.
+    """
+
+    named: frozenset[str]
+    inspected: frozenset[str]
+
+    def as_dict(self) -> dict[str, list[str]]:
+        return {"named_repositories": sorted(self.named), "inspected_repositories": sorted(self.inspected)}
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "CompileContext":
+        value = record.get("compile")
+        if not isinstance(value, Mapping):
+            raise IntakeError("this compile-mode intake.json records no compile context; run prepare-plan again")
+        named, inspected = value.get("named_repositories"), value.get("inspected_repositories")
+        if not all(isinstance(v, list) and all(isinstance(n, str) for n in v) for v in (named, inspected)):
+            raise IntakeError("intake.json records a malformed compile context; run prepare-plan again")
+        repositories = record.get("repositories")
+        if not isinstance(repositories, Mapping) or set(inspected) != set(repositories):
+            raise IntakeError(
+                "intake.json's compile context does not match its recorded repositories; run prepare-plan again"
+            )
+        return cls(named=frozenset(named), inspected=frozenset(inspected))
+
+
+def names_repository(text: str, name: str) -> bool:
+    """Whether ``text`` names repository ``name`` as a repository.
+
+    Conservative, so a plain word in prose ("the web client", "an app
+    restart") does not count: the name must be in a code span, next to
+    "repository"/"repo" (including a "Repos: a, b" list), or be a qualified name (containing ``-``, ``_``,
+    ``.`` or ``/``) appearing as a whole token.
+    """
+
+    if not name:
+        return False
+    escaped = re.escape(name)
+    token = rf"(?<![\w./-]){escaped}(?![\w/-])(?!\.\w)"
+    patterns = [
+        rf"`{escaped}`",
+        # "repository web", "Repos: app, web", "repos `app` and web"
+        rf"\b(repository|repositories|repo|repos)\b:?\s+(`?[\w./-]+`?\s*(,|and)\s*)*`?{token}",
+        rf"{token}\s+(repository|repo)\b",
+    ]
+    if re.search(r"[-_./]", name):
+        patterns.append(token)
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+
+def compile_context_for(
+    interpretation: Interpretation,
+    source: SourcePlan,
+    *,
+    project_context: str | None,
+    primary_repository: str,
+    inspected: Iterable[str],
+) -> CompileContext:
+    """The :class:`CompileContext` of one prepare: of every repository the
+    interpretation uses or intake inspected, those the source plan or
+    PROJECT.md names, plus the preparing project itself."""
+
+    inspected = frozenset(inspected)
+    used = {run.primary_repository for run in interpretation.runs}
+    used.update(name for _, _, _, stage in interpretation.stages() for name in stage.repositories)
+    texts = (source.text, project_context or "")
+    named = {name for name in used | inspected if any(names_repository(text, name) for text in texts)}
+    named.add(primary_repository)
+    return CompileContext(named=frozenset(named), inspected=inspected)
+
+
 def check_interpretation(
-    interpretation: Interpretation, source: SourcePlan, *, mode: str
+    interpretation: Interpretation,
+    source: SourcePlan,
+    *,
+    mode: str,
+    compile_context: CompileContext | None = None,
 ) -> tuple[Finding, ...]:
     """Everything the engine can verify about an interpretation, as findings.
 
     Pure and deterministic, so approval recomputes exactly what prepare
     reported and a person's review of ``report.md`` is a review of what
-    approval will enforce.
+    approval will enforce. Compile mode keeps every check below and adds its
+    own (:func:`_compile_checks`); its findings carry a disposition.
     """
 
+    if mode == MODE_COMPILE and compile_context is None:
+        raise ValueError("compile mode is checked against a CompileContext")
     findings: list[Finding] = []
 
-    def add(code: str, message: str, *, stages: Sequence[str] = (), ranges: Sequence[LineRange] = (), severity: str = SEVERITY_BLOCKING) -> None:
+    def add(
+        code: str,
+        message: str,
+        *,
+        stages: Sequence[str] = (),
+        ranges: Sequence[LineRange] = (),
+        severity: str = SEVERITY_BLOCKING,
+        disposition: str | None = None,
+    ) -> None:
+        if mode == MODE_COMPILE:
+            disposition = disposition or (DISPOSITION_REFUSE if severity == SEVERITY_BLOCKING else DISPOSITION_PLAN_NOTE)
+            severity = DISPOSITION_SEVERITY[disposition]
+        else:
+            disposition = None
         findings.append(
-            Finding(code=code, severity=severity, message=message, stages=tuple(stages), ranges=tuple(ranges), origin="engine")
+            Finding(
+                code=code,
+                severity=severity,
+                message=message,
+                stages=tuple(stages),
+                ranges=tuple(ranges),
+                origin="engine",
+                disposition=disposition,
+            )
         )
 
     total = len(source.lines)
@@ -742,7 +1077,9 @@ def check_interpretation(
             add("unknown_reference", f"{owner} follows unknown stage {gate.after_stage!r}")
         if after is not None:
             slice_ = interpretation.runs[after[0]]
-            if after[1] != len(slice_.stages) - 1:
+            # Compile mode renders such a gate into the slice's manifest
+            # (gates_before), and the runtime stops for it.
+            if after[1] != len(slice_.stages) - 1 and mode != MODE_COMPILE:
                 following = slice_.stages[after[1] + 1].label
                 add(
                     "gate_inside_run",
@@ -758,7 +1095,8 @@ def check_interpretation(
             if where is None:
                 add("unknown_reference", f"{owner} blocks unknown stage {blocked!r}")
                 continue
-            if after is not None and where[0] <= after[0]:
+            same_slice_later = after is not None and where[0] == after[0] and where[1] > after[1]
+            if after is not None and where[0] <= after[0] and not (mode == MODE_COMPILE and same_slice_later):
                 add(
                     "dependency_not_satisfied",
                     f"{owner} follows stage {gate.after_stage} but blocks stage {blocked}, which "
@@ -766,7 +1104,7 @@ def check_interpretation(
                     stages=[gate.after_stage or "", blocked],
                     ranges=good,
                 )
-            elif where[1] != 0:
+            elif where[1] != 0 and mode != MODE_COMPILE:
                 first = interpretation.runs[where[0]].stages[0].label
                 add(
                     "gate_inside_run",
@@ -804,6 +1142,14 @@ def check_interpretation(
             "amendment_in_faithful_mode",
             "faithful mode must not propose a plan amendment; re-run in refine mode or drop it",
         )
+    if mode == MODE_COMPILE:
+        assert compile_context is not None
+        if amendment is not None and amendment != source.text:
+            add(
+                "amendment_in_compile_mode",
+                "compile mode never proposes a plan amendment; re-run in refine mode for one",
+            )
+        _compile_checks(interpretation, source, compile_context, add)
     if interpretation.verdict == VERDICT_CANNOT_INTERPRET and not any(
         f.blocking for f in interpretation.findings
     ):
@@ -812,6 +1158,362 @@ def check_interpretation(
             "the agent could not interpret the plan faithfully but raised no blocking finding saying why",
         )
     return tuple(findings)
+
+
+def _lines(ranges: Iterable[LineRange], total: int) -> set[int]:
+    """Every line number ``ranges`` cover, ignoring out-of-range ones (those
+    are already an ``invalid_range`` finding)."""
+
+    return {n for r in ranges if 1 <= r.start <= r.end <= total for n in range(r.start, r.end + 1)}
+
+
+def _sentences(source: SourcePlan) -> list[tuple[list[int], str]]:
+    """Each prose sentence with the line numbers it spans. Headings and
+    fenced code are skipped; inline code spans are blanked."""
+
+    out: list[tuple[list[int], str]] = []
+    paragraph: list[int] = []
+    fenced = False
+
+    def flush() -> None:
+        if not paragraph:
+            return
+        text, owner = "", []
+        for number in paragraph:
+            line = _INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), source.lines[number - 1])
+            text += line + " "
+            owner += [number] * (len(line) + 1)
+        start = 0
+        for match in [*_SENTENCE_END_RE.finditer(text), None]:
+            end = match.start() if match else len(text)
+            sentence = text[start:end]
+            if sentence.strip():
+                first = start + len(sentence) - len(sentence.lstrip())
+                last = start + len(sentence.rstrip()) - 1
+                out.append((sorted(set(owner[first : last + 1])), sentence.strip()))
+            if match:
+                start = match.end()
+        paragraph.clear()
+
+    for number, line in enumerate(source.lines, start=1):
+        if _FENCE_RE.match(line):
+            flush()
+            fenced = not fenced
+            continue
+        if fenced or _HEADING_RE.match(line) or not line.strip():
+            flush()
+            continue
+        paragraph.append(number)
+    flush()
+    return out
+
+
+def states_gate(sentence: str) -> bool:
+    """Whether one prose sentence states a gate on a stage."""
+
+    text = _NEGATED_GATE_RE.sub(" ", sentence)
+    return bool(_GATE_TEXT_RE.search(text) and _STAGE_AS_PREREQUISITE_RE.search(text))
+
+
+def gate_relation_problems(
+    interpretation: Interpretation, source: SourcePlan
+) -> list[tuple[list[int], str]]:
+    """``(lines, why)`` for every gate sentence whose declared gate lost the
+    stage relation the source states: a gate sentence blocking Stage X
+    must be carried by a gate that blocks X; one following Stage Y by a gate
+    whose ``after_stage`` is Y. Labels that name no stage of the
+    interpretation are not checked. Whether the text is covered at all is
+    ``gate_dropped``'s."""
+
+    labels = {_slug(stage.label): stage.label for _, _, _, stage in interpretation.stages()}
+    total = len(source.lines)
+    problems: list[tuple[list[int], str]] = []
+    for lines, sentence in _sentences(source):
+        if not states_gate(sentence):
+            continue
+        text = _NEGATED_GATE_RE.sub(" ", sentence)
+        covering = [g for g in interpretation.gates if set(lines) & _lines(g.ranges, total)]
+        if not covering:
+            continue
+        blocked = {
+            labels[k]
+            for m in _GATE_BLOCKS_RE.finditer(text)
+            if (k := _slug(m.group("label") or m.group("subject") or m.group("object"))) in labels
+        }
+        follows = {labels[k] for m in _GATE_FOLLOWS_RE.finditer(text) if (k := _slug(m.group("label"))) in labels}
+        enforced = {label for g in covering for label in g.blocks_stages}
+        after = {g.after_stage for g in covering if g.after_stage}
+        ids = ", ".join(repr(g.id) for g in covering)
+        for label in sorted(blocked - enforced):
+            problems.append((lines, f"the source gate blocks stage {label}, but gate {ids} does not block it"))
+        for label in sorted(follows - after):
+            problems.append((lines, f"the source gate follows stage {label}, but gate {ids} does not follow it"))
+    return problems
+
+
+def _compile_checks(
+    interpretation: Interpretation,
+    source: SourcePlan,
+    context: CompileContext,
+    add: Callable[..., None],
+) -> None:
+    """Compile mode's own guards, on top of every faithful/refine check.
+
+    - Every source line stating an independent review maps to a node: it is
+      some stage's own text or context a stage attaches.
+    - No gate disappears: every line of a sentence that states a gate (see
+      :func:`states_gate`) is part of a declared gate. Stage text, context
+      or an exclusion does not substitute for an enforced prerequisite.
+    - A repository neither the plan nor PROJECT.md names needs a decision; a
+      named one intake did not inspect refuses, saying how to supply it.
+    - Every agent ``needs_decision`` carries a decision, with a unique id.
+    """
+
+    total = len(source.lines)
+    substantive = set(source.substantive_lines())
+    blocks = {block.id: block for block in interpretation.context}
+    on_node: set[int] = set()
+    for _, _, _, stage in interpretation.stages():
+        on_node |= _lines(stage.source_ranges, total)
+        for cid in stage.context_ids:
+            if cid in blocks:
+                on_node |= _lines(blocks[cid].ranges, total)
+    gated = _lines((r for gate in interpretation.gates for r in gate.ranges), total)
+
+    for number in sorted(substantive):
+        text = source.lines[number - 1]
+        if _REVIEW_REQUIREMENT_RE.search(text) and number not in on_node:
+            add(
+                "review_requirement_unmapped",
+                f"line {number} states an independent review, but no node carries it "
+                f"({text.strip()[:80]!r}); a review requirement must reach a stage's brief",
+                ranges=[LineRange(number, number)],
+            )
+
+    for paragraph, text in _sentences(source):
+        if not states_gate(text):
+            continue
+        missing = [n for n in paragraph if n in substantive and n not in gated]
+        if missing:
+            add(
+                "gate_dropped",
+                f"lines {_ranges_text(_group(missing, source))} state a gate but no declared gate "
+                f"carries them ({text.strip()[:80]!r}); a gate in a brief or an exclusion is not enforced",
+                ranges=_group(missing, source),
+            )
+
+    for lines, why in gate_relation_problems(interpretation, source):
+        ranges = _group(lines, source)
+        add(
+            "gate_unenforced",
+            f"lines {_ranges_text(ranges)}: {why}; a gate that no longer blocks what the plan says it "
+            "blocks is not enforced",
+            ranges=ranges,
+        )
+
+    used: dict[str, list[str]] = {}
+    for _, _, run, stage in interpretation.stages():
+        used.setdefault(run.primary_repository, []).append(stage.label)
+        for name in stage.repositories:
+            used.setdefault(name, []).append(stage.label)
+    for name, labels in sorted(used.items()):
+        stages = sorted(set(labels))
+        if name not in context.named:
+            add(
+                "unnamed_repository",
+                f"repository {name!r} is used by stages {', '.join(stages)}, but neither the plan "
+                "nor PROJECT.md names it; a person decides whether it belongs to this plan",
+                stages=stages,
+                disposition=DISPOSITION_NEEDS_DECISION,
+            )
+        elif name not in context.inspected:
+            add(
+                "sibling_not_supplied",
+                f"the plan names repository {name!r} (stages {', '.join(stages)}), but intake did "
+                f"not inspect it; run prepare-plan again with --context-repository {name}=<path>",
+                stages=stages,
+            )
+
+    decision_ids: set[str] = set()
+    for finding in interpretation.findings:
+        if finding.disposition != DISPOSITION_NEEDS_DECISION:
+            continue
+        if finding.decision is None:
+            add(
+                "decision_missing",
+                f"agent finding {finding.code!r} needs a decision but states none: {finding.message[:80]}",
+                stages=finding.stages,
+                ranges=finding.ranges,
+            )
+        elif finding.decision.id in decision_ids:
+            add("duplicate_id", f"decision id {finding.decision.id!r} is used twice")
+        else:
+            decision_ids.add(finding.decision.id)
+
+
+def guard_compile_findings(
+    interpretation: Interpretation, source: SourcePlan, context: CompileContext
+) -> tuple[Finding, ...]:
+    """The agent's compile findings, each ``auto_resolved`` one kept only if
+    its transform is in :data:`TRANSFORMS` and its guard holds; otherwise it
+    becomes ``needs_decision`` (blocking), saying why. Never upgrades."""
+
+    out: list[Finding] = []
+    for finding in interpretation.findings:
+        if finding.disposition == DISPOSITION_AUTO_RESOLVED:
+            problem = _transform_problem(finding, interpretation, source, context)
+            if problem is not None:
+                finding = replace(
+                    finding,
+                    disposition=DISPOSITION_NEEDS_DECISION,
+                    severity=DISPOSITION_SEVERITY[DISPOSITION_NEEDS_DECISION],
+                    downgraded=problem,
+                )
+        out.append(finding)
+    return tuple(out)
+
+
+def _transform_problem(
+    finding: Finding, interpretation: Interpretation, source: SourcePlan, context: CompileContext
+) -> str | None:
+    """Why ``finding``'s auto-resolution does not hold, or ``None`` if it does."""
+
+    transform = finding.transform
+    if transform is None:
+        return "auto_resolved without a transform"
+    if transform not in TRANSFORMS:
+        return f"transform {transform!r} is not one the engine can check (expected one of {list(TRANSFORMS)})"
+    total = len(source.lines)
+    substantive = set(source.substantive_lines())
+    for r in finding.ranges:
+        if not 1 <= r.start <= r.end <= total:
+            return f"it cites lines {r.start}–{r.end}, outside 1–{total}"
+    cited = _lines(finding.ranges, total) & substantive
+    where = {stage.label: (index, run, stage) for index, (_, _, run, stage) in enumerate(interpretation.stages())}
+    if not finding.stages:
+        return f"{transform} names no stage"
+    unknown = [label for label in finding.stages if label not in where]
+    if unknown:
+        return f"{transform} names unknown stage(s) {unknown}"
+    stages = [where[label] for label in finding.stages]
+    blocks = {block.id: block for block in interpretation.context}
+
+    def own(stage: IntakeStage) -> set[int]:
+        return _lines(stage.source_ranges, total) & substantive
+
+    def brief(stage: IntakeStage) -> set[int]:
+        lines = own(stage)
+        for cid in stage.context_ids:
+            if cid in blocks:
+                lines |= _lines(blocks[cid].ranges, total) & substantive
+        return lines
+
+    def whole_section(stage: IntakeStage) -> str | None:
+        first = min((r.start for r in stage.source_ranges), default=0)
+        section = source.section_at(first)
+        if section is None:
+            return f"stage {stage.label}'s text does not start at a heading"
+        if own(stage) != _lines([section], total) & substantive:
+            return f"stage {stage.label}'s text is not exactly its heading section (lines {section})"
+        return None
+
+    def needs_citation() -> str | None:
+        return None if cited else f"{transform} cites no source text"
+
+    if transform == "relabel_stage":
+        for _, _, stage in stages:
+            problem = whole_section(stage)
+            if problem:
+                return problem
+            heading = source.lines[min(r.start for r in stage.source_ranges) - 1]
+            if not re.search(rf"(?<![0-9A-Za-z]){re.escape(stage.label)}(?![0-9A-Za-z])", heading):
+                return f"stage {stage.label}'s heading does not carry that label"
+        return None
+
+    if transform == "attach_context":
+        if problem := needs_citation():
+            return problem
+        for _, _, stage in stages:
+            attached = set()
+            for cid in stage.context_ids:
+                if cid in blocks:
+                    attached |= _lines(blocks[cid].ranges, total)
+            if not cited <= attached:
+                return f"stage {stage.label} does not attach context carrying all the cited text"
+        return None
+
+    if transform == "split_review_barrier":
+        if problem := needs_citation():
+            return problem
+        runs = {run.id for _, run, _ in stages}
+        implementation = [s for s in stages if s[2].mode == StageMode.IMPLEMENTATION.value]
+        reviews = [s for s in stages if s[2].mode == StageMode.INDEPENDENT_REVIEW.value]
+        if len(runs) != 1 or not implementation or not reviews:
+            return "a review barrier split needs an implementation node and an independent_review node in one run slice"
+        if max(index for index, _, _ in implementation) > min(index for index, _, _ in reviews):
+            return "the review node does not run after the implementation node it reviews"
+        head = implementation[0][2]
+        section = source.section_at(min((r.start for r in head.source_ranges), default=0))
+        if section is None:
+            return f"stage {head.label}'s text does not start at a heading"
+        span = _lines([section], total)
+        if any(not own(stage) <= span for _, _, stage in stages) or not cited <= span:
+            return f"the nodes do not map to one source stage (lines {section})"
+        if not any(_REVIEW_REQUIREMENT_RE.search(source.lines[n - 1]) for n in cited):
+            return "the cited text does not state an independent review"
+        if not cited <= set().union(*(own(stage) for _, _, stage in reviews)):
+            return "the cited review text is not the review node's own text"
+        return None
+
+    if transform == "gate_at_boundary":
+        if problem := needs_citation():
+            return problem
+        touching = [gate for gate in interpretation.gates if cited & _lines(gate.ranges, total)]
+        if not cited <= _lines((r for gate in touching for r in gate.ranges), total):
+            return "some cited gate text no longer maps to a declared gate"
+        for gate in touching:
+            if not set(finding.stages) & ({gate.after_stage} | set(gate.blocks_stages)):
+                return f"gate {gate.id!r} neither follows nor blocks the named stages"
+            text = " ".join(source.lines[n - 1] for n in sorted(_lines(gate.ranges, total)))
+            kinds = {kind for kind, evidence in _GATE_KIND_EVIDENCE.items() if evidence.search(text)}
+            if kinds != {gate.kind}:
+                found = ", ".join(sorted(kinds)) or "none"
+                return (
+                    f"gate {gate.id!r}'s source text does not establish its kind {gate.kind!r} "
+                    f"unambiguously (evidence for: {found})"
+                )
+        for lines, why in gate_relation_problems(interpretation, source):
+            if cited & set(lines):
+                return why
+        return None
+
+    if transform == "reorder_within_candidate":
+        if problem := needs_citation():
+            return problem
+        if len(stages) < 2 or len({run.id for _, run, _ in stages}) != 1:
+            return "a reorder within one candidate names at least two stages of one run slice"
+        for _, _, stage in stages:
+            problem = whole_section(stage)
+            if problem:
+                return problem
+        if not cited <= set().union(*(own(stage) for _, _, stage in stages)):
+            return "the cited dependency text is not the named stages' own text"
+        return None
+
+    # conditional_sibling
+    if problem := needs_citation():
+        return problem
+    for _, _, stage in stages:
+        if not stage.repositories:
+            return f"stage {stage.label} declares no sibling"
+        for name in stage.repositories:
+            if name not in context.named:
+                return f"sibling {name!r} is named by neither the plan nor PROJECT.md"
+            if name not in context.inspected:
+                return f"sibling {name!r} was not inspected (--context-repository {name}=<path>)"
+        if not cited <= brief(stage):
+            return f"the cited condition is not carried verbatim in stage {stage.label}'s brief"
+    return None
 
 
 def _group(numbers: Sequence[int], source: SourcePlan) -> list[LineRange]:
@@ -830,26 +1532,77 @@ def _group(numbers: Sequence[int], source: SourcePlan) -> list[LineRange]:
     return groups
 
 
-def all_findings(interpretation: Interpretation, source: SourcePlan, *, mode: str) -> tuple[Finding, ...]:
-    """Agent findings then engine findings, blocking first within each."""
+def all_findings(
+    interpretation: Interpretation,
+    source: SourcePlan,
+    *,
+    mode: str,
+    compile_context: CompileContext | None = None,
+) -> tuple[Finding, ...]:
+    """Agent findings then engine findings, blocking first within each. In
+    compile mode the agent's auto-resolutions are guarded first."""
 
-    engine = check_interpretation(interpretation, source, mode=mode)
-    ordered = list(interpretation.findings) + list(engine)
+    engine = check_interpretation(interpretation, source, mode=mode, compile_context=compile_context)
+    agent = (
+        guard_compile_findings(interpretation, source, compile_context)
+        if mode == MODE_COMPILE and compile_context is not None
+        else interpretation.findings
+    )
+    ordered = list(agent) + list(engine)
     return tuple(sorted(ordered, key=lambda f: SEVERITIES.index(f.severity)))
+
+
+def slice_manifest_gates(
+    interpretation: Interpretation, run_id: str
+) -> tuple[dict[str, tuple[Gate, ...]], tuple[Gate, ...]]:
+    """``(gates_before by stage label, completion gates)`` that run slice
+    ``run_id``'s manifest carries, so the runtime stops for them.
+
+    Compile mode only; empty otherwise. A gate lands before the earliest
+    stage of this slice it must precede: the stage after its ``after_stage``
+    when that is inside this slice, or any stage of this slice it blocks --
+    including the first, before which the run stops before creating
+    anything. A gate after this slice's last stage that blocks nothing is
+    the slice's closeout gate.
+    """
+
+    before: dict[str, list[Gate]] = {}
+    completion: list[Gate] = []
+    if not interpretation.compiled:
+        return {}, ()
+    run = next((run for run in interpretation.runs if run.id == run_id), None)
+    if run is None:
+        return {}, ()
+    index = {stage.label: position for position, stage in enumerate(run.stages)}
+    last = len(run.stages) - 1
+    for gate in interpretation.gates:
+        candidates = [index[b] for b in gate.blocks_stages if b in index]
+        after = index.get(gate.after_stage) if gate.after_stage else None
+        if after is not None and after < last:
+            candidates.append(after + 1)
+        if candidates:
+            before.setdefault(run.stages[min(candidates)].label, []).append(gate)
+        elif after == last and not gate.blocks_stages:
+            completion.append(gate)
+    return {label: tuple(gates) for label, gates in before.items()}, tuple(completion)
 
 
 def run_prerequisites(interpretation: Interpretation, run_id: str) -> tuple[str, ...]:
     """What a person must confirm before approving run slice ``run_id``:
     every gate that blocks one of its stages, and every earlier run slice
-    one of its stages depends on. Sorted, for a stable record."""
+    one of its stages depends on. Sorted, for a stable record. A gate the
+    slice's own manifest carries (:func:`slice_manifest_gates`) is not one:
+    the run stops for it instead."""
 
     run_of: dict[str, str] = {
         stage.label: run.id for _, _, run, stage in interpretation.stages()
     }
     labels = {stage.label for _, _, run, stage in interpretation.stages() if run.id == run_id}
+    before, completion = slice_manifest_gates(interpretation, run_id)
+    in_manifest = {gate.id for gates in before.values() for gate in gates} | {gate.id for gate in completion}
     required: set[str] = set()
     for gate in interpretation.gates:
-        if labels.intersection(gate.blocks_stages):
+        if gate.id not in in_manifest and labels.intersection(gate.blocks_stages):
             required.add(gate.id)
     for _, _, run, stage in interpretation.stages():
         if run.id != run_id:
@@ -978,6 +1731,8 @@ def findings_summary(findings: Sequence[Finding], verdict: str) -> dict[str, Any
     metadata for ``intake.json``. Approval recomputes the findings itself."""
 
     counts = {severity: sum(1 for f in findings if f.severity == severity) for severity in SEVERITIES}
+    if any(f.disposition for f in findings):
+        counts["dispositions"] = {d: sum(1 for f in findings if f.disposition == d) for d in DISPOSITIONS}
     return {**counts, "verdict": verdict}
 
 
@@ -1015,6 +1770,7 @@ def render_brief(
     stage_id: str,
     position: int,
     include_goal: bool = True,
+    decisions: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     """The exact ``brief.md`` for one stage, assembled from source text.
 
@@ -1033,6 +1789,10 @@ def render_brief(
     plan-context boilerplate below. ``include_goal=False`` reproduces the
     ``1`` brief format (see ``BRIEF_FORMAT_VERSION``), byte for byte, so a
     legacy intake's recorded digests still match at approval.
+
+    ``decisions`` are the answered decisions of ``decisions.json`` (see
+    :func:`answered_decisions`); each that applies to this stage is appended
+    under its own labelled heading, after everything quoted from the plan.
     """
 
     blocks = {block.id: block for block in interpretation.context}
@@ -1071,7 +1831,33 @@ def render_brief(
     ]
     if stage.intake_scope:
         out += ["", "# Intake scoping", "", _SCOPE_PREAMBLE, "", stage.intake_scope.strip()]
+    for answer in decisions_for_stage(decisions, stage.label):
+        option = answer["option"]
+        out += [
+            "",
+            "# Preparation decision (not plan text)",
+            "",
+            _DECISION_PREAMBLE,
+            "",
+            f"Decision `{answer['id']}`: {answer['question']}",
+            "",
+            f"Answer `{option['id']}`: {option['label']}. Consequence: {option['consequence']}",
+        ]
     return "\n".join(out).rstrip() + "\n"
+
+
+_DECISION_PREAMBLE = (
+    "A person answered this question when the plan was prepared; it is recorded in the "
+    "intake's decisions.json, verbatim. It is not text from the source plan, which was "
+    "not edited."
+)
+
+
+def decisions_for_stage(decisions: Sequence[Mapping[str, Any]], label: str) -> list[Mapping[str, Any]]:
+    """The answered decisions that apply to stage ``label``: those whose
+    finding named it, and those whose finding named no stage at all."""
+
+    return [answer for answer in decisions if not answer.get("stages") or label in answer["stages"]]
 
 
 def amendment_diff(source: SourcePlan, amended: str) -> str:
@@ -1142,6 +1928,137 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# -- answered decisions -------------------------------------------------------------
+
+DECISIONS_VERSION = 1
+
+
+def read_decisions(intake_dir: Path, record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The answered decisions an intake was prepared with, verified against
+    the digest ``intake.json`` records for them, or ``[]`` for an intake
+    prepared without answers. Refuses a ``decisions.json`` that is missing,
+    edited, or present without being recorded."""
+
+    recorded = record.get("decisions")
+    path = Path(intake_dir) / DECISIONS_FILENAME
+    if recorded is None:
+        if path.exists():
+            raise IntakeError(f"{path} exists but intake.json records no decisions; run prepare-plan again")
+        return []
+    if not isinstance(recorded, Mapping) or not isinstance(recorded.get("digest"), str):
+        raise IntakeError(f"{Path(intake_dir) / 'intake.json'} records malformed decisions; run prepare-plan again")
+    text = _read_text(path)
+    if sha256_text(text) != recorded["digest"]:
+        raise IntakeError(f"{path} changed after the intake was prepared; run prepare-plan again")
+    payload = json.loads(text)
+    return list(payload.get("answers") or [])
+
+
+def recorded_answers(record: Mapping[str, Any]) -> dict[str, str]:
+    """``{decision id: option id}`` an intake was prepared with (display copy
+    in ``intake.json``, sealed with it)."""
+
+    recorded = record.get("decisions")
+    return dict(recorded.get("answers") or {}) if isinstance(recorded, Mapping) else {}
+
+
+def posed_decisions(interpretation: Interpretation) -> dict[str, Finding]:
+    """Every decision a ``needs_decision`` finding of this interpretation asks."""
+
+    return {
+        f.decision.id: f
+        for f in interpretation.findings
+        if f.decision is not None and f.disposition == DISPOSITION_NEEDS_DECISION
+    }
+
+
+def answered_decisions(parent_dir: Path, answers: Mapping[str, str], source_text: str) -> dict[str, Any]:
+    """``decisions.json`` for a compile prepare that answers ``parent_dir``'s
+    decisions, or refuse (:class:`IntakeError`, before any provider turn).
+
+    Refuses unless the parent is a finished compile intake, the source plan
+    still has the parent's source digest, and every answer names a decision
+    the parent's interpretation asks (or one the parent itself was prepared
+    with, given the same option) and one of that decision's options. The
+    parent's own answers are carried forward, so answers accumulate. The
+    question, option label and consequence are copied verbatim.
+    """
+
+    parent_dir = Path(parent_dir)
+    record = _read_json(parent_dir / "intake.json")
+    problem = completion_marker_problem(parent_dir, record)
+    if problem:
+        raise IntakeError(problem)
+    if record.get("mode") != MODE_COMPILE:
+        raise IntakeError(f"{parent_dir} is a {record.get('mode')!r} intake; only compile intakes ask decisions")
+    if sha256_text(source_text) != record.get("source_digest"):
+        raise IntakeError(
+            f"the source plan changed since {parent_dir.name} asked its questions; its decisions no "
+            "longer describe it. Prepare it again without answers"
+        )
+    interpretation_text = _read_text(parent_dir / "interpretation.json")
+    if sha256_text(interpretation_text) != record.get("interpretation_digest"):
+        raise IntakeError(f"{parent_dir / 'interpretation.json'} was modified after intake")
+    posed = posed_decisions(parse_interpretation(interpretation_text, mode=MODE_COMPILE))
+    entries = {entry["id"]: entry for entry in read_decisions(parent_dir, record)}
+    parent_id = str(record.get("intake_id") or parent_dir.name)
+    for decision_id, option_id in answers.items():
+        if decision_id in entries:
+            if entries[decision_id]["option"]["id"] != option_id:
+                raise IntakeError(
+                    f"decision {decision_id!r} was already answered {entries[decision_id]['option']['id']!r}; "
+                    "an answer is not changed by answering again. Prepare without answers to start over"
+                )
+            continue
+        finding = posed.get(decision_id)
+        if finding is None:
+            raise IntakeError(
+                f"--answer {decision_id}=…: {parent_id} asks no decision {decision_id!r}; it asks "
+                f"{sorted(posed) or 'none'}"
+            )
+        decision = finding.decision
+        assert decision is not None
+        option = next((o for o in decision.options if o.id == option_id), None)
+        if option is None:
+            raise IntakeError(
+                f"--answer {decision_id}={option_id}: decision {decision_id!r} offers "
+                f"{[o.id for o in decision.options]}"
+            )
+        entries[decision_id] = {
+            "id": decision.id,
+            "question": decision.question,
+            "why": decision.why,
+            "option": {"id": option.id, "label": option.label, "consequence": option.consequence},
+            "stages": [s for s in finding.stages if s],
+            "posed_by": parent_id,
+        }
+    return {
+        "version": DECISIONS_VERSION,
+        "parent": {"intake_id": parent_id, "interpretation_digest": record.get("interpretation_digest")},
+        "source_digest": record.get("source_digest"),
+        "answers": [entries[key] for key in sorted(entries)],
+    }
+
+
+def _decisions_note(decisions: Mapping[str, Any]) -> str:
+    lines = [
+        "## Preparation decisions (a person's answers)",
+        "",
+        "An earlier intake of this plan asked these questions and a person answered them. "
+        "Interpret the plan with these answers applied: do not ask them again, and do not "
+        "treat them as plan text or edit the plan for them.",
+    ]
+    for answer in decisions["answers"]:
+        option = answer["option"]
+        stages = ", ".join(answer.get("stages") or []) or "every stage"
+        lines += [
+            "",
+            f"- `{answer['id']}` ({stages}): {answer['question']}",
+            f"  Answer `{option['id']}`: {option['label']}. Consequence: {option['consequence']}",
+        ]
+    return "\n".join(lines)
+
+
 def prepare_plan(
     plan_path: Path,
     repo_root: Path,
@@ -1155,8 +2072,20 @@ def prepare_plan(
     provider: Mapping[str, Any] | None = None,
     now: Callable[[], datetime] = _utc_now,
     mint_run_key: Callable[[str], str] = new_run_key,
+    answer_parent: Path | None = None,
+    answers: Mapping[str, str] | None = None,
+    validate: Callable[[Interpretation, list[Finding]], None] | None = None,
 ) -> IntakeResult:
     """Run one intake turn and write a reviewable proposal. Executes nothing.
+
+    ``answer_parent`` and ``answers`` (compile mode only) answer the
+    decisions an earlier intake of the same plan asked: they are checked
+    (:func:`answered_decisions`) before any provider turn, given to the
+    agent, written to this intake's ``decisions.json`` and rendered into the
+    affected briefs. The answered intake itself is never written.
+
+    ``validate(interpretation, findings)`` runs after the turn and before
+    anything is written; whatever it raises refuses with nothing persisted.
 
     Refuses (:class:`IntakeError`) when the mode is unknown, intake
     artifacts would be visible to git, the provider fails, any repository
@@ -1184,6 +2113,15 @@ def prepare_plan(
     label = plan_label(Path(plan_path), repo_root)
     source = SourcePlan(label=label, text=text)
 
+    decisions: dict[str, Any] | None = None
+    if answer_parent is not None:
+        if mode != MODE_COMPILE:
+            raise IntakeError("only a compile prepare answers decisions")
+        decisions = answered_decisions(answer_parent, dict(answers or {}), text)
+    elif answers:
+        raise IntakeError("answers need the intake that asked them")
+    answered = list(decisions["answers"]) if decisions else []
+
     prompt = assemble_intake_prompt(
         plan_label=label,
         source_text=text,
@@ -1192,13 +2130,14 @@ def prepare_plan(
         primary_repository=primary_repository,
         repo_root=repo_root.resolve(),
         context_repositories={name: Path(path).resolve() for name, path in context_repositories.items()},
+        extra_notes=[_decisions_note(decisions)] if decisions else (),
     )
 
     named = [(primary_repository, repo_root), *sorted(context_repositories.items())]
     watched = [Path(path) for _, path in named]
     before = [_fingerprint(path) for path in watched]
     try:
-        result = adapter.start_structured(prompt, INTERPRETATION_SCHEMA)
+        result = adapter.start_structured(prompt, interpretation_schema(mode))
     except ProviderError as exc:
         raise IntakeError(f"the intake agent failed: {exc}") from exc
     after = [_fingerprint(path) for path in watched]
@@ -1222,11 +2161,24 @@ def prepare_plan(
         for (name, path), fingerprint in zip(named, after)
     }
 
-    interpretation = parse_interpretation(result.text)
-    findings = all_findings(interpretation, source, mode=mode)
+    interpretation = parse_interpretation(result.text, mode=mode)
+    compile_context = (
+        compile_context_for(
+            interpretation,
+            source,
+            project_context=project_context,
+            primary_repository=primary_repository,
+            inspected=snapshots,
+        )
+        if mode == MODE_COMPILE
+        else None
+    )
+    findings = all_findings(interpretation, source, mode=mode, compile_context=compile_context)
+    if validate is not None:
+        validate(interpretation, findings)
 
     run_keys = {run.id: mint_run_key(label) for run in interpretation.runs}
-    briefs = _render_briefs(source, interpretation, run_keys)
+    briefs = _render_briefs(source, interpretation, run_keys, decisions=answered)
     duplicate_ids = _duplicates([stage_id for stage_id, _, _ in briefs.values()])
     if duplicate_ids:
         raise IntakeError(f"derived stage ids collide: {duplicate_ids}; labels must slug uniquely")
@@ -1257,8 +2209,12 @@ def prepare_plan(
         _write(path, content)
         brief_digests[stage_id] = sha256_text(content)
 
+    decisions_text = json.dumps(decisions, indent=2, ensure_ascii=False) + "\n" if decisions else None
+    if decisions_text is not None:
+        _write(directory / DECISIONS_FILENAME, decisions_text)
+
     amendment = None
-    if interpretation.amended_plan is not None and interpretation.amended_plan != text:
+    if mode != MODE_COMPILE and interpretation.amended_plan is not None and interpretation.amended_plan != text:
         amendment = amendment_diff(source, interpretation.amended_plan)
         _write(directory / "amendment.diff", amendment)
 
@@ -1283,6 +2239,24 @@ def prepare_plan(
         "provider": dict(provider or {}),
         "provider_session_id": result.session_id,
         "amendment_proposed": amendment is not None,
+        # Compile mode only: what its repository guards were checked
+        # against. Sealed with intake.json; approval recomputes from it.
+        **({"compile": compile_context.as_dict()} if compile_context is not None else {}),
+        # The recorded decision inputs: sealed with intake.json, and the
+        # digest is re-checked at approval and before every run.
+        **(
+            {
+                "decisions": {
+                    "file": DECISIONS_FILENAME,
+                    "digest": sha256_text(decisions_text),
+                    "parent_intake_id": decisions["parent"]["intake_id"],
+                    "parent_interpretation_digest": decisions["parent"]["interpretation_digest"],
+                    "answers": {entry["id"]: entry["option"]["id"] for entry in answered},
+                }
+            }
+            if decisions is not None and decisions_text is not None
+            else {}
+        ),
         # Display metadata only (see approval_requirements): approval never
         # reads these two, it recomputes and enforces everything.
         "findings": findings_summary(findings, interpretation.verdict),
@@ -1301,6 +2275,7 @@ def prepare_plan(
         amendment=amendment is not None,
         provider=record["provider"],
         repositories=snapshots,
+        decisions=answered,
     )
     record["repositories"] = snapshots
     record["report_intake_dir"] = str(directory)
@@ -1503,6 +2478,7 @@ def _render_briefs(
     run_keys: Mapping[str, str],
     *,
     include_goal: bool = True,
+    decisions: Sequence[Mapping[str, Any]] = (),
 ) -> dict[tuple[str, str], tuple[str, str, str]]:
     """``{(run id, label): (stage id, relative path, content)}``."""
 
@@ -1518,6 +2494,7 @@ def _render_briefs(
                 stage_id=stage_id,
                 position=index,
                 include_goal=include_goal,
+                decisions=decisions,
             )
             relative = f"briefs/{_slug(run.id) or 'run'}/{index:02d}-{_slug(stage.label) or 'stage'}.md"
             briefs[(run.id, stage.label)] = (stage_id, relative, content)
@@ -1539,6 +2516,20 @@ def _ranges_text(ranges: Sequence[LineRange]) -> str:
     return ", ".join(str(r) for r in ranges) or "—"
 
 
+def _manifest_gate_lines(interpretation: Interpretation, run: RunSlice) -> list[str]:
+    before, completion = slice_manifest_gates(interpretation, run.id)
+    lines = [
+        f"- The run stops before stage {label} for: {', '.join('`' + g.id + '`' for g in gates)}"
+        for label, gates in before.items()
+    ]
+    if completion:
+        lines.append(
+            "- The run stops before reporting complete for: "
+            + ", ".join("`" + g.id + "`" for g in completion)
+        )
+    return lines
+
+
 def render_report(
     source: SourcePlan,
     interpretation: Interpretation,
@@ -1551,6 +2542,7 @@ def render_report(
     amendment: bool,
     provider: Mapping[str, Any],
     repositories: Mapping[str, Any],
+    decisions: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     """``report.md``: everything a person needs to decide on approval."""
 
@@ -1570,6 +2562,20 @@ def render_report(
     if interpretation.summary:
         out += ["", interpretation.summary]
 
+    if decisions:
+        out += ["", "## Preparation decisions", ""]
+        out.append(
+            "A person's answers to earlier intakes' questions (`decisions.json`). They render "
+            "into the affected briefs as preparation decisions; the source plan is not edited."
+        )
+        for answer in decisions:
+            option = answer["option"]
+            stages = ", ".join(answer.get("stages") or []) or "every stage"
+            out.append(
+                f"- `{answer['id']}` (asked by `{answer['posed_by']}`; {stages}): {answer['question']} "
+                f"→ `{option['id']}` {option['label']}: {option['consequence']}"
+            )
+
     out += ["", "## Findings", ""]
     if not findings:
         out.append("None.")
@@ -1579,8 +2585,17 @@ def render_report(
             where.append("stages " + ", ".join(s for s in f.stages if s))
         if f.ranges:
             where.append("lines " + _ranges_text(f.ranges))
+        if f.transform:
+            where.append(f"transform `{f.transform}`")
         suffix = f" ({'; '.join(where)})" if where else ""
-        out.append(f"- **{f.severity}** `{f.code}` [{f.origin}]{suffix}: {f.message}")
+        label = f"{f.disposition}** ({f.severity})" if f.disposition else f"{f.severity}**"
+        out.append(f"- **{label} `{f.code}` [{f.origin}]{suffix}: {f.message}")
+        if f.downgraded:
+            out.append(f"  - Engine: auto-resolution rejected, so a person decides: {f.downgraded}")
+        if f.decision is not None:
+            out.append(f"  - Decision `{f.decision.id}`: {f.decision.question} {f.decision.why}".rstrip())
+            for option in f.decision.options:
+                out.append(f"    - `{option.id}` {option.label}: {option.consequence}")
 
     out += ["", "## Run slices", ""]
     out.append(
@@ -1599,6 +2614,7 @@ def render_report(
             else f"- Expected branch: **cannot be approved**: {problem}",
             f"- Run key: `{run_keys.get(run.id, '?')}`",
             f"- Gates a person confirms at approval: {', '.join('`' + g + '`' for g in gates) or 'none'}",
+            *_manifest_gate_lines(interpretation, run),
             "- Earlier run slices that must be approved and complete first: "
             + (', '.join('`' + e + '`' for e in earlier) or 'none'),
         ]
@@ -1674,14 +2690,15 @@ def render_report(
             f"`{str(snapshot.get('head'))[:12]}`" + (f"; {len(dirty)} dirty path(s)" if dirty else "")
         )
 
-    out += ["", "## Proposed amendment", ""]
-    out.append(
-        "See `amendment.diff`. It is a proposal for the source plan and is not applied; the "
-        "manifest executes the source text as sliced above. Approval requires "
-        "--without-amendment, or apply it to the plan and run intake again."
-        if amendment
-        else "None."
-    )
+    if mode != MODE_COMPILE:  # compile mode never proposes one (amendment_in_compile_mode)
+        out += ["", "## Proposed amendment", ""]
+        out.append(
+            "See `amendment.diff`. It is a proposal for the source plan and is not applied; the "
+            "manifest executes the source text as sliced above. Approval requires "
+            "--without-amendment, or apply it to the plan and run intake again."
+            if amendment
+            else "None."
+        )
 
     out += ["", "## Next step", ""]
     if blocking:
@@ -1829,6 +2846,10 @@ def _completed_slice(intake_dir: Path, run_id: str) -> _CompletedSlice:
     )
 
 
+def _manifest_gate(gate: Gate) -> dict[str, str]:
+    return {"id": gate.id, "title": gate.title or gate.id, "kind": gate.kind, "reason": gate.reason or gate.title or gate.id}
+
+
 def approve_plan(
     intake_dir: Path,
     *,
@@ -1864,6 +2885,156 @@ def approve_plan(
     never rewritten: repeating an identical one returns it, and a
     conflicting one refuses.
     """
+
+    return seal_approval(
+        build_approval(
+            intake_dir,
+            run_id=run_id,
+            repo_root=repo_root,
+            sparring_dir=sparring_dir,
+            primary_repository=primary_repository,
+            expected_branch=expected_branch,
+            repositories=repositories,
+            repository_branches=repository_branches,
+            confirmed_prerequisites=confirmed_prerequisites,
+            without_amendment=without_amendment,
+        ),
+        now=now,
+    )
+
+
+@dataclass(frozen=True)
+class PendingApproval:
+    """What :func:`seal_approval` would write for one run slice, decided by
+    :func:`build_approval` from the verified intake and the repositories as
+    they are now. Holding one writes nothing."""
+
+    intake_dir: Path
+    run_id: str
+    run_key: str
+    expected_branch: str
+    manifest_path: Path
+    approval_path: Path
+    manifest_text: str
+    manifest_digest: str
+    #: The idempotence decision an existing approval must agree with.
+    decision: Mapping[str, Any]
+    sparring_dir: Path
+    #: ``approval.json`` without its ``approved_at``; ``None`` when an
+    #: identical approval already exists, which sealing returns.
+    payload: Mapping[str, Any] | None
+    #: The parsed intake record and interpretation it was decided on.
+    record: Mapping[str, Any]
+    interpretation: "Interpretation"
+    stages: tuple[Mapping[str, Any], ...]
+
+    def result(self, created: bool) -> Approval:
+        return Approval(
+            manifest_path=self.manifest_path,
+            approval_path=self.approval_path,
+            run_key=self.run_key,
+            expected_branch=self.expected_branch,
+            manifest_digest=self.manifest_digest,
+            created=created,
+        )
+
+
+def _existing_approval(pending: PendingApproval) -> Approval:
+    """The approval already on disk for this slice, if it is the one
+    ``pending`` would write, or refuse: an approval is never rewritten."""
+
+    run_id, manifest_path = pending.run_id, pending.manifest_path
+    try:
+        previous = read_approval(pending.approval_path)
+    except IntakeApprovalError as exc:
+        raise IntakeError(f"run slice {run_id!r} has an approval that cannot be used: {exc}") from exc
+    decision = dict(pending.decision)
+    recorded = {key: previous.payload.get(key) for key in decision}
+    # A recorded branch move is part of the approval's decision.
+    recorded["expected_branch"] = previous.expected_branch
+    if recorded != decision:
+        raise IntakeError(
+            f"run slice {run_id!r} was already approved with {recorded}; an approval is not "
+            f"rewritten, and this one would record {decision}"
+        )
+    on_disk = manifest_path.read_bytes() if manifest_path.is_file() else b""
+    if sha256_bytes(on_disk) != previous.field("manifest_sha256"):
+        raise IntakeError(
+            f"{manifest_path} changed after run slice {run_id!r} was approved; it will not "
+            "run. Run prepare-plan and approve-plan again"
+        )
+    if on_disk != pending.manifest_text.encode("utf-8"):
+        raise IntakeError(
+            f"run slice {run_id!r} was already approved with a different manifest "
+            f"({manifest_path}); an approval is not rewritten. Run prepare-plan again"
+        )
+    return pending.result(created=False)
+
+
+def seal_approval(
+    pending: PendingApproval,
+    *,
+    now: Callable[[], datetime] = _utc_now,
+    approved_via: str | None = None,
+) -> Approval:
+    """Write what :func:`build_approval` decided: the manifest envelope, the
+    registry entry and, exactly once, ``approval.json``.
+
+    ``approved_via`` names the command a person approved through (recorded
+    as ``approved_via`` when given). It is not part of the idempotence
+    decision, so the same slice approved by ``approve-plan`` and confirmed
+    by ``start-plan`` is one approval, not a conflict.
+    """
+
+    if pending.payload is None:
+        return _existing_approval(pending)
+    approval = {
+        "version": APPROVAL_VERSION,
+        "decision": "approved",
+        "approved_at": now().isoformat(),
+        **pending.payload,
+        **({"approved_via": approved_via} if approved_via else {}),
+    }
+    # The manifest may be replaced until an approval exists for it; the
+    # approval is created exactly once, and it is what makes the manifest
+    # runnable. A crash between the two leaves an unapproved manifest that
+    # run-plan refuses and a repeat of this approval completes.
+    write_atomic(pending.manifest_path, pending.manifest_text)
+    registry = intake_root(pending.sparring_dir) / REGISTRY_DIRNAME / f"{pending.run_key}.json"
+    write_atomic(
+        registry,
+        json.dumps(
+            {
+                "run_key": pending.run_key,
+                "intake_dir": str(pending.intake_dir.resolve()),
+                "run_id": pending.run_id,
+                "stage_ids": approval["stage_ids"],
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    if not write_exclusive(pending.approval_path, json.dumps(approval, indent=2) + "\n"):
+        # Another approval won the race; it decides, and this one must agree.
+        return _existing_approval(pending)
+    return pending.result(created=True)
+
+
+def build_approval(
+    intake_dir: Path,
+    *,
+    run_id: str,
+    repo_root: Path,
+    sparring_dir: Path,
+    primary_repository: str,
+    expected_branch: str | None = None,
+    repositories: Mapping[str, str] | None = None,
+    repository_branches: Mapping[str, str] | None = None,
+    confirmed_prerequisites: Sequence[str] = (),
+    without_amendment: bool = False,
+) -> PendingApproval:
+    """Every check :func:`approve_plan` makes, and the approval it would
+    write, without writing anything. Refuses exactly as it does."""
 
     intake_dir = Path(intake_dir)
     repo_root = Path(repo_root)
@@ -1911,11 +3082,14 @@ def approve_plan(
         raise IntakeError("interpretation.json was modified after intake; run prepare-plan again")
 
     source = SourcePlan(label=str(record["plan_label"]), text=snapshot)
-    interpretation = parse_interpretation(interpretation_text)
-    findings = all_findings(interpretation, source, mode=mode)
+    interpretation = parse_interpretation(interpretation_text, mode=mode)
+    compile_context = CompileContext.from_record(record) if mode == MODE_COMPILE else None
+    findings = all_findings(interpretation, source, mode=mode, compile_context=compile_context)
     # Derived from the interpretation itself, never taken from intake.json.
     amendment_proposed = (
-        interpretation.amended_plan is not None and interpretation.amended_plan != source.text
+        mode != MODE_COMPILE
+        and interpretation.amended_plan is not None
+        and interpretation.amended_plan != source.text
     )
     blocking = [f for f in findings if f.blocking]
     if blocking:
@@ -1947,7 +3121,8 @@ def approve_plan(
     ):
         raise IntakeError("intake.json does not record a run key for every run slice; run prepare-plan again")
     inspected = _recorded_repositories(record)
-    briefs = _render_briefs(source, interpretation, run_keys, include_goal=include_goal)
+    decisions = read_decisions(intake_dir, record)
+    briefs = _render_briefs(source, interpretation, run_keys, include_goal=include_goal, decisions=decisions)
 
     # The person reviewed report.md. Approving is only meaningful if it is
     # the report this intake renders, so a stale or edited one refuses.
@@ -1964,6 +3139,7 @@ def approve_plan(
         amendment=amendment_proposed,
         provider=record.get("provider") or {},
         repositories=inspected,
+        decisions=decisions,
     )
     if not isinstance(report_dir, str) or rendered != report_text or sha256_text(report_text) != record.get("report_digest"):
         raise IntakeError(
@@ -2041,6 +3217,7 @@ def approve_plan(
             )
 
     run_key = run_keys[run_id]
+    gates_before, completion_gates = slice_manifest_gates(interpretation, run_id)
     stages = []
     recorded_briefs = record.get("briefs") or {}
     for stage in run.stages:
@@ -2068,14 +3245,21 @@ def approve_plan(
                 }
                 for name in stage.repositories
             ]
+        if gates_before.get(stage.label):
+            entry["gates_before"] = [_manifest_gate(gate) for gate in gates_before[stage.label]]
         stages.append(entry)
 
-    manifest_payload = {
-        "version": MANIFEST_VERSION,
+    # v1 whenever no gate is carried, so such a manifest (and its digest) is
+    # exactly what it was before v2 existed.
+    gated = bool(gates_before or completion_gates)
+    manifest_payload: dict[str, Any] = {
+        "version": MANIFEST_VERSION_GATES if gated else MANIFEST_VERSION,
         "plan_label": source.label,
         "source_digest": f"sha256:{source.digest}",
         "stages": stages,
     }
+    if completion_gates:
+        manifest_payload["completion_gates"] = [_manifest_gate(gate) for gate in completion_gates]
     try:
         manifest = parse_manifest(json.dumps(manifest_payload))
     except (ManifestError, StageError) as exc:
@@ -2092,45 +3276,26 @@ def approve_plan(
         "confirmed_gates": sorted(confirmed),
         "without_amendment": bool(without_amendment and amendment_proposed),
     }
-
-    def result(created: bool) -> Approval:
-        return Approval(
-            manifest_path=manifest_path,
-            approval_path=approval_path,
-            run_key=run_key,
-            expected_branch=branch,
-            manifest_digest=digest,
-            created=created,
-        )
-
-    def existing() -> Approval:
-        try:
-            previous = read_approval(approval_path)
-        except IntakeApprovalError as exc:
-            raise IntakeError(f"run slice {run_id!r} has an approval that cannot be used: {exc}") from exc
-        recorded = {key: previous.payload.get(key) for key in decision}
-        # A recorded branch move is part of the approval's decision.
-        recorded["expected_branch"] = previous.expected_branch
-        if recorded != decision:
-            raise IntakeError(
-                f"run slice {run_id!r} was already approved with {recorded}; an approval is not "
-                f"rewritten, and this one would record {decision}"
-            )
-        on_disk = manifest_path.read_bytes() if manifest_path.is_file() else b""
-        if sha256_bytes(on_disk) != previous.field("manifest_sha256"):
-            raise IntakeError(
-                f"{manifest_path} changed after run slice {run_id!r} was approved; it will not "
-                "run. Run prepare-plan and approve-plan again"
-            )
-        if on_disk != manifest_text.encode("utf-8"):
-            raise IntakeError(
-                f"run slice {run_id!r} was already approved with a different manifest "
-                f"({manifest_path}); an approval is not rewritten. Run prepare-plan again"
-            )
-        return result(created=False)
+    pending = PendingApproval(
+        intake_dir=intake_dir,
+        run_id=run_id,
+        run_key=run_key,
+        expected_branch=branch,
+        manifest_path=manifest_path,
+        approval_path=approval_path,
+        manifest_text=manifest_text,
+        manifest_digest=digest,
+        decision=decision,
+        sparring_dir=Path(sparring_dir),
+        payload=None,
+        record=record,
+        interpretation=interpretation,
+        stages=tuple(stages),
+    )
 
     if approval_path.exists():
-        return existing()
+        _existing_approval(pending)
+        return pending
 
     # A new decision: the repositories must still be where intake saw them.
     require_intake_ignored(repo_root, sparring_dir)
@@ -2197,10 +3362,7 @@ def approve_plan(
         )
 
     starting = now_seen[primary_repository]
-    approval = {
-        "version": APPROVAL_VERSION,
-        "decision": "approved",
-        "approved_at": now().isoformat(),
+    payload = {
         "intake_id": intake_id,
         "intake_dir": str(intake_dir.resolve()),
         "run_id": run_id,
@@ -2226,34 +3388,17 @@ def approve_plan(
         },
         **decision,
     }
-    # The manifest may be replaced until an approval exists for it; the
-    # approval is created exactly once, and it is what makes the manifest
-    # runnable. A crash between the two leaves an unapproved manifest that
-    # run-plan refuses and a repeat of this approval completes.
-    write_atomic(manifest_path, manifest_text)
-    registry = intake_root(sparring_dir) / REGISTRY_DIRNAME / f"{run_key}.json"
-    write_atomic(
-        registry,
-        json.dumps(
-            {
-                "run_key": run_key,
-                "intake_dir": str(intake_dir.resolve()),
-                "run_id": run_id,
-                "stage_ids": approval["stage_ids"],
-            },
-            indent=2,
-        )
-        + "\n",
-    )
-    if not write_exclusive(approval_path, json.dumps(approval, indent=2) + "\n"):
-        # Another approval won the race; it decides, and this one must agree.
-        return existing()
-    return result(created=True)
+    return replace(pending, payload=payload)
 
 
 __all__ = [
     "AGENT_FINDING_CODES",
     "Approval",
+    "COMPILE_INTERPRETATION_SCHEMA",
+    "CompileContext",
+    "DISPOSITIONS",
+    "Decision",
+    "DecisionOption",
     "Finding",
     "INTAKE_DIRNAME",
     "INTERPRETATION_SCHEMA",
@@ -2262,9 +3407,20 @@ __all__ = [
     "Interpretation",
     "MODES",
     "SourcePlan",
+    "TRANSFORMS",
     "all_findings",
+    "PendingApproval",
+    "answered_decisions",
     "approve_plan",
+    "build_approval",
+    "posed_decisions",
+    "read_decisions",
+    "recorded_answers",
+    "seal_approval",
     "check_interpretation",
+    "compile_context_for",
+    "guard_compile_findings",
+    "interpretation_schema",
     "intake_not_ignored_message",
     "parse_interpretation",
     "prepare_plan",
@@ -2272,6 +3428,7 @@ __all__ = [
     "repository_snapshot",
     "require_intake_ignored",
     "run_prerequisites",
+    "slice_manifest_gates",
     "feature_branch_needed",
     "slice_branch",
     "slice_runs_agent",
