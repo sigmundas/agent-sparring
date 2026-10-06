@@ -169,9 +169,13 @@ There are three ways to continue a stage, and they are not interchangeable:
   `--sparring-effort` may choose the new conversation's model or effort.
   Each role supports exactly one provider today, so a different
   `--stage-provider` / `--sparring-provider` is refused; don't try one.
-- **`sparring reset-stage`** — archives the stage's attempt as history and
-  restarts the stage from the preceding accepted candidate. Only when the
-  person wants the attempt itself discarded, or the engine names it in a
+- **`sparring reset-stage`** — recovery for a stage that ran under the
+  wrong mode (implementation vs independent review) compared with what the
+  plan input now declares: archives that attempt as history and restarts
+  the stage. The repository must already be at the preceding accepted
+  candidate; the command verifies this and does not move HEAD there. It
+  refuses a stage that ran in the declared mode, so it is not a way to
+  discard an unwanted attempt. Use it only when the engine names it in a
   refusal. Ask first.
 
 The engine decides whose turn runs next, from its recorded `next_turn`.
