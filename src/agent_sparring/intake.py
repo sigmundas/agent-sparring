@@ -1590,7 +1590,7 @@ def slice_manifest_gates(
 def run_prerequisites(interpretation: Interpretation, run_id: str) -> tuple[str, ...]:
     """What a person must confirm before approving run slice ``run_id``:
     every gate that blocks one of its stages, and every earlier run slice
-    one of its stages depends on. Sorted, for a stable record. A gate the
+    one of its stages depends on or one of its gates follows. Sorted, for a stable record. A gate the
     slice's own manifest carries (:func:`slice_manifest_gates`) is not one:
     the run stops for it instead."""
 
@@ -1604,6 +1604,13 @@ def run_prerequisites(interpretation: Interpretation, run_id: str) -> tuple[str,
     for gate in interpretation.gates:
         if gate.id not in in_manifest and labels.intersection(gate.blocks_stages):
             required.add(gate.id)
+        # A gate this slice stops for or waits on that follows another
+        # slice's stage stands between the two: the earlier slice must have
+        # run, whether or not any stage here also depends on it.
+        if gate.id in in_manifest or labels.intersection(gate.blocks_stages):
+            other = run_of.get(gate.after_stage or "")
+            if other is not None and other != run_id:
+                required.add(other)
     for _, _, run, stage in interpretation.stages():
         if run.id != run_id:
             continue

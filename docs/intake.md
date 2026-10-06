@@ -71,7 +71,9 @@ is run again.
   finding.
   Approving a slice requires `--confirm-prerequisite <gate id>` for every
   gate it waits for, recorded in `approval.json`. An earlier slice it
-  depends on is **not** confirmed by name: approval requires that slice's
+  depends on — through a stage's `depends_on`, or because a gate it waits
+  for or carries follows that slice's stage — is **not** confirmed by name:
+  approval requires that slice's
   own approval and its sealed run recorded complete with an accepted final
   candidate, and records that evidence.
 - **Repository snapshots.** Intake records every inspected repository,
@@ -121,6 +123,11 @@ is run again.
   inside an intake envelope — and then creates `approval.json` exactly
   once. Repeating an identical approval returns it; a conflicting one
   refuses; neither rewrites it.
+
+Stage `depends_on` is intake's interpreted dependency graph. Deterministic
+validation checks that graph and its execution order; it does not prove that
+every dependency in arbitrary source prose was represented faithfully. That
+remains part of semantic intake review.
 
 **Compile mode** (`--mode compile`, Stage 1 of the
 [run-plan compiler plan](plans/run-plan-compiler.md)). The agent may
