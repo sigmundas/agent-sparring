@@ -64,6 +64,8 @@ from agent_sparring.intake import (
     prepare_plan,
 )
 from agent_sparring.manifest import ManifestError
+from agent_sparring import managed_run
+from agent_sparring.managed_run import ManagedRunError
 from agent_sparring.migration_history import MigrationHistoryError, record_history_snapshot
 from agent_sparring.migration_status import REPORT_VERSION as MIGRATION_REPORT_VERSION
 from agent_sparring.migration_status import MigrationStatusError, classify
@@ -2025,6 +2027,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool, source: PlanSou
                 make_adapters,
                 adopt=args.adopt,
                 allow_push_for_run=args.allow_push_for_run,
+                managed=bool(getattr(args, "managed_record", None)),
                 **common,
             )
     except ProviderPause as exc:
@@ -2145,11 +2148,176 @@ def _cmd_check_plan(args: argparse.Namespace) -> int:
 
 
 def _cmd_run_plan(args: argparse.Namespace) -> int:
+    if args.managed:
+        return _run_managed_plan(args)
+    if args.target_branch:
+        print("could not run plan: --target-branch is for --managed runs", file=sys.stderr)
+        return 1
+    if not args.expected_branch:
+        print("could not run plan: --expected-branch is required (or use --managed)", file=sys.stderr)
+        return 1
     return _run_plan_command(args, resume=False)
 
 
 def _cmd_resume_plan(args: argparse.Namespace) -> int:
+    if args.run_key:
+        try:
+            repo_root = _resolve_repo_root(args, Path(args.sparring_dir))
+            record = managed_run.read_record(repo_root, args.run_key)
+        except (ManagedRunError, ProjectConfigError) as exc:
+            if not (isinstance(exc, ManagedRunError) and exc.code == "not_a_repository"):
+                print(f"could not resume plan: {exc}", file=sys.stderr)
+                return 1
+            record = None
+        if record is not None:
+            return _resume_managed_plan(args, repo_root, record)
+    if not args.expected_branch:
+        print(
+            "could not resume plan: --expected-branch is required (a managed run is resumed "
+            "by --run-key alone)",
+            file=sys.stderr,
+        )
+        return 1
     return _run_plan_command(args, resume=True)
+
+
+def _managed_input(args: argparse.Namespace) -> tuple[str, Path]:
+    if bool(args.plan_path) == bool(args.manifest):
+        raise PlanError(
+            "give exactly one plan input: the reviewed Markdown plan as a positional "
+            "argument, or --manifest with an execution manifest"
+        )
+    return ("manifest", Path(args.manifest)) if args.manifest else ("markdown", Path(args.plan_path))
+
+
+def _check_managed_source(source: PlanSource) -> None:
+    """Single repository first; intake manifests are follow-up work."""
+
+    if source.kind not in managed_run.INPUT_KINDS:
+        raise ManagedRunError(
+            "input_kind_unsupported",
+            f"a {source.kind} input cannot run --managed yet; use a Markdown plan or a plain manifest",
+        )
+    if any(stage.repositories for stage in source.stages()):
+        raise ManagedRunError(
+            "sibling_repositories",
+            "this plan input declares sibling repositories; a managed run is single-repository for now",
+        )
+
+
+def _run_managed_plan(
+    args: argparse.Namespace, *, base_sha: str | None = None, expected_digest: str | None = None
+) -> int:
+    """run-plan --managed: preflight, create the record + branch + worktree,
+    then run there exactly as run-plan does."""
+
+    from agent_sparring.plan import new_run_key
+
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        if args.expected_branch:
+            raise ManagedRunError(
+                "expected_branch_with_managed",
+                "--expected-branch cannot be given with --managed: the engine chooses the managed branch",
+            )
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        kind, input_path = _managed_input(args)
+
+        def source_label(read_path: Path, mapped: Path) -> str:
+            source = load_plan_source(read_path, repo_root, manifest=kind == "manifest")
+            _check_managed_source(source)
+            if expected_digest is not None and source.digest() != expected_digest:
+                raise ManagedRunError("plan_changed", "the plan changed since it was confirmed; run start-plan again")
+            if kind == "manifest":
+                return source.label
+            # Relative: read inside the worktree, so labelled as there.
+            return mapped.as_posix()
+
+        prepared = managed_run.plan_managed_run(
+            repo_root,
+            sparring_dir,
+            source_label=source_label,
+            input_kind=kind,
+            input_path=input_path,
+            target_branch=args.target_branch,
+            run_key=args.run_key,
+            new_run_key=new_run_key,
+            base_sha=base_sha,
+        )
+        record = managed_run.create_managed_worktree(repo_root, prepared)
+    except (ManagedRunError, PlanError, ProjectConfigError, GitContextError) as exc:
+        print(f"could not run plan: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"managed run {record.run_key}: branch {record.branch} from {record.target_branch} "
+        f"({record.base_sha[:12]}) in {record.worktree_path}",
+        file=sys.stderr,
+    )
+    if prepared.uncommitted:
+        print(
+            f"uncommitted changes in your checkout are not part of this run: {', '.join(prepared.uncommitted)}",
+            file=sys.stderr,
+        )
+    return _run_in_record(args, record, resume=False)
+
+
+def _run_in_record(args: argparse.Namespace, record: managed_run.ManagedRunRecord, *, resume: bool) -> int:
+    run_args = argparse.Namespace(**vars(args))
+    run_args.sparring_dir = str(record.sparring_dir)
+    run_args.repo_root = record.worktree_path
+    run_args.expected_branch = record.branch
+    run_args.run_key = record.run_key
+    run_args.plan_path = record.input_path if record.input_kind == "markdown" else None
+    run_args.manifest = record.input_path if record.input_kind == "manifest" else None
+    run_args.managed_record = record
+    return _run_plan_command(run_args, resume=resume)
+
+
+def _resume_managed_plan(args: argparse.Namespace, repo_root: Path, record: managed_run.ManagedRunRecord) -> int:
+    """resume-plan --run-key K for a managed run, from any worktree."""
+
+    try:
+        if args.expected_branch and args.expected_branch != record.branch:
+            raise ManagedRunError(
+                "branch_mismatch",
+                f"run {record.run_key} runs on {record.branch}, not {args.expected_branch}",
+            )
+        if args.repo_root and not managed_run.same_repository(Path(args.repo_root), repo_root):
+            raise ManagedRunError("repository_mismatch", f"{args.repo_root} is not a worktree of this repository")
+        if args.plan_path or args.manifest:
+            kind, given = _managed_input(args)
+            managed_run.check_input_agrees(
+                record, kind=kind, path=given, invoking_top=managed_run.worktree_top(repo_root)
+            )
+        managed_run.verify_worktree(repo_root, record)
+    except (ManagedRunError, PlanError) as exc:
+        print(f"could not resume plan: {exc}", file=sys.stderr)
+        return 1
+    started = (record.sparring_dir / "plans" / f"{record.run_key}.json").is_file()
+    # An interrupted first start: the worktree exists, the run does not yet.
+    return _run_in_record(args, record, resume=started)
+
+
+def _cmd_runs(args: argparse.Namespace) -> int:
+    try:
+        repo_root = Path(args.repo_root) if args.repo_root else Path(".")
+        payload = managed_run.runs_payload(repo_root)
+    except ManagedRunError as exc:
+        print(f"could not list runs: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        json.dump(payload, sys.stdout, indent=2)
+        print()
+        return 0
+    if not payload["runs"]:
+        print("no managed runs")
+    for run in payload["runs"]:
+        where = run["worktree_path"] + ("" if run["worktree_exists"] else " (missing)")
+        print(
+            f"{run['run_key']}  {run['plan_label']}  {run['lifecycle']}/{run['run_status']}  "
+            f"{run['branch']} -> {run['target_branch']}  {where}"
+        )
+    return 0
 
 
 def _cmd_reset_stage(args: argparse.Namespace) -> int:
@@ -2500,8 +2668,13 @@ def _start_plan_command(args: argparse.Namespace, repo_root: Path, *, answers: d
     parts = [
         "sparring", "--sparring-dir", str(Path(args.sparring_dir).resolve()), "start-plan",
         str(Path(args.plan_path).resolve()), "--repo-root", str(Path(repo_root).resolve()),
-        "--expected-branch", args.expected_branch,
     ]
+    if getattr(args, "managed", False):
+        parts.append("--managed")
+        if args.target_branch:
+            parts += ["--target-branch", args.target_branch]
+    else:
+        parts += ["--expected-branch", args.expected_branch]
     for value in args.context_repository or []:
         parts += ["--context-repository", value]
     for value in args.repository_branch or []:
@@ -2559,6 +2732,16 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
     repo_root = Path(args.repo_root or ".")
     status = None
+    if args.managed and args.expected_branch:
+        print("start-plan refused: --expected-branch cannot be given with --managed: the engine chooses the managed branch", file=sys.stderr)
+        return 1
+    if not args.managed and (args.target_branch or not args.expected_branch):
+        print(
+            "start-plan refused: "
+            + ("--target-branch is for --managed runs" if args.target_branch else "--expected-branch is required (or use --managed)"),
+            file=sys.stderr,
+        )
+        return 1
     try:
         repo_root = _resolve_repo_root(args, sparring_dir)
         context_repositories = {
@@ -2583,6 +2766,8 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
             models=models,
             allow_push_for_run=args.allow_push_for_run,
             execution=_start_execution(args),
+            managed=bool(args.managed),
+            target_branch=args.target_branch,
         )
 
         def prepare(parent: Path | None, given: dict, validate) -> Path:
@@ -2642,6 +2827,13 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
     run_args.run_key = None
     run_args.adopt = False
     run_args.stop_after_stage = None
+    if status.route == ROUTE_DIRECT and args.managed:
+        run_args.manifest = None
+        return _run_managed_plan(
+            run_args,
+            base_sha=status.payload["managed"]["base_sha"],
+            expected_digest=status.source.digest(),
+        )
     if status.route == ROUTE_DIRECT:
         run_args.manifest = None
         # The source the token was computed over, never the file read again.
@@ -2681,7 +2873,16 @@ def _print_start_status(payload: dict | None, args: argparse.Namespace, repo_roo
         print("  " + shlex.join(_start_plan_command(args, repo_root, answers=answers, token=None)))
         return
     run = payload["slice"]
-    print(f"ready: {payload['plan']['label']} ({payload['route']} route) on {payload['expected_branch']}")
+    managed = payload.get("managed")
+    if managed:
+        print(
+            f"ready: {payload['plan']['label']} ({payload['route']} route), managed: a new branch and "
+            f"worktree from {managed['target_branch']} at {managed['base_sha'][:12]}"
+        )
+        if managed["not_part_of_this_run"]:
+            print(f"  uncommitted changes here are not part of this run: {', '.join(managed['not_part_of_this_run'])}")
+    else:
+        print(f"ready: {payload['plan']['label']} ({payload['route']} route) on {payload['expected_branch']}")
     execution = payload.get("execution") or {}
     print(
         f"  sparring dir {execution.get('sparring_dir')}, permission mode {execution.get('permission_mode')}, claude executable "
@@ -2782,13 +2983,15 @@ def _add_role_model_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_loop_arguments(
-    parser: argparse.ArgumentParser, repo_root_help: str, *, branch_help: str
+    parser: argparse.ArgumentParser, repo_root_help: str, *, branch_help: str, branch_required: bool = True
 ) -> None:
     """The flags run-loop, run-plan and resume-plan share: repo root,
-    expected branch, provider selection and the SEND_BACK runaway limit."""
+    expected branch, provider selection and the SEND_BACK runaway limit.
+    ``branch_required=False`` for the plan commands, whose managed form
+    has the engine choose the branch (checked in the command instead)."""
 
     parser.add_argument("--repo-root", default=None, help=repo_root_help)
-    parser.add_argument("--expected-branch", required=True, help=branch_help)
+    parser.add_argument("--expected-branch", required=branch_required, default=None, help=branch_help)
     parser.add_argument(
         "--stage-provider",
         default=None,
@@ -3567,7 +3770,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_loop_arguments(
         start,
         repo_root_help,
-        branch_help="the branch checked out now, which the run uses; required. start-plan never switches branches",
+        branch_help="the branch checked out now, which the run uses; required unless --managed. start-plan never switches branches",
+        branch_required=False,
+    )
+
+    start.add_argument(
+        "--managed",
+        action="store_true",
+        help=(
+            "run in a new engine-managed branch + worktree created from --target-branch; the "
+            "invoking checkout is never switched or written to. Refused with --expected-branch"
+        ),
+    )
+    start.add_argument(
+        "--target-branch",
+        default=None,
+        metavar="BRANCH",
+        help="with --managed: the branch the managed run starts from (default: the branch checked out at --repo-root)",
     )
     start.add_argument("--allow-push-for-run", action="store_true", help=_ALLOW_RUN_HELP)
     start.set_defaults(func=_cmd_start_plan)
@@ -3659,7 +3878,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_loop_arguments(
         run_plan,
         repo_root_help,
-        branch_help="the feature branch every stage of this plan must modify; required",
+        branch_help="the feature branch every stage of this plan must modify; required unless --managed",
+        branch_required=False,
+    )
+
+    run_plan.add_argument(
+        "--managed",
+        action="store_true",
+        help=(
+            "run in a new engine-managed branch + worktree created from --target-branch; the "
+            "invoking checkout is never switched or written to. Refused with --expected-branch"
+        ),
+    )
+    run_plan.add_argument(
+        "--target-branch",
+        default=None,
+        metavar="BRANCH",
+        help="with --managed: the branch the managed run starts from (default: the branch checked out at --repo-root)",
     )
     run_plan.add_argument("--allow-push-for-run", action="store_true", help=_ALLOW_RUN_HELP)
     run_plan.add_argument(
@@ -3704,7 +3939,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_loop_arguments(
         resume_plan_parser,
         repo_root_help,
-        branch_help="the feature branch the plan run was started for; required",
+        branch_help=(
+            "the feature branch the plan run was started for; required, except for a managed "
+            "run named by --run-key, whose record supplies it"
+        ),
+        branch_required=False,
     )
     resume_plan_parser.add_argument(
         "--evidence",
@@ -3759,7 +3998,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_recovery_arguments(resume_plan_parser)
-    resume_plan_parser.set_defaults(func=_cmd_resume_plan, adopt=False)
+    resume_plan_parser.set_defaults(func=_cmd_resume_plan, adopt=False, managed=False, target_branch=None)
+
+    runs_parser = subparsers.add_parser(
+        "runs", help="list this repository's managed runs (read-only)"
+    )
+    runs_parser.add_argument("--repo-root", default=None, help=repo_root_help)
+    runs_parser.add_argument("--json", action="store_true", help="report as JSON")
+    runs_parser.set_defaults(func=_cmd_runs)
 
     reset_stage_parser = subparsers.add_parser(
         "reset-stage",

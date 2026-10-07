@@ -574,6 +574,10 @@ class PlanRunState:
     #: leaving the pause, restored if the resume is then refused before any
     #: provider turn -- a refused resume leaves the recorded reason as it was.
     left_provider_pause: dict[str, Any] | None = field(default=None, repr=False, compare=False)
+    #: Whether this run executes in an engine-managed worktree (see
+    #: :mod:`agent_sparring.managed_run`). Omitted while ``False``, and
+    #: absent from older states, which read as unmanaged.
+    managed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -600,6 +604,8 @@ class PlanRunState:
         if self.provider_pause is None:
             payload.pop("provider_pause", None)
         payload.pop("left_provider_pause", None)
+        if not self.managed:
+            payload.pop("managed", None)
         return payload
 
     # -- the obligation ledger -------------------------------------------
@@ -707,6 +713,7 @@ class PlanRunState:
                     if isinstance(payload.get("provider_pause"), dict)
                     else None
                 ),
+                managed=_managed_flag(payload.get("managed", False)),
             )
         except (PushError, DeferredGateError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -726,6 +733,12 @@ class PlanRunState:
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _managed_flag(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise PlanError(f"malformed plan-run state: managed must be true or false, not {value!r}")
+    return value
 
 
 def _awaiting_from_dict(
@@ -1147,6 +1160,7 @@ def start_plan(
     self_check: bool = False,
     stop_after_stage: str | None = None,
     report: Reporter = lambda message: None,
+    managed: bool = False,
 ) -> PlanRunResult:
     """Validate the whole plan, record position at stage 1, and run.
 
@@ -1199,6 +1213,14 @@ def start_plan(
 
     if not expected_branch or not expected_branch.strip():
         raise PlanError("expected_branch is required for a plan run")
+    from agent_sparring.managed_run import ManagedRunError, refuse_unmanaged_here
+
+    if not managed:
+        # One managed worktree belongs to one managed run.
+        try:
+            refuse_unmanaged_here(Path(repo_root))
+        except ManagedRunError as exc:
+            raise PlanError(str(exc)) from exc
 
     source = _coerce_source(plan, repo_root)
     bind_fresh_run = getattr(source, "bind_fresh_run", None)
@@ -1274,6 +1296,8 @@ def start_plan(
     if leftovers:
         adopted = _check_adoption(sparring_dir, stages, leftovers, report=report)
     _require_state_ignored(repo_root, state_path)
+    if managed:
+        _require_managed_record(repo_root, key, expected_branch)
 
     state = PlanRunState(
         plan=label,
@@ -1284,6 +1308,7 @@ def start_plan(
         status=PlanRunStatus.RUNNING,
         source=source.kind,
         run=key,
+        managed=managed,
     )
     if allow_push_for_run:
         try:
@@ -1315,6 +1340,15 @@ def start_plan(
         report=report,
         stop_after_stage=stop_after_stage,
     )
+
+
+def _require_managed_record(repo_root: Path, run_key: str, expected_branch: str) -> None:
+    from agent_sparring.managed_run import ManagedRunError, require_state_matches
+
+    try:
+        require_state_matches(Path(repo_root), run_key, expected_branch=expected_branch)
+    except ManagedRunError as exc:
+        raise PlanError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -1709,6 +1743,8 @@ def resume_plan(
             f"{state.expected_branch!r}, not {expected_branch!r}; refusing to resume on a "
             "different branch"
         )
+    if state.managed:
+        _require_managed_record(repo_root, owner.key, expected_branch)
     if state.source != source.kind:
         raise PlanError(
             f"plan run {owner.key} of {label} was started from a {state.source} plan input, "

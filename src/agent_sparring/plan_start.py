@@ -95,6 +95,11 @@ class StartRequest:
     #: Every other option that changes what runs (permission mode, provider
     #: executables as given, the send-back limit): shown and bound as given.
     execution: Mapping[str, Any] = field(default_factory=dict)
+    #: A managed run (direct route only): the engine creates the branch and
+    #: worktree from ``target_branch`` (default: the one checked out), so the
+    #: token binds the target and its tip instead of ``expected_branch``.
+    managed: bool = False
+    target_branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -179,7 +184,10 @@ def evaluate(request: StartRequest, *, prepare: Prepare | None) -> StartStatus:
 
     payload = _base(request)
     try:
-        preflight(request, label=payload["plan"]["label"])
+        if request.managed:
+            managed_preflight(request, payload)
+        else:
+            preflight(request, label=payload["plan"]["label"])
         try:
             text = Path(request.plan_path).read_text(encoding="utf-8")
         except OSError as exc:
@@ -197,6 +205,11 @@ def evaluate(request: StartRequest, *, prepare: Prepare | None) -> StartStatus:
                     "sibling repositories to put on a branch"
                 )
             return _direct_status(request, payload, direct, text)
+        if request.managed:
+            raise StartPlanError(
+                "--managed runs only a plan that runs directly ('## Stage <n>' sections); the "
+                "intake route with --managed is not supported yet"
+            )
         # A slice declares only repositories given with --context-repository:
         # any other branch name is refused before a preparation writes anything.
         unknown = sorted(set(request.repository_branches) - set(request.context_repositories))
@@ -245,6 +258,29 @@ def preflight(request: StartRequest, *, label: str) -> None:
         )
 
 
+def managed_preflight(request: StartRequest, payload: dict[str, Any]) -> None:
+    """The managed checks before a token: target branch and its tip, the
+    project committed there, no siblings. The invoking checkout need not be
+    clean -- its uncommitted changes are reported as not part of the run."""
+
+    from agent_sparring.managed_run import ManagedRunError, dirty_paths, resolve_target
+
+    if request.context_repositories:
+        raise StartPlanError(
+            "--context-repository: a managed run is single-repository for now [sibling_repositories]"
+        )
+    try:
+        target, base_sha = resolve_target(Path(request.repo_root), request.target_branch)
+        uncommitted = dirty_paths(Path(request.repo_root))
+    except ManagedRunError as exc:
+        raise StartPlanError(str(exc)) from exc
+    payload["managed"] = {
+        "target_branch": target,
+        "base_sha": base_sha,
+        "not_part_of_this_run": list(uncommitted),
+    }
+
+
 # -- direct route -----------------------------------------------------------------
 
 
@@ -278,7 +314,15 @@ def _direct_status(request: StartRequest, payload: dict[str, Any], source, text:
             "plan_label": source.label,
             "plan_digest": source.digest(),
             "source_digest": sha256_text(text),
-            "expected_branch": request.expected_branch,
+            **(
+                {
+                    "managed": True,
+                    "target_branch": payload["managed"]["target_branch"],
+                    "base_sha": payload["managed"]["base_sha"],
+                }
+                if request.managed
+                else {"expected_branch": request.expected_branch}
+            ),
             # The primary and every repository supplied with the request:
             # whatever was given is bound, never silently ignored.
             "repositories": [
