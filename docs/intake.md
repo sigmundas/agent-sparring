@@ -3,10 +3,9 @@
 [← Documentation index](README.md)
 
 
-> **Experimental.** Design status (2026-09-27): Stage A of the
-> [plan-intake integrity revision plan](plans/plan-intake-integrity-revision.md)
-> -- approval binds execution -- is implemented and described here; Stages B
-> and C (source ownership, gate topology, review usability) are not, so their
+> **Experimental.** Design status (2026-09-27): Stage A of the intake integrity
+> revision -- approval binds execution -- is implemented and described here;
+> Stages B and C (source ownership, gate topology, review usability) are not, so their
 > integrity claims do not hold yet. A plain Markdown plan
 > ([Run a whole plan](plans.md)) needs none of this. The normal way in is
 > [`sparring start-plan`](#one-command-start-sparring-start-plan), which
@@ -129,10 +128,8 @@ validation checks that graph and its execution order; it does not prove that
 every dependency in arbitrary source prose was represented faithfully. That
 remains part of semantic intake review.
 
-**Compile mode** (`--mode compile`, Stage 1 of the
-[run-plan compiler plan](plans/run-plan-compiler.md)). The agent may
-normalize the execution topology, never what the plan asks for, and never
-proposes an amendment. Each agent finding carries a `disposition` instead of
+**Compile mode** (`--mode compile`). The agent may normalize the execution
+topology, never what the plan asks for, and never proposes an amendment. Each agent finding carries a `disposition` instead of
 a severity — `auto_resolved` (info), `plan_note` (recommendation),
 `needs_decision` or `refuse` (both blocking) — and a `needs_decision` one a
 `decision` (id, question, why, at least two options). `auto_resolved` is

@@ -14,10 +14,8 @@ reference it links into.
 | [Reference](reference.md) | cross-repository candidates, review-only stages, `next_turn`, resume vs fresh session vs reset, who owns which artifact |
 | [Design](design.md) | principles, architecture and build history |
 
-Design records under [plans/](plans/) are historical or proposed work, not
-descriptions of current behavior:
-
-- [plans/plan-intake-integrity-revision.md](plans/plan-intake-integrity-revision.md):
-  the plan-intake integrity revision (Stage A implemented; B and C pending).
-- [plans/backend-selection.md](plans/backend-selection.md): per-role backend
-  selection for `codex-cli` (proposed, not implemented).
+For a minimal staged plan, see the [Quickstart](../QUICKSTART.md). For a
+completed implementation example, see the extension's
+[colleague-sharing plan](https://github.com/sigmundas/agent-sparring-vscode/blob/main/docs/plans/colleague-sharing.md).
+Retired engine implementation plans remain in Git history; the reference pages
+above describe current behavior.
