@@ -247,6 +247,49 @@ class ManagedRunTests(_PlanRepoTestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self._records()), 1)
 
+    def test_run_key_used_by_a_run_state_in_another_worktree_refuses(self):
+        other = self.repo.parent / "other-wt"
+        _run_git(self.repo, "worktree", "add", "-q", str(other), "feature/x")
+        plans = other / ".sparring" / "plans"
+        plans.mkdir(parents=True)
+        (plans / "plan-abc-1234abcd.json").write_text("{}", encoding="utf-8")
+        before = _git(self.repo, "branch", "--list")
+        code, _, err = self._start_managed("--run-key", "plan-abc-1234abcd")
+        self.assertEqual(code, 1)
+        self.assertIn("run_key_used", err)
+        self.assertEqual(self._records(), ())
+        self.assertEqual(_git(self.repo, "branch", "--list"), before)
+
+    def test_start_plan_managed_refuses_without_committed_project(self):
+        code, out, err = self._main(
+            "start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed",
+            "--target-branch", "feature/x", "--json",
+        )
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "refused")
+        self.assertIsNone(payload["confirm_token"])
+        self.assertIn("project_not_committed", payload["error"])
+
+    def test_start_plan_managed_binds_the_committed_configuration_not_the_checkouts(self):
+        argv = ("start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed", "--json")
+        code, out, err = self._main(*argv)
+        self.assertEqual(code, 0, err)
+        clean_token = json.loads(out)["confirm_token"]
+        # A dirty, different configuration in the invoking checkout is not
+        # what the managed worktree runs with, so it changes nothing bound.
+        (self.sparring_dir / "project.toml").write_text(
+            'project = "repo"\n\n[agents.stage]\nprovider = "codex-cli"\n', encoding="utf-8"
+        )
+        code, out, err = self._main(*argv)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["confirm_token"], clean_token)
+        # Committed on the target, it is what the managed run resolves.
+        _run_git(self.repo, "commit", "-q", "-am", "stage on codex")
+        code, out, err = self._main(*argv)
+        self.assertEqual(code, 1)
+        self.assertIn("'codex-cli'", json.loads(out)["error"])
+
 
 class RecordTests(_PlanRepoTestCase):
     def _record(self, **overrides) -> ManagedRunRecord:
@@ -281,3 +324,38 @@ class RecordTests(_PlanRepoTestCase):
         payload["extra"] = 1
         with self.assertRaises(ManagedRunError):
             ManagedRunRecord.from_dict(payload)
+        payload = self._record().to_dict()
+        payload["schema_version"] = True
+        with self.assertRaises(ManagedRunError) as ctx:
+            ManagedRunRecord.from_dict(payload)
+        self.assertEqual(ctx.exception.code, "record_schema_unknown")
+
+    def test_plan_schema_record_without_project_dir_reads_with_the_default(self):
+        payload = self._record().to_dict()
+        del payload["project_dir"]
+        self.assertEqual(ManagedRunRecord.from_dict(payload).project_dir, ".sparring")
+
+    def test_relative_input_and_escaping_project_dir_refuse(self):
+        for key, value in (
+            ("input", {"kind": "markdown", "path": "docs/plan.md"}),
+            ("project_dir", "/outside"),
+            ("project_dir", "../outside"),
+            ("project_dir", "a/../../b"),
+            ("project_dir", "."),
+        ):
+            payload = self._record().to_dict()
+            payload[key] = value
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(ManagedRunError) as ctx:
+                    ManagedRunRecord.from_dict(payload)
+                self.assertEqual(ctx.exception.code, "record_malformed")
+        with self.assertRaises(ManagedRunError):
+            self._record(project_dir="/outside").sparring_dir
+
+    def test_project_dir_symlinked_outside_the_worktree_refuses(self):
+        worktree = Path(self._tmp.name) / "wt"
+        worktree.mkdir()
+        (worktree / ".sparring").symlink_to(Path(self._tmp.name))
+        with self.assertRaises(ManagedRunError) as ctx:
+            self._record(worktree_path=str(worktree)).sparring_dir
+        self.assertEqual(ctx.exception.code, "project_dir_outside_worktree")

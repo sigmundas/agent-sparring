@@ -2713,6 +2713,20 @@ def _start_execution(args: argparse.Namespace) -> dict:
     }
 
 
+def _committed_agents(args: argparse.Namespace, repo_root: Path, sparring_dir: Path) -> EffectiveAgents:
+    """The agents a managed run will actually use: resolved from the
+    project.toml committed at the target's tip -- what the managed worktree
+    is checked out at -- never from the invoking checkout's copy."""
+
+    import tempfile
+
+    target, base_sha = managed_run.resolve_target(repo_root, args.target_branch)
+    _, config = managed_run.committed_project(repo_root, sparring_dir, target, base_sha)
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / CONFIG_FILENAME).write_bytes(config)
+        return _resolve_agents(args, Path(tmp))
+
+
 def _cmd_start_plan(args: argparse.Namespace) -> int:
     """One confirmation from a human plan to a managed run (see
     :mod:`agent_sparring.plan_start`). Without ``--confirm``: report
@@ -2748,7 +2762,9 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
             name: Path(path) for name, path in _pairs(args.context_repository, "--context-repository").items()
         }
         answers = _pairs(args.answer, "--answer")
-        effective = _resolve_agents(args, sparring_dir)
+        effective = (
+            _committed_agents(args, repo_root, sparring_dir) if args.managed else _resolve_agents(args, sparring_dir)
+        )
         models = {
             resolved.role: {"provider": resolved.provider, "model": resolved.model, "effort": resolved.effort}
             for resolved in (effective.stage, effective.sparring)
@@ -2789,7 +2805,7 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
             ).directory
 
         status = evaluate(request, prepare=None if args.confirm else prepare)
-    except (IntakeError, ProjectConfigError, AgentConfigError, OSError) as exc:
+    except (IntakeError, ProjectConfigError, AgentConfigError, ManagedRunError, OSError) as exc:
         error = str(exc)
     else:
         error = status.payload["error"]

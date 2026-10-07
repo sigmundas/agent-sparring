@@ -263,7 +263,7 @@ def managed_preflight(request: StartRequest, payload: dict[str, Any]) -> None:
     project committed there, no siblings. The invoking checkout need not be
     clean -- its uncommitted changes are reported as not part of the run."""
 
-    from agent_sparring.managed_run import ManagedRunError, dirty_paths, resolve_target
+    from agent_sparring.managed_run import ManagedRunError, committed_project, dirty_paths, resolve_target
 
     if request.context_repositories:
         raise StartPlanError(
@@ -271,6 +271,9 @@ def managed_preflight(request: StartRequest, payload: dict[str, Any]) -> None:
         )
     try:
         target, base_sha = resolve_target(Path(request.repo_root), request.target_branch)
+        # The worktree must be a working project at base_sha, as run-plan
+        # --managed requires: never a token for a start that would refuse.
+        committed_project(Path(request.repo_root), Path(request.sparring_dir), target, base_sha)
         uncommitted = dirty_paths(Path(request.repo_root))
     except ManagedRunError as exc:
         raise StartPlanError(str(exc)) from exc

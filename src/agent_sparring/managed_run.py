@@ -54,10 +54,22 @@ _RECORD_KEYS = frozenset(
         "remote",
         "created_at",
         "created_by",
-        "project_dir",
         "events",
     }
 )
+#: Optional in schema v1 (absent means ``.sparring``): the project
+#: directory relative to the worktree, always contained in it.
+_OPTIONAL_KEYS = frozenset({"project_dir"})
+DEFAULT_PROJECT_DIR = ".sparring"
+
+
+def valid_project_dir(value: Any) -> bool:
+    """A relative path strictly inside the worktree: no root, no ``..``."""
+
+    if not isinstance(value, str) or not value or "\\" in value:
+        return False
+    path = Path(value)
+    return bool(path.parts) and not path.is_absolute() and all(part not in ("", ".", "..") for part in path.parts)
 
 
 class ManagedRunError(RuntimeError):
@@ -166,8 +178,8 @@ class ManagedRunRecord:
     base_sha: str
     remote: str | None
     created_at: str
-    #: The project directory (``.sparring``) relative to the worktree.
-    project_dir: str
+    #: The project directory relative to the worktree (see :data:`_OPTIONAL_KEYS`).
+    project_dir: str = DEFAULT_PROJECT_DIR
     created_by: str = "engine"
     events: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
@@ -181,7 +193,22 @@ class ManagedRunRecord:
 
     @property
     def sparring_dir(self) -> Path:
-        return Path(self.worktree_path) / self.project_dir
+        """The project directory inside the worktree; refuses one that
+        would resolve outside it (a symlink, or a hand-edited record)."""
+
+        worktree = Path(self.worktree_path)
+        if not valid_project_dir(self.project_dir):
+            raise ManagedRunError("record_malformed", f"project_dir {self.project_dir!r} is not inside the worktree")
+        directory = worktree / self.project_dir
+        if worktree.exists():
+            try:
+                directory.resolve().relative_to(worktree.resolve())
+            except ValueError as exc:
+                raise ManagedRunError(
+                    "project_dir_outside_worktree",
+                    f"{directory} resolves outside the managed worktree {worktree}",
+                ) from exc
+        return directory
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -208,14 +235,14 @@ class ManagedRunRecord:
         if not isinstance(payload, Mapping):
             raise bad("not a JSON object")
         version = payload.get("schema_version")
-        if version != SCHEMA_VERSION:
+        if type(version) is not int or version != SCHEMA_VERSION:
             raise ManagedRunError(
                 "record_schema_unknown",
                 f"{where} has schema_version {version!r}; this engine reads only {SCHEMA_VERSION}",
             )
         keys = set(payload)
-        if keys != _RECORD_KEYS:
-            missing, extra = sorted(_RECORD_KEYS - keys), sorted(keys - _RECORD_KEYS)
+        missing, extra = sorted(_RECORD_KEYS - keys), sorted(keys - _RECORD_KEYS - _OPTIONAL_KEYS)
+        if missing or extra:
             raise bad(f"missing {missing}, unexpected {extra}")
 
         def text(key: str) -> str:
@@ -229,6 +256,11 @@ class ManagedRunRecord:
             raise bad("input must be {kind, path}")
         if source["kind"] not in INPUT_KINDS or not isinstance(source["path"], str) or not source["path"]:
             raise bad("input.kind must be markdown or manifest, with a path")
+        if not Path(source["path"]).is_absolute():
+            raise bad("input.path must be absolute")
+        project_dir = payload.get("project_dir", DEFAULT_PROJECT_DIR)
+        if not valid_project_dir(project_dir):
+            raise bad("project_dir must be a relative path inside the worktree")
         remote = payload["remote"]
         if remote is not None and (not isinstance(remote, str) or not remote):
             raise bad("remote must be a string or null")
@@ -264,7 +296,7 @@ class ManagedRunRecord:
             base_sha=text("base_sha"),
             remote=remote,
             created_at=text("created_at"),
-            project_dir=text("project_dir"),
+            project_dir=project_dir,
             created_by="engine",
             events=tuple(dict(event) for event in events),
         )
@@ -364,6 +396,38 @@ def record_for_worktree(repo_root: Path, worktree: Path) -> ManagedRunRecord | N
 # -- creation ----------------------------------------------------------------
 
 
+def committed_project(repo_root: Path, sparring_dir: Path, target: str, base_sha: str) -> tuple[Path, bytes]:
+    """``(project dir relative to the worktree, its project.toml at base_sha)``.
+
+    The managed worktree is checked out at ``base_sha``, so this committed
+    file -- not the invoking checkout's copy -- is the configuration the run
+    executes with. Refuses when the project directory is not inside the
+    invoking worktree or its project.toml is not committed there."""
+
+    top = worktree_top(repo_root)
+    try:
+        project_rel = Path(sparring_dir).resolve().relative_to(top)
+        if not valid_project_dir(project_rel.as_posix()):
+            raise ValueError(project_rel)
+    except ValueError as exc:
+        raise ManagedRunError(
+            "project_outside_worktree",
+            f"the project directory {sparring_dir} is not inside {top}; a managed worktree "
+            "needs it at the same relative location",
+        ) from exc
+    config_rel = (project_rel / "project.toml").as_posix()
+    shown = subprocess.run(
+        ["git", "-C", str(top), "show", f"{base_sha}:{config_rel}"], capture_output=True, check=False
+    )
+    if shown.returncode != 0:
+        raise ManagedRunError(
+            "project_not_committed",
+            f"{config_rel} is not committed at {target} ({base_sha}); a managed worktree must be a "
+            "working project, so commit the project configuration first",
+        )
+    return project_rel, shown.stdout
+
+
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40].rstrip("-") or "plan"
 
@@ -424,21 +488,7 @@ def plan_managed_run(
             "target_moved",
             f"target branch {target} is at {tip}, not {base_sha} as confirmed; run start-plan again",
         )
-    try:
-        project_rel = Path(sparring_dir).resolve().relative_to(invoking_top)
-    except ValueError as exc:
-        raise ManagedRunError(
-            "project_outside_worktree",
-            f"the project directory {sparring_dir} is not inside {invoking_top}; a managed worktree "
-            "needs it at the same relative location",
-        ) from exc
-    config_rel = (project_rel / "project.toml").as_posix()
-    if _git(invoking_top, "cat-file", "-e", f"{tip}:{config_rel}").returncode != 0:
-        raise ManagedRunError(
-            "project_not_committed",
-            f"{config_rel} is not committed at {target} ({tip}); a managed worktree must be a "
-            "working project, so commit the project configuration first",
-        )
+    project_rel, _ = committed_project(invoking_top, sparring_dir, target, tip)
 
     entries = worktree_list(invoking_top)
     main = Path(entries[0]["path"])  # type: ignore[arg-type]
@@ -456,8 +506,17 @@ def plan_managed_run(
 
     if record_path(invoking_top, key).exists():
         raise ManagedRunError("record_exists", f"run key {key} already has a managed-run record; nothing was created")
-    if (Path(sparring_dir) / "plans" / f"{key}.json").exists():
-        raise ManagedRunError("run_key_used", f"run key {key} is already used by a run state; nothing was created")
+    # A run key is one identity repository-wide: look in this project's state
+    # directory in every registered worktree, not only the invoking one.
+    state_dirs = {Path(sparring_dir).resolve() / "plans"} | {
+        Path(str(entry["path"])) / project_rel / "plans" for entry in entries
+    }
+    for directory in sorted(state_dirs):
+        if (directory / f"{key}.json").exists():
+            raise ManagedRunError(
+                "run_key_used",
+                f"run key {key} is already used by the run state {directory / f'{key}.json'}; nothing was created",
+            )
     if branch_exists(invoking_top, branch):
         raise ManagedRunError("branch_exists", f"branch {branch} already exists; nothing was created")
     if os.path.lexists(worktree) or any(entry["path"] == str(worktree) for entry in entries):
