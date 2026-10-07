@@ -20,20 +20,44 @@ to begin.
 ## 1. Collect what was decided
 
 List what the discussion actually settled, and separately what is still open.
-Leave out ideas the discussion rejected. Classify consequential uncertainty
-before finalizing the plan:
+Leave out ideas the discussion rejected.
+
+An existing plan is evidence of prior intent, not proof that every choice in
+it is an approved requirement: preserve the contract; re-evaluate the recipe.
+Carry forward its required outcomes, safety and correctness invariants,
+explicit product decisions, approved architectural constraints, and project or
+external requirements, verified against current code (§2). Unless explicitly
+approved as requirements, re-evaluate module, class and file layout, extraction
+sequences, stage boundaries, convenience ordering, commit choreography and
+labels, temporary or verifier tooling, test-seam strategy, historical
+workarounds, audit procedures and estimates. Keep such structure only where a
+proven invariant or approved architecture depends on it.
+
+Classify open uncertainty before finalizing the plan:
 
 - Resolve cheap factual uncertainty by inspecting the repository.
 - Resolve product or scope questions that change what should be built before
   plan approval; ask the person rather than guessing.
-- Technical uncertainty that leaves the approved outcome intact may be
-  investigated within its implementation stage. State what is undecided and
-  the constraints on that decision where it matters.
-- Resolve technical uncertainty that could materially change
-  architecture, scope, repository boundaries, stage topology or downstream
-  work before approving downstream implementation contracts. Do not write
-  speculative downstream stages behind an investigation that may invalidate
-  them.
+- For an unresolved technical question, ask: would two reasonable answers
+  change a downstream acceptance contract, the user or product outcome, a
+  repository boundary, a required external action, stage dependencies or
+  topology, or which work must exist? If yes, resolve it before approving the
+  affected downstream stages; do not write speculative stages behind an
+  investigation that may invalidate them. If no, it is implementation freedom
+  or bounded investigation within its stage; state the constraints on that
+  decision where they matter. Names, helper decomposition, internal API or
+  type shapes, module layout and edit sequence are not consequential by
+  default; they become so only when the choice changes what downstream work
+  must deliver or how it is accepted.
+
+A recommended or default answer is still an unanswered decision. If either
+reasonable answer would change a written stage's scope, required files or
+artifacts, behavior, hard constraints, acceptance evidence, repositories or
+topology, settle it before presenting that stage as ready for approval; choosing
+a default does not turn it into an assumption. Questions that alter no stage
+contract, such as whether to track an excluded, unrelated issue separately,
+optional follow-up, or execution and publishing preferences, need not block
+approval.
 
 Agent Sparring has no generic research lifecycle. If a managed investigation
 is appropriate, plan a durable, independently reviewable deliverable (for
@@ -62,8 +86,15 @@ that must occur before later work. Order stages so each can meet its own
 contract using accepted prerequisites, without later work making it complete.
 A single stage is appropriate when the whole change has one acceptance boundary.
 
+A stage must be both conceptually coherent and practically reviewable. Ask
+whether one fresh reviewer, receiving this candidate and its evidence, can
+realistically establish that the contract holds. Split when the changed
+surface, interactions, independent risks or evidence burden become too broad
+for confident review, even when the work shares one architectural theme.
+
 Do not split merely by file, architectural layer, implementation versus tests,
-or an assumption that smaller is safer. Keep the implementation and evidence
+to reduce diff size, because implementation naturally has several steps, or on
+an assumption that smaller is safer. Keep the implementation and evidence
 for a coherent behavior together. Separate a refactor only when it has an
 independently meaningful contract and can safely be accepted on its own; a
 refactor solely enabling one behavior change may belong in that same stage.
@@ -106,6 +137,15 @@ it does not move implementation into that repository or coordinate merges.
 A review-only stage requires manifest `mode: independent_review`; a title
 alone still runs implementation. Add a separate review stage only when it
 serves a meaningful acceptance purpose beyond each stage's normal review.
+
+A plan defines which candidate is acceptable; local isolation and publication
+or integration policy are separate concerns. Merge cadence, pull request versus
+direct merge, squash policy, branch naming and merge queues belong to
+execution, repository or team policy, not plan design, unless the requested
+task concerns them. State a Git constraint only when correctness or evidence
+depends on it, for example keeping a candidate based on a particular reviewed
+commit, not rebasing onto unrelated changes during a sensitive migration, or
+not force-pushing a reviewed branch.
 
 Keep implementation separate from production/manual actions. Real external
 prerequisites need supported mechanisms: intake prerequisites confirmed at
@@ -183,15 +223,18 @@ the intake quality vocabulary where useful:
 - Missing acceptance criteria, requirements with no corresponding acceptance
   evidence, and omitted global context.
 - Dependency/order mismatch; stages needing later stages to become internally
-  complete; arbitrary boundaries; stages too broad for one coherent candidate;
-  adjacent stages that would form a clearer single acceptance boundary.
+  complete; arbitrary boundaries; stages too broad for one coherent candidate
+  or for one fresh reviewer to confidently establish their contract; adjacent
+  stages that would form a clearer single acceptance boundary.
 - Implementation mixed with production/manual action; cross-repository
   ambiguity or a missing candidate strategy; unnecessary human gates.
 - Repeated or contradictory requirements (distinguish necessary shared
   invariants from redundant instructions), stale baseline facts, open questions
-  presented as instructions, and ambiguous source or unresolved decisions.
-- Unnecessary implementation prescription, or starting-point suggestions
-  accidentally written as hard scope restrictions.
+  presented as instructions or settled by a default, and ambiguous source or
+  unresolved decisions.
+- Unnecessary implementation prescription, including recipe inherited from an
+  earlier plan or Git workflow presented as a candidate contract, or
+  starting-point suggestions accidentally written as hard scope restrictions.
 
 Revise the draft when this review finds a problem. Resolve consequential open
 questions before downstream approval rather than turning them into agent
