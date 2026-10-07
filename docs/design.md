@@ -946,57 +946,66 @@ behave as before and are never cleanup candidates.
 
 ## Creation: before preparation, because approval binds the path
 
-Intake approval records the primary worktree's canonical path, so isolation
-has to happen **before** `prepare`/`approve`, not by moving an approved run:
+Intake approval binds a slice to the primary worktree's canonical path, so
+isolating an intake would have to happen **before** `prepare`/`approve`, not
+by moving an approved run. That route is not built: an intake input is
+refused `--managed`. As built:
 
-- `start-plan` (the normal path) gains an opt-in to run in a new managed
-  worktree. It creates the worktree at the current HEAD on a new branch,
-  writes the record, and then prepares and approves **inside** that
-  worktree, exactly as if the person had run `start-plan` there. The
-  existing approval checks then apply unchanged.
-- Names are automatic and deterministic from the plan and run key: the
-  directory is a sibling of the main worktree, `<repo>-sparring-<run-key>`,
-  and the branch is `sparring/<plan-slug>-<short-run-key>`. A collision is
-  refused, never resolved by reusing or overwriting; a branch name is never
-  reused for a different run.
-- The target branch is recorded at creation: the branch checked out where
-  `start-plan` was invoked. It is not inferred later.
-- First slice: single-repository runs only. A run with declared sibling
-  repositories is refused isolation until sibling worktrees have the same
-  ownership rules.
+- `run-plan --managed` and `start-plan --managed` (direct route: a Markdown
+  plan or plain manifest) create the worktree from the **target branch** —
+  `--target-branch`, else the branch checked out at `--repo-root`; a
+  detached HEAD refuses. `start-plan` reads the project configuration as
+  committed at that target and binds its confirmation to the target's tip
+  (`base_sha`); a target that moved before confirmation refuses
+  (`target_moved`). The engine then writes the record, adds the worktree on
+  a new branch and runs the plan inside it. The invoking checkout is never
+  switched or written to.
+- Names are automatic: the directory is a sibling of the main worktree,
+  `<repo>-sparring-<run-key>`, and the branch is
+  `sparring/<plan-slug>-<8 hex>`. A collision is refused, never resolved by
+  reusing or overwriting; a run key is claimed once.
+- The target branch is recorded at creation and never inferred later.
+- Single-repository runs only: a declared sibling repository is refused
+  (`sibling_repositories`).
 
 ## Finish: one engine command, dry run first
 
-Merging and cleanup are one explicit engine command over one run, for
-example `sparring finish-run <run-key> [--merge] [--push] [--dry-run] [--json]`.
-`--dry-run --json` reports every check below with pass/fail and the reason;
-without `--dry-run` it performs only what the checks allow, in order, and
-stops at the first refusal. Every check is re-made at execution time; a dry
-run is advice, never a token.
+Merging and cleanup are one explicit engine command over one run:
+`sparring finish-run --run-key <key> [--dry-run] [--allow-merge-commit]
+[--push-target] [--merge-only] [--json]`. `--dry-run` reports every check
+below with pass/fail and the reason, and whether the run is eligible to
+**merge** and to **clean up** — separately, since a run whose project state
+cannot be archived may still be merged. Without `--dry-run` it performs only
+what the checks allow, in order, and stops at the first failure. Every check
+is re-made at execution time; a dry run is advice, never a token.
 
-A managed worktree may be removed only when **all** of these hold:
+Merging requires all of:
 
-1. the record exists and says the engine created it;
-2. the plan run is `complete` with every stage accepted, nothing in
-   `awaiting`, and no open deferred human verification;
-3. no runner holds the worktree (the concurrency lock is free and no live
-   process is recorded for it);
-4. the worktree is clean: no modified, staged or untracked non-ignored
-   files;
-5. the branch tip is the run's accepted final candidate;
-6. the target branch contains that tip (ancestry, not message or patch
-   matching). With `--merge`, the engine first merges into the target —
-   fast-forward, or a merge commit if the project allows it — from a clean
-   target worktree; it never rebases or rewrites either branch;
-7. when the repository has a remote, the commit the target now points at is
-   reachable on it. With `--push`, the engine pushes the target first,
-   under the existing push rules; it never force-pushes;
-8. no other worktree has the branch checked out.
+1. an engine-created record whose `created` event proves the branch and
+   worktree are the run's;
+2. the plan run is `complete` with every stage accepted at the final
+   candidate, nothing in `awaiting`, and no evidence pending review;
+3. no runner holds the worktree lock;
+4. the registered worktree has the record's branch checked out and is
+   clean (no modified, staged or untracked non-ignored files);
+5. HEAD, the branch tip and the final accepted candidate agree;
+6. when the record has a remote, the **candidate** is reachable on it;
+7. no other worktree has the branch checked out;
+8. a checkout that has the target checked out has no staged or modified
+   tracked files and no merge/rebase/cherry-pick/revert/bisect in progress;
+9. the target exists and either contains the candidate, can fast-forward
+   to it, or — only with `--allow-merge-commit` — merges without conflict.
+   Ancestry decides, never message or patch matching; nothing is rebased.
 
-Removal is then `git worktree remove` without `--force`, followed by
-deleting the branch with `git branch -d` (never `-D`), and marking the
-record finished. A failure part-way leaves everything that was not yet
-removed in place and says what remains.
+Cleanup additionally requires every ignored file under the project
+directory to be archivable. Execution then: merge; push the target only with
+`--push-target` (never forced; pushing is optional, so target reachability
+is not a check); archive the worktree's project state to
+`<git-common-dir>/agent-sparring/runs/<run-key>/`; `git worktree remove`
+without `--force`; `git branch -d` (never `-D`); record `finished`. Each
+step appends an event, so a run stopped part-way is resumed by running the
+command again, and the report says what remains. Remote branches are never
+deleted; a kept one is reported. `--merge-only` stops after merge and push.
 
 **Never automatic.** Nothing is removed on completion, on a timer or on
 window close. A dirty, paused, unaccepted, unmerged or unpushed worktree is

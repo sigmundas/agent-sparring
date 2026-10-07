@@ -1080,13 +1080,13 @@ def prune_report(repo_root: Path) -> dict[str, Any]:
             if not entry.is_dir() or entry.name.startswith(".") or not managed_run._RUN_KEY_RE.match(entry.name):
                 continue
             record = records.get(entry.name)
-            state = "finished" if record is not None and record.lifecycle == "finished" else (
-                "has no record" if record is None else f"is {record.lifecycle}"
-            )
+            if record is not None and record.lifecycle != "finished":
+                continue  # an unfinished finish re-reads its archive on retry: retained
+            state = "is finished" if record is not None else "has no record"
             items.append({
                 "kind": "archive", "run_key": entry.name, "path": str(entry), "reason": "archived",
                 "detail": f"archived project state of run {entry.name}, which {state}; "
-                          "no run reads an archive",
+                          "no unfinished run reads it",
             })
     return {
         "schema_version": PRUNE_SCHEMA_VERSION,

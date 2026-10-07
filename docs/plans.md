@@ -358,7 +358,8 @@ sparring prune --dry-run [--json]
   nothing the engine did not record.
 
 **Finish checks** (each reported with `ok` and a sentence; any failure makes
-the run ineligible): `unmanaged` (no engine-created record that owns a
+the run ineligible to merge, except `unarchived_project_state`, which only
+blocks cleanup — `eligible` reports `merge` and `cleanup` separately): `unmanaged` (no engine-created record that owns a
 branch and worktree), `run_not_complete` (not complete, or a stage not
 accepted at the final candidate), `human_gate_pending`, `runner_live`,
 `worktree_missing`, `branch_mismatch`, `worktree_dirty`,

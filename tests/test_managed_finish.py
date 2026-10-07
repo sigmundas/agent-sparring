@@ -919,6 +919,29 @@ class FinishHardeningTests(_FinishTestCase):
         self.assertEqual((code, report["stopped_at"]), (1, "archive_state"))
         self.assertEqual(report["completed_steps"], ["merge"])
 
+    def test_prune_retains_the_archive_of_an_interrupted_finish(self):
+        record, _ = self._complete()
+        real_append = managed_run.append_event
+
+        def fail_branch_deleted(repo_root, run_key, event, detail=None):
+            if event == "branch_deleted":
+                raise OSError("simulated crash")
+            return real_append(repo_root, run_key, event, detail)
+
+        with mock.patch.object(managed_run, "append_event", side_effect=fail_branch_deleted):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_branch"))
+        self.assertTrue(managed_finish.archive_dir(self.repo, record.run_key).is_dir())
+        items = managed_finish.prune_report(self.repo)["items"]
+        self.assertEqual([(i["kind"], i["reason"]) for i in items], [("record", "worktree_missing")])
+
+        code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (0, None))
+        items = managed_finish.prune_report(self.repo)["items"]
+        self.assertEqual(
+            sorted((i["kind"], i["reason"]) for i in items), [("archive", "archived"), ("record", "finished")]
+        )
+
     # -- F2/F3: the target checkout immediately before the merge -------------------
 
     def test_target_switched_branch_before_merge_refuses(self):
