@@ -51,8 +51,9 @@ class ProjectConfig:
     # not opt in -- every migration command then refuses with a clear
     # "not configured" message rather than guessing a default.
     migrations: "MigrationsConfig | None" = None
-    # ``[finish] delete_remote_branch``: whether ``finish-run`` may delete a
-    # managed run's remote branch once the remote target contains it.
+    # ``[finish] delete_remote_branch``: parsed for compatibility but never
+    # honoured -- ``finish-run`` always keeps the remote branch and reports
+    # ``remote_delete_unavailable`` (see ``managed_finish.REMOTE_DELETE_UNAVAILABLE``).
     finish_delete_remote_branch: bool = False
 
     def command(self, name: str) -> str | None:

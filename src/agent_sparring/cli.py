@@ -2355,6 +2355,8 @@ def _cmd_finish_run(args: argparse.Namespace) -> int:
             print(f"  would: {action}")
         for path in finish["deleted_ignored_paths"]:
             print(f"  would delete ignored: {path}")
+        for kept in finish["kept"]:
+            print(f"  kept ({kept['code']}): {kept['detail']}")
     return 0 if finish["eligible"]["merge"] else 3
 
 
@@ -2386,6 +2388,10 @@ def _execute_finish_run(args: argparse.Namespace) -> int:
                 print("  remaining: " + ", ".join(report["remaining"]))
         else:
             print(report["reason"] or f"run {args.run_key} is finished")
+        for path in report["deleted_ignored_paths"]:
+            print(f"  deleted ignored: {path}")
+        for kept in report["kept"]:
+            print(f"  kept ({kept['code']}): {kept['detail']}")
     if report["stopped_at"] is None:
         return 0
     return 3 if report["stopped_at"] == "checks" else 1

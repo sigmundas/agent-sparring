@@ -562,7 +562,7 @@ class FinishExecutionTests(_FinishTestCase):
         self.assertEqual(code, 1)
         self.assertEqual(report["stopped_at"], "remove_worktree")
         self.assertEqual(report["completed_steps"], ["merge", "archive_state"])
-        self.assertEqual(report["remaining"], ["remove_worktree", "delete_branch", "delete_remote_branch", "finished"])
+        self.assertEqual(report["remaining"], ["remove_worktree", "delete_branch", "finished"])
         self.assertTrue(managed_run.record_path(self.repo, record.run_key).is_file())
         self.assertEqual(_git(self.repo, "rev-parse", record.branch), head)
         self.assertTrue(Path(record.worktree_path).is_dir())
@@ -587,7 +587,7 @@ class FinishExecutionTests(_FinishTestCase):
             code, report, _ = self._finish(record)
         self.assertEqual(code, 1)
         self.assertEqual(report["stopped_at"], "delete_branch")
-        self.assertEqual(report["remaining"], ["delete_branch", "delete_remote_branch", "finished"])
+        self.assertEqual(report["remaining"], ["delete_branch", "finished"])
         self.assertFalse(Path(record.worktree_path).exists())
         self.assertEqual(_git(self.repo, "rev-parse", record.branch), head)
         code, report, err = self._finish(record)
@@ -607,25 +607,22 @@ class FinishExecutionTests(_FinishTestCase):
         self.assertEqual(managed_run.record_path(self.repo, record.run_key).read_bytes(), record_bytes)
         self.assertEqual(_git(self.repo, "for-each-ref"), refs)
 
-    def test_remote_branch_deleted_only_under_policy_and_containment(self):
+    def test_remote_branch_is_always_kept_even_under_policy(self):
         record, _ = self._complete()
         head = self._set_policy(record, True)
-        # Policy on, but the remote target does not contain the candidate: kept.
-        code, report, err = self._finish(record)
-        self.assertEqual(code, 0, err)
-        self.assertNotIn("delete_remote_branch", report["completed_steps"])
-        self.assertIn(record.branch, _git(self.repo, "ls-remote", "origin"))
-        self.assertNotIn("remote_branch_deleted", self._events(record))
-        self._assert_cleaned(record, head)
-
-    def test_remote_branch_deleted_with_policy_and_pushed_target(self):
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
+        finish = self._status(record)["finish"]
+        (kept,) = finish["kept"]
+        self.assertEqual((kept["action"], kept["code"]), ("keep_remote_branch", "remote_delete_unavailable"))
+        self.assertIn("atomic remote deletion is not available", kept["detail"])
+        self.assertIn("delete_remote_branch = true is not honoured", kept["detail"])
+        # Even with the remote target containing the candidate, nothing deletes it.
         code, report, err = self._finish(record, "--push-target")
         self.assertEqual(code, 0, err)
-        self.assertIn("delete_remote_branch", report["completed_steps"])
-        self.assertNotIn(record.branch, _git(self.repo, "ls-remote", "origin"))
-        self.assertIn("remote_branch_deleted", self._events(record))
+        self.assertNotIn("delete_remote_branch", report["completed_steps"] + report["remaining"])
+        self.assertEqual([k["code"] for k in report["kept"]], ["remote_delete_unavailable"])
+        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
+        self.assertNotIn("remote_branch_deleted", self._events(record))
+        self._assert_cleaned(record, head)
 
     def test_remote_branch_kept_without_policy(self):
         record, _ = self._complete()
@@ -634,6 +631,26 @@ class FinishExecutionTests(_FinishTestCase):
         self.assertEqual(code, 0, err)
         self.assertNotIn("delete_remote_branch", report["completed_steps"])
         self.assertIn(record.branch, _git(self.repo, "ls-remote", "origin"))
+        (kept,) = report["kept"]
+        self.assertEqual(kept["code"], "remote_delete_unavailable")
+        self.assertNotIn("not honoured", kept["detail"])
+
+    def test_no_remote_push_deletes_a_branch(self):
+        record, _ = self._complete()
+        self._set_policy(record, True)
+        real_git = managed_run._git
+        pushes = []
+
+        def recording(cwd, *args):
+            if "push" in args:
+                pushes.append(args)
+            return real_git(cwd, *args)
+
+        with mock.patch.object(managed_run, "_git", side_effect=recording):
+            code, _, err = self._finish(record, "--push-target")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(pushes)
+        self.assertFalse([p for p in pushes if any(arg.startswith(":") for arg in p)], pushes)
 
 
 class FinishConfigTests(unittest.TestCase):
@@ -729,13 +746,6 @@ class FinishRecoveryTests(_FinishTestCase):
 
     def test_recovery_rechecks_target_containment(self):
         record, head = self._complete()
-        real_git = managed_run._git
-
-        def failing_remote_delete(cwd, *args):
-            if args[:1] == ("push",) and args[-1].startswith(":"):
-                return subprocess.CompletedProcess(args, 1, "", "simulated")
-            return real_git(cwd, *args)
-
         # Get past local branch deletion, then stop before finished.
         real_append = managed_run.append_event
 
@@ -746,7 +756,7 @@ class FinishRecoveryTests(_FinishTestCase):
 
         with mock.patch.object(managed_run, "append_event", side_effect=fail_finished):
             code, report, _ = self._finish(record)
-        # The remote branch is kept (no policy), so the failure is at finished.
+        # The remote branch is always kept, so the failure is at finished.
         self.assertEqual((code, report["stopped_at"]), (1, "finished"))
         self.assertEqual(report["remaining"], ["finished"])
         # The target is moved back behind the candidate.
@@ -757,3 +767,275 @@ class FinishRecoveryTests(_FinishTestCase):
             self.assertEqual((code, report["stopped_at"]), (1, "merge"), flags)
             self.assertIn("no longer contains", report["reason"])
         self.assertNotIn("finished", self._events(record))
+
+
+class FinishHardeningTests(_FinishTestCase):
+    """Project-state archival, target races, in-progress operations, the
+    finished report and the record re-read under the lock."""
+
+    _finish = FinishExecutionTests._finish
+    _events = FinishExecutionTests._events
+    _assert_cleaned = FinishExecutionTests._assert_cleaned
+
+    def _extra_state(self, record):
+        """A reset stage's archived attempt, an unreadable stage and a loose file."""
+
+        stages = record.sparring_dir / "stages"
+        attempt = stages / ".archive" / "old-stage" / "attempt-1"
+        attempt.mkdir(parents=True)
+        (attempt / "state.json").write_text('{"previous": true}\n', encoding="utf-8")
+        broken = stages / "broken-stage"
+        broken.mkdir()
+        (broken / "state.json").write_text("{not json", encoding="utf-8")
+        (record.sparring_dir / "plans" / "notes.log").write_text("loose\n", encoding="utf-8")
+        return {
+            "stages/.archive/old-stage/attempt-1/state.json": '{"previous": true}\n',
+            "stages/broken-stage/state.json": "{not json",
+            "plans/notes.log": "loose\n",
+        }
+
+    def _after_checks(self, action):
+        """Run ``action`` between the eligibility checks and the first write."""
+
+        real = managed_finish.finish_status
+
+        def wrapper(*args, **kwargs):
+            status = real(*args, **kwargs)
+            if kwargs.get("lock_held"):
+                action()
+            return status
+
+        return mock.patch.object(managed_finish, "finish_status", side_effect=wrapper)
+
+    def _ignore_build(self, record):
+        worktree = Path(record.worktree_path)
+        (worktree / "build").mkdir()
+        (worktree / "build" / "out.bin").write_text("x", encoding="utf-8")
+        exclude = self.repo / ".git" / "info" / "exclude"
+        exclude.write_text(exclude.read_text(encoding="utf-8") + "build/\n", encoding="utf-8")
+
+    # -- F1: nothing under the project dir is deleted unarchived -------------------
+
+    def test_reset_attempts_and_unreadable_stages_are_archived(self):
+        record, head = self._complete()
+        extra = self._extra_state(record)
+        self.assertTrue(self._status(record)["finish"]["eligible"]["cleanup"])
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self._assert_cleaned(record, head)
+        archive = managed_finish.archive_dir(self.repo, record.run_key)
+        for rel, content in extra.items():
+            self.assertEqual((archive / rel).read_text(encoding="utf-8"), content, rel)
+        self.assertFalse([p for p in report["deleted_ignored_paths"] if p.startswith(".sparring")])
+
+    def test_unarchivable_entry_refuses_cleanup_with_nothing_removed(self):
+        record, _ = self._complete()
+        self._extra_state(record)
+        secret = record.sparring_dir / "stages" / ".archive" / "old-stage" / "attempt-1" / "state.json"
+        secret.chmod(0)
+        self.addCleanup(secret.chmod, 0o644)
+        failed, finish = self._failed(record)
+        self.assertEqual(failed, {"unarchived_project_state"})
+        self.assertEqual(finish["eligible"], {"merge": True, "cleanup": False})
+        self.assertIn("stages/.archive/old-stage/attempt-1/state.json", next(
+            c["detail"] for c in finish["checks"] if c["code"] == "unarchived_project_state"
+        ))
+        before = self._refs_and_files(record)
+        code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (3, "checks"))
+        self.assertIn("unarchived_project_state", report["reason"])
+        self.assertEqual(self._refs_and_files(record), before)
+        self.assertTrue(secret.exists())
+        self.assertFalse(managed_finish.archive_dir(self.repo, record.run_key).exists())
+
+    def test_entry_becoming_unarchivable_after_the_checks_refuses_at_archive(self):
+        record, head = self._complete()
+        self._extra_state(record)
+        secret = record.sparring_dir / "stages" / "broken-stage" / "state.json"
+        self.addCleanup(secret.chmod, 0o644)
+        with self._after_checks(lambda: secret.chmod(0)):
+            code, report, _ = self._finish(record)
+        self.assertEqual(code, 1)
+        self.assertEqual((report["stopped_at"], report["completed_steps"]), ("archive_state", ["merge"]))
+        self.assertIn("unarchived_project_state", report["reason"])
+        self.assertTrue(secret.exists())
+        self.assertTrue(Path(record.worktree_path).is_dir())
+        self.assertEqual(_git(self.repo, "rev-parse", record.branch), head)
+        self.assertNotIn("state_archived", self._events(record))
+
+    def test_file_written_after_archiving_blocks_removal(self):
+        record, _ = self._complete()
+        real = managed_finish._archive_state
+
+        def archive_then_write(repo_root, rec):
+            result = real(repo_root, rec)
+            (rec.sparring_dir / "plans" / "late.log").write_text("late\n", encoding="utf-8")
+            return result
+
+        with mock.patch.object(managed_finish, "_archive_state", side_effect=archive_then_write):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "remove_worktree"))
+        self.assertIn("plans/late.log", report["reason"])
+        self.assertTrue((record.sparring_dir / "plans" / "late.log").exists())
+
+    def test_deleted_ignored_paths_in_dry_run_and_execution(self):
+        record, _ = self._complete()
+        self._ignore_build(record)
+        finish = self._status(record)["finish"]
+        self.assertEqual(finish["deleted_ignored_paths"], ["build"])
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["deleted_ignored_paths"], ["build"])
+
+    def test_ignored_ancestor_of_the_project_dir_lists_only_outside_paths(self):
+        record, _ = self._complete()
+        fake = type("R", (), {"worktree_path": record.worktree_path, "project_dir": "outer/.sparring"})()
+        outer = Path(record.worktree_path) / "outer"
+        (outer / ".sparring").mkdir(parents=True)
+        (outer / ".sparring" / "state.json").write_text("{}", encoding="utf-8")
+        (outer / "cache.bin").write_text("x", encoding="utf-8")
+        exclude = self.repo / ".git" / "info" / "exclude"
+        exclude.write_text(exclude.read_text(encoding="utf-8") + "outer/\n", encoding="utf-8")
+        self.assertIn("outer/cache.bin", managed_finish._deleted_ignored(fake))
+        self.assertNotIn("outer/.sparring/state.json", managed_finish._deleted_ignored(fake))
+
+    # -- F5: archive failure is not completed ------------------------------------
+
+    def test_unreadable_archive_on_rerun_is_not_reported_completed(self):
+        record, _ = self._complete()
+        real_append = managed_run.append_event
+
+        def fail_branch_deleted(repo_root, run_key, event, detail=None):
+            if event == "branch_deleted":
+                raise OSError("simulated crash")
+            return real_append(repo_root, run_key, event, detail)
+
+        with mock.patch.object(managed_run, "append_event", side_effect=fail_branch_deleted):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_branch"))
+        archived = managed_finish.archive_dir(self.repo, record.run_key) / "plans" / f"{record.run_key}.json"
+        archived.write_text("{broken", encoding="utf-8")
+        code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "archive_state"))
+        self.assertEqual(report["completed_steps"], ["merge"])
+
+    # -- F2/F3: the target checkout immediately before the merge -------------------
+
+    def test_target_switched_branch_before_merge_refuses(self):
+        record, _ = self._complete()
+        main = _git(self.repo, "rev-parse", "main")
+        with self._after_checks(lambda: _run_git(self.repo, "checkout", "-q", "feature/x")):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"], report["completed_steps"]), (1, "merge", []))
+        self.assertIn("target_moved", report["reason"])
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), main)
+        self.assertNotIn("merged", self._events(record))
+
+    def test_target_switched_to_another_branch_in_same_checkout_refuses(self):
+        record, _ = self._complete()
+        main = _git(self.repo, "rev-parse", "main")
+        other = self.repo.parent / "main-elsewhere"
+        refs_before = _git(self.repo, "for-each-ref")
+
+        def move():
+            _run_git(self.repo, "checkout", "-q", "feature/x")
+            _run_git(self.repo, "worktree", "add", "-q", str(other), "main")
+
+        with self._after_checks(move):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "merge"))
+        self.assertIn("target_moved", report["reason"])
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), main)
+        self.assertEqual(_git(self.repo, "for-each-ref"), refs_before)
+
+    def test_target_head_moved_before_merge_refuses(self):
+        record, _ = self._complete()
+
+        def commit():
+            (self.repo / "late.txt").write_text("late\n", encoding="utf-8")
+            _run_git(self.repo, "add", "late.txt")
+            _run_git(self.repo, "commit", "-q", "-m", "late")
+
+        with self._after_checks(commit):
+            code, report, _ = self._finish(record)
+        moved = _git(self.repo, "rev-parse", "main")
+        self.assertEqual((code, report["stopped_at"]), (1, "merge"))
+        self.assertIn("target_moved", report["reason"])
+        self.assertEqual(_git(self.repo, "log", "-1", "--format=%s", moved), "late")
+        self.assertNotIn("merged", self._events(record))
+
+    def _git_path(self, name):
+        return Path(_git(self.repo, "rev-parse", "--path-format=absolute", "--git-path", name))
+
+    def test_user_merge_in_progress_refuses_and_is_left_intact(self):
+        record, _ = self._complete()
+        _run_git(self.repo, "checkout", "-q", "-b", "side", "main")
+        (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
+        _run_git(self.repo, "add", "side.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "side")
+        _run_git(self.repo, "checkout", "-q", "main")
+        _run_git(self.repo, "merge", "-q", "--no-ff", "--no-commit", "side")
+        merge_head = self._git_path("MERGE_HEAD").read_text(encoding="utf-8")
+        failed, _ = self._failed(record)
+        self.assertIn("target_operation_in_progress", failed)
+        code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (3, "checks"))
+        self.assertIn("target_operation_in_progress", report["reason"])
+        self.assertEqual(self._git_path("MERGE_HEAD").read_text(encoding="utf-8"), merge_head)
+        self.assertTrue((self.repo / "side.txt").exists())
+
+    def test_operation_started_after_the_checks_is_never_aborted(self):
+        for name, content in (("MERGE_HEAD", None), ("rebase-merge", "dir")):
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                record, _ = self._complete()
+                path = self._git_path(name)
+                main = _git(self.repo, "rev-parse", "main")
+
+                def start():
+                    if content == "dir":
+                        path.mkdir()
+                        (path / "head-name").write_text("refs/heads/main\n", encoding="utf-8")
+                    else:
+                        path.write_text(main + "\n", encoding="utf-8")
+
+                with self._after_checks(start):
+                    code, report, _ = self._finish(record)
+                self.assertEqual((code, report["stopped_at"]), (1, "merge"))
+                self.assertIn("target_operation_in_progress", report["reason"])
+                self.assertTrue(path.exists())
+                self.assertEqual(_git(self.repo, "rev-parse", "main"), main)
+                self.assertNotIn("merged", self._events(record))
+
+    # -- F6/F7: reporting and the record under the lock ----------------------------
+
+    def test_rerun_after_finished_reports_only_recorded_events(self):
+        record, _ = self._complete()
+        self.assertEqual(self._finish(record)[0], 0)
+        code, report, err = self._finish(record, "--push-target")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            report["completed_steps"], ["merge", "archive_state", "remove_worktree", "delete_branch", "finished"]
+        )
+        self.assertEqual(report["remaining"], [])
+        self.assertNotIn("target_pushed", self._events(record))
+
+    def test_record_changed_before_the_lock_is_re_read(self):
+        record, _ = self._complete()
+        real_lock = managed_finish.worktree_lock
+        path = managed_run.record_path(self.repo, record.run_key)
+
+        def edit_then_lock(worktree):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["created_by"] = "person"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            return real_lock(worktree)
+
+        main = _git(self.repo, "rev-parse", "main")
+        with mock.patch.object(managed_finish, "worktree_lock", side_effect=edit_then_lock):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (3, "checks"))
+        self.assertIn("unmanaged", report["reason"])
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), main)
+        self.assertTrue(Path(record.worktree_path).is_dir())
