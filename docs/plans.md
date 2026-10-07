@@ -8,7 +8,8 @@ without you launching each one:
 
 ```text
 reviewed plan
-    -> sparring run-plan docs/plans/foo.md --repo-root . --expected-branch feature/x
+    -> sparring start-plan docs/plans/foo.md --repo-root . --expected-branch feature/x
+    -> review the summary, then run its confirmation command
     -> Stage 1: run-loop … READY -> freeze -> accept
     -> Stage 2: fresh sessions … READY -> freeze -> accept
     -> Stage 3: … NEEDS_YOU -> plan pauses, prints the checks it needs
