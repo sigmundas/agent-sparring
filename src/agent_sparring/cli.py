@@ -2332,6 +2332,25 @@ def _cmd_runs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_prune(args: argparse.Namespace) -> int:
+    try:
+        repo_root = Path(args.repo_root) if args.repo_root else Path(".")
+        payload = managed_finish.prune_report(repo_root)
+    except ManagedRunError as exc:
+        print(f"could not report prunable state: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        json.dump(payload, sys.stdout, indent=2)
+        print()
+        return 0
+    if not payload["items"]:
+        print("nothing believed unused")
+    for item in payload["items"]:
+        print(f"{item['kind']} {item['run_key']} ({item['reason']}): {item['path']}")
+        print(f"  {item['detail']}")
+    return 0
+
+
 def _cmd_finish_run(args: argparse.Namespace) -> int:
     if not args.dry_run:
         return _execute_finish_run(args)
@@ -4101,6 +4120,18 @@ def build_parser() -> argparse.ArgumentParser:
     runs_parser.add_argument("--repo-root", default=None, help=repo_root_help)
     runs_parser.add_argument("--json", action="store_true", help="report as JSON")
     runs_parser.set_defaults(func=_cmd_runs)
+
+    prune_parser = subparsers.add_parser(
+        "prune",
+        help=(
+            "report engine-recorded managed-run state believed unused, with why "
+            "(read-only: --dry-run is required; nothing is deleted)"
+        ),
+    )
+    prune_parser.add_argument("--repo-root", default=None, help=repo_root_help)
+    prune_parser.add_argument("--dry-run", action="store_true", required=True, help="report only (required)")
+    prune_parser.add_argument("--json", action="store_true", help="report as JSON")
+    prune_parser.set_defaults(func=_cmd_prune)
 
     finish_run_parser = subparsers.add_parser(
         "finish-run",

@@ -486,3 +486,71 @@ A consuming project's agent instructions may well tell agents to keep the
 active plan updated with their progress, which is right everywhere except
 inside a managed run — so the restriction travels with the managed prompt
 rather than depending on the project's own wording.
+
+## Managed-run JSON
+
+Every payload carries `schema_version` (currently `1`); a client refuses a
+version it does not know. Behavior: [plans.md](plans.md#managed-runs).
+
+**Record** — `<git-common-dir>/agent-sparring/worktrees/<run-key>.json`.
+Fields other than `events` never change; lifecycle is derived from the
+append-only events (`created`, `merged` `{mode, target_sha}`,
+`target_pushed`, `state_archived`, `worktree_removed`, `branch_deleted`,
+`finished`; no `created` event means `creating`).
+
+```json
+{"schema_version": 1, "run_key": "…", "plan_label": "docs/plans/foo.md",
+ "input": {"kind": "markdown | manifest", "path": "/abs/path"},
+ "worktree_path": "/abs/<repo>-sparring-<run-key>", "branch": "sparring/<slug>-<hex>",
+ "target_branch": "main", "base_sha": "<40 hex>", "remote": "origin | null",
+ "created_at": "<UTC ISO-8601>", "created_by": "engine",
+ "events": [{"at": "…", "event": "created", "detail": {}}]}
+```
+
+**`runs --json`** — `{"schema_version", "runs": [run]}`, each run:
+`run_key`, `plan_label`, `managed: true`, `worktree_path`,
+`worktree_exists`, `branch`, `target_branch`, `base_sha`, `created_at`,
+`lifecycle` (`creating | creation_failed | created | merged |
+worktree_removed | finished`), `run_status` (the run state's status, or
+`missing` / `unreadable`), and the `git` and `finish` objects below.
+
+**`git`** — `head`, `branch_tip`, `clean`, `final_candidate`,
+`candidate_pushed`, `target_tip`, `target_contains_candidate`,
+`target_checked_out_at`; each `null` when it could not be determined.
+
+**`finish-run --dry-run --json`** (the `finish` object):
+
+```json
+{"schema_version": 1, "run_key": "…", "managed": true,
+ "eligible": {"merge": true, "cleanup": true},
+ "merge_mode": "already_merged | fast_forward | merge_commit | null",
+ "actions": ["…"], "checks": [{"code": "…", "ok": true, "detail": "…"}],
+ "deleted_ignored_paths": ["…"],
+ "kept": [{"action": "keep_remote_branch", "code": "remote_delete_unavailable", "detail": "…"}],
+ "summary": "…"}
+```
+
+**`finish-run --json`** (execution):
+
+```json
+{"schema_version": 1, "run_key": "…",
+ "completed_steps": ["merge", "push_target", "archive_state", "remove_worktree", "delete_branch", "finished"],
+ "stopped_at": "checks | <step> | null", "reason": "… | null",
+ "remaining": ["…"], "deleted_ignored_paths": ["…"], "kept": [{"action": "…", "code": "…", "detail": "…"}]}
+```
+
+Exit codes: `0` done (or eligible, for a dry run), `3` refused by its
+checks, `1` a step or the command failed.
+
+**`prune --dry-run --json`** — read-only; nothing is deleted:
+
+```json
+{"schema_version": 1, "dry_run": true,
+ "items": [{"kind": "record | archive", "run_key": "…", "path": "/abs/…",
+            "reason": "finished | worktree_missing | archived", "detail": "…"}],
+ "engine_snapshots": []}
+```
+
+Only engine-recorded state appears. `engine_snapshots` is always empty
+today: no snapshot is recorded, and an unrecorded worktree is never named
+(see `docs/design.md`, "Engine snapshots").

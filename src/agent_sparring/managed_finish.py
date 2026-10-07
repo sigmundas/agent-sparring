@@ -1044,3 +1044,53 @@ def _push_target(repo_root: Path, record: ManagedRunRecord, candidate: str) -> M
     if not _events(record, "target_pushed"):
         record = managed_run.append_event(repo_root, record.run_key, "target_pushed", {"remote": record.remote})
     return record
+
+
+# -- prune report (read-only) ----------------------------------------------------
+
+PRUNE_SCHEMA_VERSION = 1
+
+
+def prune_report(repo_root: Path) -> dict[str, Any]:
+    """Managed-run state believed unused, each item with why. Never deletes.
+
+    Only engine-recorded state is reported: records (finished, or whose
+    worktree directory is gone) and finish archives. Nothing is inferred from
+    directory or branch names, so no unrecorded worktree -- an engine snapshot
+    among them -- is ever named here."""
+
+    records = {record.run_key: record for record in managed_run.list_records(repo_root)}
+    items: list[dict[str, Any]] = []
+    for run_key, record in records.items():
+        path = str(managed_run.record_path(repo_root, run_key))
+        if record.lifecycle == "finished":
+            items.append({
+                "kind": "record", "run_key": run_key, "path": path, "reason": "finished",
+                "detail": f"run {run_key} is finished: its worktree and branch were removed",
+            })
+        elif not Path(record.worktree_path).is_dir():
+            items.append({
+                "kind": "record", "run_key": run_key, "path": path, "reason": "worktree_missing",
+                "detail": f"the worktree directory {record.worktree_path} of run {run_key} "
+                          f"({record.lifecycle}) no longer exists",
+            })
+    archives = managed_run.git_common_dir(repo_root) / ARCHIVE_SUBDIR
+    if archives.is_dir():
+        for entry in sorted(archives.iterdir()):
+            if not entry.is_dir() or entry.name.startswith(".") or not managed_run._RUN_KEY_RE.match(entry.name):
+                continue
+            record = records.get(entry.name)
+            state = "finished" if record is not None and record.lifecycle == "finished" else (
+                "has no record" if record is None else f"is {record.lifecycle}"
+            )
+            items.append({
+                "kind": "archive", "run_key": entry.name, "path": str(entry), "reason": "archived",
+                "detail": f"archived project state of run {entry.name}, which {state}; "
+                          "no run reads an archive",
+            })
+    return {
+        "schema_version": PRUNE_SCHEMA_VERSION,
+        "dry_run": True,
+        "items": items,
+        "engine_snapshots": [],
+    }

@@ -317,6 +317,74 @@ commit, so a surface that has been open a while cannot authorize a candidate
 the run has since replaced. The default is no authorization at all, which is
 also what a run recorded before any of this existed loads as.
 
+## Managed runs
+
+A **managed** run gets its own branch and worktree, created, recorded,
+resumed in, merged from and removed by the engine; you never pick a branch
+or clean up a worktree yourself. Runs without `--managed` behave exactly as
+before, and a worktree the engine did not record is never touched.
+
+```sh
+# start: a new worktree and branch from --target-branch (default: the branch
+# checked out here); your checkout is not switched or modified
+sparring start-plan docs/plans/foo.md --managed [--target-branch main]
+sparring run-plan docs/plans/foo.md --repo-root . --managed      # without the confirmation step
+# resume from any checkout of the repository
+sparring resume-plan --run-key <run-key> [--evidence "..."]
+# list, check, finish
+sparring runs [--json]
+sparring finish-run --run-key <run-key> --dry-run [--json]       # exit 0 eligible, 3 not
+sparring finish-run --run-key <run-key> [--push-target] [--allow-merge-commit] [--merge-only] [--json]
+# what is believed unused (never deletes)
+sparring prune --dry-run [--json]
+```
+
+- The record lives at `<git-common-dir>/agent-sparring/worktrees/<run-key>.json`;
+  it is the only link between a run and its worktree. The worktree is a
+  sibling directory `<repo>-sparring-<run-key>` on branch
+  `sparring/<plan-slug>-<suffix>`. Only Markdown plans and plain manifests
+  run managed, and only in a single repository.
+- `finish-run` re-makes every check, then in order: merges into the target
+  (fast-forward; a merge commit only with `--allow-merge-commit`; never a
+  rebase), pushes the target with `--push-target` (never forced), archives
+  the worktree's `.sparring/` state to `<git-common-dir>/agent-sparring/runs/<run-key>/`,
+  removes the worktree (`git worktree remove`, never `--force`), deletes the
+  local branch (`git branch -d`, never `-D`) and records the run finished.
+  It stops at the first failure, leaving the rest in place and saying what
+  remains; running it again continues. A remote branch is never deleted —
+  it is reported as kept. `--merge-only` stops after the merge (and push).
+- `prune --dry-run` reports finished records, records whose worktree
+  directory is gone and finish archives, each with its reason. It names
+  nothing the engine did not record.
+
+**Finish checks** (each reported with `ok` and a sentence; any failure makes
+the run ineligible): `unmanaged` (no engine-created record that owns a
+branch and worktree), `run_not_complete` (not complete, or a stage not
+accepted at the final candidate), `human_gate_pending`, `runner_live`,
+`worktree_missing`, `branch_mismatch`, `worktree_dirty`,
+`candidate_mismatch` (HEAD, branch tip and accepted candidate differ),
+`candidate_not_pushed`, `branch_in_use`, `target_checkout_dirty`,
+`target_operation_in_progress`, `target_advanced` (target moved past the
+base: needs `--allow-merge-commit`, or the target is missing),
+`merge_conflict`, and `unarchived_project_state` (cleanup only: the run's
+project state cannot be archived; the merge may still go ahead).
+
+**Start and resume refusals** (`could not run plan: …` / `could not resume
+plan: …`, everything left in place): `expected_branch_with_managed`,
+`input_kind_unsupported` (an intake input), `sibling_repositories`,
+`detached_head`, `project_not_committed`, `path_exists` / `branch_exists` /
+`run_key_used` / `record_exists` (a collision is never resolved by reuse),
+`worktree_add_failed`, `creation_failed` / `creation_incomplete`,
+`target_moved`, `input_mismatch` / `input_kind_mismatch` /
+`repository_mismatch` (a resume naming a different input or repository),
+`managed_record_missing` / `managed_record_mismatch` /
+`managed_record_unowned` / `worktree_branch_mismatch` /
+`worktree_unregistered` (run state and record disagree: an integrity
+refusal), and `record_malformed` / `record_unreadable` /
+`record_schema_unknown`. Finish execution steps report `stopped_at` as one
+of `merge`, `push_target`, `archive_state`, `remove_worktree`,
+`delete_branch`. JSON shapes: [reference](reference.md#managed-run-json).
+
 ## Marking stages in a plan — or handing over an execution manifest
 
 There are two ways to tell `run-plan` what the stages are. The Markdown

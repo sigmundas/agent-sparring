@@ -906,21 +906,25 @@ mirror, never an input.
 
 ---
 
-# Run worktrees (design; not implemented)
+# Run worktrees
 
-The intended flow is *pick a plan → run → watch → merge → clean up*, with
-branches and worktrees as implementation details a person never has to
-manage. This section fixes who owns them and the invariants any
-implementation must keep. Nothing here is implemented yet; the first slices
-are listed at the end.
+The flow is *pick a plan → run → watch → merge → clean up*, with branches
+and worktrees as implementation details a person never has to manage. This
+section fixes who owns them and the invariants the implementation keeps.
+**As built** (plan `docs/plans/managed-run-worktrees.md`): `run-plan
+--managed` / `start-plan --managed` create a recorded worktree and branch,
+`resume-plan --run-key` resumes in it from any checkout, `sparring runs`
+lists records, `finish-run [--dry-run]` checks and performs merge and
+cleanup, and `prune --dry-run` reports what is believed unused. User-facing
+behavior and refusal codes are in [plans.md](plans.md#managed-runs); JSON
+shapes in [reference.md](reference.md#managed-run-json).
 
-**Today.** The engine never creates a worktree. People and agents create
-them; the engine only checks that a run is where it was approved — intake
-approval binds a slice to the canonical worktree path and git directory, and
-resume repeats that check — and holds one implementation writer per
-worktree (`concurrency.py`). Nothing records which worktree belongs to which
-run. The VS Code extension finds runs in sibling worktrees by reading `git
-worktree list` (read-only) and shows them; it does not own them either.
+**What remains.** Not built yet: managed runs through the intake route (an
+intake input is refused `--managed`); multi-repository runs (a manifest
+declaring sibling `repositories` is refused); an explicitly confirmed
+*abandon* that keeps the branch; and any deletion mode for `prune`.
+Unmanaged runs — the current checkout, or a worktree a person made —
+behave as before and are never cleanup candidates.
 
 ## Ownership: the engine creates, records and removes
 
@@ -1002,12 +1006,25 @@ branch.
 
 ## Prunable engine state
 
-Engine-owned state that no run still uses — intake directories of
-superseded or finished intakes, stage directories of runs whose worktree
-was removed, manifest bindings for removed worktrees, worktree records whose
-directory is gone, migration history beyond its retention — is **reported**
-by a read-only `sparring prune --dry-run --json`, each item with why it is
-believed unused. Deleting any of it is a later, separate decision.
+Engine-owned state that no run still uses is **reported** by a read-only
+`sparring prune --dry-run --json`, each item with why it is believed unused.
+As built it reports, from the records alone: finished records, records whose
+worktree directory is gone, and finish archives under
+`<git-common-dir>/agent-sparring/runs/`. Intake directories, stale stage
+directories, manifest bindings and migration-history retention are not yet
+reported. Deleting any of it is a later, separate decision; there is no
+deletion mode.
+
+### Engine snapshots
+
+Nothing in the engine or the extension creates `agent-sparring-engine-<sha>`
+worktrees today, so none are tracked and `prune` never names one — it never
+infers ownership from a directory or branch name, so an unrecorded snapshot
+is invisible to it by design (`engine_snapshots` is always empty). If an
+engine run ever executes from a snapshot, the design is: the run state
+records `engine: {commit, path}`; a snapshot is retained while any
+non-finished run references it, and is reported prunable (reason: no
+non-finished run references it) otherwise.
 
 ## Clients
 
@@ -1019,13 +1036,16 @@ decides eligibility, and keeps branch and worktree details under
 diagnostics. Opening a managed worktree in a window is offered, never
 required.
 
-## First slices
+## Slices as built
 
-1. The worktree record format and `start-plan` isolation for
-   single-repository runs (creation only).
-2. `finish-run --dry-run --json`: every check above, read-only.
-3. `finish-run` execution: merge, push and removal under those checks.
-4. `prune --dry-run --json`.
+1. The worktree record format, creation and resume for single-repository
+   runs.
+2. `finish-run --dry-run --json` and `runs --json`: every check above,
+   read-only, from one function so they cannot disagree.
+3. `finish-run` execution: merge, optional target push, state archive,
+   worktree and branch removal under those checks. Remote branches are
+   never deleted; a kept one is reported.
+4. `prune --dry-run --json` and an end-to-end test.
 
 ---
 
