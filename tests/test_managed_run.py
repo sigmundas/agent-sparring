@@ -290,6 +290,58 @@ class ManagedRunTests(_PlanRepoTestCase):
         self.assertEqual(code, 1)
         self.assertIn("'codex-cli'", json.loads(out)["error"])
 
+    def test_resume_refuses_a_project_dir_escaping_the_worktree_by_symlink(self):
+        import shutil
+
+        with mock.patch("agent_sparring.cli._run_in_record", return_value=1):
+            self._start_managed()
+        (record,) = self._records()
+        outside = self.repo.parent / "outside"
+        outside.mkdir()
+        project = Path(record.worktree_path) / ".sparring"
+        shutil.rmtree(project)
+        project.symlink_to(outside)
+        adapters = (_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU]))
+        with mock.patch("agent_sparring.cli._run_plan_command") as run:
+            code, _, err = self._main("resume-plan", "--run-key", record.run_key, adapters=adapters)
+        self.assertEqual(code, 1)
+        self.assertIn("project_dir_outside_worktree", err)
+        run.assert_not_called()
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def _preview(self):
+        code, out, err = self._main(
+            "start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed", "--json"
+        )
+        return code, json.loads(out), err
+
+    def test_managed_preview_ignores_a_malformed_dirty_checkout_configuration(self):
+        code, clean, err = self._preview()
+        self.assertEqual(code, 0, err)
+        (self.sparring_dir / "project.toml").write_text("this is [not toml\n", encoding="utf-8")
+        code, payload, err = self._preview()
+        self.assertEqual(code, 0, payload.get("error"))
+        self.assertEqual(payload["confirm_token"], clean["confirm_token"])
+
+    def test_managed_preview_ignores_an_uncommitted_project_name_change(self):
+        code, clean, err = self._preview()
+        self.assertEqual(code, 0, err)
+        (self.sparring_dir / "project.toml").write_text('project = "renamed"\n', encoding="utf-8")
+        code, payload, err = self._preview()
+        self.assertEqual(code, 0, payload.get("error"))
+        self.assertEqual(payload["confirm_token"], clean["confirm_token"])
+        code, _, err = self._main(
+            "start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed",
+            "--confirm", clean["confirm_token"],
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self._records()), 1)
+        # Committed, the name is bound.
+        _run_git(self.repo, "commit", "-q", "-am", "rename")
+        code, payload, err = self._preview()
+        self.assertEqual(code, 0, payload.get("error"))
+        self.assertNotEqual(payload["confirm_token"], clean["confirm_token"])
+
 
 class RecordTests(_PlanRepoTestCase):
     def _record(self, **overrides) -> ManagedRunRecord:

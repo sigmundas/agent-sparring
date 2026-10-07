@@ -2263,7 +2263,12 @@ def _run_managed_plan(
 
 def _run_in_record(args: argparse.Namespace, record: managed_run.ManagedRunRecord, *, resume: bool) -> int:
     run_args = argparse.Namespace(**vars(args))
-    run_args.sparring_dir = str(record.sparring_dir)
+    try:
+        # Containment is checked here, before anything runs or is written.
+        run_args.sparring_dir = str(record.sparring_dir)
+    except ManagedRunError as exc:
+        print(f"could not {'resume' if resume else 'run'} plan: {exc}", file=sys.stderr)
+        return 1
     run_args.repo_root = record.worktree_path
     run_args.expected_branch = record.branch
     run_args.run_key = record.run_key
@@ -2293,7 +2298,11 @@ def _resume_managed_plan(args: argparse.Namespace, repo_root: Path, record: mana
     except (ManagedRunError, PlanError) as exc:
         print(f"could not resume plan: {exc}", file=sys.stderr)
         return 1
-    started = (record.sparring_dir / "plans" / f"{record.run_key}.json").is_file()
+    try:
+        started = (record.sparring_dir / "plans" / f"{record.run_key}.json").is_file()
+    except ManagedRunError as exc:
+        print(f"could not resume plan: {exc}", file=sys.stderr)
+        return 1
     # An interrupted first start: the worktree exists, the run does not yet.
     return _run_in_record(args, record, resume=started)
 
@@ -2713,10 +2722,11 @@ def _start_execution(args: argparse.Namespace) -> dict:
     }
 
 
-def _committed_agents(args: argparse.Namespace, repo_root: Path, sparring_dir: Path) -> EffectiveAgents:
-    """The agents a managed run will actually use: resolved from the
-    project.toml committed at the target's tip -- what the managed worktree
-    is checked out at -- never from the invoking checkout's copy."""
+def _committed_agents(args: argparse.Namespace, repo_root: Path, sparring_dir: Path) -> tuple[EffectiveAgents, str]:
+    """The agents and primary repository name a managed run will actually
+    use: resolved from the project.toml committed at the target's tip --
+    what the managed worktree is checked out at -- never from the invoking
+    checkout's copy (--repository-name still overrides the name)."""
 
     import tempfile
 
@@ -2724,7 +2734,7 @@ def _committed_agents(args: argparse.Namespace, repo_root: Path, sparring_dir: P
     _, config = managed_run.committed_project(repo_root, sparring_dir, target, base_sha)
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / CONFIG_FILENAME).write_bytes(config)
-        return _resolve_agents(args, Path(tmp))
+        return _resolve_agents(args, Path(tmp)), _project_repository_name(args, Path(tmp), repo_root)
 
 
 def _cmd_start_plan(args: argparse.Namespace) -> int:
@@ -2762,14 +2772,15 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
             name: Path(path) for name, path in _pairs(args.context_repository, "--context-repository").items()
         }
         answers = _pairs(args.answer, "--answer")
-        effective = (
-            _committed_agents(args, repo_root, sparring_dir) if args.managed else _resolve_agents(args, sparring_dir)
-        )
+        if args.managed:
+            effective, primary = _committed_agents(args, repo_root, sparring_dir)
+        else:
+            effective = _resolve_agents(args, sparring_dir)
+            primary = _project_repository_name(args, sparring_dir, repo_root)
         models = {
             resolved.role: {"provider": resolved.provider, "model": resolved.model, "effort": resolved.effort}
             for resolved in (effective.stage, effective.sparring)
         }
-        primary = _project_repository_name(args, sparring_dir, repo_root)
         request = StartRequest(
             plan_path=Path(args.plan_path),
             repo_root=repo_root,
