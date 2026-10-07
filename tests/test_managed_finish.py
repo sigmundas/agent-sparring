@@ -746,7 +746,9 @@ class FinishRecoveryTests(_FinishTestCase):
 
         with mock.patch.object(managed_run, "append_event", side_effect=fail_finished):
             code, report, _ = self._finish(record)
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
+        # The remote branch is kept (no policy), so the failure is at finished.
+        self.assertEqual((code, report["stopped_at"]), (1, "finished"))
+        self.assertEqual(report["remaining"], ["finished"])
         # The target is moved back behind the candidate.
         _run_git(self.repo, "update-ref", "refs/heads/main", record.base_sha)
         _run_git(self.repo, "reset", "-q", "--hard", record.base_sha)

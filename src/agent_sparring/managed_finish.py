@@ -760,21 +760,24 @@ def _finish_locked(
     completed.append("delete_branch")
 
     # 7. delete remote branch -- policy and containment, otherwise kept
-    if record.remote and not _events(record, "remote_branch_deleted"):
-        allowed, _ = _delete_remote_policy(repo_root, record, candidate)
-        if allowed and _remote_branch_deletable(repo_root, record, candidate):
-            result = managed_run._git(repo_root, "push", record.remote, f":refs/heads/{record.branch}")
-            if result.returncode != 0:
-                raise _StepFailed("delete_remote_branch", f"the remote branch could not be deleted: {result.stderr.strip()}")
-            record = managed_run.append_event(repo_root, run_key, "remote_branch_deleted", {"remote": record.remote})
-            completed.append("delete_remote_branch")
-    elif _events(record, "remote_branch_deleted"):
+    if _events(record, "remote_branch_deleted"):
         completed.append("delete_remote_branch")
+    elif record.remote and _delete_remote_policy(repo_root, record, candidate)[0] and _remote_branch_deletable(
+        repo_root, record, candidate
+    ):
+        result = managed_run._git(repo_root, "push", record.remote, f":refs/heads/{record.branch}")
+        if result.returncode != 0:
+            raise _StepFailed("delete_remote_branch", f"the remote branch could not be deleted: {result.stderr.strip()}")
+        record = managed_run.append_event(repo_root, run_key, "remote_branch_deleted", {"remote": record.remote})
+        completed.append("delete_remote_branch")
+    else:
+        # Kept by policy or containment: intentionally skipped, so it is
+        # neither where a later failure stopped nor something remaining.
+        planned.remove("delete_remote_branch")
 
     # 8. finished
     managed_run.append_event(repo_root, run_key, "finished")
     completed.append("finished")
-    planned = [step for step in planned if step in completed]  # a kept remote branch is not "remaining"
     return _report(run_key, completed, None, None, planned), None
 
 
