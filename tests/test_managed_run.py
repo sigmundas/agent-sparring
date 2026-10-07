@@ -116,12 +116,12 @@ class ManagedRunTests(_ManagedRepoTestCase):
 
     def test_colliding_branch_or_path_refuses_and_creates_nothing(self):
         key = "plan-abc-1234abcd"
-        _run_git(self.repo, "branch", "sparring/plan-1234abcd")
+        _run_git(self.repo, "branch", "sparring/plan-abc-1234abcd")
         code, _, err = self._start_managed("--run-key", key)
         self.assertEqual(code, 1)
         self.assertIn("branch_exists", err)
         self.assertEqual(self._records(), ())
-        _run_git(self.repo, "branch", "-d", "sparring/plan-1234abcd")
+        _run_git(self.repo, "branch", "-d", "sparring/plan-abc-1234abcd")
         path = self.repo.parent / f"repo-sparring-{key}"
         path.mkdir()
         code, _, err = self._start_managed("--run-key", key)
@@ -345,6 +345,181 @@ class ManagedRunTests(_ManagedRepoTestCase):
         self.assertNotEqual(payload["confirm_token"], clean["confirm_token"])
 
 
+class _Crash(BaseException):
+    """A simulated process death: not caught by any engine handler."""
+
+
+class CreationLifecycleTests(_ManagedRepoTestCase):
+    KEY = "plan-abc-1234abcd"
+
+    def _crash_on(self, target: str, should_crash, key=KEY):
+        real = getattr(managed_run, target)
+
+        def crashing(*args, **kwargs):
+            if should_crash(*args):
+                raise _Crash(target)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(managed_run, target, crashing), self.assertRaises(_Crash):
+            self._start_managed("--run-key", key)
+        return managed_run.read_record(self.repo, key)
+
+    def _crash_before_created(self, key=KEY):
+        """Crash after ``worktree add``, before the ``created`` event."""
+
+        record = self._crash_on("append_event", lambda repo, run_key, event, *rest: event == "created", key)
+        self.assertEqual(record.lifecycle, "creating")
+        self.assertFalse(record.owns_git_state)
+        self.assertTrue(Path(record.worktree_path).is_dir())
+        return record
+
+    def _resume_refused(self, key, code_name):
+        before = managed_run.read_record(self.repo, key)
+        with mock.patch("agent_sparring.cli._run_plan_command") as run:
+            code, _, err = self._main("resume-plan", "--run-key", key)
+        self.assertEqual(code, 1)
+        self.assertIn(code_name, err)
+        run.assert_not_called()
+        self.assertEqual(managed_run.read_record(self.repo, key), before)
+        return err
+
+    def _unmanaged_runs_work(self):
+        _run_git(self.repo, "checkout", "-q", "feature/x")
+        try:
+            code, _, err = self._main(
+                "start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--expected-branch", "feature/x",
+                "--json",
+            )
+            self.assertEqual(code, 0, err)
+            code, _, err = self._main(
+                "run-plan", str(self.plan_path), "--repo-root", str(self.repo), "--expected-branch", "feature/x",
+            )
+            self.assertEqual(code, 0, err)
+        finally:
+            _run_git(self.repo, "checkout", "-q", "main")
+
+    def test_crash_after_record_before_worktree_add(self):
+        record = self._crash_on("_git", lambda cwd, *args: args[:2] == ("worktree", "add"))
+        self.assertEqual(record.lifecycle, "creating")
+        self.assertFalse(managed_run.branch_exists(self.repo, record.branch))
+        self.assertFalse(Path(record.worktree_path).exists())
+        self._resume_refused(self.KEY, "creation_incomplete")
+        code, out, err = self._main("runs", "--repo-root", str(self.repo), "--json")
+        self.assertEqual(code, 0, err)
+        (run,) = json.loads(out)["runs"]
+        self.assertEqual(run["lifecycle"], "creating")
+        self.assertFalse(run["finish"]["managed"])
+        code, _, err = self._start_managed("--run-key", "plan-abc-0000ffff")
+        self.assertEqual(code, 0, err)
+        self._unmanaged_runs_work()
+
+    def test_worktree_add_fails_on_a_preexisting_user_branch(self):
+        real_git = managed_run._git
+
+        def racing_git(cwd, *args):
+            # The user's branch appears between preflight and the add.
+            if args[:3] == ("worktree", "add", "-b"):
+                real_git(cwd, "branch", args[3], "feature/x")
+            return real_git(cwd, *args)
+
+        user_tip = _git(self.repo, "rev-parse", "feature/x")
+        with mock.patch.object(managed_run, "_git", racing_git):
+            code, _, err = self._start_managed("--run-key", self.KEY)
+        self.assertEqual(code, 1)
+        self.assertIn("worktree_add_failed", err)
+        (record,) = self._records()
+        self.assertEqual(record.lifecycle, "creation_failed")
+        self.assertFalse(record.owns_git_state)
+        self.assertEqual(record.events[-1]["detail"]["branch_found"], True)
+        self.assertFalse(record.events[-1]["detail"]["attributed"])
+        self._resume_refused(self.KEY, "creation_failed")
+        self.assertEqual(_git(self.repo, "rev-parse", record.branch), user_tip)
+        self.assertFalse(Path(record.worktree_path).exists())
+        self._unmanaged_runs_work()
+
+    def test_crash_before_created_event_resume_confirms_once(self):
+        record = self._crash_before_created()
+        worktrees = managed_run.worktree_list(self.repo)
+        code, _, err = self._main("resume-plan", "--run-key", self.KEY)
+        self.assertEqual(code, 0, err)
+        code, _, err = self._main("resume-plan", "--run-key", self.KEY, "--evidence", "ok")
+        self.assertEqual(code, 0, err)
+        (after,) = self._records()
+        self.assertEqual([e["event"] for e in after.events], ["created"])
+        self.assertEqual(managed_run.worktree_list(self.repo), worktrees)
+        self.assertEqual(after.worktree_path, record.worktree_path)
+
+    def test_crash_before_created_event_refuses_a_changed_worktree(self):
+        def dirty(worktree):
+            (worktree / "docs" / "plan.md").write_text("changed\n", encoding="utf-8")
+
+        def untracked(worktree):
+            (worktree / "new.txt").write_text("new\n", encoding="utf-8")
+
+        def moved(worktree):
+            untracked(worktree)
+            _run_git(worktree, "add", "new.txt")
+            _run_git(worktree, "commit", "-q", "-m", "moved")
+
+        def reset_back(worktree):
+            moved(worktree)
+            _run_git(worktree, "reset", "-q", "--hard", "HEAD~1")
+
+        for index, change in enumerate((dirty, untracked, moved, reset_back)):
+            with self.subTest(change=change.__name__):
+                key = f"plan-x-{index:08x}"
+                record = self._crash_before_created(key)
+                change(Path(record.worktree_path))
+                self._resume_refused(key, "creation_incomplete")
+                self.assertTrue(Path(record.worktree_path).is_dir())
+                self.assertTrue(managed_run.branch_exists(self.repo, record.branch))
+
+    def test_crash_during_append_event_leaves_no_temp_and_record_unchanged(self):
+        code, _, err = self._start_managed("--run-key", self.KEY)
+        self.assertEqual(code, 0, err)
+        path = managed_run.record_path(self.repo, self.KEY)
+        before = path.read_bytes()
+        for patch in (
+            mock.patch.object(managed_run.os, "replace", side_effect=_Crash("rename")),
+            mock.patch.object(managed_run.json, "dumps", side_effect=_Crash("write")),
+        ):
+            with self.subTest(patch=patch), patch, self.assertRaises(_Crash):
+                managed_run.append_event(self.repo, self.KEY, "merged", {})
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), [path.name])
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_failed_exclusive_create_leaves_no_temp(self):
+        code, _, err = self._start_managed("--run-key", self.KEY)
+        self.assertEqual(code, 0, err)
+        directory = managed_run.records_dir(self.repo)
+        with mock.patch.object(managed_run.os, "link", side_effect=_Crash("link")), self.assertRaises(_Crash):
+            managed_run.create_record(self.repo, ManagedRunRecord(**{**self._records()[0].__dict__, "run_key": "other-1"}))
+        self.assertEqual(sorted(p.name for p in directory.iterdir()), [f"{self.KEY}.json"])
+
+    def test_hidden_and_temp_files_do_not_poison_discovery(self):
+        record = self._crash_before_created()
+        directory = managed_run.records_dir(self.repo)
+        (directory / ".tmp-abc123.json").write_text("{not json", encoding="utf-8")
+        (directory / ".hidden.json").write_text("garbage", encoding="utf-8")
+        (directory / ".DS_Store").write_text("x", encoding="utf-8")
+        code, out, err = self._main("runs", "--repo-root", str(self.repo), "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([r["run_key"] for r in json.loads(out)["runs"]], [self.KEY])
+        code, _, err = self._main("resume-plan", "--run-key", self.KEY)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self._records()[0].lifecycle, "created")
+        self._unmanaged_runs_work()
+        self.assertTrue((directory / ".tmp-abc123.json").exists())
+        self.assertEqual(Path(record.worktree_path).is_dir(), True)
+
+    def test_run_keys_differing_outside_the_former_suffix_get_distinct_branches(self):
+        for key in ("plan-a-1234abcd", "plan-b-1234abcd"):
+            code, _, err = self._start_managed("--run-key", key)
+            self.assertEqual(code, 0, err)
+        branches = {record.branch for record in self._records()}
+        self.assertEqual(len(branches), 2)
+
+
 class RecordTests(_PlanRepoTestCase):
     def _record(self, **overrides) -> ManagedRunRecord:
         fields = dict(
@@ -413,3 +588,14 @@ class RecordTests(_PlanRepoTestCase):
         with self.assertRaises(ManagedRunError) as ctx:
             self._record(worktree_path=str(worktree)).sparring_dir
         self.assertEqual(ctx.exception.code, "project_dir_outside_worktree")
+
+    def test_branch_derives_from_the_whole_run_key(self):
+        self.assertNotEqual(
+            managed_run.managed_branch("plan-a-1234abcd"), managed_run.managed_branch("plan-b-1234abcd")
+        )
+        branches = {managed_run.managed_branch(key) for key in ("a.b-1", "a_2eb-1", "A.b-1", "a.B-1", "x.lock", "a..b")}
+        self.assertEqual(len(branches), 6)
+        for branch in branches:
+            self.assertEqual(
+                subprocess.run(["git", "check-ref-format", f"refs/heads/{branch}"]).returncode, 0, branch
+            )

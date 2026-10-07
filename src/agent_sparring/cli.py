@@ -2294,6 +2294,8 @@ def _resume_managed_plan(args: argparse.Namespace, repo_root: Path, record: mana
             managed_run.check_input_agrees(
                 record, kind=kind, path=given, invoking_top=managed_run.worktree_top(repo_root)
             )
+        # A record without ``created`` owns nothing until proven otherwise.
+        record = managed_run.confirm_creation(repo_root, record)
         managed_run.verify_worktree(repo_root, record)
     except (ManagedRunError, PlanError) as exc:
         print(f"could not resume plan: {exc}", file=sys.stderr)

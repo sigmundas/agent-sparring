@@ -31,6 +31,7 @@ RECORDS_SUBDIR = Path("agent-sparring") / "worktrees"
 INPUT_KINDS = ("markdown", "manifest")
 EVENTS = (
     "created",
+    "creation_failed",
     "merged",
     "target_pushed",
     "state_archived",
@@ -195,10 +196,22 @@ class ManagedRunRecord:
     @property
     def lifecycle(self) -> str:
         names = {event["event"] for event in self.events}
-        for name in ("finished", "worktree_removed", "merged", "created"):
+        for name in ("finished", "worktree_removed", "merged", "created", "creation_failed"):
             if name in names:
                 return name
         return "creating"
+
+    @property
+    def owns_git_state(self) -> bool:
+        """Whether the record's branch and worktree are proven the engine's.
+
+        Only a ``created`` event proves it. A ``creating`` record (interrupted
+        before that event) or a ``creation_failed`` one names a branch and
+        path it never verifiably made: nothing may treat them as this run's
+        -- not resume, finish or cleanup -- until :func:`confirm_creation`
+        has proven the interrupted creation completed."""
+
+        return any(event["event"] == "created" for event in self.events)
 
     @property
     def sparring_dir(self) -> Path:
@@ -344,19 +357,32 @@ def read_record(repo_root: Path, run_key: str) -> ManagedRunRecord | None:
 
 
 def list_records(repo_root: Path) -> tuple[ManagedRunRecord, ...]:
-    """Every record of this repository, by run key. Unreadable records refuse."""
+    """Every record of this repository, by run key. Unreadable records refuse.
+
+    Only ``<run key>.json`` names are records; hidden files -- among them a
+    writer's stale ``.tmp-*.json`` -- are ignored, never deleted here."""
 
     directory = records_dir(repo_root)
     if not directory.is_dir():
         return ()
-    return tuple(_load(path) for path in sorted(directory.glob("*.json")))
+    paths = sorted(
+        path for path in directory.iterdir()
+        if path.suffix == ".json" and _RUN_KEY_RE.match(path.stem) and path.is_file()
+    )
+    return tuple(_load(path) for path in paths)
 
 
 def _write_temp(directory: Path, payload: dict[str, Any]) -> Path:
+    """A complete temp file beside the record; removed again if writing fails."""
+
     directory.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
     return Path(name)
 
 
@@ -388,7 +414,10 @@ def append_event(repo_root: Path, run_key: str, event: str, detail: Mapping[str,
         }
     )
     temp = _write_temp(path.parent, updated.to_dict())
-    os.replace(temp, path)
+    try:
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
     return updated
 
 
@@ -437,8 +466,18 @@ def committed_project(repo_root: Path, sparring_dir: Path, target: str, base_sha
     return project_rel, shown.stdout
 
 
-def _slug(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40].rstrip("-") or "plan"
+def managed_branch(run_key: str) -> str:
+    """The managed branch for ``run_key``: an injective encoding of the whole
+    key, so distinct run keys never share a branch. Every character outside
+    ``[a-z0-9-]`` (including ``_`` itself, uppercase and ``.``) becomes ``_``
+    plus two hex digits, so the result is a valid ref component (no dots, no
+    ``.lock``) and distinct even on a case-insensitive ref store."""
+
+    _check_run_key(run_key)
+    encoded = "".join(
+        char if char in "abcdefghijklmnopqrstuvwxyz0123456789-" else f"_{ord(char):02x}" for char in run_key
+    )
+    return f"sparring/{encoded}"
 
 
 @dataclass(frozen=True)
@@ -506,10 +545,7 @@ def plan_managed_run(
         _check_run_key(run_key)
     label = source_label(read_path, mapped)
     key = run_key or new_run_key(label)
-    suffix = key.rsplit("-", 1)[-1]
-    if not re.fullmatch(r"[0-9a-f]{8}", suffix):
-        suffix = re.sub(r"[^0-9a-f]", "", key)[-8:] or "run"
-    branch = f"sparring/{_slug(Path(label).stem)}-{suffix}"
+    branch = managed_branch(key)
     worktree = (main.parent / f"{main.name}-sparring-{key}").resolve()
     input_abs = worktree / mapped if not mapped.is_absolute() else mapped
 
@@ -555,8 +591,10 @@ def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRun
     """Record (exclusive), ``git worktree add -b``, then the ``created`` event.
 
     A failed ``worktree add`` that left neither branch nor path removes the
-    record it just wrote; otherwise the record stays and the refusal says
-    what exists."""
+    record it just wrote. Otherwise the record gains a ``creation_failed``
+    event naming what was found: a branch or path that exists after a failed
+    add may predate it or be someone else's, so it is never attributed to
+    the run (the record does not :attr:`~ManagedRunRecord.owns_git_state`)."""
 
     record = plan.record
     path = create_record(repo_root, record)
@@ -572,13 +610,100 @@ def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRun
                 "worktree_add_failed",
                 f"git worktree add failed ({result.stderr.strip()}); nothing was left behind",
             )
+        append_event(
+            repo_root,
+            record.run_key,
+            "creation_failed",
+            {
+                "stderr": result.stderr.strip(),
+                "branch_found": branch_left,
+                "path_found": path_left,
+                "attributed": False,
+            },
+        )
         raise ManagedRunError(
             "worktree_add_failed",
-            f"git worktree add failed ({result.stderr.strip()}); left in place: record {path}"
-            + (f", branch {record.branch}" if branch_left else "")
-            + (f", path {record.worktree_path}" if path_left else ""),
+            f"git worktree add failed ({result.stderr.strip()}); record {path} is marked creation_failed and "
+            "claims nothing; found and left untouched, not the run's:"
+            + (f" branch {record.branch}" if branch_left else "")
+            + (f" path {record.worktree_path}" if path_left else ""),
         )
     return append_event(repo_root, record.run_key, "created", {})
+
+
+def _creation_proof_failure(repo_root: Path, record: ManagedRunRecord) -> str | None:
+    """Why an interrupted creation cannot be proven complete, else ``None``.
+
+    Proof: the path is a registered worktree of this repository with the
+    record's branch checked out; branch tip and worktree HEAD are
+    ``base_sha``; the worktree is clean (untracked files included); and the
+    branch is new -- preflight refused an existing one before the record was
+    written, and its reflog has exactly one entry, ``branch: Created from
+    <base_sha>`` at ``base_sha``, no earlier than the record's ``created_at``
+    (what ``git worktree add -b <branch> <path> <base_sha>`` writes). A
+    branch someone made in the moment between preflight and the add with
+    that same start point and message is indistinguishable; anything else
+    is refused."""
+
+    repo_root = Path(repo_root)
+    path = Path(record.worktree_path)
+    if not path.is_dir():
+        return f"{path} does not exist"
+    entry = next((entry for entry in worktree_list(repo_root) if entry["path"] == str(path.resolve())), None)
+    if entry is None:
+        return f"{path} is not a registered worktree of this repository"
+    if entry["branch"] != record.branch:
+        return f"{path} has {entry['branch'] or 'a detached HEAD'} checked out, not {record.branch}"
+    if not branch_exists(repo_root, record.branch):
+        return f"branch {record.branch} does not exist"
+    tip = _git_out(repo_root, "rev-parse", f"refs/heads/{record.branch}^{{commit}}")
+    head = _git_out(path, "rev-parse", "HEAD^{commit}")
+    if tip != record.base_sha or head != record.base_sha:
+        return f"branch tip {tip} / worktree HEAD {head} is not base_sha {record.base_sha}"
+    dirty = _git_out(path, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
+    if dirty.strip():
+        return f"{path} has changes: {', '.join(line[3:] for line in dirty.splitlines())}"
+    reflog = _git(
+        repo_root, "reflog", "show", "--date=unix", "--format=%H%x00%gs%x00%gd", f"refs/heads/{record.branch}", "--"
+    )
+    lines = [line for line in reflog.stdout.splitlines() if line] if reflog.returncode == 0 else []
+    if len(lines) != 1:
+        return f"branch {record.branch} has {len(lines)} reflog entries, not exactly its creation"
+    sha, subject, selector = (lines[0].split("\0") + ["", ""])[:3]
+    if sha != record.base_sha or subject != f"branch: Created from {record.base_sha}":
+        return f"branch {record.branch}'s reflog does not start with its creation at {record.base_sha}"
+    stamp = re.search(r"@\{(\d+)\}$", selector)
+    created = datetime.fromisoformat(record.created_at.replace("Z", "+00:00")).timestamp()
+    if stamp is None or int(stamp.group(1)) < int(created):
+        return f"branch {record.branch} was created before run {record.run_key}'s record"
+    return None
+
+
+def confirm_creation(repo_root: Path, record: ManagedRunRecord) -> ManagedRunRecord:
+    """``record`` if it owns its git state; else, for a ``creating`` record
+    whose interrupted creation is positively proven complete, the record
+    with ``created`` appended once. Anything else refuses, changing
+    nothing; a second worktree is never made."""
+
+    if record.owns_git_state:
+        return record
+    if record.lifecycle == "creating":
+        failure = _creation_proof_failure(repo_root, record)
+        if failure is None:
+            current = read_record(repo_root, record.run_key)
+            if current is not None and current.owns_git_state:
+                return current
+            return append_event(repo_root, record.run_key, "created", {"confirmed_on_resume": True})
+        raise ManagedRunError(
+            "creation_incomplete",
+            f"run {record.run_key}'s creation was interrupted and cannot be proven complete ({failure}); "
+            "nothing was changed and its branch and path are not attributed to it",
+        )
+    raise ManagedRunError(
+        "creation_failed",
+        f"run {record.run_key}'s creation failed; it owns no branch or worktree and cannot be resumed "
+        "(start a new run)",
+    )
 
 
 # -- resume ------------------------------------------------------------------
@@ -662,7 +787,9 @@ def refuse_unmanaged_here(repo_root: Path) -> None:
         if exc.code == "not_a_repository":
             return
         raise
-    if record is not None:
+    # A creation_failed record never claimed its path; a creating one may yet
+    # be proven to own it, so it still keeps unmanaged runs out.
+    if record is not None and record.lifecycle != "creation_failed":
         raise ManagedRunError(
             "managed_worktree",
             f"{top} is the managed worktree of run {record.run_key}; it belongs to that run only "

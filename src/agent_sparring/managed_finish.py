@@ -180,6 +180,12 @@ def finish_status(repo_root: Path, run_key: str, *, allow_merge_commit: bool = F
     if record is None or record.created_by != "engine":
         checks.add("unmanaged", False, f"{run_key} has no engine-created managed-run record; it is never finished")
         return {"git": git, "finish": _finish(run_key, managed=False, checks=checks)}
+    if not record.owns_git_state:
+        checks.add(
+            "unmanaged", False,
+            f"{run_key} is {record.lifecycle}: its record proves no branch or worktree is the run's; it is never finished",
+        )
+        return {"git": git, "finish": _finish(run_key, managed=False, checks=checks)}
     checks.add("unmanaged", True, f"engine-created managed run on {record.branch}")
 
     worktree = Path(record.worktree_path)
