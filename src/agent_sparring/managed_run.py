@@ -121,21 +121,26 @@ def worktree_top(path: Path) -> Path:
 
 
 def worktree_list(repo_root: Path) -> list[dict[str, str | None]]:
-    """``git worktree list --porcelain`` as ``[{path, head, branch}]``,
-    main worktree first; ``branch`` is the short name or ``None``."""
+    """``git worktree list --porcelain`` as ``[{path, head, branch, locked}]``,
+    main worktree first; ``branch`` is the short name or ``None``;
+    ``locked`` the lock reason (``""`` when locked without one) or ``None``."""
 
     raw = _git_out(repo_root, "worktree", "list", "--porcelain")
     entries: list[dict[str, str | None]] = []
     current: dict[str, str | None] | None = None
     for line in raw.splitlines():
         if line.startswith("worktree "):
-            current = {"path": str(Path(line[len("worktree "):]).resolve()), "head": None, "branch": None}
+            current = {
+                "path": str(Path(line[len("worktree "):]).resolve()), "head": None, "branch": None, "locked": None,
+            }
             entries.append(current)
         elif current is not None and line.startswith("HEAD "):
             current["head"] = line[len("HEAD "):]
         elif current is not None and line.startswith("branch "):
             ref = line[len("branch "):]
             current["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+        elif current is not None and (line == "locked" or line.startswith("locked ")):
+            current["locked"] = line[len("locked "):]
     return entries
 
 
@@ -587,20 +592,58 @@ def plan_managed_run(
     return ManagedRunPlan(record=record, uncommitted=dirty_paths(invoking_top))
 
 
-def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRunRecord:
-    """Record (exclusive), ``git worktree add -b``, then the ``created`` event.
+def creation_mark(record: ManagedRunRecord) -> str:
+    """The engine's provenance mark for ``record``'s creation.
 
-    A failed ``worktree add`` that left neither branch nor path removes the
-    record it just wrote. Otherwise the record gains a ``creation_failed``
+    Written as the branch's creation reflog message (``git update-ref -m``)
+    and as the new worktree's lock reason (``git worktree add --lock
+    --reason``), each atomically with what it marks. Plain ``git branch``,
+    ``git switch -c`` or ``git worktree add`` never write it, so only the
+    engine -- or someone deliberately forging this exact text -- produces a
+    branch and worktree carrying it."""
+
+    return f"agent-sparring: create managed run {record.run_key} ({record.created_at})"
+
+
+def _branch_is_engines(repo_root: Path, record: ManagedRunRecord) -> bool:
+    """The branch's whole reflog is the engine's creation at ``base_sha``."""
+
+    reflog = _git(repo_root, "reflog", "show", "--format=%H%x00%gs", f"refs/heads/{record.branch}", "--")
+    lines = [line for line in reflog.stdout.splitlines() if line] if reflog.returncode == 0 else []
+    return lines == [f"{record.base_sha}\0{creation_mark(record)}"]
+
+
+def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRunRecord:
+    """Record (exclusive), the branch (``update-ref``, exclusive, marked),
+    the worktree (``worktree add --lock``, marked), then ``created``.
+
+    A failed creation that left neither branch nor path (the engine's own
+    unused branch is removed) removes the record it just wrote. Otherwise the record gains a ``creation_failed``
     event naming what was found: a branch or path that exists after a failed
     add may predate it or be someone else's, so it is never attributed to
     the run (the record does not :attr:`~ManagedRunRecord.owns_git_state`)."""
 
     record = plan.record
     path = create_record(repo_root, record)
+    mark = creation_mark(record)
+    # The branch first, exclusively (old value empty: it must not exist),
+    # carrying the engine's mark in its reflog; then the worktree, locked with
+    # the same mark until ``created`` is recorded.
     result = _git(
-        Path(repo_root), "worktree", "add", "-b", record.branch, record.worktree_path, record.base_sha
+        Path(repo_root), "update-ref", "--create-reflog", "-m", mark,
+        f"refs/heads/{record.branch}", record.base_sha, "",
     )
+    if result.returncode == 0:
+        result = _git(
+            Path(repo_root), "worktree", "add", "--lock", "--reason", mark, record.worktree_path, record.branch
+        )
+        if (
+            result.returncode != 0
+            and not os.path.lexists(record.worktree_path)
+            and _branch_is_engines(Path(repo_root), record)
+        ):
+            # Our own, unused branch: removed only if still exactly as made.
+            _git(Path(repo_root), "update-ref", "-d", f"refs/heads/{record.branch}", record.base_sha)
     if result.returncode != 0:
         branch_left = branch_exists(Path(repo_root), record.branch)
         path_left = os.path.lexists(record.worktree_path)
@@ -628,22 +671,33 @@ def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRun
             + (f" branch {record.branch}" if branch_left else "")
             + (f" path {record.worktree_path}" if path_left else ""),
         )
-    return append_event(repo_root, record.run_key, "created", {})
+    created = append_event(repo_root, record.run_key, "created", {})
+    _release_lock(repo_root, created)
+    return created
+
+
+def _release_lock(repo_root: Path, record: ManagedRunRecord) -> None:
+    """Unlock a created run's worktree if it still holds the engine's lock."""
+
+    entry = next(
+        (e for e in worktree_list(repo_root) if e["path"] == str(Path(record.worktree_path).resolve())), None
+    )
+    if entry is not None and entry["locked"] == creation_mark(record):
+        _git(Path(repo_root), "worktree", "unlock", record.worktree_path)
 
 
 def _creation_proof_failure(repo_root: Path, record: ManagedRunRecord) -> str | None:
     """Why an interrupted creation cannot be proven complete, else ``None``.
 
     Proof: the path is a registered worktree of this repository with the
-    record's branch checked out; branch tip and worktree HEAD are
-    ``base_sha``; the worktree is clean (untracked files included); and the
-    branch is new -- preflight refused an existing one before the record was
-    written, and its reflog has exactly one entry, ``branch: Created from
-    <base_sha>`` at ``base_sha``, no earlier than the record's ``created_at``
-    (what ``git worktree add -b <branch> <path> <base_sha>`` writes). A
-    branch someone made in the moment between preflight and the add with
-    that same start point and message is indistinguishable; anything else
-    is refused."""
+    record's branch checked out and locked with the engine's
+    :func:`creation_mark`; the branch's whole reflog is the engine's
+    creation at ``base_sha`` (same mark; ``update-ref`` with an empty old
+    value, so the branch did not exist before); branch tip and worktree HEAD
+    are ``base_sha``; and the worktree is clean, untracked files included.
+    A branch or worktree made any other way -- a user's ``git branch`` at the
+    same base, a later ``git worktree add`` at the recorded path -- lacks the
+    mark and is refused, never attributed."""
 
     repo_root = Path(repo_root)
     path = Path(record.worktree_path)
@@ -654,8 +708,12 @@ def _creation_proof_failure(repo_root: Path, record: ManagedRunRecord) -> str | 
         return f"{path} is not a registered worktree of this repository"
     if entry["branch"] != record.branch:
         return f"{path} has {entry['branch'] or 'a detached HEAD'} checked out, not {record.branch}"
+    if entry["locked"] != creation_mark(record):
+        return f"{path} does not carry the engine's creation lock for run {record.run_key}"
     if not branch_exists(repo_root, record.branch):
         return f"branch {record.branch} does not exist"
+    if not _branch_is_engines(repo_root, record):
+        return f"branch {record.branch}'s reflog is not solely the engine's creation at {record.base_sha}"
     tip = _git_out(repo_root, "rev-parse", f"refs/heads/{record.branch}^{{commit}}")
     head = _git_out(path, "rev-parse", "HEAD^{commit}")
     if tip != record.base_sha or head != record.base_sha:
@@ -663,19 +721,6 @@ def _creation_proof_failure(repo_root: Path, record: ManagedRunRecord) -> str | 
     dirty = _git_out(path, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
     if dirty.strip():
         return f"{path} has changes: {', '.join(line[3:] for line in dirty.splitlines())}"
-    reflog = _git(
-        repo_root, "reflog", "show", "--date=unix", "--format=%H%x00%gs%x00%gd", f"refs/heads/{record.branch}", "--"
-    )
-    lines = [line for line in reflog.stdout.splitlines() if line] if reflog.returncode == 0 else []
-    if len(lines) != 1:
-        return f"branch {record.branch} has {len(lines)} reflog entries, not exactly its creation"
-    sha, subject, selector = (lines[0].split("\0") + ["", ""])[:3]
-    if sha != record.base_sha or subject != f"branch: Created from {record.base_sha}":
-        return f"branch {record.branch}'s reflog does not start with its creation at {record.base_sha}"
-    stamp = re.search(r"@\{(\d+)\}$", selector)
-    created = datetime.fromisoformat(record.created_at.replace("Z", "+00:00")).timestamp()
-    if stamp is None or int(stamp.group(1)) < int(created):
-        return f"branch {record.branch} was created before run {record.run_key}'s record"
     return None
 
 
@@ -686,14 +731,16 @@ def confirm_creation(repo_root: Path, record: ManagedRunRecord) -> ManagedRunRec
     nothing; a second worktree is never made."""
 
     if record.owns_git_state:
+        _release_lock(repo_root, record)
         return record
     if record.lifecycle == "creating":
         failure = _creation_proof_failure(repo_root, record)
         if failure is None:
             current = read_record(repo_root, record.run_key)
-            if current is not None and current.owns_git_state:
-                return current
-            return append_event(repo_root, record.run_key, "created", {"confirmed_on_resume": True})
+            if current is None or not current.owns_git_state:
+                current = append_event(repo_root, record.run_key, "created", {"confirmed_on_resume": True})
+            _release_lock(repo_root, current)
+            return current
         raise ManagedRunError(
             "creation_incomplete",
             f"run {record.run_key}'s creation was interrupted and cannot be proven complete ({failure}); "
@@ -768,6 +815,12 @@ def require_state_matches(repo_root: Path, run_key: str, *, expected_branch: str
     if record is None:
         raise ManagedRunError(
             "managed_record_missing", f"run {run_key} is recorded as managed but has no managed-run record"
+        )
+    if not record.owns_git_state:
+        raise ManagedRunError(
+            "managed_record_unowned",
+            f"run {run_key}'s record is {record.lifecycle}: it does not prove the branch or worktree are the "
+            f"run's (resume-plan --run-key {run_key} verifies an interrupted creation)",
         )
     top = str(worktree_top(repo_root))
     if record.worktree_path != top or record.branch != expected_branch:

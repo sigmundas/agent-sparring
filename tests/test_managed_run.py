@@ -399,7 +399,7 @@ class CreationLifecycleTests(_ManagedRepoTestCase):
             _run_git(self.repo, "checkout", "-q", "main")
 
     def test_crash_after_record_before_worktree_add(self):
-        record = self._crash_on("_git", lambda cwd, *args: args[:2] == ("worktree", "add"))
+        record = self._crash_on("_git", lambda cwd, *args: args[:1] == ("update-ref",))
         self.assertEqual(record.lifecycle, "creating")
         self.assertFalse(managed_run.branch_exists(self.repo, record.branch))
         self.assertFalse(Path(record.worktree_path).exists())
@@ -417,9 +417,9 @@ class CreationLifecycleTests(_ManagedRepoTestCase):
         real_git = managed_run._git
 
         def racing_git(cwd, *args):
-            # The user's branch appears between preflight and the add.
-            if args[:3] == ("worktree", "add", "-b"):
-                real_git(cwd, "branch", args[3], "feature/x")
+            # The user's branch appears between preflight and the creation.
+            if args[:2] == ("update-ref", "--create-reflog"):
+                real_git(cwd, "branch", args[4][len("refs/heads/"):], "feature/x")
             return real_git(cwd, *args)
 
         user_tip = _git(self.repo, "rev-parse", "feature/x")
@@ -439,14 +439,19 @@ class CreationLifecycleTests(_ManagedRepoTestCase):
 
     def test_crash_before_created_event_resume_confirms_once(self):
         record = self._crash_before_created()
-        worktrees = managed_run.worktree_list(self.repo)
+        def shape():
+            return [(e["path"], e["branch"], e["head"]) for e in managed_run.worktree_list(self.repo)]
+
+        worktrees = shape()
         code, _, err = self._main("resume-plan", "--run-key", self.KEY)
         self.assertEqual(code, 0, err)
+        entry = next(e for e in managed_run.worktree_list(self.repo) if e["branch"] == record.branch)
+        self.assertIsNone(entry["locked"])
         code, _, err = self._main("resume-plan", "--run-key", self.KEY, "--evidence", "ok")
         self.assertEqual(code, 0, err)
         (after,) = self._records()
         self.assertEqual([e["event"] for e in after.events], ["created"])
-        self.assertEqual(managed_run.worktree_list(self.repo), worktrees)
+        self.assertEqual(shape(), worktrees)
         self.assertEqual(after.worktree_path, record.worktree_path)
 
     def test_crash_before_created_event_refuses_a_changed_worktree(self):
@@ -473,6 +478,95 @@ class CreationLifecycleTests(_ManagedRepoTestCase):
                 self._resume_refused(key, "creation_incomplete")
                 self.assertTrue(Path(record.worktree_path).is_dir())
                 self.assertTrue(managed_run.branch_exists(self.repo, record.branch))
+
+    def _user_worktree_at(self, record, *, branch_args):
+        _run_git(self.repo, *branch_args)
+        _run_git(self.repo, "worktree", "add", "-q", record.worktree_path, record.branch)
+
+    def test_user_branch_and_worktree_made_after_an_interrupted_creation_are_not_attributed(self):
+        record = self._crash_on("_git", lambda cwd, *args: args[:1] == ("update-ref",))
+        self.assertFalse(managed_run.branch_exists(self.repo, record.branch))
+        # Later, a user makes the same branch at the same base and a clean
+        # worktree at the recorded path: same shape, no engine mark.
+        self._user_worktree_at(record, branch_args=("branch", record.branch, record.base_sha))
+        self._resume_refused(self.KEY, "creation_incomplete")
+        self.assertFalse(managed_run.read_record(self.repo, self.KEY).owns_git_state)
+        self.assertTrue(Path(record.worktree_path).is_dir())
+
+    def test_engine_branch_with_a_user_worktree_is_not_attributed(self):
+        # Crash after the engine's branch, before its worktree; the user adds one.
+        record = self._crash_on("_git", lambda cwd, *args: args[:2] == ("worktree", "add"))
+        self.assertTrue(managed_run.branch_exists(self.repo, record.branch))
+        _run_git(self.repo, "worktree", "add", "-q", record.worktree_path, record.branch)
+        err = self._resume_refused(self.KEY, "creation_incomplete")
+        self.assertIn("creation lock", err)
+
+    def test_same_base_collision_then_crash_before_creation_failed_refuses(self):
+        real_git = managed_run._git
+        real_append = managed_run.append_event
+
+        def racing_git(cwd, *args):
+            if args[:2] == ("update-ref", "--create-reflog"):
+                real_git(cwd, "branch", args[4][len("refs/heads/"):], args[5])
+            return real_git(cwd, *args)
+
+        def crash(repo_root, run_key, event, detail=None):
+            if event == "creation_failed":
+                raise _Crash(event)
+            return real_append(repo_root, run_key, event, detail)
+
+        with mock.patch.object(managed_run, "_git", racing_git), \
+                mock.patch.object(managed_run, "append_event", crash), self.assertRaises(_Crash):
+            self._start_managed("--run-key", self.KEY)
+        record = managed_run.read_record(self.repo, self.KEY)
+        self.assertEqual(record.lifecycle, "creating")
+        user_tip = _git(self.repo, "rev-parse", record.branch)
+        self.assertEqual(user_tip, record.base_sha)
+        _run_git(self.repo, "worktree", "add", "-q", record.worktree_path, record.branch)
+        self._resume_refused(self.KEY, "creation_incomplete")
+        self.assertEqual(_git(self.repo, "rev-parse", record.branch), user_tip)
+
+    def _set_events(self, key, events):
+        path = managed_run.record_path(self.repo, key)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["events"] = events
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_plan_state_guard_requires_proven_ownership(self):
+        code, _, err = self._start_managed("--run-key", self.KEY)
+        self.assertEqual(code, 0, err)
+        (record,) = self._records()
+        worktree = Path(record.worktree_path)
+        state_path = record.sparring_dir / "plans" / f"{self.KEY}.json"
+        for lifecycle, events in (
+            ("creating", []),
+            ("creation_failed", [{"at": "x", "event": "creation_failed", "detail": {}}]),
+        ):
+            with self.subTest(lifecycle=lifecycle):
+                self._set_events(self.KEY, events)
+                with self.assertRaises(ManagedRunError) as ctx:
+                    managed_run.require_state_matches(worktree, self.KEY, expected_branch=record.branch)
+                self.assertEqual(ctx.exception.code, "managed_record_unowned")
+                state_before = state_path.read_bytes()
+                # Resume without --run-key, from inside the worktree.
+                err_io = io.StringIO()
+                with mock.patch("agent_sparring.cli._build_loop_adapters") as adapters, \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_io):
+                    code = main([
+                        "--sparring-dir", str(record.sparring_dir), "resume-plan",
+                        str(worktree / "docs" / "plan.md"), "--repo-root", str(worktree),
+                        "--expected-branch", record.branch, "--evidence", "ok",
+                    ])
+                self.assertEqual(code, 1)
+                self.assertIn("managed_record_unowned", err_io.getvalue())
+                adapters.assert_not_called()
+                self.assertEqual(state_path.read_bytes(), state_before)
+                # And through the plan module's own guard.
+                from agent_sparring.plan import PlanError, _require_managed_record
+
+                with self.assertRaises(PlanError) as plan_ctx:
+                    _require_managed_record(worktree, self.KEY, record.branch)
+                self.assertIn("managed_record_unowned", str(plan_ctx.exception))
 
     def test_crash_during_append_event_leaves_no_temp_and_record_unchanged(self):
         code, _, err = self._start_managed("--run-key", self.KEY)
