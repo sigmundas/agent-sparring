@@ -647,3 +647,111 @@ class FinishConfigTests(unittest.TestCase):
             parse_project_config('project = "p"\n[finish]\ndelete_remote = true\n')
         with self.assertRaises(ProjectConfigError):
             parse_project_config('project = "p"\n[finish]\ndelete_remote_branch = "yes"\n')
+
+
+class FinishRecoveryTests(_FinishTestCase):
+    """Ignored-file preservation, interrupted cleanup and operational failures."""
+
+    _finish = FinishExecutionTests._finish
+    _events = FinishExecutionTests._events
+    _assert_cleaned = FinishExecutionTests._assert_cleaned
+
+    def _ignored_collision(self):
+        exclude = self.repo / ".git" / "info" / "exclude"
+        exclude.write_text(exclude.read_text(encoding="utf-8") + "feature.txt\n", encoding="utf-8")
+        (self.repo / "feature.txt").write_text("ignored but mine\n", encoding="utf-8")
+
+    def test_ignored_user_file_is_never_overwritten_by_a_fast_forward(self):
+        record, _ = self._complete()
+        self._ignored_collision()
+        tip = _git(self.repo, "rev-parse", "main")
+        code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"], report["completed_steps"]), (1, "merge", []))
+        self.assertEqual((self.repo / "feature.txt").read_text(encoding="utf-8"), "ignored but mine\n")
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), tip)
+        self.assertNotIn("merged", self._events(record))
+        self.assertTrue(Path(record.worktree_path).is_dir())
+
+    def test_ignored_user_file_is_never_overwritten_by_a_merge_commit(self):
+        record, _ = self._complete()
+        (self.repo / "other.txt").write_text("other\n", encoding="utf-8")
+        _run_git(self.repo, "add", "other.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "other")
+        self._ignored_collision()
+        tip = _git(self.repo, "rev-parse", "main")
+        code, report, _ = self._finish(record, "--allow-merge-commit")
+        self.assertEqual((code, report["stopped_at"]), (1, "merge"))
+        self.assertEqual((self.repo / "feature.txt").read_text(encoding="utf-8"), "ignored but mine\n")
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), tip)
+        self.assertFalse((self.repo / ".git" / "MERGE_HEAD").exists())
+
+    def test_removal_without_its_event_is_reconciled_on_rerun(self):
+        record, head = self._complete()
+        real_append = managed_run.append_event
+
+        def fail_removed(repo_root, run_key, event, detail=None):
+            if event == "worktree_removed":
+                raise OSError("simulated crash after removal")
+            return real_append(repo_root, run_key, event, detail)
+
+        with mock.patch.object(managed_run, "append_event", side_effect=fail_removed):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "remove_worktree"))
+        self.assertIn("simulated crash", report["reason"])
+        self.assertFalse(Path(record.worktree_path).exists())
+        self.assertNotIn("worktree_removed", self._events(record))
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self._assert_cleaned(record, head)
+        self.assertEqual(self._events(record).count("worktree_removed"), 1)
+
+    def test_archive_failure_is_a_structured_report(self):
+        record, head = self._complete()
+        with mock.patch.object(managed_finish.shutil, "copy2", side_effect=OSError("disk full")):
+            code, report, _ = self._finish(record)
+        self.assertEqual(code, 1)
+        self.assertEqual((report["stopped_at"], report["completed_steps"]), ("archive_state", ["merge"]))
+        self.assertIn("disk full", report["reason"])
+        self.assertEqual(report["remaining"][0], "archive_state")
+        self.assertTrue(Path(record.worktree_path).is_dir())
+        self.assertEqual(_git(self.repo, "rev-parse", record.branch), head)
+        code, _, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self._assert_cleaned(record, head)
+
+    def test_record_write_failure_is_a_structured_report(self):
+        record, _ = self._complete()
+        with mock.patch.object(managed_run, "_write_temp", side_effect=PermissionError("read-only")):
+            code, report, _ = self._finish(record)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["stopped_at"], "merge")
+        self.assertIn("read-only", report["reason"])
+
+    def test_recovery_rechecks_target_containment(self):
+        record, head = self._complete()
+        real_git = managed_run._git
+
+        def failing_remote_delete(cwd, *args):
+            if args[:1] == ("push",) and args[-1].startswith(":"):
+                return subprocess.CompletedProcess(args, 1, "", "simulated")
+            return real_git(cwd, *args)
+
+        # Get past local branch deletion, then stop before finished.
+        real_append = managed_run.append_event
+
+        def fail_finished(repo_root, run_key, event, detail=None):
+            if event == "finished":
+                raise OSError("simulated crash before finished")
+            return real_append(repo_root, run_key, event, detail)
+
+        with mock.patch.object(managed_run, "append_event", side_effect=fail_finished):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
+        # The target is moved back behind the candidate.
+        _run_git(self.repo, "update-ref", "refs/heads/main", record.base_sha)
+        _run_git(self.repo, "reset", "-q", "--hard", record.base_sha)
+        for flags in ((), ("--merge-only",)):
+            code, report, _ = self._finish(record, *flags)
+            self.assertEqual((code, report["stopped_at"]), (1, "merge"), flags)
+            self.assertIn("no longer contains", report["reason"])
+        self.assertNotIn("finished", self._events(record))

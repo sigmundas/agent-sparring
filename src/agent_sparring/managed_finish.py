@@ -182,7 +182,7 @@ def finish_status(
     checks = _Checks()
     try:
         record = managed_run.read_record(repo_root, run_key)
-    except ManagedRunError as exc:
+    except (ManagedRunError, OSError) as exc:
         checks.add("unmanaged", False, f"no usable managed-run record for {run_key}: {exc}")
         return {"git": git, "finish": _finish(run_key, managed=False, checks=checks)}
     if record is None or record.created_by != "engine":
@@ -533,10 +533,11 @@ def _merge(record: ManagedRunRecord, git: dict[str, Any], merge_mode: str, repo_
     checkout = git["target_checked_out_at"]
     if checkout is not None:
         where = Path(checkout)
+        _refuse_untracked_collisions(where, old_tip, candidate, merge_mode)
         if merge_mode == "fast_forward":
-            result = managed_run._git(where, "merge", "--ff-only", candidate)
+            result = managed_run._git(where, "merge", "--ff-only", "--no-overwrite-ignore", candidate)
         else:
-            result = managed_run._git(where, "merge", "--no-ff", "--no-edit", candidate)
+            result = managed_run._git(where, "merge", "--no-ff", "--no-edit", "--no-overwrite-ignore", candidate)
         if result.returncode != 0:
             if merge_mode == "merge_commit" and managed_run._git(
                 where, "rev-parse", "--verify", "--quiet", "MERGE_HEAD"
@@ -563,6 +564,40 @@ def _merge(record: ManagedRunRecord, git: dict[str, Any], merge_mode: str, repo_
     if target_sha is None or not _is_ancestor(repo_root, candidate, target_sha):
         raise _StepFailed("merge", f"{record.target_branch} does not contain {candidate} after the merge")
     return {"mode": merge_mode, "target_sha": target_sha, "candidate": candidate}
+
+
+def _refuse_untracked_collisions(checkout: Path, old_tip: str, candidate: str, merge_mode: str) -> None:
+    """Refuse a merge that would write over an untracked or ignored file.
+
+    ``--no-overwrite-ignore`` is passed too, but git's merge-commit path does
+    not honour it for every backend; the user's files are never ours to
+    replace, so check every path the merge would write ourselves."""
+
+    new = candidate
+    if merge_mode == "merge_commit":
+        tree = managed_run._git(checkout, "merge-tree", "--write-tree", "--no-messages", old_tip, candidate)
+        if tree.returncode != 0:
+            raise _StepFailed("merge", "the merge conflicts" if tree.returncode == 1 else tree.stderr.strip())
+        new = tree.stdout.split()[0]
+    changed = managed_run._git_out_raw(checkout, "diff", "--name-only", "--no-renames", "-z", old_tip, new)
+    tracked = set(managed_run._git_out_raw(checkout, "ls-tree", "-r", "-z", "--name-only", old_tip).split("\0"))
+    collisions: list[str] = []
+    for path in filter(None, changed.split("\0")):
+        parts = Path(path).parts
+        for depth in range(1, len(parts) + 1):
+            prefix = Path(*parts[:depth])
+            on_disk = checkout / prefix
+            is_leaf = depth == len(parts)
+            if not (on_disk.exists() or on_disk.is_symlink()):
+                break
+            if (is_leaf or not on_disk.is_dir() or on_disk.is_symlink()) and prefix.as_posix() not in tracked:
+                collisions.append(prefix.as_posix())
+                break
+    if collisions:
+        raise _StepFailed(
+            "merge",
+            f"the merge would overwrite untracked or ignored files in {checkout}: " + ", ".join(sorted(collisions)[:10]),
+        )
 
 
 def _report(run_key: str, completed: list[str], stopped_at: str | None, reason: str | None,
@@ -598,7 +633,7 @@ def finish_run(
     completed: list[str] = []
     try:
         record = managed_run.read_record(repo_root, run_key)
-    except ManagedRunError as exc:
+    except (ManagedRunError, OSError) as exc:
         return _report(run_key, completed, "checks", f"unmanaged: {exc}", planned), None
     if record is None or record.created_by != "engine" or not record.owns_git_state:
         status = finish_status(repo_root, run_key)
@@ -614,9 +649,11 @@ def finish_run(
         return _report(run_key, completed, "checks", f"runner_live: {exc}", planned), None
     except _StepFailed as exc:
         return _report(run_key, completed, exc.step, exc.reason, planned), None
-    except ManagedRunError as exc:
+    except (ManagedRunError, OSError) as exc:
+        # An operational failure (git, disk, permissions, a record write)
+        # stops at the step in progress; later steps stay untouched.
         stopped = next((step for step in planned if step not in completed), None)
-        return _report(run_key, completed, stopped, str(exc), planned), None
+        return _report(run_key, completed, stopped, f"{type(exc).__name__}: {exc}", planned), None
 
 
 def _finish_locked(
@@ -627,6 +664,18 @@ def _finish_locked(
     removed = bool(_events(record, "worktree_removed"))
     if removed and not _worktree_gone(repo_root, record):
         raise _StepFailed("remove_worktree", f"{record.worktree_path} was recorded removed but exists again")
+    if (
+        not removed
+        and _events(record, "merged")
+        and _events(record, "state_archived")
+        and _worktree_gone(repo_root, record)
+        and _archive_readable(repo_root, record)
+    ):
+        # Removal succeeded but its event was never persisted (interrupted):
+        # the record proves the merge and the archive, git proves the
+        # worktree is gone, so record what is already true.
+        record = managed_run.append_event(repo_root, run_key, "worktree_removed", {"reconciled": True})
+        removed = True
     if not removed and not merge_only and managed_run.worktree_top(repo_root) == Path(record.worktree_path).resolve():
         return _report(
             run_key, completed, "checks",
@@ -641,6 +690,9 @@ def _finish_locked(
         candidate = merged[-1]["detail"].get("candidate") if merged else None
         if not candidate:
             raise _StepFailed("merge", "the record has no merged candidate")
+        target_tip = _rev(repo_root, f"refs/heads/{record.target_branch}")
+        if target_tip is None or not _is_ancestor(repo_root, candidate, target_tip):
+            raise _StepFailed("merge", f"{record.target_branch} no longer contains the merged candidate {candidate}")
         completed.append("merge")
         if push_target:
             record = _push_target(repo_root, record, candidate)
