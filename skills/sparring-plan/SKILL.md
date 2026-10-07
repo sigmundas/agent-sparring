@@ -29,7 +29,7 @@ before finalizing the plan:
 - Technical uncertainty that leaves the approved outcome intact may be
   investigated within its implementation stage. State what is undecided and
   the constraints on that decision where it matters.
-- Normally resolve technical uncertainty that could materially change
+- Resolve technical uncertainty that could materially change
   architecture, scope, repository boundaries, stage topology or downstream
   work before approving downstream implementation contracts. Do not write
   speculative downstream stages behind an investigation that may invalidate
@@ -78,6 +78,10 @@ implementation constraints already decided. Distinguish:
 - **Implementation freedom:** decisions left to the stage agent within the
   contract, including technical investigation that cannot change its outcome.
 
+Implementation freedom cannot weaken required invariants, safety or correctness
+properties, hard constraints or required acceptance evidence, even if visible
+behavior is unchanged.
+
 Do not prescribe classes, helpers, abstractions, edit sequences or internal
 structure unless they are themselves consequential approved requirements.
 
@@ -108,10 +112,12 @@ prerequisites need supported mechanisms: intake prerequisites confirmed at
 run-slice approval, or manifest v2 `gates_before` / `completion_gates` emitted
 by compile intake or declared explicitly. Say what each gate blocks and what
 evidence satisfies it; document order or a prose dependency is insufficient.
-Consult [human gates](../../docs/gates.md) for checks needed before a stage may
-become READY. Human checks are only for verification agents cannot perform,
-not merely checks a read-only reviewer cannot run. Do not invent gates for
-automatable checks or move unresolved product scope into execution.
+Human checks are only for verification agents cannot adequately perform,
+not merely checks a read-only reviewer cannot run. Consult
+[human gates](../../docs/gates.md) for immediate checks and
+[deferred verification](../../docs/plans.md#a-check-that-is-owed-but-not-now)
+for checks still owed. Do not invent gates for automatable checks or move
+unresolved product scope into execution.
 
 ## 4. Write a lightweight, self-contained plan
 
@@ -138,13 +144,19 @@ These are essential concepts, not mandatory field labels. Add invariants,
 hard constraints, starting points, implementation freedom, prerequisites /
 ordering rationale, uncertainty or human checks only where they materially
 clarify the stage. For a necessary human check, state the action, pass criteria
-and why stage acceptance depends on it; later production actions belong to
-their own supported gates, not that stage's acceptance checks.
+and whether later work needs its answer before proceeding, or verification is
+still owed without a downstream implementation dependency. A reviewer may
+accept a stage while retaining a deferred human verification obligation that
+must be satisfied before plan completion. Do not decide or promise deferral
+in the plan: timing remains a reviewer/runtime decision. A manual, device or
+visual check alone does not require an immediate boundary. Later production
+actions belong to their own supported gates, not that stage's acceptance checks.
 
-Durable project-wide knowledge belongs in `.sparring/PROJECT.md`, which is
-normal project context. Direct Markdown stage agents receive only their own
-stage section plus that normal context: prose above the first stage heading
-is not sent to them. Put every plan-specific invariant or constraint required
+Durable project-wide knowledge belongs in `.sparring/PROJECT.md`, separately
+supplied to stage agents and reviewers as normal project context. Direct
+Markdown stage agents receive only their own stage section plus that normal
+context: prose above the first stage heading is not sent to them. Put every
+plan-specific invariant or constraint required
 by a stage inside that stage, even when the person-facing summary states it
 too. Refer to accepted prerequisite results explicitly without relying on the
 agent receiving earlier or later sections.
@@ -157,9 +169,10 @@ Structural rules the engine enforces for direct Markdown:
 - The section ends at the next `#` or `##` heading; only that section becomes
   its brief. Keep each stage self-contained.
 
-Do not revise the input of a live run: execution binds the plan's content and
-stable run/stage identity. This skill creates a plan for review, not a runtime
-mechanism for replacing stages or rewriting engine state.
+Direct Markdown's execution digest binds parsed stage numbers, titles and
+sections, not out-of-stage prose. Do not edit an actively executing plan to
+change its contracts; changed executable contracts need a newly reviewed
+plan/run identity, not dynamic replanning or rewriting engine state.
 
 ## 5. Challenge the draft semantically
 
