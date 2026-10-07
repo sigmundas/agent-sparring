@@ -4,7 +4,8 @@
 ``sparring finish-run --dry-run`` report from, so the listing and the dry
 run can never disagree. It never writes: every git command here reads, and
 the merge simulation uses ``git merge-tree --write-tree``, which writes only
-unreferenced objects. Acquiring and releasing the worktree lock touches only
+unreferenced objects, and ``git status`` runs with ``--no-optional-locks`` so
+it never refreshes a checkout's index. Acquiring and releasing the worktree lock touches only
 the lock file outside the repository.
 
 Eligibility is advice, never a token: a finish that executes re-runs every
@@ -18,7 +19,6 @@ from typing import Any
 
 from agent_sparring import managed_run
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
-from agent_sparring.git_context import GitContextError, dirty_entries, verify_pushed
 from agent_sparring.managed_run import ManagedRunError, ManagedRunRecord
 
 FINISH_SCHEMA_VERSION = 1
@@ -79,6 +79,46 @@ def _rev(cwd: Path, ref: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
 
+def _status(cwd: Path, *, all_untracked: bool = False) -> list[tuple[str, str]]:
+    """``git status`` as ``[(XY, path)]`` without git's optional index
+    refresh, so reporting never rewrites a checkout's index. Raises
+    :class:`ManagedRunError` if git fails."""
+
+    args = ["--no-optional-locks", "status", "--porcelain=v1", "-z"]
+    if all_untracked:
+        args.append("--untracked-files=all")
+    tokens = managed_run._git_out_raw(cwd, *args).split("\0")
+    entries: list[tuple[str, str]] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        i += 1
+        if len(token) < 3:
+            continue
+        entries.append((token[:2], token[3:]))
+        if token[0] in ("R", "C"):
+            i += 1  # the rename/copy source path
+    return entries
+
+
+def _remote_contains(cwd: Path, remote: str, branch: str, candidate: str) -> tuple[bool, str]:
+    """Is ``candidate`` reachable from ``refs/heads/<branch>`` on the record's
+    ``remote`` -- bound to the record, never to mutable upstream config."""
+
+    ref = f"refs/heads/{branch}"
+    result = managed_run._git(cwd, "ls-remote", "--exit-code", remote, ref)
+    if result.returncode != 0:
+        return False, f"{remote} has no {ref} ({result.stderr.strip() or 'ls-remote found nothing'})"
+    remote_sha = (result.stdout.split() or [""])[0]
+    if remote_sha == candidate:
+        return True, f"{remote}/{branch} is exactly {candidate}"
+    if _rev(cwd, remote_sha) is None:
+        return False, f"{remote}/{branch} is at {remote_sha}, which is not present locally; fetch and re-check"
+    if _is_ancestor(cwd, candidate, remote_sha):
+        return True, f"{candidate} is reachable from {remote}/{branch} ({remote_sha})"
+    return False, f"{candidate} is not reachable from {remote}/{branch} ({remote_sha})"
+
+
 def _is_ancestor(cwd: Path, ancestor: str, descendant: str) -> bool:
     return managed_run._git(cwd, "merge-base", "--is-ancestor", ancestor, descendant).returncode == 0
 
@@ -94,6 +134,8 @@ def _final_candidate(record: ManagedRunRecord, state: Any) -> tuple[bool, str, s
     source = load_plan_source(Path(record.input_path), worktree, manifest=record.input_kind == "manifest")
     if isinstance(source, MarkdownPlanSource):
         source = source.in_namespace(record.run_key)
+    if source.digest() != state.plan_digest:
+        return False, f"{record.input_path} no longer matches the plan this run executed", None
     candidate: str | None = None
     unaccepted: list[str] = []
     for planned in source.stages():
@@ -199,8 +241,8 @@ def finish_status(repo_root: Path, run_key: str, *, allow_merge_commit: bool = F
             else f"{entry['branch'] or 'a detached HEAD'} is checked out, not {record.branch}",
         )
         try:
-            dirty = dirty_entries(worktree, all_untracked=True)
-        except GitContextError as exc:
+            dirty = _status(worktree, all_untracked=True)
+        except ManagedRunError as exc:
             dirty, dirty_error = (), str(exc)
         else:
             dirty_error = None
@@ -208,7 +250,7 @@ def finish_status(repo_root: Path, run_key: str, *, allow_merge_commit: bool = F
         checks.add(
             "worktree_dirty", git["clean"],
             dirty_error or ("the worktree is clean" if not dirty
-                            else "uncommitted: " + ", ".join(e.path for e in dirty[:10])),
+                            else "uncommitted: " + ", ".join(path for _, path in dirty[:10])),
         )
         git["head"] = _rev(worktree, "HEAD")
     git["branch_tip"] = _rev(repo_root, f"refs/heads/{record.branch}")
@@ -221,7 +263,7 @@ def finish_status(repo_root: Path, run_key: str, *, allow_merge_commit: bool = F
     )
     if record.remote:
         if candidate and present:
-            pushed, detail = verify_pushed(worktree, candidate, record.branch)
+            pushed, detail = _remote_contains(worktree, record.remote, record.branch, candidate)
         else:
             pushed, detail = False, "no candidate in a present worktree to check against the remote"
         git["candidate_pushed"] = pushed
@@ -243,9 +285,9 @@ def finish_status(repo_root: Path, run_key: str, *, allow_merge_commit: bool = F
     git["target_checked_out_at"] = target_at
     if target_at is not None:
         try:
-            tracked = [e.path for e in dirty_entries(Path(target_at)) if e.status not in ("??", "!!")]
+            tracked = [path for code, path in _status(Path(target_at)) if code not in ("??", "!!")]
             target_error = None
-        except GitContextError as exc:
+        except ManagedRunError as exc:
             tracked, target_error = [], str(exc)
         checks.add(
             "target_checkout_dirty", not tracked and target_error is None,

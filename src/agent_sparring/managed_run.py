@@ -99,6 +99,15 @@ def _git_out(cwd: Path, *args: str, code: str = "git_failed") -> str:
     return result.stdout.strip()
 
 
+def _git_out_raw(cwd: Path, *args: str, code: str = "git_failed") -> str:
+    """Like :func:`_git_out`, but stdout unstripped (NUL-delimited output)."""
+
+    result = _git(cwd, *args)
+    if result.returncode != 0:
+        raise ManagedRunError(code, result.stderr.strip() or f"git {' '.join(args)} failed in {cwd}")
+    return result.stdout
+
+
 def git_common_dir(repo_root: Path) -> Path:
     common = Path(_git_out(repo_root, "rev-parse", "--git-common-dir", code="not_a_repository"))
     if not common.is_absolute():

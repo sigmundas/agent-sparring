@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import conftest_path  # noqa: F401
@@ -51,12 +52,19 @@ class ManagedFinishTests(_ManagedRepoTestCase):
         finish = self._status(record, **kwargs)["finish"]
         return {check["code"] for check in finish["checks"] if not check["ok"]}, finish
 
+    def _index(self, checkout: Path) -> bytes:
+        return Path(_git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "index")).read_bytes()
+
     def _refs_and_files(self, record):
+        """Refs, both checkouts' index bytes and engine files -- read without
+        running ``git status``, which may itself refresh an index."""
+
         worktree = Path(record.worktree_path)
         return (
             _git(self.repo, "for-each-ref"),
-            _git(self.repo, "status", "--porcelain", "--ignored"),
-            _git(worktree, "status", "--porcelain", "--ignored"),
+            self._index(self.repo),
+            self._index(worktree),
+            sorted(p.name for p in worktree.iterdir()),
             managed_run.record_path(self.repo, record.run_key).read_bytes(),
             (record.sparring_dir / "plans" / f"{record.run_key}.json").read_bytes(),
         )
@@ -190,6 +198,48 @@ class ManagedFinishTests(_ManagedRepoTestCase):
         status = self._status(record)
         self.assertTrue(status["git"]["candidate_pushed"])
         self.assertTrue(status["finish"]["eligible"]["merge"])
+
+    def test_candidate_pushed_is_bound_to_the_recorded_remote_and_branch(self):
+        record, head = self._complete(push=False)
+        worktree = Path(record.worktree_path)
+        # Upstream config pointing at another ref that has the candidate does not count.
+        _run_git(worktree, "push", "-q", "origin", f"{head}:refs/heads/elsewhere")
+        _run_git(worktree, "config", f"branch.{record.branch}.remote", "origin")
+        _run_git(worktree, "config", f"branch.{record.branch}.merge", "refs/heads/elsewhere")
+        failed, _ = self._failed(record)
+        self.assertEqual(failed, {"candidate_not_pushed"})
+        # A recorded non-origin remote is checked, not origin.
+        _run_git(worktree, "push", "-q", "origin", record.branch)
+        other = self.repo.parent / "other.git"
+        _run_git(self.repo.parent, "init", "-q", "--bare", str(other))
+        _run_git(self.repo, "remote", "add", "upstream", str(other))
+        path = managed_run.record_path(self.repo, record.run_key)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["remote"] = "upstream"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        failed, _ = self._failed(record)
+        self.assertEqual(failed, {"candidate_not_pushed"})
+        _run_git(worktree, "push", "-q", "upstream", record.branch)
+        failed, _ = self._failed(record)
+        self.assertEqual(failed, set())
+
+    def test_stale_index_stat_is_not_refreshed(self):
+        record, _ = self._complete()
+        worktree = Path(record.worktree_path)
+        for tracked in (worktree / "feature.txt", self.repo / "docs" / "plan.md"):
+            os.utime(tracked, (1_000_000_000, 1_000_000_000))
+        before = (self._index(self.repo), self._index(worktree))
+        self.assertTrue(self._status(record)["finish"]["eligible"]["merge"])
+        self.assertEqual((self._index(self.repo), self._index(worktree)), before)
+
+    def test_edited_plan_is_not_complete(self):
+        record, _ = self._complete()
+        plan = Path(record.input_path)
+        plan.write_text(plan.read_text(encoding="utf-8").replace("Lay the groundwork.", "Do something else."), encoding="utf-8")
+        failed, finish = self._failed(record)
+        self.assertIn("run_not_complete", failed)
+        detail = next(c["detail"] for c in finish["checks"] if c["code"] == "run_not_complete")
+        self.assertIn("no longer matches", detail)
 
     def test_branch_in_use(self):
         record, _ = self._complete()
