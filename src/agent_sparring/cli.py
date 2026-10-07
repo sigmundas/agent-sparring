@@ -64,7 +64,7 @@ from agent_sparring.intake import (
     prepare_plan,
 )
 from agent_sparring.manifest import ManifestError
-from agent_sparring import managed_run
+from agent_sparring import managed_finish, managed_run
 from agent_sparring.managed_run import ManagedRunError
 from agent_sparring.migration_history import MigrationHistoryError, record_history_snapshot
 from agent_sparring.migration_status import REPORT_VERSION as MIGRATION_REPORT_VERSION
@@ -2310,7 +2310,7 @@ def _resume_managed_plan(args: argparse.Namespace, repo_root: Path, record: mana
 def _cmd_runs(args: argparse.Namespace) -> int:
     try:
         repo_root = Path(args.repo_root) if args.repo_root else Path(".")
-        payload = managed_run.runs_payload(repo_root)
+        payload = managed_finish.runs_report(repo_root)
     except ManagedRunError as exc:
         print(f"could not list runs: {exc}", file=sys.stderr)
         return 1
@@ -2326,7 +2326,38 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             f"{run['run_key']}  {run['plan_label']}  {run['lifecycle']}/{run['run_status']}  "
             f"{run['branch']} -> {run['target_branch']}  {where}"
         )
+        print(f"  {run['finish']['summary']}")
     return 0
+
+
+def _cmd_finish_run(args: argparse.Namespace) -> int:
+    if not args.dry_run:
+        print(
+            "finish-run currently supports only --dry-run; nothing was merged or removed",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        repo_root = Path(args.repo_root) if args.repo_root else Path(".")
+        status = managed_finish.finish_status(
+            repo_root, args.run_key, allow_merge_commit=args.allow_merge_commit
+        )
+    except ManagedRunError as exc:
+        print(f"could not check run {args.run_key}: {exc}", file=sys.stderr)
+        return 1
+    finish = status["finish"]
+    if args.json:
+        json.dump(finish, sys.stdout, indent=2)
+        print()
+    else:
+        print(finish["summary"])
+        for check in finish["checks"]:
+            print(f"  [{'ok' if check['ok'] else 'NO'}] {check['code']}: {check['detail']}")
+        for action in finish["actions"]:
+            print(f"  would: {action}")
+        for path in finish["deleted_ignored_paths"]:
+            print(f"  would delete ignored: {path}")
+    return 0 if finish["eligible"]["merge"] else 3
 
 
 def _cmd_reset_stage(args: argparse.Namespace) -> int:
@@ -4033,6 +4064,24 @@ def build_parser() -> argparse.ArgumentParser:
     runs_parser.add_argument("--repo-root", default=None, help=repo_root_help)
     runs_parser.add_argument("--json", action="store_true", help="report as JSON")
     runs_parser.set_defaults(func=_cmd_runs)
+
+    finish_run_parser = subparsers.add_parser(
+        "finish-run",
+        help=(
+            "check whether a managed run can be merged into its target branch and cleaned "
+            "up; only --dry-run exists so far, which reads and changes nothing "
+            "(exit 0 eligible to merge, 3 not eligible)"
+        ),
+    )
+    finish_run_parser.add_argument("--run-key", required=True, help="the managed run to finish")
+    finish_run_parser.add_argument("--repo-root", default=None, help=repo_root_help)
+    finish_run_parser.add_argument("--dry-run", action="store_true", help="report eligibility only")
+    finish_run_parser.add_argument(
+        "--allow-merge-commit", action="store_true",
+        help="accept a merge commit when the target has advanced past the run's base",
+    )
+    finish_run_parser.add_argument("--json", action="store_true", help="report as JSON")
+    finish_run_parser.set_defaults(func=_cmd_finish_run)
 
     reset_stage_parser = subparsers.add_parser(
         "reset-stage",

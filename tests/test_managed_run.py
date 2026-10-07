@@ -19,7 +19,7 @@ def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-class ManagedRunTests(_PlanRepoTestCase):
+class _ManagedRepoTestCase(_PlanRepoTestCase):
     def setUp(self):
         super().setUp()
         _run_git(self.repo, "checkout", "-q", "main")
@@ -50,6 +50,8 @@ class ManagedRunTests(_PlanRepoTestCase):
     def _start_managed(self, *extra: str):
         return self._main("run-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed", *extra)
 
+
+class ManagedRunTests(_ManagedRepoTestCase):
     def test_creation_makes_one_branch_worktree_and_record_leaving_checkout_untouched(self):
         (self.repo / "dirty.txt").write_text("mine\n", encoding="utf-8")
         (self.repo / "docs" / "plan.md").write_text(PLAN, encoding="utf-8")
@@ -224,7 +226,7 @@ class ManagedRunTests(_PlanRepoTestCase):
         self.assertEqual(
             set(run),
             {"run_key", "plan_label", "managed", "worktree_path", "worktree_exists", "branch",
-             "target_branch", "base_sha", "created_at", "lifecycle", "run_status"},
+             "target_branch", "base_sha", "created_at", "lifecycle", "run_status", "git", "finish"},
         )
         self.assertTrue(run["managed"])
         self.assertTrue(run["worktree_exists"])
