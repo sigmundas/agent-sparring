@@ -3,6 +3,8 @@
 Pairs a stage implementation agent with an independent sparring agent, so the
 two can exchange corrections without a human acting as courier.
 
+## What it does
+
 You write (or have an agent draft) a plan made of bounded stages. For each
 stage, an implementation agent (Claude Code by default) does the work. An
 independent, read-only reviewer (Codex by default) inspects the candidate.
@@ -21,6 +23,17 @@ the exact SHA that was reviewed. No agent can wave any of them through.
 The tool is generic: it contains no knowledge of any particular project. Each
 project supplies a small `.sparring/project.toml` and a prose
 `.sparring/PROJECT.md`.
+
+Review happens at each stage, with the aim of finding mistakes before later
+work builds on them. Within a stage, the implementer and reviewer normally
+resume their own separate conversations across corrections. Human checks that
+block the stage return to the same reviewer, keeping feedback close to the
+work and making it visible before the plan advances.
+
+This continuity may reduce repeated setup and explanation. We have not
+benchmarked token usage, cost or completion time against other workflows;
+reusing a conversation does not by itself establish savings. See
+[context reuse and its limits](docs/stages.md#feedback-and-context-continuity).
 
 ## Get started
 

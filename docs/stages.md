@@ -17,6 +17,33 @@ sparring run-loop <stage-id> --repo-root . --expected-branch feature/x
 conversation rather than restarting one. It stops on `READY`, `NEEDS_YOU` or
 `ESCALATE`.
 
+### Feedback and context continuity
+
+Bounded stages put review checkpoints between pieces of work. The aim is to
+surface mistakes while their scope is still small, before later stages build
+on them. Within a stage, corrections normally resume the implementation and
+review conversations separately; each role keeps its own history. A new stage
+starts new conversations, and an explicit
+[fresh session](reference.md#resume-fresh-session-reset) replaces the selected
+role's conversation within an existing stage.
+
+A human check that blocks the current stage can be answered before the plan
+advances. The recorded evidence goes back to that stage's reviewer, which can
+ask for a correction or further evidence. This keeps the check close to the
+work under review. Some checks deliberately belong at a later checkpoint;
+[deferred checks](plans.md#a-check-that-is-owed-but-not-now) follow that separate
+workflow, so not every manual check is resolved within the stage that raised it.
+
+Context reuse may reduce repeated repository orientation and explanation, but
+we have not benchmarked token usage, cost or completion time against workflows
+that start new agents for each implementation or review turn. Retained history
+still contributes to later requests; conversation length, prompt caching and
+correction rounds can change the cost in either direction. The benefit described
+here is continuity and frequent opportunities for feedback. Lower token use or
+cost remains a hypothesis to measure.
+
+### Activity and usage
+
 While it runs, `.sparring/stages/<stage-id>/activity.jsonl` receives one
 line per observable event (turn started, file edited, command finished,
 verdict, ...). It is telemetry for watching a stage, never an input to the
