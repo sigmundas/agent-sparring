@@ -167,7 +167,14 @@ def _ignored(worktree: Path, *pathspec: str, directory: bool = False) -> list[st
     args = ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"]
     if directory:
         args.append("--directory")
-    out = managed_run._git_out_raw(worktree, *args, "--", *pathspec)
+    result = managed_run._git(worktree, *args, "--", *pathspec)
+    # git warns on stderr and still exits 0 when it cannot open a directory,
+    # so a successful listing with any warning is incomplete, not an answer.
+    if result.returncode != 0 or result.stderr.strip():
+        raise ManagedRunError(
+            "git_failed", f"git ls-files could not list every ignored file: {result.stderr.strip() or 'failed'}"
+        )
+    out = result.stdout
     return [entry.rstrip("/") for entry in out.split("\0") if entry]
 
 
@@ -186,9 +193,27 @@ def _project_state_files(record: ManagedRunRecord) -> list[str]:
     return sorted(files)
 
 
+def _untraversable(record: ManagedRunRecord) -> list[str]:
+    """Directories under the project directory that cannot be listed: their
+    contents are invisible to any listing, so they can never be proven archived."""
+
+    root = record.sparring_dir
+    failed: list[str] = []
+
+    def onerror(exc: OSError) -> None:
+        failed.append(Path(exc.filename).relative_to(root).as_posix() + "/" if exc.filename else str(exc))
+
+    for directory, _, _ in os.walk(root, onerror=onerror):
+        if not os.access(directory, os.R_OK | os.X_OK):
+            rel = Path(directory).relative_to(root).as_posix() + "/"
+            if rel not in failed:
+                failed.append(rel)
+    return sorted(set(failed))
+
+
 def _unarchivable(record: ManagedRunRecord, files: list[str]) -> list[str]:
     root = record.sparring_dir
-    return [
+    return _untraversable(record) + [
         rel for rel in files
         if not (root / rel).is_symlink() and not ((root / rel).is_file() and os.access(root / rel, os.R_OK))
     ]
@@ -365,9 +390,13 @@ def finish_status(
                             else "uncommitted: " + ", ".join(path for _, path in dirty[:10])),
         )
         git["head"] = _rev(worktree, "HEAD")
+        untraversable = _untraversable(record)
         try:
-            unarchivable = _unarchivable(record, _project_state_files(record))
-            deleted_ignored = _deleted_ignored(record)
+            if untraversable:
+                unarchivable = untraversable
+            else:
+                unarchivable = _unarchivable(record, _project_state_files(record))
+                deleted_ignored = _deleted_ignored(record)
         except (ManagedRunError, OSError) as exc:
             checks.add("unarchived_project_state", False, f"the worktree's ignored files cannot be listed: {exc}")
         else:
@@ -595,7 +624,13 @@ def _archive_state(repo_root: Path, record: ManagedRunRecord) -> tuple[Path, dic
     state_path = record.sparring_dir / "plans" / f"{record.run_key}.json"
     if not state_path.is_file():
         raise _StepFailed("archive_state", f"the run state {state_path} does not exist")
-    files = _project_state_files(record)
+    untraversable = _untraversable(record)
+    if untraversable:
+        raise _unarchived(record, untraversable)
+    try:
+        files = _project_state_files(record)
+    except ManagedRunError as exc:
+        raise _StepFailed("archive_state", f"unarchived_project_state: {exc}") from exc
     unarchivable = _unarchivable(record, files)
     if unarchivable:
         raise _unarchived(record, unarchivable)
@@ -638,10 +673,11 @@ def _verify_archived(record: ManagedRunRecord, archived: dict[str, str]) -> None
 
     try:
         files = _project_state_files(record)
+        untraversable = _untraversable(record)
         current = _digests(record.sparring_dir, files)
-    except OSError as exc:
+    except (OSError, ManagedRunError) as exc:
         raise _StepFailed("remove_worktree", f"unarchived_project_state: {exc}") from exc
-    missing = [rel for rel, digest in current.items() if archived.get(rel) != digest]
+    missing = untraversable + [rel for rel, digest in current.items() if archived.get(rel) != digest]
     if missing:
         raise _StepFailed(
             "remove_worktree",
@@ -846,6 +882,10 @@ def finish_run(
             if not _owned(locked) or locked.worktree_path != record.worktree_path:
                 status = finish_status(repo_root, run_key, lock_held=True)
                 return report("checks", status["finish"]["summary"]), status["finish"]
+            # The remote branch is kept whatever happens below: report it on
+            # every return, including --merge-only, refusals and failures.
+            merged = _events(locked, "merged")
+            notes["kept"] = _kept_remote(repo_root, locked, merged[-1]["detail"].get("candidate") if merged else None)
             if _events(locked, "finished"):
                 # Report only what the record shows actually happened.
                 recorded = {event["event"] for event in locked.events}
@@ -917,7 +957,8 @@ def _finish_locked(
     else:
         status = finish_status(repo_root, run_key, allow_merge_commit=allow_merge_commit, lock_held=True)
         finish, git = status["finish"], status["git"]
-        notes["deleted_ignored"] = finish["deleted_ignored_paths"]
+        if git["final_candidate"]:
+            notes["kept"] = _kept_remote(repo_root, record, git["final_candidate"])
         if not finish["eligible"]["merge"] or (not merge_only and not finish["eligible"]["cleanup"]):
             return report("checks", finish["summary"]), finish
         candidate = git["final_candidate"]
@@ -947,10 +988,12 @@ def _finish_locked(
         completed.append("archive_state")
         # 4. remove worktree -- only what is archived or reported may go
         _verify_archived(record, archived)
-        notes["deleted_ignored"] = _deleted_ignored(record)
+        deleted_ignored = _deleted_ignored(record)
         result = managed_run._git(repo_root, "worktree", "remove", record.worktree_path)
         if result.returncode != 0 or not _worktree_gone(repo_root, record):
             raise _StepFailed("remove_worktree", f"git worktree remove failed: {result.stderr.strip()}")
+        # Only paths this removal actually deleted are reported.
+        notes["deleted_ignored"] = deleted_ignored
         record = managed_run.append_event(repo_root, run_key, "worktree_removed")
     completed.append("remove_worktree")
 
@@ -975,10 +1018,6 @@ def _finish_locked(
     if not _events(record, "branch_deleted"):
         record = managed_run.append_event(repo_root, run_key, "branch_deleted")
     completed.append("delete_branch")
-
-    # The remote branch is always kept (see REMOTE_DELETE_UNAVAILABLE): a
-    # reported outcome, not a step, so it never fails or remains.
-    notes["kept"] = _kept_remote(repo_root, record, candidate)
 
     # 6. finished
     managed_run.append_event(repo_root, run_key, "finished")

@@ -2389,7 +2389,7 @@ def _execute_finish_run(args: argparse.Namespace) -> int:
         else:
             print(report["reason"] or f"run {args.run_key} is finished")
         for path in report["deleted_ignored_paths"]:
-            print(f"  deleted ignored: {path}")
+            print(f"  deleted ignored: {path}")  # only paths a completed removal deleted
         for kept in report["kept"]:
             print(f"  kept ({kept['code']}): {kept['detail']}")
     if report["stopped_at"] is None:

@@ -1039,3 +1039,114 @@ class FinishHardeningTests(_FinishTestCase):
         self.assertIn("unmanaged", report["reason"])
         self.assertEqual(_git(self.repo, "rev-parse", "main"), main)
         self.assertTrue(Path(record.worktree_path).is_dir())
+
+
+class FinishHardeningFollowUpTests(_FinishTestCase):
+    """Incomplete traversal, the kept remote branch on every return, and
+    deleted paths reported only after a removal."""
+
+    _finish = FinishExecutionTests._finish
+    _events = FinishExecutionTests._events
+    _assert_cleaned = FinishExecutionTests._assert_cleaned
+    _extra_state = FinishHardeningTests._extra_state
+    _after_checks = FinishHardeningTests._after_checks
+    _ignore_build = FinishHardeningTests._ignore_build
+
+    def _lock_dir(self, record):
+        locked = record.sparring_dir / "stages" / ".archive" / "old-stage"
+        self.addCleanup(locked.chmod, 0o755)
+        return locked
+
+    def test_unreadable_directory_refuses_cleanup_with_nothing_removed(self):
+        record, _ = self._complete()
+        self._extra_state(record)
+        locked = self._lock_dir(record)
+        locked.chmod(0)
+        failed, finish = self._failed(record)
+        self.assertEqual(failed, {"unarchived_project_state"})
+        detail = next(c["detail"] for c in finish["checks"] if c["code"] == "unarchived_project_state")
+        self.assertIn("stages/.archive/old-stage/", detail)
+        before = self._refs_and_files(record)
+        code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (3, "checks"))
+        self.assertIn("unarchived_project_state", report["reason"])
+        self.assertEqual(self._refs_and_files(record), before)
+        locked.chmod(0o755)
+        self.assertTrue((locked / "attempt-1" / "state.json").exists())
+        self.assertFalse(managed_finish.archive_dir(self.repo, record.run_key).exists())
+
+    def test_directory_becoming_unreadable_after_the_checks_refuses_at_archive(self):
+        record, head = self._complete()
+        self._extra_state(record)
+        locked = self._lock_dir(record)
+        with self._after_checks(lambda: locked.chmod(0)):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"], report["completed_steps"]), (1, "archive_state", ["merge"]))
+        self.assertIn("unarchived_project_state", report["reason"])
+        self.assertIn("stages/.archive/old-stage/", report["reason"])
+        self.assertTrue(Path(record.worktree_path).is_dir())
+        self.assertEqual(_git(self.repo, "rev-parse", record.branch), head)
+
+    def test_listing_with_a_git_warning_is_incomplete(self):
+        record, _ = self._complete()
+        real_git = managed_run._git
+
+        def warning(cwd, *args):
+            result = real_git(cwd, *args)
+            if args[:1] == ("ls-files",):
+                return subprocess.CompletedProcess(result.args, 0, result.stdout, "warning: could not open directory 'x/'")
+            return result
+
+        with mock.patch.object(managed_run, "_git", side_effect=warning):
+            failed, _ = self._failed(record)
+            with self.assertRaises(managed_run.ManagedRunError):
+                managed_finish._project_state_files(record)
+        self.assertEqual(failed, {"unarchived_project_state"})
+
+    def _kept_codes(self, report):
+        return [k["code"] for k in report["kept"]]
+
+    def test_kept_is_reported_on_every_return(self):
+        record, _ = self._complete()
+        # A refusal at the checks.
+        (Path(record.worktree_path) / "stray.txt").write_text("x\n", encoding="utf-8")
+        code, report, _ = self._finish(record)
+        self.assertEqual((code, self._kept_codes(report)), (3, ["remote_delete_unavailable"]))
+        (Path(record.worktree_path) / "stray.txt").unlink()
+        # --merge-only.
+        code, report, err = self._finish(record, "--merge-only")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self._kept_codes(report), ["remote_delete_unavailable"])
+        # A failure before local branch deletion.
+        _run_git(self.repo, "worktree", "lock", record.worktree_path)
+        code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "remove_worktree"))
+        self.assertEqual(self._kept_codes(report), ["remote_delete_unavailable"])
+        _run_git(self.repo, "worktree", "unlock", record.worktree_path)
+        code, report, err = self._finish(record)
+        self.assertEqual((code, self._kept_codes(report)), (0, ["remote_delete_unavailable"]), err)
+        # A finished rerun.
+        code, report, err = self._finish(record)
+        self.assertEqual((code, self._kept_codes(report)), (0, ["remote_delete_unavailable"]), err)
+
+    def _text(self, record, *flags):
+        return self._main("finish-run", "--run-key", record.run_key, "--repo-root", str(self.repo), *flags)
+
+    def test_deleted_ignored_reported_only_after_removal(self):
+        record, _ = self._complete()
+        self._ignore_build(record)
+        code, out, err = self._text(record, "--merge-only")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("deleted ignored", out)
+        self.assertIn("kept (remote_delete_unavailable)", out)
+        code, report, _ = self._finish(record, "--merge-only")
+        self.assertEqual(report["deleted_ignored_paths"], [])
+        _run_git(self.repo, "worktree", "lock", record.worktree_path)
+        code, out, _ = self._text(record)
+        self.assertEqual(code, 1)
+        self.assertNotIn("deleted ignored", out)
+        _run_git(self.repo, "worktree", "unlock", record.worktree_path)
+        code, out, err = self._text(record)
+        self.assertEqual(code, 0, err)
+        self.assertIn("deleted ignored: build", out)
+        self.assertFalse(Path(record.worktree_path).exists())
