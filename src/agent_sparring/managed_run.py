@@ -617,8 +617,8 @@ def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRun
     """Record (exclusive), the branch (``update-ref``, exclusive, marked),
     the worktree (``worktree add --lock``, marked), then ``created``.
 
-    A failed creation that left neither branch nor path (the engine's own
-    unused branch is removed) removes the record it just wrote. Otherwise the record gains a ``creation_failed``
+    A failed creation that left neither branch nor path removes the record
+    it just wrote; nothing git-side is ever deleted here. Otherwise the record gains a ``creation_failed``
     event naming what was found: a branch or path that exists after a failed
     add may predate it or be someone else's, so it is never attributed to
     the run (the record does not :attr:`~ManagedRunRecord.owns_git_state`)."""
@@ -637,13 +637,9 @@ def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRun
         result = _git(
             Path(repo_root), "worktree", "add", "--lock", "--reason", mark, record.worktree_path, record.branch
         )
-        if (
-            result.returncode != 0
-            and not os.path.lexists(record.worktree_path)
-            and _branch_is_engines(Path(repo_root), record)
-        ):
-            # Our own, unused branch: removed only if still exactly as made.
-            _git(Path(repo_root), "update-ref", "-d", f"refs/heads/{record.branch}", record.base_sha)
+        # A failed add leaves the engine's branch in place: it may already be
+        # checked out elsewhere, and deleting a ref never asks. The record is
+        # marked creation_failed below; cleanup is not this function's.
     if result.returncode != 0:
         branch_left = branch_exists(Path(repo_root), record.branch)
         path_left = os.path.lexists(record.worktree_path)

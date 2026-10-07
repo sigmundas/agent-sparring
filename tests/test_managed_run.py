@@ -501,6 +501,32 @@ class CreationLifecycleTests(_ManagedRepoTestCase):
         err = self._resume_refused(self.KEY, "creation_incomplete")
         self.assertIn("creation lock", err)
 
+    def test_engine_branch_checked_out_elsewhere_before_add_is_preserved(self):
+        other = self.repo.parent / "user-wt"
+        real_git = managed_run._git
+
+        def racing_git(cwd, *args):
+            # The user checks out the engine's new branch before its worktree add.
+            if args[:2] == ("worktree", "add") and "--lock" in args:
+                real_git(cwd, "worktree", "add", "-q", str(other), args[-1])
+                (other / "mine.txt").write_text("mine\n", encoding="utf-8")
+            return real_git(cwd, *args)
+
+        with mock.patch.object(managed_run, "_git", racing_git):
+            code, _, err = self._start_managed("--run-key", self.KEY)
+        self.assertEqual(code, 1)
+        self.assertIn("worktree_add_failed", err)
+        (record,) = self._records()
+        self.assertEqual(record.lifecycle, "creation_failed")
+        self.assertTrue(managed_run.branch_exists(self.repo, record.branch))
+        self.assertEqual(_git(self.repo, "rev-parse", record.branch), record.base_sha)
+        entry = next(e for e in managed_run.worktree_list(self.repo) if e["path"] == str(other.resolve()))
+        self.assertEqual(entry["branch"], record.branch)
+        self.assertEqual((other / "mine.txt").read_text(encoding="utf-8"), "mine\n")
+        self.assertFalse(Path(record.worktree_path).exists())
+        self._resume_refused(self.KEY, "creation_failed")
+        self.assertTrue(managed_run.branch_exists(self.repo, record.branch))
+
     def test_same_base_collision_then_crash_before_creation_failed_refuses(self):
         real_git = managed_run._git
         real_append = managed_run.append_event
