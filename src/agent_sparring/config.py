@@ -51,6 +51,9 @@ class ProjectConfig:
     # not opt in -- every migration command then refuses with a clear
     # "not configured" message rather than guessing a default.
     migrations: "MigrationsConfig | None" = None
+    # ``[finish] delete_remote_branch``: whether ``finish-run`` may delete a
+    # managed run's remote branch once the remote target contains it.
+    finish_delete_remote_branch: bool = False
 
     def command(self, name: str) -> str | None:
         """Return a configured project command by name, if any."""
@@ -310,6 +313,15 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
 
     migrations = _parse_migrations(table, source=source)
 
+    finish_table = _optional_table(table, "finish", where=source)
+    unknown_finish = sorted(set(finish_table) - {"delete_remote_branch"})
+    if unknown_finish:
+        raise ProjectConfigError(
+            f"{source} [finish] has unknown field(s) {', '.join(repr(key) for key in unknown_finish)}; "
+            "supported fields: delete_remote_branch"
+        )
+    delete_remote = _optional_bool(finish_table, "delete_remote_branch", where=f"{source} [finish]")
+
     return ProjectConfig(
         project=project_name,
         repo_root=repo_root,
@@ -320,6 +332,7 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
         stage_self_check=self_check if self_check is not None else False,
         obsolete_agent_settings=obsolete,
         migrations=migrations,
+        finish_delete_remote_branch=bool(delete_remote),
     )
 
 

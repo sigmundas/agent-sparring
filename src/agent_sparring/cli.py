@@ -2334,11 +2334,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
 
 def _cmd_finish_run(args: argparse.Namespace) -> int:
     if not args.dry_run:
-        print(
-            "finish-run currently supports only --dry-run; nothing was merged or removed",
-            file=sys.stderr,
-        )
-        return 2
+        return _execute_finish_run(args)
     try:
         repo_root = Path(args.repo_root) if args.repo_root else Path(".")
         status = managed_finish.finish_status(
@@ -2360,6 +2356,39 @@ def _cmd_finish_run(args: argparse.Namespace) -> int:
         for path in finish["deleted_ignored_paths"]:
             print(f"  would delete ignored: {path}")
     return 0 if finish["eligible"]["merge"] else 3
+
+
+def _execute_finish_run(args: argparse.Namespace) -> int:
+    try:
+        repo_root = Path(args.repo_root) if args.repo_root else Path(".")
+        report, refused = managed_finish.finish_run(
+            repo_root,
+            args.run_key,
+            merge_only=args.merge_only,
+            allow_merge_commit=args.allow_merge_commit,
+            push_target=args.push_target,
+        )
+    except ManagedRunError as exc:
+        print(f"could not finish run {args.run_key}: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        json.dump(report, sys.stdout, indent=2)
+        print()
+    else:
+        for step in report["completed_steps"]:
+            print(f"  done: {step}")
+        if report["stopped_at"] is not None:
+            print(f"stopped at {report['stopped_at']}: {report['reason']}")
+            for check in (refused or {}).get("checks", []):
+                if not check["ok"]:
+                    print(f"  [NO] {check['code']}: {check['detail']}")
+            if report["remaining"]:
+                print("  remaining: " + ", ".join(report["remaining"]))
+        else:
+            print(report["reason"] or f"run {args.run_key} is finished")
+    if report["stopped_at"] is None:
+        return 0
+    return 3 if report["stopped_at"] == "checks" else 1
 
 
 def _cmd_reset_stage(args: argparse.Namespace) -> int:
@@ -4070,9 +4099,10 @@ def build_parser() -> argparse.ArgumentParser:
     finish_run_parser = subparsers.add_parser(
         "finish-run",
         help=(
-            "check whether a managed run can be merged into its target branch and cleaned "
-            "up; only --dry-run exists so far, which reads and changes nothing "
-            "(exit 0 eligible to merge, 3 not eligible)"
+            "merge a complete managed run into its target branch and clean it up "
+            "(archive its state, remove its worktree and branch), re-checking "
+            "eligibility first; --dry-run only reports (exit 0 done/eligible, "
+            "3 not eligible, 1 a step failed)"
         ),
     )
     finish_run_parser.add_argument("--run-key", required=True, help="the managed run to finish")
@@ -4081,6 +4111,10 @@ def build_parser() -> argparse.ArgumentParser:
     finish_run_parser.add_argument(
         "--allow-merge-commit", action="store_true",
         help="accept a merge commit when the target has advanced past the run's base",
+    )
+    finish_run_parser.add_argument("--merge-only", action="store_true", help="merge (and push) but do not clean up")
+    finish_run_parser.add_argument(
+        "--push-target", action="store_true", help="push the target branch to the record's remote (never forced)"
     )
     finish_run_parser.add_argument("--json", action="store_true", help="report as JSON")
     finish_run_parser.set_defaults(func=_cmd_finish_run)
