@@ -27,6 +27,7 @@ from agent_sparring.intake import (
     compile_context_for,
     parse_interpretation,
     run_prerequisites,
+    slice_ancestors,
     slice_manifest_gates,
 )
 from agent_sparring.intake_approval import load_intake_manifest
@@ -421,6 +422,53 @@ class IntakeGateRenderingTests(unittest.TestCase):
         before, _ = slice_manifest_gates(interpretation, "app")
         self.assertEqual(list(before), ["1"])
         self.assertEqual(run_prerequisites(interpretation, "app"), ())
+
+    def test_a_gate_carried_into_a_later_slice_still_requires_the_slice_it_follows(self):
+        # "After Stage 1, before Stage 2" with the stages in separate slices
+        # and no structured dependency between them: the second slice stops
+        # for the gate, but it must not be approvable before the first ran.
+        payload = _gated_interpretation()
+        first, second = payload["runs"][0]["stages"]
+        second["depends_on"] = []
+        payload["runs"] = [
+            {**payload["runs"][0], "id": "one", "stages": [first]},
+            {**payload["runs"][0], "id": "two", "stages": [second]},
+        ]
+        interpretation = parse_interpretation(json.dumps(payload), mode="compile")
+        before, _ = slice_manifest_gates(interpretation, "two")
+        self.assertEqual({label: [g.id for g in gates] for label, gates in before.items()}, {"2": ["canary"]})
+        self.assertEqual(run_prerequisites(interpretation, "two"), ("one",))
+        self.assertEqual(run_prerequisites(interpretation, "one"), ())
+
+    def test_completion_gate_remains_a_manifest_obligation_not_a_slice_prerequisite(self):
+        payload = _gated_interpretation()
+        payload["gates"][0].update(after_stage="2", blocks_stages=[])
+        interpretation = parse_interpretation(json.dumps(payload), mode="compile")
+        before, completion = slice_manifest_gates(interpretation, "app")
+        self.assertEqual(before, {})
+        self.assertEqual([gate.id for gate in completion], ["canary"])
+        self.assertEqual(run_prerequisites(interpretation, "app"), ())
+        self.assertEqual(slice_ancestors(interpretation, "app"), ())
+
+    def test_gate_and_explicit_slice_prerequisites_have_transitive_closure(self):
+        payload = _gated_interpretation()
+        first, second = payload["runs"][0]["stages"]
+        second["depends_on"] = []
+        third = {**second, "label": "3", "depends_on": ["2"]}
+        payload["runs"] = [
+            {**payload["runs"][0], "id": "one", "stages": [first]},
+            {**payload["runs"][0], "id": "two", "stages": [second]},
+            {**payload["runs"][0], "id": "three", "stages": [third]},
+        ]
+        for mode in ("compile", "faithful"):
+            with self.subTest(mode=mode):
+                interpretation = parse_interpretation(json.dumps(payload), mode=mode)
+                self.assertEqual(run_prerequisites(interpretation, "one"), ())
+                self.assertEqual(run_prerequisites(interpretation, "two"),
+                                 ("one",) if mode == "compile" else ("canary", "one"))
+                self.assertEqual(run_prerequisites(interpretation, "three"), ("two",))
+                self.assertEqual(slice_ancestors(interpretation, "three"), ("one", "two"))
+                self.assertEqual(slice_ancestors(interpretation, "one"), ())
 
     def _prepare_and_approve(self, payload):
         from agent_sparring.intake import prepare_plan
