@@ -1716,6 +1716,28 @@ def _print_next_commands(exc: BaseException, rerun: str, reset: str | None = Non
         print(f"  {reset}", file=sys.stderr)
 
 
+def _drift_reset_command(
+    args: argparse.Namespace, sparring_dir: Path, repo_root: Path, cause: BaseException
+) -> str | None:
+    """The ``reset-stage`` alternative to a finalization-drift refusal.
+
+    None for a managed run: reset-stage cannot be addressed by run key, and
+    a hint that names the worktree, branch and plan input is exactly what a
+    managed run's person should never need. The resume line still prints.
+    """
+
+    if not isinstance(cause, FinalizationDrift) or _managed_record(args) is not None:
+        return None
+    return shlex.join(
+        [
+            "sparring", "--sparring-dir", str(Path(sparring_dir).resolve()),
+            "reset-stage", cause.stage_id, *_plan_command_parts(args),
+            "--repo-root", str(Path(repo_root).resolve()),
+            "--expected-branch", args.expected_branch,
+        ]
+    )
+
+
 def _given_options(
     args: argparse.Namespace, options: tuple[str, ...], **defaults: str
 ) -> list[str]:
@@ -2107,20 +2129,9 @@ _resume_retry_parts(args, exc.run),
                     args,
                     sparring_dir,
                     repo_root,
-[*_resume_retry_parts(args, run_key), *_unapplied_next_turn(exc)],
+                    [*_resume_retry_parts(args, run_key), *_unapplied_next_turn(exc)],
                 ),
-                reset=(
-                    shlex.join(
-                        [
-                            "sparring", "--sparring-dir", str(Path(sparring_dir).resolve()),
-                            "reset-stage", cause.stage_id, *_plan_command_parts(args),
-                            "--repo-root", str(Path(repo_root).resolve()),
-                            "--expected-branch", args.expected_branch,
-                        ]
-                    )
-                    if isinstance(cause, FinalizationDrift)
-                    else None
-                ),
+                reset=_drift_reset_command(args, sparring_dir, repo_root, cause),
             )
         return 1
 

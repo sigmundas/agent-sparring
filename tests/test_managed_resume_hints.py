@@ -157,3 +157,35 @@ class RecoveryResumeHintTests(unittest.TestCase):
 
     def test_reopen_stage(self):
         self._check(cli._cmd_reopen_stage)
+
+
+class DriftRefusalTests(unittest.TestCase):
+    """A finalization-drift refusal offers reset-stage only to an unmanaged run."""
+
+    def _printed(self, managed: bool) -> str:
+        from agent_sparring.next_turn import FinalizationDrift
+
+        args = _args(managed)
+        cause = FinalizationDrift("drift", stage_id="s1")
+        reset = cli._drift_reset_command(args, Path("/wt/.sparring"), Path("/wt"), cause)
+        rerun = cli._retry_command(args, Path("/wt/.sparring"), Path("/wt"), cli._resume_retry_parts(args, "K1"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cli._print_next_commands(cause, rerun, reset=reset)
+        return err.getvalue()
+
+    def test_managed_refusal_prints_only_the_short_resume(self):
+        printed = self._printed(managed=True)
+        self.assertIn(f"  {SHORT}\n", printed)
+        self.assertNotIn("reset-stage", printed)
+        self.assertNotIn("discard", printed)
+        self.assertNotIn("/wt", printed)
+
+    def test_unmanaged_refusal_keeps_the_reset_alternative(self):
+        printed = self._printed(managed=False)
+        self.assertIn("Or deliberately discard this attempt:", printed)
+        self.assertIn(
+            "reset-stage s1 " + str(Path("docs/plans/x.md").resolve())
+            + " --repo-root /wt --expected-branch sparring/x",
+            printed,
+        )
