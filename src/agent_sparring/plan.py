@@ -2183,8 +2183,20 @@ class _Disarming:
         self._rollback.armed = False
         return self._adapter.converse(session_id, prompt)
 
+    # Every other attribute is the adapter's own, read and written alike:
+    # a callback installed on the wrapper (``on_session_observed``) must be
+    # the one the provider sees.
     def __getattr__(self, name: str) -> Any:
         return getattr(self._adapter, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in ("_adapter", "_rollback"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._adapter, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        delattr(self._adapter, name)
 
 
 @contextlib.contextmanager

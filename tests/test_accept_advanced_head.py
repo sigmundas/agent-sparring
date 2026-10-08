@@ -26,7 +26,7 @@ from agent_sparring.plan import (
     resume_plan,
 )
 from agent_sparring.sessions import SessionError
-from agent_sparring.providers import ProviderUnavailable
+from agent_sparring.providers import ProviderError, ProviderUnavailable
 from agent_sparring.stage import SiblingPin, StageStatus
 from test_plan import (
     NEEDS_YOU,
@@ -559,6 +559,60 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
         self.assertEqual(self._stage(S1).read_state().next_turn_candidate.head_sha, advanced)
         self.assertIn("Accepted branch advance", self._stage(S1).read_notes())
         self.assertIsNotNone(self._plan_state().evidence_pending)
+
+    def test_a_fresh_reviewer_announcing_its_session_then_failing_is_recovered(self):
+        # The engine installs its session-recording callback by assigning
+        # it on the adapter it was handed; with the flag that adapter is the
+        # rollback's wrapper, and the provider must still see the callback.
+        stage_adapter, sparring_adapter, _ = self._pause()
+        advanced = self._land_other()
+
+        class _AnnouncesThenCrashes(_SparringAdapter):
+            def __init__(self, verdicts):
+                super().__init__(verdicts)
+                self.on_session_observed = None
+                self.crash = True
+
+            def start(self, prompt):
+                self.start_calls.append(prompt)
+                if self.on_session_observed is not None:
+                    self.on_session_observed("spar-fresh")
+                if self.crash:
+                    raise ProviderError("reviewer crashed after announcing its thread")
+                return self._next("spar-fresh")
+
+        reviewer = _AnnouncesThenCrashes([NEEDS_YOU])
+        with self.assertRaises(PlanRunError):
+            self._resume(
+                stage_adapter, reviewer, evidence="prerequisite landed",
+                accept_advanced_head=advanced, fresh_roles=("sparring",), fresh_reason="test",
+            )
+        # The callback reached the provider, and was put back afterwards.
+        self.assertIsNone(reviewer.on_session_observed)
+        state = self._stage(S1).read_state()
+        self.assertEqual(state.sessions["sparring"][-1].session_id, "spar-fresh")
+        self.assertEqual(state.next_turn_candidate.head_sha, advanced)
+        self.assertIn("Accepted branch advance", self._stage(S1).read_notes())
+
+        # The next resume continues that conversation instead of opening another.
+        reviewer.crash = False
+        self._resume(stage_adapter, reviewer)
+        self.assertEqual([sid for sid, _ in reviewer.resume_calls], ["spar-fresh"])
+        self.assertEqual(len(reviewer.start_calls), 1)
+
+    def test_the_rollback_wrapper_is_transparent_to_optional_adapter_hooks(self):
+        rollback = plan_module._Rollback(armed=True)
+        plain = _SparringAdapter([])
+        hooked = _SparringAdapter([])
+        hooked.on_session_observed = None
+        make = rollback.adapters(lambda stage: (plain, hooked))
+        wrapped_plain, wrapped_hooked = make(None)
+        self.assertFalse(hasattr(wrapped_plain, "on_session_observed"))
+        wrapped_hooked.on_session_observed = print
+        self.assertIs(hooked.on_session_observed, print)
+        wrapped_hooked.on_session_observed = None
+        self.assertIsNone(hooked.on_session_observed)
+        self.assertTrue(rollback.armed)
 
 def _set_status(stage, status):
     state = stage.read_state()
