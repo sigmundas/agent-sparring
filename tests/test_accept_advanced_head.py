@@ -14,11 +14,15 @@ from unittest import mock
 
 import conftest_path  # noqa: F401
 
-from agent_sparring.next_turn import NEXT_TURN_STAGE, record_next_turn
-from agent_sparring.plan import PlanError
+from agent_sparring import plan as plan_module
+from agent_sparring.deferred_gate import CheckOutcome
+from agent_sparring.next_turn import NEXT_TURN_STAGE, NextTurnError, record_next_turn
+from agent_sparring.plan import DeferredAnswer, PlanError, PlanRunError
+from agent_sparring.providers import ProviderUnavailable
 from agent_sparring.stage import SiblingPin, StageStatus
 from test_plan import (
     NEEDS_YOU,
+    READY,
     S1,
     _PlanRepoTestCase,
     _SparringAdapter,
@@ -288,15 +292,18 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
         )
 
     def test_a_stage_not_waiting_for_review_is_refused(self):
-        stage_adapter, sparring_adapter, _ = self._pause()
-        advanced = self._land_other()
-        stage = self._stage(S1)
         for label, mutate in (
-            ("next_turn=stage", lambda: record_next_turn(stage, NEXT_TURN_STAGE)),
-            ("ACCEPTED", lambda: _set_status(stage, StageStatus.ACCEPTED)),
+            ("next_turn=stage", lambda stage: record_next_turn(stage, NEXT_TURN_STAGE)),
+            ("ACCEPTED", lambda stage: _set_status(stage, StageStatus.ACCEPTED)),
         ):
             with self.subTest(label):
-                mutate()
+                # Each from a fresh pause, so neither relies on the other.
+                self.tearDown_and_reset()
+                stage_adapter, sparring_adapter, _ = self._pause()
+                advanced = self._land_other()
+                stage = self._stage(S1)
+                mutate(stage)
+                self.assertEqual(stage.read_state().next_turn == "sparring", label == "ACCEPTED")
                 self._refused(
                     (stage_adapter, sparring_adapter),
                     "has none",
@@ -326,28 +333,132 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
             accept_advanced_head=advanced,
         )
 
-    def test_a_failure_writing_the_note_leaves_the_repin_and_no_false_record(self):
-        stage_adapter, sparring_adapter, pinned = self._pause()
-        advanced = self._land_other()
-        plan_before = self.state_path.read_bytes()
-        with mock.patch(
-            "agent_sparring.plan.record_human_evidence", side_effect=OSError("disk full")
-        ):
-            with self.assertRaises(OSError):
-                self._resume(
-                    stage_adapter, sparring_adapter, evidence="done",
-                    accept_advanced_head=advanced,
-                )
-        # notes.md never claims a re-pin; the re-pin itself is a verified
-        # fact about the repository, and the plan run state is untouched.
-        self.assertNotIn("Accepted branch advance", self._stage(S1).read_notes())
-        self.assertEqual(self._stage(S1).read_state().next_turn_candidate.head_sha, advanced)
-        self.assertEqual(self.state_path.read_bytes(), plan_before)
-        # The same evidence then records without the flag.
-        self._resume(stage_adapter, sparring_adapter, evidence="done")
-        self.assertIn("done", self._stage(S1).read_notes())
-        self.assertNotEqual(pinned, advanced)
+    def test_a_failure_at_any_write_puts_everything_back(self):
+        # The re-pin, the note and the run state land together or not at
+        # all, even with a push grant recorded first in the same resume.
+        real_repin = plan_module.repin_after_authorized_advance
+        proofs = []
 
+        def second_proof_refuses(*args):
+            proofs.append(args)
+            if len(proofs) == 2:
+                raise NextTurnError("the repository changed between the two proofs")
+            return real_repin(*args)
+
+        failures = {
+            "re-pin write": ("record_next_turn", OSError("disk full")),
+            "note write": ("record_human_evidence", OSError("disk full")),
+            "evidence_pending write": ("_sparring_digest", OSError("disk full")),
+            "second proof": ("repin_after_authorized_advance", second_proof_refuses),
+        }
+        for label, (name, effect) in failures.items():
+            with self.subTest(label):
+                self.tearDown_and_reset()
+                proofs.clear()
+                stage_adapter, sparring_adapter, _ = self._pause()
+                advanced = self._land_other()
+                before = self._snapshot()
+                with mock.patch.object(plan_module, name, side_effect=effect):
+                    with self.assertRaises((OSError, PlanError)):
+                        self._resume(
+                            stage_adapter, sparring_adapter, evidence="done",
+                            accept_advanced_head=advanced, allow_push_for_run=True,
+                        )
+                self.assertEqual(self._snapshot(), before)
+                if label == "second proof":
+                    self.assertEqual(len(proofs), 2)
+                # Nothing is half-applied, so the same command then succeeds.
+                self._accepted((stage_adapter, sparring_adapter), advanced)
+
+    def test_combined_deferred_answers_are_refused_before_anything_is_written(self):
+        stage_adapter, sparring_adapter, _ = self._pause()
+        advanced = self._land_other()
+        self._refused(
+            (stage_adapter, sparring_adapter),
+            "--deferred-result",
+            evidence="done",
+            accept_advanced_head=advanced,
+            allow_push_for_run=True,
+            deferred_results=(DeferredAnswer(check_ref="nope:nope", outcome=CheckOutcome.PASS),),
+        )
+
+    # -- index-only and range-wide checks -------------------------------
+
+    def test_an_index_only_change_to_the_attempt_is_refused(self):
+        stage_adapter, sparring_adapter, _ = self._pause()
+        advanced = self._land_other()
+        # Restage both.txt with different bytes, then put the working tree
+        # back: the candidate content is identical, what was staged is not.
+        self._write("both.txt", "staged differently\n")
+        _run_git(self.repo, "add", "both.txt")
+        self._write("both.txt", "attempt staged then edited\n")
+        self._refused(
+            (stage_adapter, sparring_adapter),
+            "what the attempt staged differs",
+            evidence="done",
+            accept_advanced_head=advanced,
+        )
+
+    def test_a_pin_without_index_evidence_is_accepted_only_with_nothing_staged(self):
+        stage_adapter, sparring_adapter, _ = self._pause()
+        stage = self._stage(S1)
+        state = stage.read_state()
+        state.next_turn_candidate = dataclasses.replace(
+            state.next_turn_candidate, index_digest=None
+        )
+        stage.write_state(state)
+        advanced = self._land_other()
+        adapters = (stage_adapter, sparring_adapter)
+        self._refused(
+            adapters, "cannot be shown unchanged", evidence="done", accept_advanced_head=advanced
+        )
+        _run_git(self.repo, "restore", "--staged", "staged.txt", "both.txt")
+        self._resume(*adapters, evidence="done", accept_advanced_head=advanced)
+        self.assertEqual(stage.read_state().next_turn_candidate.head_sha, advanced)
+
+    def test_a_range_that_changes_then_restores_an_attempt_path_is_refused(self):
+        stage_adapter, sparring_adapter, _ = self._pause()
+        attempt = (self.repo / "tracked.txt").read_text()
+        self._write("tracked.txt", "prerequisite\n")
+        self._land("touch an attempt path", "tracked.txt", push=False)
+        self._write("tracked.txt", "tracked.txt base\n")
+        self._land("restore it", "tracked.txt", push=False)
+        advanced = self._land_other()
+        self._write("tracked.txt", attempt)
+        self._refused(
+            (stage_adapter, sparring_adapter),
+            "uncommitted attempt content (tracked.txt)",
+            evidence="done",
+            accept_advanced_head=advanced,
+        )
+
+    def test_a_pending_review_that_raised_no_gate_is_refused(self):
+        # Implementation done and the review pinned, but the reviewer never
+        # ruled (here: its provider failed), so there is no NEEDS_YOU.
+        stage_adapter = _StageAdapter(self.repo)
+        original_turn = stage_adapter._turn
+
+        def dirty_turn(session_id):
+            self._write("tracked.txt", "attempt unstaged\n")
+            return original_turn(session_id)
+
+        stage_adapter._turn = dirty_turn
+
+        class _Down(_SparringAdapter):
+            def start(self, prompt):
+                raise ProviderUnavailable("usage limit reached")
+
+        with self.assertRaises(PlanRunError):
+            self._start(stage_adapter, _Down([]))
+        state = self._stage(S1).read_state()
+        self.assertEqual(state.next_turn, "sparring")
+        advanced = self._land_other()
+        self._refused(
+            (stage_adapter, _SparringAdapter([NEEDS_YOU])),
+            "not stopped on one",
+            evidence="anything",
+            accept_advanced_head=advanced,
+        )
 
 def _set_status(stage, status):
     state = stage.read_state()
@@ -357,3 +468,62 @@ def _set_status(stage, status):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from test_independent_review import REVIEW_STAGE, _ReviewRepoTestCase  # noqa: E402
+from test_manifest import _ManifestRepoTestCase  # noqa: E402
+
+MANIFEST_STAGE = "stage-3c-cloud-schema"
+
+
+class AcceptAdvancedHeadReviewOnlyTests(_ReviewRepoTestCase):
+    def test_a_review_only_stage_is_refused_with_nothing_changed(self):
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        self.start(stage_adapter, _SparringAdapter([READY, NEEDS_YOU]))
+        stage_dir = self.stage(REVIEW_STAGE).directory
+        (self.repo / "prereq.txt").write_text("prerequisite\n", encoding="utf-8")
+        _run_git(self.repo, "add", "prereq.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "prerequisite")
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        files = (self.state_path, stage_dir / "state.json", stage_dir / "notes.md")
+        before = [path.read_bytes() if path.exists() else None for path in files]
+
+        with self.assertRaises(PlanError) as ctx:
+            self.resume(
+                stage_adapter, _SparringAdapter([READY]), evidence="done",
+                accept_advanced_head=_head_sha(self.repo),
+            )
+        self.assertIn("has none", str(ctx.exception))
+        self.assertEqual([path.read_bytes() if path.exists() else None for path in files], before)
+
+
+class AcceptAdvancedHeadManifestTests(_ManifestRepoTestCase):
+    def test_an_intake_manifest_run_repins_like_a_markdown_one(self):
+        stage_adapter = _StageAdapter(self.repo)
+        original_turn = stage_adapter._turn
+
+        def dirty_turn(session_id):
+            (self.repo / "wip.txt").write_text("attempt\n", encoding="utf-8")
+            return original_turn(session_id)
+
+        stage_adapter._turn = dirty_turn
+        sparring_adapter = _SparringAdapter([NEEDS_YOU, NEEDS_YOU])
+        self._start(stage_adapter, sparring_adapter)
+        pinned = self._stage(MANIFEST_STAGE).read_state().next_turn_candidate.head_sha
+        (self.repo / "prereq.txt").write_text("prerequisite\n", encoding="utf-8")
+        _run_git(self.repo, "add", "prereq.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "prerequisite")
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        advanced = _head_sha(self.repo)
+
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(stage_adapter, sparring_adapter, evidence="done")
+        self.assertIn("(--next-turn cannot re-pin a recorded candidate.)", str(ctx.exception))
+        self._resume(
+            stage_adapter, sparring_adapter, evidence="done", accept_advanced_head=advanced
+        )
+
+        state = self._stage(MANIFEST_STAGE).read_state()
+        self.assertEqual(state.next_turn_candidate.head_sha, advanced)
+        self.assertIn(f"from HEAD {pinned} to {advanced}", self._stage(MANIFEST_STAGE).read_notes())
+        self.assertEqual(stage_adapter.resume_calls, [])

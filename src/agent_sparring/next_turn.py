@@ -41,6 +41,7 @@ from agent_sparring.finalization import (
     _is_stage_artifact,
     _uncommitted_content_paths,
     read_commit_content,
+    read_index_content,
     read_worktree_content,
 )
 from agent_sparring.git_context import (
@@ -195,6 +196,7 @@ def capture_candidate(repo_root: Path, stage: Stage, state: StageState) -> TurnC
         head = resolve_commit(repo_root, "HEAD", label="HEAD")
         uncommitted = _uncommitted_content_paths(repo_root, stage)
         content = read_worktree_content(repo_root, stage)
+        index = read_index_content(repo_root, stage)
     except (GitContextError, FinalizationError) as exc:
         raise NextTurnError(f"could not read the candidate identity: {exc}") from exc
     untracked_paths = set(untracked_candidate_paths(repo_root, stage))
@@ -223,6 +225,7 @@ def capture_candidate(repo_root: Path, stage: Stage, state: StageState) -> TurnC
         repositories=tuple(pins),
         tracked_digest=tracked_digest,
         untracked=untracked,
+        index_digest=index.digest if index is not None else "unmerged",
     )
 
 
@@ -294,12 +297,13 @@ def repin_after_authorized_advance(
     onto the branch beneath the stage's uncommitted attempt. Everything else
     stays refused. The re-pin happens only if ``accepted_head`` is the
     current HEAD, the pinned HEAD is a strict ancestor of it, every sibling
-    pin is unchanged, no path the new commits change has uncommitted
-    content, the untracked candidate files are byte-identical to the pinned
-    ones, and the current content with exactly those commits taken back out
-    reproduces the pinned content digest. That last check proves the
-    attempt's work is preserved exactly and that the only difference is the
-    named commits. Returns the newly pinned candidate; writes nothing.
+    pin is unchanged, no path any commit in the range touched has
+    uncommitted content, the untracked candidate files are byte-identical to
+    the pinned ones, and the current content -- and the current index --
+    with exactly those commits taken back out reproduce the pinned digests.
+    That proves the attempt's work, written and staged, is preserved exactly
+    and that the only difference is the named commits. Returns the newly
+    pinned candidate; writes nothing.
     """
 
     pinned = state.next_turn_candidate
@@ -354,17 +358,71 @@ def repin_after_authorized_advance(
     try:
         before = read_commit_content(repo_root, stage, pinned.head_sha)
         after = read_commit_content(repo_root, stage, accepted)
-        uncommitted = set(_uncommitted_content_paths(repo_root, stage))
+        uncommitted = _attempt_paths(_uncommitted_content_paths(repo_root, stage))
         content = read_worktree_content(repo_root, stage)
+        index = read_index_content(repo_root, stage)
+        # Every path any commit in the range touched, not only the net
+        # difference: a commit that changed an attempt path and a later one
+        # that restored it still both wrote to that path.
+        touched = {
+            path
+            for path in _git(
+                repo_root, "log", "-m", "--no-renames", "--name-only", "--format=", "-z",
+                f"{pinned.head_sha}..{accepted}",
+            ).split("\0")
+            if path and not _is_stage_artifact(repo_root, stage, path)
+        }
     except FinalizationError as exc:
         raise NextTurnError(f"could not read the candidate content: {exc}") from exc
     advanced = before.diverged_from(after)
-    overlap = sorted(uncommitted.intersection(advanced))
+    overlap = sorted(uncommitted.intersection(touched | set(advanced)))
     if overlap:
         raise NextTurnError(
             "the accepted commits change paths that also hold uncommitted attempt "
             f"content ({', '.join(overlap)}); refusing to merge them into one candidate"
         )
+    if _without(content, before, advanced).digest != pinned.content_digest:
+        raise NextTurnError(
+            f"the repository is not the pinned candidate plus the commits "
+            f"{pinned.head_sha[:12]}..{accepted[:12]}; something else changed as well"
+        )
+    # The same proof for what the attempt staged. A marker recorded before
+    # the index was pinned cannot show that, so it is accepted only while
+    # nothing is staged at all.
+    if index is None:
+        raise NextTurnError("the index holds an unmerged path; resolve it first")
+    if pinned.index_digest is None:
+        if index.entries != after.entries:
+            raise NextTurnError(
+                "the attempt has staged changes, and this review was pinned before staged "
+                "content was recorded, so they cannot be shown unchanged; unstage them "
+                "(git restore --staged) and rerun"
+            )
+    elif _without(index, before, advanced).digest != pinned.index_digest:
+        raise NextTurnError(
+            "what the attempt staged differs from what was staged when the review was "
+            "pinned; the attempt's work is not preserved exactly"
+        )
+    return current
+
+
+def _attempt_paths(entries: tuple[str, ...]) -> set[str]:
+    """Both sides of each ``"new (renamed from old)"`` status entry."""
+
+    paths: set[str] = set()
+    for entry in entries:
+        new, separator, old = entry.partition(" (renamed from ")
+        paths.add(new)
+        if separator:
+            paths.add(old[:-1])
+    return paths
+
+
+def _without(
+    content: CandidateContent, before: CandidateContent, advanced: tuple[str, ...]
+) -> CandidateContent:
+    """``content`` with each ``advanced`` path put back as ``before`` held it."""
+
     old_entries = dict(before.entries)
     rebuilt = dict(content.entries)
     for path in advanced:
@@ -372,13 +430,7 @@ def repin_after_authorized_advance(
             rebuilt[path] = old_entries[path]
         else:
             rebuilt.pop(path, None)
-    if CandidateContent(entries=tuple(sorted(rebuilt.items()))).digest != pinned.content_digest:
-        raise NextTurnError(
-            f"the repository is not the pinned candidate plus the commits "
-            f"{pinned.head_sha[:12]}..{accepted[:12]}; something else changed as well"
-        )
-    return current
-
+    return CandidateContent(entries=tuple(sorted(rebuilt.items())))
 
 @dataclass(frozen=True)
 class _IndexOrder:
