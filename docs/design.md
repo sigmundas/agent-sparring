@@ -915,14 +915,15 @@ section fixes who owns them and the invariants the implementation keeps.
 --managed` / `start-plan --managed` create a recorded worktree and branch,
 `resume-plan --run-key` resumes in it from any checkout, `sparring runs`
 lists records, `finish-run [--dry-run]` checks and performs merge and
-cleanup, and `prune --dry-run` reports what is believed unused. User-facing
+cleanup, and `prune` reports (`--dry-run`) or deletes, by explicit
+selector, finished runs' records and archives. User-facing
 behavior and refusal codes are in [plans.md](plans.md#managed-runs); JSON
 shapes in [reference.md](reference.md#managed-run-json).
 
 **What remains.** Not built yet: managed runs through the intake route (an
 intake input is refused `--managed`); multi-repository runs (a manifest
 declaring sibling `repositories` is refused); an explicitly confirmed
-*abandon* that keeps the branch; and any deletion mode for `prune`.
+*abandon* that keeps the branch.
 Unmanaged runs — the current checkout, or a worktree a person made —
 behave as before and are never cleanup candidates.
 
@@ -998,18 +999,45 @@ Merging requires all of:
    Ancestry decides, never message or patch matching; nothing is rebased.
 
 Cleanup additionally requires every ignored file under the project
-directory to be archivable. Execution then: merge; push the target only with
-`--push-target` (never forced; pushing is optional, so target reachability
-is not a check); archive the worktree's project state to
+directory to be archivable. Execution then: merge; with `[finish]
+remove_plan` commit the plan file's removal on the target; push the target
+only with `--push-target` (never forced; pushing is optional, so target
+reachability is not a check); archive the worktree's project state to
 `<git-common-dir>/agent-sparring/runs/<run-key>/`; `git worktree remove`
-without `--force`; `git branch -d` (never `-D`); record `finished`. Each
+without `--force`; `git branch -d` (never `-D`); with `[finish]
+delete_remote_branch` delete the remote branch; record `finished`. Each
 step appends an event, so a run stopped part-way is resumed by running the
-command again, and the report says what remains. Remote branches are never
-deleted; a kept one is reported. `--merge-only` stops after merge and push.
+command again (a step is skipped only when its event is recorded), and the
+report says what remains. `--merge-only` stops after merge, plan removal
+and push. Both options are off by default and read from the reviewed
+candidate's own config.
+
+**Plan removal is byte-exact.** The plan is the human's document, so the
+engine may delete it only here, only by opt-in, and only when the target's
+bytes equal the exact bytes snapshotted when the run started (stored as
+engine state under `plans/` and archived with the run) — never by stage
+digest or any semantic comparison, and never by reconciling a plan that is
+already gone. Any reason not to remove it (no snapshot, not tracked,
+absent, changed, a dirty target checkout, an operation in progress, no git
+identity) is reported and the finish continues; only an unexpected git
+failure stops it. A manifest run removes only the manifest file. The
+removal commit sits one commit past the candidate; every later check uses
+ancestry, so it is still "contains the candidate".
+
+**Remote deletion is compare-and-delete.** A check-then-delete would race
+with a concurrent push and drop someone's commits, so the delete is a
+`push --force-with-lease=refs/heads/<b>:<candidate> --delete`, which the
+server refuses unless the branch is exactly the merged candidate; that
+lease is the only force anywhere in finish. A read of the remote only
+classifies a refusal. A refused or unreachable delete keeps the branch and
+stops the finish unfinished; re-running resumes. With the option off the
+branch is kept and reported (`remote_delete_disabled`, plus the legacy
+`remote_delete_unavailable` kept entry for one release).
 
 **Never automatic.** Nothing is removed on completion, on a timer or on
 window close. A dirty, paused, unaccepted, unmerged or unpushed worktree is
-never removed, and no engine path uses `--force`, `-D` or a force push.
+never removed, and no engine path uses `--force`, `-D` or a force push —
+the one exception being the opted-in, lease-guarded remote branch delete.
 Abandoning a run is a separate, explicitly confirmed action that keeps the
 branch.
 
@@ -1021,8 +1049,13 @@ As built it reports, from the records alone: finished records, records whose
 worktree directory is gone, and finish archives under
 `<git-common-dir>/agent-sparring/runs/`. Intake directories, stale stage
 directories, manifest bindings and migration-history retention are not yet
-reported. Deleting any of it is a later, separate decision; there is no
-deletion mode.
+reported. `sparring prune --older-than DAYS` and/or `--keep N` (never
+automatic, no config key) deletes finished runs' records and archives —
+records whose lifecycle is finished and archives whose record is finished
+or missing — after re-checking under a lock and after appending a fsynced
+summary line per run to `runs/pruned.jsonl`; if that write fails nothing is
+deleted. Unfinished runs are never touched and a record whose worktree is
+merely missing is only reported.
 
 ### Engine snapshots
 
@@ -1055,6 +1088,9 @@ required.
    worktree and branch removal under those checks. Remote branches are
    never deleted; a kept one is reported.
 4. `prune --dry-run --json` and an end-to-end test.
+5. Opt-in `[finish] remove_plan` (byte-exact against a start snapshot) and
+   `[finish] delete_remote_branch` (lease-guarded), and `prune` deletion by
+   `--older-than` / `--keep` with a `pruned.jsonl` summary.
 
 ---
 
