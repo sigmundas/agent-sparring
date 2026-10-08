@@ -1490,16 +1490,22 @@ def _retry_command(
     sessions, --next-turn, --evidence, push grants) are not repeated: each
     was already applied and recorded by this invocation."""
 
-    parts = [
-        "sparring",
-        "--sparring-dir",
-        str(Path(sparring_dir).resolve()),
-        *command,
-        "--repo-root",
-        str(Path(repo_root).resolve()),
-        "--expected-branch",
-        args.expected_branch,
-    ]
+    managed = _managed_record(args)
+    if managed is not None:
+        # A managed run is addressed by its key alone: the record supplies
+        # the worktree, branch, state directory and plan input.
+        parts = ["sparring", *command]
+    else:
+        parts = [
+            "sparring",
+            "--sparring-dir",
+            str(Path(sparring_dir).resolve()),
+            *command,
+            "--repo-root",
+            str(Path(repo_root).resolve()),
+            "--expected-branch",
+            args.expected_branch,
+        ]
     for option in (
         "stage_provider",
         "sparring_provider",
@@ -1507,7 +1513,7 @@ def _retry_command(
         "sparring_model",
         "stage_effort",
         "sparring_effort",
-        "stop_after_stage",
+        *(() if managed is not None else ("stop_after_stage",)),
     ):
         value = getattr(args, option, None)
         if value is not None:
@@ -1757,6 +1763,36 @@ def _plan_input_args(args: argparse.Namespace, run: str = "") -> str:
     return f"{addressed} --run-key {run}" if run else addressed
 
 
+def _managed_record(args: argparse.Namespace):
+    return getattr(args, "managed_record", None)
+
+
+def _resume_command(args: argparse.Namespace, run: str = "") -> str:
+    """The copyable ``resume-plan`` command for this run, without the
+    situation-specific flags a caller appends.
+
+    A managed run is resumed by its key alone, from any checkout of the
+    repository: its record supplies the worktree, branch and plan input.
+    """
+
+    record = _managed_record(args)
+    if record is not None:
+        return f"sparring resume-plan --run-key {record.run_key}"
+    return (
+        f"sparring resume-plan {_plan_input_args(args, run)} --repo-root {args.repo_root or '.'} "
+        f"--expected-branch {args.expected_branch}"
+    )
+
+
+def _resume_retry_parts(args: argparse.Namespace, run: str | None) -> list[str]:
+    """``resume-plan`` and its run addressing, for :func:`_retry_command`."""
+
+    record = _managed_record(args)
+    if record is not None:
+        return ["resume-plan", "--run-key", record.run_key]
+    return ["resume-plan", *_plan_command_parts(args), *(["--run-key", run] if run else [])]
+
+
 def _report_plan_result(
     result: PlanRunResult, args: argparse.Namespace, sparring_dir: Path
 ) -> None:
@@ -1795,8 +1831,7 @@ def _report_plan_result(
         print()
         print("Continue when you are ready:")
         print(
-            f"  sparring resume-plan {_plan_input_args(args, result.run)} "
-            f"--repo-root {args.repo_root or '.'} --expected-branch {args.expected_branch}"
+            f"  {_resume_command(args, result.run)}"
         )
         return
 
@@ -1821,10 +1856,7 @@ def _report_plan_result(
     print()
     print(stage.read_sparring().rstrip())
     print()
-    resume = (
-        f"sparring resume-plan {_plan_input_args(args, result.run)} --repo-root {args.repo_root or '.'} "
-        f"--expected-branch {args.expected_branch}"
-    )
+    resume = _resume_command(args, result.run)
     if routing.action is RoutingAction.ESCALATE:
         print("To spar this stage elsewhere, build a packet from the current handoff:")
         print(f"  handoff: {stage.directory / 'handoff.md'}")
@@ -1858,10 +1890,7 @@ def _report_deferred_verification_required(
 
     awaiting = result.awaiting
     assert isinstance(awaiting, DeferredVerificationRequired)  # the caller checked
-    resume = (
-        f"sparring resume-plan {_plan_input_args(args, result.run)} --repo-root {args.repo_root or '.'} "
-        f"--expected-branch {args.expected_branch}"
-    )
+    resume = _resume_command(args, result.run)
     print(f"plan paused: {result.plan}")
     print(f"needs: {awaiting.kind}")
     print(f"why now: {awaiting.reason}")
@@ -1921,10 +1950,7 @@ def _report_push_authorization_required(
 
     awaiting = result.awaiting
     assert awaiting is not None  # the caller checked
-    resume = (
-        f"sparring resume-plan {_plan_input_args(args, result.run)} --repo-root {args.repo_root or '.'} "
-        f"--expected-branch {args.expected_branch}"
-    )
+    resume = _resume_command(args, result.run)
     print(f"plan paused: {result.plan}")
     print(f"stage: {result.stage_id} ({stage.directory})")
     print(f"needs: {PUSH_AUTHORIZATION_REQUIRED}")
@@ -2041,15 +2067,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool, source: PlanSou
                 args,
                 sparring_dir,
                 repo_root,
-                [
-                    "resume-plan",
-                    *(
-                        ["--manifest", str(Path(args.manifest).resolve())]
-                        if args.manifest
-                        else [str(Path(args.plan_path).resolve())]
-                    ),
-                    *(["--run-key", exc.run] if exc.run else []),
-                ],
+_resume_retry_parts(args, exc.run),
             ),
         )
         return 1
@@ -2073,12 +2091,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool, source: PlanSou
                     args,
                     sparring_dir,
                     repo_root,
-                    [
-                        "resume-plan",
-                        *_plan_command_parts(args),
-                        *(["--run-key", run_key] if run_key else []),
-                        *_unapplied_next_turn(exc),
-                    ],
+[*_resume_retry_parts(args, run_key), *_unapplied_next_turn(exc)],
                 ),
                 reset=(
                     shlex.join(
@@ -2468,8 +2481,7 @@ def _cmd_reset_stage(args: argparse.Namespace) -> int:
     print()
     print("The stage is fresh and the run is paused at it. Continue with:")
     print(
-        f"  sparring resume-plan {_plan_input_args(args, result.run)} "
-        f"--repo-root {args.repo_root or '.'} --expected-branch {args.expected_branch}"
+        f"  {_resume_command(args, result.run)}"
     )
     return 0
 
@@ -2516,8 +2528,7 @@ def _cmd_reopen_stage(args: argparse.Namespace) -> int:
         "Continue with:"
     )
     print(
-        f"  sparring resume-plan {_plan_input_args(args, result.run)} "
-        f"--repo-root {args.repo_root or '.'} --expected-branch {args.expected_branch}"
+        f"  {_resume_command(args, result.run)}"
     )
     return 0
 
