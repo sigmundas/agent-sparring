@@ -214,12 +214,15 @@ it is recorded, and nothing runs -- the reviewer never judges an answer
 against different content. `--next-turn` cannot re-pin a recorded marker:
 restore the recorded candidate, or, if the change was deliberate, choose how
 to continue explicitly (for example `sparring reset-stage`). The one re-pin is
-`--evidence ... --accept-advanced-head SHA`, for a branch deliberately
-fast-forwarded beneath the uncommitted attempt (a separately landed
-prerequisite): accepted only if `SHA` is a SHA prefix of the current HEAD,
-the pinned HEAD is its ancestor, no sibling moved, the added commits touch no
-uncommitted path, and taking them back out reproduces the pinned content
-exactly. It is checked in full before any run or stage state is written.
+`--evidence ... --accept-advanced-head SHA`, answering a recorded NEEDS_YOU
+whose branch was deliberately fast-forwarded beneath the uncommitted attempt
+(a separately landed prerequisite): accepted only if `SHA` is a SHA prefix of
+the current HEAD, the pinned HEAD is its ancestor, no sibling moved, no commit
+in the range touches an uncommitted path, and taking the commits back out
+reproduces the pinned content and the pinned staged content exactly (a review
+pinned before staged content was recorded is accepted only with nothing
+staged). It is checked in full before anything is written, cannot be combined
+with `--deferred-result`, and its writes land together or not at all.
 A resume without evidence over a recorded NEEDS_YOU / ESCALATE keeps that
 pause and runs nothing, whatever the marker says; `--fresh-*` or `--next-turn` alone are
 refused there, because neither answers a person. State with no marker keeps

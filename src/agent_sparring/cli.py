@@ -4115,11 +4115,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SHA",
         help=(
-            "with --evidence only: the branch was deliberately advanced to exactly this "
-            "commit, named by its (abbreviated) SHA (for example a separately landed prerequisite) while the stage waited "
-            "on you. The pending review is re-pinned to it only if HEAD is this commit, "
-            "fast-forwards from the pinned one, and the stage's uncommitted work is "
-            "provably unchanged; refused otherwise, with nothing recorded"
+            "with --evidence answering a NEEDS_YOU only: the branch was deliberately "
+            "advanced to exactly this commit, named by its (abbreviated) SHA (for example "
+            "a separately landed prerequisite) while the stage waited on you. The pending "
+            "review is re-pinned to it only if HEAD is this commit, fast-forwards from the "
+            "pinned one, and the stage's uncommitted work, written and staged, is provably "
+            "unchanged; refused otherwise, with nothing recorded"
         ),
     )
     resume_plan_parser.add_argument(
