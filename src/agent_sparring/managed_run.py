@@ -33,6 +33,7 @@ EVENTS = (
     "created",
     "creation_failed",
     "merged",
+    "plan_removed",
     "target_pushed",
     "state_archived",
     "worktree_removed",

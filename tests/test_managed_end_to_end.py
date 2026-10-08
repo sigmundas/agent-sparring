@@ -104,6 +104,7 @@ class PruneReportTests(_ManagedRepoTestCase):
         self.assertNotIn("agent-sparring-engine", out)
         self.assertIsNotNone(managed_run.read_record(self.repo, record.run_key))
 
-    def test_dry_run_is_required(self):
-        with self.assertRaises(SystemExit):
-            self._main("prune", "--json", "--repo-root", str(self.repo))
+    def test_a_selector_or_dry_run_is_required(self):
+        code, _, err = self._main("prune", "--json", "--repo-root", str(self.repo))
+        self.assertEqual(code, 2)
+        self.assertIn("--dry-run", err)
