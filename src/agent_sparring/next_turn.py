@@ -307,10 +307,22 @@ def repin_after_authorized_advance(
         raise NextTurnError(
             f"stage {stage.stage_id!r} has no pinned candidate to re-pin"
         )
+    # A commit id, not a revision expression: "HEAD", a branch or "HEAD~1"
+    # would accept whatever the branch holds rather than a commit the person
+    # named, and a hex-looking ref name must not stand in for a SHA prefix.
+    if not re.fullmatch(r"[0-9a-f]{4,64}", accepted_head):
+        raise NextTurnError(
+            f"{accepted_head!r} is not a commit SHA; name the commit by its (abbreviated) SHA"
+        )
     try:
         accepted = resolve_commit(repo_root, accepted_head, label="accepted head")
     except GitContextError as exc:
         raise NextTurnError(f"could not resolve the accepted head: {exc}") from exc
+    if not accepted.startswith(accepted_head):
+        raise NextTurnError(
+            f"{accepted_head!r} resolves to {accepted}, which it is not a prefix of (a ref "
+            "with that name?); name the commit by its SHA"
+        )
     current = capture_candidate(repo_root, stage, state)
     if current.head_sha != accepted:
         raise NextTurnError(

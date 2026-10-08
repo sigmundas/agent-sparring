@@ -1817,6 +1817,18 @@ def resume_plan(
             next_turn,
             evidence=bool(evidence and evidence.strip()),
         )
+    if accept_advanced_head is not None:
+        # Likewise validated in full before anything is written: a refused
+        # re-pin must not leave a push grant, a deferred answer or a marker
+        # behind. The evidence path below repeats the proof before writing.
+        _check_advanced_head(
+            sparring_dir,
+            repo_root,
+            stages[state.current_stage_index],
+            accept_advanced_head,
+            evidence=bool(evidence and evidence.strip()),
+            next_turn=next_turn,
+        )
     _grant_push_authorization(
         state,
         state_path,
@@ -1837,12 +1849,6 @@ def resume_plan(
         report=report,
         context=slice_context(source) if deferred_results else None,
     )
-
-    if accept_advanced_head is not None and not (evidence and evidence.strip()):
-        raise PlanError(
-            "--accept-advanced-head is recorded with the human evidence that authorizes "
-            "it; pass --evidence as well"
-        )
 
     sparrer_first = False
     if evidence is not None and evidence.strip():
@@ -1907,17 +1913,21 @@ def resume_plan(
                         f"refusing to record evidence for stage {current.stage_id!r}: "
                         f"--accept-advanced-head {accept_advanced_head}: {repin_exc}"
                     ) from repin_exc
-                evidence = (
-                    f"{evidence.rstrip()}\n\nAccepted branch advance: the pending review "
-                    f"was re-pinned from HEAD {pinned_head} to {repinned.head_sha} "
-                    "(--accept-advanced-head). The stage's uncommitted work was verified "
-                    "unchanged; the only difference is the commits in that range."
-                )
-                record_human_evidence(stage, evidence)
+                # The re-pin is written first: should the note then fail,
+                # notes.md never claims a re-pin that did not happen, and the
+                # stage holds exactly the candidate a plain --evidence rerun
+                # verifies against.
                 record_next_turn(
                     stage, NEXT_TURN_SPARRING, candidate=repinned, source="manual"
                 )
                 current_state = stage.read_state()
+                record_human_evidence(
+                    stage,
+                    f"{evidence.rstrip()}\n\nAccepted branch advance: the pending review "
+                    f"was re-pinned from HEAD {pinned_head} to {repinned.head_sha} "
+                    "(--accept-advanced-head). The stage's uncommitted work was verified "
+                    "unchanged; the only difference is the commits in that range.",
+                )
                 report(
                     f"stage {current.stage_id}: re-pinned the pending review from "
                     f"{pinned_head} to {repinned.head_sha}"
@@ -1925,15 +1935,9 @@ def resume_plan(
                 evidence = None
             else:
                 if accept_advanced_head is not None:
-                    raise PlanError(
-                        f"--accept-advanced-head: stage {current.stage_id!r} still holds "
-                        "its pinned candidate; there is no branch advance to accept"
-                    )
+                    raise PlanError(_still_pinned_message(current.stage_id))
         elif accept_advanced_head is not None:
-            raise PlanError(
-                f"--accept-advanced-head applies only to a stage whose pending review no "
-                f"longer matches the repository; {current.stage_id!r} has none"
-            )
+            raise PlanError(_no_pending_review_message(current.stage_id))
         if evidence is not None:
             record_human_evidence(stage, evidence)
         report(f"recorded human evidence in {stage.directory / 'notes.md'}")
@@ -2035,6 +2039,72 @@ def _check_next_turn_choice(
         check_next_turn_choice(repo_root, stage, choice)
     except (StageError, NextTurnError) as exc:
         raise PlanError(str(exc)) from exc
+
+
+def _still_pinned_message(stage_id: str) -> str:
+    return (
+        f"--accept-advanced-head: stage {stage_id!r} still holds its pinned candidate; there "
+        "is no branch advance to accept (if an earlier --accept-advanced-head already re-pinned "
+        "it, record the evidence without the flag)"
+    )
+
+
+def _no_pending_review_message(stage_id: str) -> str:
+    return (
+        "--accept-advanced-head applies only to a stage whose pending review no longer "
+        f"matches the repository; {stage_id!r} has none"
+    )
+
+
+def _check_advanced_head(
+    sparring_dir: Path,
+    repo_root: Path,
+    planned: PlannedStage,
+    accepted_head: str,
+    *,
+    evidence: bool,
+    next_turn: str | None,
+) -> None:
+    """Refuse (:class:`PlanError`) an ``--accept-advanced-head`` the resume
+    could not honour, without creating or changing anything: the same proof
+    the evidence path runs before it re-pins, run before any plan-run or
+    stage state is written."""
+
+    if not evidence:
+        raise PlanError(
+            "--accept-advanced-head is recorded with the human evidence that authorizes "
+            "it; pass --evidence as well"
+        )
+    if next_turn is not None:
+        raise PlanError(
+            "--accept-advanced-head re-pins a recorded review; it cannot be combined with "
+            "--next-turn, which pins one where none is recorded. Nothing was changed."
+        )
+    try:
+        stage = Stage.resolve(sparring_dir, planned.stage_id)
+        stage_state = stage.read_state() if stage.exists() else None
+    except StageError as exc:
+        raise PlanError(str(exc)) from exc
+    if (
+        stage_state is None
+        or planned.review_only
+        or stage_state.status is StageStatus.ACCEPTED
+        or stage_state.next_turn != NEXT_TURN_SPARRING
+    ):
+        raise PlanError(_no_pending_review_message(planned.stage_id))
+    try:
+        verify_candidate(repo_root, stage, stage_state)
+    except NextTurnError:
+        pass
+    else:
+        raise PlanError(_still_pinned_message(planned.stage_id))
+    try:
+        repin_after_authorized_advance(repo_root, stage, stage_state, accepted_head)
+    except NextTurnError as exc:
+        raise PlanError(
+            f"refusing to record evidence for stage {planned.stage_id!r}: "
+            f"--accept-advanced-head {accepted_head}: {exc}"
+        ) from exc
 
 
 def _grant_push_authorization(
