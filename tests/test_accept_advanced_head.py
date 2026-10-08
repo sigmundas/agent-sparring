@@ -6,6 +6,7 @@ and an untracked file. A refusal must leave notes.md, the stage's
 state.json and the plan run state byte-for-byte as they were.
 """
 
+import contextlib
 import dataclasses
 import subprocess
 import unittest
@@ -17,7 +18,14 @@ import conftest_path  # noqa: F401
 from agent_sparring import plan as plan_module
 from agent_sparring.deferred_gate import CheckOutcome
 from agent_sparring.next_turn import NEXT_TURN_STAGE, NextTurnError, record_next_turn
-from agent_sparring.plan import DeferredAnswer, PlanError, PlanRunError
+from agent_sparring.plan import (
+    DeferredAnswer,
+    PlanError,
+    PlanRunError,
+    PlanRunState,
+    resume_plan,
+)
+from agent_sparring.sessions import SessionError
 from agent_sparring.providers import ProviderUnavailable
 from agent_sparring.stage import SiblingPin, StageStatus
 from test_plan import (
@@ -85,12 +93,13 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
 
     def _snapshot(self):
         stage_dir = self._stage(S1).directory
-        notes = stage_dir / "notes.md"
-        return (
-            notes.read_bytes() if notes.exists() else None,
-            (stage_dir / "state.json").read_bytes(),
-            self.state_path.read_bytes(),
+        files = (
+            stage_dir / "notes.md",
+            stage_dir / "state.json",
+            stage_dir / "activity.jsonl",
+            self.state_path,
         )
+        return tuple(path.read_bytes() if path.exists() else None for path in files)
 
     def _refused(self, adapters, expect: str, **kwargs) -> str:
         before = self._snapshot()
@@ -348,7 +357,7 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
         failures = {
             "re-pin write": ("record_next_turn", OSError("disk full")),
             "note write": ("record_human_evidence", OSError("disk full")),
-            "evidence_pending write": ("_sparring_digest", OSError("disk full")),
+            "evidence_pending digest": ("_sparring_digest", OSError("disk full")),
             "second proof": ("repin_after_authorized_advance", second_proof_refuses),
         }
         for label, (name, effect) in failures.items():
@@ -459,6 +468,97 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
             evidence="anything",
             accept_advanced_head=advanced,
         )
+
+    def test_a_run_state_save_that_fails_midway_is_put_back(self):
+        # A real write failure: the evidence_pending save truncates the run
+        # state to garbage and then raises.
+        stage_adapter, sparring_adapter, _ = self._pause()
+        advanced = self._land_other()
+        before = self._snapshot()
+        real_save = PlanRunState.save
+
+        def torn_save(run_state, path):
+            if run_state.evidence_pending is not None:
+                Path(path).write_bytes(b"{ torn")
+                raise OSError("disk full")
+            return real_save(run_state, path)
+
+        with mock.patch.object(PlanRunState, "save", torn_save):
+            with self.assertRaises(OSError):
+                self._resume(
+                    stage_adapter, sparring_adapter, evidence="done",
+                    accept_advanced_head=advanced, allow_push_for_run=True,
+                )
+        self.assertEqual(self._snapshot(), before)
+        self._accepted((stage_adapter, sparring_adapter), advanced)
+
+    def test_refusals_before_the_first_provider_turn_put_everything_back(self):
+        refusals = {
+            "unknown stop-after-stage": dict(stop_after_stage="no-such-stage"),
+            "fresh session refused": dict(
+                fresh_roles=("sparring",),
+                patch=("agent_sparring.plan.start_fresh_sessions", SessionError("refused")),
+            ),
+            "loop candidate check": dict(
+                patch=(
+                    "agent_sparring.loop.verify_candidate",
+                    NextTurnError("candidate drifted"),
+                ),
+            ),
+            "adapter construction": dict(factory_error=RuntimeError("no provider binary")),
+        }
+        for label, options in refusals.items():
+            with self.subTest(label):
+                self.tearDown_and_reset()
+                stage_adapter, sparring_adapter, _ = self._pause()
+                advanced = self._land_other()
+                before = self._snapshot()
+                turns = len(sparring_adapter.start_calls) + len(sparring_adapter.resume_calls)
+                options = dict(options)
+                target = options.pop("patch", None)
+                factory_error = options.pop("factory_error", None)
+                with contextlib.ExitStack() as stack:
+                    if target is not None:
+                        stack.enter_context(mock.patch(target[0], side_effect=target[1]))
+                    with self.assertRaises(Exception):
+                        if factory_error is not None:
+                            resume_plan(
+                                self.plan_path, self.sparring_dir, self.repo,
+                                mock.Mock(side_effect=factory_error),
+                                expected_branch="feature/x", evidence="done",
+                                accept_advanced_head=advanced, allow_push_for_run=True,
+                            )
+                        else:
+                            self._resume(
+                                stage_adapter, sparring_adapter, evidence="done",
+                                accept_advanced_head=advanced, allow_push_for_run=True,
+                                **options,
+                            )
+                self.assertEqual(self._snapshot(), before)
+                self.assertEqual(
+                    len(sparring_adapter.start_calls) + len(sparring_adapter.resume_calls), turns
+                )
+                self._accepted((stage_adapter, sparring_adapter), advanced)
+
+    def test_once_the_reviewer_starts_what_was_recorded_is_kept(self):
+        stage_adapter, sparring_adapter, _ = self._pause(verdicts=(NEEDS_YOU,))
+        advanced = self._land_other()
+
+        class _FailsMidTurn(_SparringAdapter):
+            def resume(self, session_id, prompt):
+                self.resume_calls.append((session_id, prompt))
+                raise ProviderUnavailable("usage limit reached")
+
+        reviewer = _FailsMidTurn([])
+        with self.assertRaises(PlanRunError):
+            self._resume(
+                stage_adapter, reviewer, evidence="prerequisite landed",
+                accept_advanced_head=advanced,
+            )
+        self.assertEqual(len(reviewer.resume_calls), 1)
+        self.assertEqual(self._stage(S1).read_state().next_turn_candidate.head_sha, advanced)
+        self.assertIn("Accepted branch advance", self._stage(S1).read_notes())
+        self.assertIsNotNone(self._plan_state().evidence_pending)
 
 def _set_status(stage, status):
     state = stage.read_state()

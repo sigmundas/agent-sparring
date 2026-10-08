@@ -1844,8 +1844,9 @@ def resume_plan(
         )
     # With --accept-advanced-head, everything this resume writes before an
     # agent runs -- push grant, re-pin, evidence, evidence_pending -- lands
-    # together or not at all; without it, this is a no-op.
-    with _rolled_back_on_failure(rollback):
+    # together or not at all, up to the first provider turn (including any
+    # refusal _drive raises before one); without it, this is a no-op.
+    with _rolled_back_on_failure(rollback) as guard:
         _grant_push_authorization(
             state,
             state_path,
@@ -1992,23 +1993,23 @@ def resume_plan(
                 }
                 state.save(state_path)
 
-    return _drive(
-        source,
-        stages,
-        state,
-        state_path,
-        sparring_dir,
-        repo_root,
-        make_adapters,
-        max_send_back_cycles=max_send_back_cycles,
-        self_check=self_check,
-        report=report,
-        sparrer_first=sparrer_first,
-        stop_after_stage=stop_after_stage,
-        next_turn_choice=next_turn,
-        fresh_roles=tuple(fresh_roles),
-        fresh_reason=fresh_reason,
-    )
+        return _drive(
+            source,
+            stages,
+            state,
+            state_path,
+            sparring_dir,
+            repo_root,
+            guard.adapters(make_adapters),
+            max_send_back_cycles=max_send_back_cycles,
+            self_check=self_check,
+            report=report,
+            sparrer_first=sparrer_first,
+            stop_after_stage=stop_after_stage,
+            next_turn_choice=next_turn,
+            fresh_roles=tuple(fresh_roles),
+            fresh_reason=fresh_reason,
+        )
 
 
 def _check_next_turn_choice(
@@ -2142,22 +2143,69 @@ def _check_advanced_head(
     return stage.directory
 
 
+class _Rollback:
+    """Whether a failure still puts the saved files back: yes until the
+    first provider turn starts, after which what the run recorded is kept."""
+
+    def __init__(self, armed: bool) -> None:
+        self.armed = armed
+
+    def adapters(self, make_adapters: AdapterFactory) -> AdapterFactory:
+        """``make_adapters`` whose adapters disarm this rollback the moment
+        any turn of theirs starts; unchanged when nothing is armed."""
+
+        if not self.armed:
+            return make_adapters
+
+        def make(stage: Stage) -> tuple[StageAgentAdapter, SparringAgentAdapter]:
+            stage_adapter, sparring_adapter = make_adapters(stage)
+            return _Disarming(stage_adapter, self), _Disarming(sparring_adapter, self)
+
+        return make
+
+
+class _Disarming:
+    """An adapter that disarms a :class:`_Rollback` before each turn."""
+
+    def __init__(self, adapter: Any, rollback: _Rollback) -> None:
+        self._adapter = adapter
+        self._rollback = rollback
+
+    def start(self, prompt: str) -> Any:
+        self._rollback.armed = False
+        return self._adapter.start(prompt)
+
+    def resume(self, session_id: str, prompt: str) -> Any:
+        self._rollback.armed = False
+        return self._adapter.resume(session_id, prompt)
+
+    def converse(self, session_id: str, prompt: str) -> Any:
+        self._rollback.armed = False
+        return self._adapter.converse(session_id, prompt)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._adapter, name)
+
+
 @contextlib.contextmanager
-def _rolled_back_on_failure(paths: Sequence[Path]) -> Iterator[None]:
+def _rolled_back_on_failure(paths: Sequence[Path]) -> Iterator[_Rollback]:
     """Put each of ``paths`` back exactly as it was -- bytes, or absent --
-    if the block raises. No paths, no effect."""
+    if the block raises while the yielded :class:`_Rollback` is still armed.
+    No paths, no effect."""
 
     saved = {path: path.read_bytes() if path.exists() else None for path in paths}
+    rollback = _Rollback(armed=bool(paths))
     try:
-        yield
+        yield rollback
     except BaseException:
-        for path, data in saved.items():
-            if data is None:
-                path.unlink(missing_ok=True)
-                continue
-            tmp = path.with_name(f".{path.name}.rollback")
-            tmp.write_bytes(data)
-            os.replace(tmp, path)
+        if rollback.armed:
+            for path, data in saved.items():
+                if data is None:
+                    path.unlink(missing_ok=True)
+                    continue
+                tmp = path.with_name(f".{path.name}.rollback")
+                tmp.write_bytes(data)
+                os.replace(tmp, path)
         raise
 
 

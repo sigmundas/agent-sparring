@@ -222,7 +222,8 @@ in the range touches an uncommitted path, and taking the commits back out
 reproduces the pinned content and the pinned staged content exactly (a review
 pinned before staged content was recorded is accepted only with nothing
 staged). It is checked in full before anything is written, cannot be combined
-with `--deferred-result`, and its writes land together or not at all.
+with `--deferred-result`, and everything it writes before the first provider
+turn lands together or not at all.
 A resume without evidence over a recorded NEEDS_YOU / ESCALATE keeps that
 pause and runs nothing, whatever the marker says; `--fresh-*` or `--next-turn` alone are
 refused there, because neither answers a person. State with no marker keeps
