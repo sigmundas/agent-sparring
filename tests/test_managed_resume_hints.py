@@ -98,3 +98,62 @@ class ResumeHintTests(unittest.TestCase):
         command = cli._retry_command(args, Path("/wt/.sparring"), Path("/wt"), cli._resume_retry_parts(args, "K1"))
         self.assertIn("--repo-root /wt --expected-branch sparring/x", command)
         self.assertIn(str(Path("docs/plans/x.md").resolve()), command)
+
+
+class _Mode:
+    value = "m"
+    describe = "d"
+
+
+_RESET = SimpleNamespace(
+    stage_id="s1", run="K1", from_mode=_Mode(), to_mode=_Mode(), stage_directory="/wt/s",
+    archive="/wt/a", discarded_sessions=(), reviewed_stage="r", reviewed_stage_id="r1",
+    reviewed_sha="abc", files=(), previous_digest="d", digest="d",
+)
+_REOPEN = SimpleNamespace(
+    stage_id="s1", run="K1", instance_id="i", title="t", failed_checks=(), candidate_sha="abc",
+    stage_directory="/wt/s",
+)
+
+
+class RecoveryResumeHintTests(unittest.TestCase):
+    """reset-stage and reopen-stage are not managed-aware themselves; the
+    hint they print still names a recorded managed run by its key."""
+
+    def _run(self, command, managed: bool) -> str:
+        args = _args(False)
+        args.sparring_dir = "/wt/.sparring"
+        args.stage_id = "s1"
+        args.mode = None
+        args.gate_instance = "i"
+        record = SimpleNamespace(run_key="K1", branch="sparring/x") if managed else None
+        patches = {
+            (cli, "_resolve_repo_root"): lambda *_: Path("/wt"),
+            (cli, "_plan_source"): lambda *_: None,
+            (cli, "reset_stage"): lambda *a, **k: _RESET,
+            (cli, "reopen_for_failed_check"): lambda *a, **k: _REOPEN,
+            (cli.managed_run, "read_record"): lambda *_: record,
+        }
+        saved = {key: getattr(*key) for key in patches}
+        out = io.StringIO()
+        try:
+            for (owner, name), value in patches.items():
+                setattr(owner, name, value)
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(command(args), 0)
+        finally:
+            for (owner, name), value in saved.items():
+                setattr(owner, name, value)
+        return out.getvalue()
+
+    def _check(self, command):
+        managed = self._run(command, managed=True)
+        self.assertIn(f"  {SHORT}\n", managed)
+        self.assertNotIn("--expected-branch", managed)
+        self.assertIn(f"  {LONG}\n", self._run(command, managed=False))
+
+    def test_reset_stage(self):
+        self._check(cli._cmd_reset_stage)
+
+    def test_reopen_stage(self):
+        self._check(cli._cmd_reopen_stage)

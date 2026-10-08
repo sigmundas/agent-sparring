@@ -1767,6 +1767,22 @@ def _managed_record(args: argparse.Namespace):
     return getattr(args, "managed_record", None)
 
 
+def _note_managed_identity(args: argparse.Namespace, repo_root: Path, run: str) -> None:
+    """For a command that is not itself managed-aware (reset-stage,
+    reopen-stage): when ``run`` is a recorded managed run on this branch,
+    remember its record so the printed resume hint is addressed by key.
+    Reporting only; a record that cannot be read leaves the long form."""
+
+    if not run or _managed_record(args) is not None:
+        return
+    try:
+        record = managed_run.read_record(repo_root, run)
+    except (ManagedRunError, OSError, ValueError):
+        return
+    if record is not None and record.branch == args.expected_branch:
+        args.managed_record = record
+
+
 def _resume_command(args: argparse.Namespace, run: str = "") -> str:
     """The copyable ``resume-plan`` command for this run, without the
     situation-specific flags a caller appends.
@@ -2479,6 +2495,7 @@ def _cmd_reset_stage(args: argparse.Namespace) -> int:
     else:
         print(f"plan digest unchanged: {result.digest}")
     print()
+    _note_managed_identity(args, repo_root, result.run)
     print("The stage is fresh and the run is paused at it. Continue with:")
     print(
         f"  {_resume_command(args, result.run)}"
@@ -2522,6 +2539,7 @@ def _cmd_reopen_stage(args: argparse.Namespace) -> int:
     print(f"candidate kept: {result.candidate_sha}")
     print(f"stage directory: {result.stage_directory}")
     print()
+    _note_managed_identity(args, repo_root, result.run)
     print(
         "The stage is open again with its candidate, both sessions and its notes "
         "intact, and the failure you reported is in its notes.md as human evidence. "
