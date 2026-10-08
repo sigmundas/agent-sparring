@@ -40,6 +40,7 @@ from agent_sparring.finalization import (
     _git,
     _is_stage_artifact,
     _uncommitted_content_paths,
+    read_commit_content,
     read_worktree_content,
 )
 from agent_sparring.git_context import (
@@ -280,6 +281,91 @@ def verify_candidate(repo_root: Path, stage: Stage, state: StageState) -> None:
             "turn in its place. Restore the recorded candidate, or deliberately choose how to "
             "continue (for example 'sparring reset-stage')."
         )
+
+
+def repin_after_authorized_advance(
+    repo_root: Path, stage: Stage, state: StageState, accepted_head: str
+) -> TurnCandidate:
+    """Re-pin a pending review onto a HEAD a person named, when the branch
+    advanced by commits made outside the stage while it waited on them.
+
+    The one case this exists for: a stage stopped on NEEDS_YOU because a
+    prerequisite had to land separately, and the person brought that commit
+    onto the branch beneath the stage's uncommitted attempt. Everything else
+    stays refused. The re-pin happens only if ``accepted_head`` is the
+    current HEAD, the pinned HEAD is a strict ancestor of it, every sibling
+    pin is unchanged, no path the new commits change has uncommitted
+    content, the untracked candidate files are byte-identical to the pinned
+    ones, and the current content with exactly those commits taken back out
+    reproduces the pinned content digest. That last check proves the
+    attempt's work is preserved exactly and that the only difference is the
+    named commits. Returns the newly pinned candidate; writes nothing.
+    """
+
+    pinned = state.next_turn_candidate
+    if pinned is None:
+        raise NextTurnError(
+            f"stage {stage.stage_id!r} has no pinned candidate to re-pin"
+        )
+    try:
+        accepted = resolve_commit(repo_root, accepted_head, label="accepted head")
+    except GitContextError as exc:
+        raise NextTurnError(f"could not resolve the accepted head: {exc}") from exc
+    current = capture_candidate(repo_root, stage, state)
+    if current.head_sha != accepted:
+        raise NextTurnError(
+            f"the accepted head {accepted} is not the current HEAD {current.head_sha}; "
+            "name the commit the branch actually holds"
+        )
+    if accepted == pinned.head_sha:
+        raise NextTurnError(
+            f"HEAD has not advanced from the pinned {pinned.head_sha}; there is nothing "
+            "to accept"
+        )
+    try:
+        _git(repo_root, "merge-base", "--is-ancestor", pinned.head_sha, accepted)
+    except FinalizationError as exc:
+        raise NextTurnError(
+            f"the pinned HEAD {pinned.head_sha} is not an ancestor of {accepted}; only a "
+            "fast-forward on top of the pinned candidate can be accepted"
+        ) from exc
+    if current.repositories != pinned.repositories:
+        raise NextTurnError(
+            "a declared sibling repository moved as well; refusing to re-pin more than "
+            "the named commits"
+        )
+    if current.untracked != pinned.untracked:
+        raise NextTurnError(
+            "the untracked candidate files differ from the pinned ones; the attempt's "
+            "work is not preserved exactly"
+        )
+    try:
+        before = read_commit_content(repo_root, stage, pinned.head_sha)
+        after = read_commit_content(repo_root, stage, accepted)
+        uncommitted = set(_uncommitted_content_paths(repo_root, stage))
+        content = read_worktree_content(repo_root, stage)
+    except FinalizationError as exc:
+        raise NextTurnError(f"could not read the candidate content: {exc}") from exc
+    advanced = before.diverged_from(after)
+    overlap = sorted(uncommitted.intersection(advanced))
+    if overlap:
+        raise NextTurnError(
+            "the accepted commits change paths that also hold uncommitted attempt "
+            f"content ({', '.join(overlap)}); refusing to merge them into one candidate"
+        )
+    old_entries = dict(before.entries)
+    rebuilt = dict(content.entries)
+    for path in advanced:
+        if path in old_entries:
+            rebuilt[path] = old_entries[path]
+        else:
+            rebuilt.pop(path, None)
+    if CandidateContent(entries=tuple(sorted(rebuilt.items()))).digest != pinned.content_digest:
+        raise NextTurnError(
+            f"the repository is not the pinned candidate plus the commits "
+            f"{pinned.head_sha[:12]}..{accepted[:12]}; something else changed as well"
+        )
+    return current
 
 
 @dataclass(frozen=True)

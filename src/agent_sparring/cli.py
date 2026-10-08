@@ -2078,6 +2078,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool, source: PlanSou
                 ),
                 allow_push_candidate=args.allow_push_candidate,
                 allow_push_for_run=args.allow_push_for_run,
+                accept_advanced_head=getattr(args, "accept_advanced_head", None),
                 next_turn=args.next_turn,
                 fresh_roles=fresh_roles,
                 fresh_reason=args.fresh_reason,
@@ -4107,6 +4108,18 @@ def build_parser() -> argparse.ArgumentParser:
             "or scope approval; appended to the current stage's notes.md under "
             "'## Human evidence', after which the SPARRER resumes against the unchanged "
             "candidate (the stage agent is not started to deliver an answer)"
+        ),
+    )
+    resume_plan_parser.add_argument(
+        "--accept-advanced-head",
+        default=None,
+        metavar="SHA",
+        help=(
+            "with --evidence only: the branch was deliberately advanced to exactly this "
+            "commit (for example a separately landed prerequisite) while the stage waited "
+            "on you. The pending review is re-pinned to it only if HEAD is this commit, "
+            "fast-forwards from the pinned one, and the stage's uncommitted work is "
+            "provably unchanged; refused otherwise, with nothing recorded"
         ),
     )
     resume_plan_parser.add_argument(

@@ -652,6 +652,105 @@ class PlanRunTests(_PlanRepoTestCase):
             )
         self.assertIn("already records next_turn = sparring", str(ctx.exception))
 
+    def _paused_with_uncommitted_attempt_then_advanced(self, sparring_adapter):
+        # The stage's attempt is uncommitted work; while the stage waits on
+        # NEEDS_YOU, a separately made prerequisite commit lands beneath it.
+        stage_adapter = _StageAdapter(self.repo)
+        original_turn = stage_adapter._turn
+
+        def dirty_turn(session_id):
+            (self.repo / "wip.txt").write_text("attempt\n", encoding="utf-8")
+            return original_turn(session_id)
+
+        stage_adapter._turn = dirty_turn
+        self._start(stage_adapter, sparring_adapter)
+        pinned = self._stage(S1).read_state().next_turn_candidate.head_sha
+        (self.repo / "prereq.txt").write_text("prerequisite\n", encoding="utf-8")
+        _run_git(self.repo, "add", "prereq.txt")
+        _run_git(self.repo, "commit", "-q", "-m", "separate prerequisite")
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        advanced = _head_sha(self.repo)
+        return stage_adapter, pinned, advanced
+
+    def test_named_branch_advance_is_accepted_with_evidence_and_repins_the_review(self):
+        sparring_adapter = _SparringAdapter([NEEDS_YOU, NEEDS_YOU])
+        stage_adapter, pinned, advanced = self._paused_with_uncommitted_attempt_then_advanced(
+            sparring_adapter
+        )
+
+        self._resume(
+            stage_adapter, sparring_adapter, evidence="prerequisite landed",
+            accept_advanced_head=advanced,
+        )
+
+        state = self._stage(S1).read_state()
+        self.assertEqual(state.next_turn_candidate.head_sha, advanced)
+        notes = self._stage(S1).read_notes()
+        self.assertIn("prerequisite landed", notes)
+        self.assertIn(f"re-pinned from HEAD {pinned} to {advanced}", notes)
+        # The reviewer, not the stage agent, answered the evidence.
+        self.assertEqual(stage_adapter.resume_calls, [])
+        self.assertEqual((self.repo / "wip.txt").read_text(encoding="utf-8"), "attempt\n")
+
+    def test_branch_advance_is_refused_when_the_attempt_changed_too(self):
+        sparring_adapter = _SparringAdapter([NEEDS_YOU])
+        stage_adapter, _, advanced = self._paused_with_uncommitted_attempt_then_advanced(
+            sparring_adapter
+        )
+        (self.repo / "wip.txt").write_text("edited outside the stage\n", encoding="utf-8")
+
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(
+                stage_adapter, sparring_adapter, evidence="done", accept_advanced_head=advanced
+            )
+        self.assertIn("--accept-advanced-head", str(ctx.exception))
+        self.assertNotIn("done", self._stage(S1).read_notes().split("## Human evidence")[-1])
+
+    def test_branch_advance_is_refused_for_a_commit_other_than_head(self):
+        sparring_adapter = _SparringAdapter([NEEDS_YOU])
+        stage_adapter, pinned, _ = self._paused_with_uncommitted_attempt_then_advanced(
+            sparring_adapter
+        )
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(
+                stage_adapter, sparring_adapter, evidence="done", accept_advanced_head=pinned
+            )
+        self.assertIn("not the current HEAD", str(ctx.exception))
+        self.assertNotIn("Accepted branch advance", self._stage(S1).read_notes())
+
+    def test_branch_advance_is_refused_when_the_new_commit_touches_attempt_paths(self):
+        sparring_adapter = _SparringAdapter([NEEDS_YOU])
+        stage_adapter, _, _ = self._paused_with_uncommitted_attempt_then_advanced(
+            sparring_adapter
+        )
+        (self.repo / "prereq.txt").write_text("changed again\n", encoding="utf-8")
+        _run_git(self.repo, "commit", "-q", "-am", "second prerequisite")
+        (self.repo / "prereq.txt").write_text("and edited\n", encoding="utf-8")
+        advanced = _head_sha(self.repo)
+
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(
+                stage_adapter, sparring_adapter, evidence="done", accept_advanced_head=advanced
+            )
+        self.assertIn("uncommitted attempt content", str(ctx.exception))
+        self.assertNotIn("Accepted branch advance", self._stage(S1).read_notes())
+
+    def test_accept_advanced_head_requires_evidence_and_a_moved_candidate(self):
+        sparring_adapter = _SparringAdapter([NEEDS_YOU])
+        stage_adapter = _StageAdapter(self.repo)
+        self._start(stage_adapter, sparring_adapter)
+        head = _head_sha(self.repo)
+
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(stage_adapter, sparring_adapter, accept_advanced_head=head)
+        self.assertIn("pass --evidence as well", str(ctx.exception))
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(
+                stage_adapter, sparring_adapter, evidence="done", accept_advanced_head=head
+            )
+        self.assertIn("still holds its pinned candidate", str(ctx.exception))
+        self.assertNotIn("Human evidence\n\n", self._stage(S1).read_notes().replace("done", ""))
+
     def test_start_refuses_when_a_run_is_already_recorded(self):
         stage_adapter = _StageAdapter(self.repo)
         self._start(stage_adapter, _SparringAdapter([NEEDS_YOU]))

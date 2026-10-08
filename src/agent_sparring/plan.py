@@ -208,6 +208,8 @@ from agent_sparring.next_turn import (
     check_next_turn_choice,
     resolve_finalization,
     resolve_legacy_ready,
+    record_next_turn,
+    repin_after_authorized_advance,
     resolve_resume_turn,
     verify_candidate,
 )
@@ -1629,6 +1631,7 @@ def resume_plan(
     deferred_results: tuple[DeferredAnswer, ...] = (),
     allow_push_candidate: str | None = None,
     allow_push_for_run: bool = False,
+    accept_advanced_head: str | None = None,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
     stop_after_stage: str | None = None,
@@ -1835,6 +1838,12 @@ def resume_plan(
         context=slice_context(source) if deferred_results else None,
     )
 
+    if accept_advanced_head is not None and not (evidence and evidence.strip()):
+        raise PlanError(
+            "--accept-advanced-head is recorded with the human evidence that authorizes "
+            "it; pass --evidence as well"
+        )
+
     sparrer_first = False
     if evidence is not None and evidence.strip():
         current = stages[state.current_stage_index]
@@ -1879,11 +1888,54 @@ def resume_plan(
             try:
                 verify_candidate(repo_root, stage, current_state)
             except NextTurnError as exc:
-                raise PlanError(
-                    f"refusing to record evidence for stage {current.stage_id!r}: {exc} "
-                    "(--next-turn cannot re-pin a recorded candidate.)"
-                ) from exc
-        record_human_evidence(stage, evidence)
+                if accept_advanced_head is None:
+                    raise PlanError(
+                        f"refusing to record evidence for stage {current.stage_id!r}: {exc} "
+                        "(--next-turn cannot re-pin a recorded candidate.)"
+                    ) from exc
+                # The person named the exact commit the branch advanced to
+                # while the stage waited on them; re-pin only if the attempt
+                # is provably unchanged beneath it. Checked before anything
+                # is written, so a refusal leaves the stage as it was.
+                pinned_head = current_state.next_turn_candidate.head_sha
+                try:
+                    repinned = repin_after_authorized_advance(
+                        repo_root, stage, current_state, accept_advanced_head
+                    )
+                except NextTurnError as repin_exc:
+                    raise PlanError(
+                        f"refusing to record evidence for stage {current.stage_id!r}: "
+                        f"--accept-advanced-head {accept_advanced_head}: {repin_exc}"
+                    ) from repin_exc
+                evidence = (
+                    f"{evidence.rstrip()}\n\nAccepted branch advance: the pending review "
+                    f"was re-pinned from HEAD {pinned_head} to {repinned.head_sha} "
+                    "(--accept-advanced-head). The stage's uncommitted work was verified "
+                    "unchanged; the only difference is the commits in that range."
+                )
+                record_human_evidence(stage, evidence)
+                record_next_turn(
+                    stage, NEXT_TURN_SPARRING, candidate=repinned, source="manual"
+                )
+                current_state = stage.read_state()
+                report(
+                    f"stage {current.stage_id}: re-pinned the pending review from "
+                    f"{pinned_head} to {repinned.head_sha}"
+                )
+                evidence = None
+            else:
+                if accept_advanced_head is not None:
+                    raise PlanError(
+                        f"--accept-advanced-head: stage {current.stage_id!r} still holds "
+                        "its pinned candidate; there is no branch advance to accept"
+                    )
+        elif accept_advanced_head is not None:
+            raise PlanError(
+                f"--accept-advanced-head applies only to a stage whose pending review no "
+                f"longer matches the repository; {current.stage_id!r} has none"
+            )
+        if evidence is not None:
+            record_human_evidence(stage, evidence)
         report(f"recorded human evidence in {stage.directory / 'notes.md'}")
         # Observational only: that evidence was recorded, never what it says.
         _plan_emitter(stage).emit("plan.evidence_recorded")
