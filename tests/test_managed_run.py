@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import subprocess
@@ -206,6 +207,29 @@ class ManagedRunTests(_ManagedRepoTestCase):
         self.assertEqual(code, 0, err)
         state = PlanRunState.load(record.sparring_dir / "plans" / f"{record.run_key}.json")
         self.assertEqual(state.source, "manifest")
+
+    def _assert_snapshot(self, record, expected: bytes):
+        from agent_sparring.plan import plan_snapshot_paths, read_plan_snapshot
+
+        source_path, digest_path = plan_snapshot_paths(record.sparring_dir, record.run_key)
+        self.assertEqual(source_path.read_bytes(), expected)
+        self.assertEqual(digest_path.read_text(encoding="utf-8").strip(), hashlib.sha256(expected).hexdigest())
+        self.assertEqual(read_plan_snapshot(record.sparring_dir, record.run_key)[0], expected)
+        # Ignored engine state: the worktree stays clean.
+        self.assertEqual(_git(Path(record.worktree_path), "status", "--porcelain"), "")
+
+    def test_plan_snapshot_is_written_at_start_for_a_markdown_run(self):
+        code, _, err = self._start_managed()
+        self.assertEqual(code, 0, err)
+        (record,) = self._records()
+        self._assert_snapshot(record, self.plan_path.read_bytes())
+
+    def test_plan_snapshot_is_written_at_start_for_a_manifest_run(self):
+        manifest = self._manifest()
+        code, _, err = self._main("run-plan", "--manifest", str(manifest), "--repo-root", str(self.repo), "--managed")
+        self.assertEqual(code, 0, err)
+        (record,) = self._records()
+        self._assert_snapshot(record, manifest.read_bytes())
 
     def test_managed_with_sibling_repositories_refuses(self):
         manifest = self._manifest(

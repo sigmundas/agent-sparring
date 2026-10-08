@@ -826,6 +826,60 @@ def run_state_path(sparring_dir: Path, run_key: str) -> Path:
     return Path(sparring_dir) / PLANS_DIRNAME / f"{run_key}.json"
 
 
+def plan_snapshot_paths(sparring_dir: Path, run_key: str) -> tuple[Path, Path]:
+    """``(source bytes, their sha256)`` of a managed run's plan file, written
+    once at run start beside the run state -- in ``.sparring/plans/``, so it
+    is ignored and archived with the run (never ``*.json``, which would read
+    as a run state). ``finish-run``'s opt-in ``remove_plan`` deletes the plan
+    only when the target's bytes match this snapshot exactly."""
+
+    plans = Path(sparring_dir) / PLANS_DIRNAME
+    return plans / f"{run_key}.source", plans / f"{run_key}.source.sha256"
+
+
+def _write_plan_snapshot(repo_root: Path, sparring_dir: Path, run_key: str) -> None:
+    """Snapshot the exact bytes of the managed run's recorded input file (the
+    Markdown plan or the manifest file; never its sidecars). Written once:
+    an existing snapshot refuses."""
+
+    from agent_sparring.managed_run import ManagedRunError, read_record
+
+    try:
+        record = read_record(Path(repo_root), run_key)
+    except ManagedRunError as exc:
+        raise PlanError(str(exc)) from exc
+    if record is None:
+        raise PlanError(f"run {run_key} has no managed-run record to snapshot the plan from")
+    try:
+        data = Path(record.input_path).read_bytes()
+    except OSError as exc:
+        raise PlanError(f"cannot snapshot the plan {record.input_path}: {exc}") from exc
+    source_path, digest_path = plan_snapshot_paths(sparring_dir, run_key)
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(source_path, "xb") as handle:
+            handle.write(data)
+        with open(digest_path, "x", encoding="utf-8") as handle:
+            handle.write(hashlib.sha256(data).hexdigest() + "\n")
+    except FileExistsError as exc:
+        raise PlanError(f"a plan snapshot for run {run_key} already exists at {exc.filename}") from exc
+
+
+def read_plan_snapshot(sparring_dir: Path, run_key: str) -> tuple[bytes, str] | None:
+    """``(bytes, sha256)`` of the run's plan snapshot, or ``None`` when the
+    run has none or it does not verify against its recorded digest."""
+
+    source_path, digest_path = plan_snapshot_paths(sparring_dir, run_key)
+    try:
+        data = source_path.read_bytes()
+        digest = digest_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if hashlib.sha256(data).hexdigest() != digest:
+        return None
+    return data, digest
+
+
 @dataclass(frozen=True)
 class RecordedRun:
     """One run instance found on disk, with the key it is filed under."""
@@ -1300,6 +1354,8 @@ def start_plan(
     _require_state_ignored(repo_root, state_path)
     if managed:
         _require_managed_record(repo_root, key, expected_branch)
+        for snapshot_path in plan_snapshot_paths(sparring_dir, key):
+            _require_state_ignored(repo_root, snapshot_path)
 
     state = PlanRunState(
         plan=label,
@@ -1320,6 +1376,8 @@ def start_plan(
         except PushError as exc:
             raise PlanError(str(exc)) from exc
         report(f"push authorization recorded for this run: {state.push_authorization.describe}")
+    if managed:
+        _write_plan_snapshot(repo_root, sparring_dir, key)
     state.save(state_path)
     # Claimed only now that the run exists: a refusal above must not leave a
     # stage marked as owned by a run that was never recorded.

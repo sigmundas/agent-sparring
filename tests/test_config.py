@@ -97,6 +97,25 @@ class ParseProjectConfigTests(unittest.TestCase):
         with self.assertRaises(ProjectConfigError):
             parse_project_config('project = "x"\n\n[stage]\nself_check = "yes"\n')
 
+    def test_finish_options_default_false_and_parse_as_bools(self):
+        config = parse_project_config(MINIMAL_TOML)
+        self.assertFalse(config.finish_remove_plan)
+        self.assertFalse(config.finish_delete_remote_branch)
+        config = parse_project_config(
+            'project = "x"\n\n[finish]\nremove_plan = true\ndelete_remote_branch = true\n'
+        )
+        self.assertTrue(config.finish_remove_plan)
+        self.assertTrue(config.finish_delete_remote_branch)
+
+    def test_finish_remove_plan_non_boolean_fails(self):
+        with self.assertRaises(ProjectConfigError):
+            parse_project_config('project = "x"\n\n[finish]\nremove_plan = "yes"\n')
+
+    def test_finish_unknown_field_fails_and_names_remove_plan(self):
+        with self.assertRaises(ProjectConfigError) as caught:
+            parse_project_config('project = "x"\n\n[finish]\nremove_plans = true\n')
+        self.assertIn("remove_plan", str(caught.exception))
+
     def test_unknown_top_level_table_is_ignored(self):
         # Older-engine tolerance: today, parse_project_config only ever looks
         # at the top-level keys it recognises (project/repo/commands/agents/

@@ -444,10 +444,11 @@ itself, which is an ordinary repository file.
 
 | Artifact | Owner | Provider-writable? | Lifetime | Purpose |
 | --- | --- | --- | --- | --- |
-| the plan document (`docs/plans/.../<plan>.md`) | human / repository | no | immutable for the lifetime of a managed run | the run's execution definition |
+| the plan document (`docs/plans/.../<plan>.md`) | human / repository | no | immutable for the lifetime of a managed run; only `finish-run` may delete it, by explicit `[finish] remove_plan` opt-in, after a byte-exact check against the run's start snapshot | the run's execution definition |
 | `PROJECT.md` | human / repository | no | edited between runs by a person | project context embedded in every prompt |
 | `project.toml` | human / repository | no | edited between runs by a person, by hand or through `sparring set-config` on their behalf | provider selection and engine configuration (model and effort are the person's own preferences, outside the repository) |
 | `plans/<run>.json` | engine | no | rewritten on every position/status change | the run's position, expected branch, plan digest, recorded push authorization and typed pause |
+| `plans/<run>.source`, `plans/<run>.source.sha256` | engine | no | written once at managed run start; archived by `finish-run` | the exact bytes of the run's plan file (Markdown plan or manifest file, never its sidecars) and their sha256, which `[finish] remove_plan` compares against |
 | `intake/<intake>/` | engine | no | written once by `prepare-plan` (the intake agent's answer is its structured result); never rewritten | a reviewable interpretation of a human plan; approval binds its exact bytes, so editing it refuses an approved run |
 | `intake/<intake>/decisions.json` | engine (`start-plan --answer`, on a person's answers) | no | written once at prepare time, inside the write-once intake; the answered intake is never written | a person's answers to an earlier intake's decisions, verbatim; `intake.json` records its digest, so approval seals it and `run-plan` re-checks it |
 | `intake/<intake>/runs/<slice>/` | engine (`approve-plan`, on a person's decision) | no | `manifest.json` replaceable until `approval.json` exists; `approval.json` created once, never rewritten | the intake manifest envelope and the approval `run-plan --manifest` verifies before running it |
