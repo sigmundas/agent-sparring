@@ -4116,7 +4116,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SHA",
         help=(
             "with --evidence only: the branch was deliberately advanced to exactly this "
-            "commit (for example a separately landed prerequisite) while the stage waited "
+            "commit, named by its (abbreviated) SHA (for example a separately landed prerequisite) while the stage waited "
             "on you. The pending review is re-pinned to it only if HEAD is this commit, "
             "fast-forwards from the pinned one, and the stage's uncommitted work is "
             "provably unchanged; refused otherwise, with nothing recorded"
