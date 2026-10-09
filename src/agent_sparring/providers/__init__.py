@@ -48,6 +48,17 @@ class ProviderUnavailable(ProviderError):
     session on another provider, can succeed."""
 
 
+class ImageInputUnsupported(ProviderError):
+    """Images were required but this provider/model cannot be shown to inspect
+    them, or an image was refused before the turn started.
+
+    Raised *before* a provider process runs, never after: a turn that was
+    asked to look at images and could not must not exist at all, so there
+    is no answer that could be mistaken for a successful inspection (see
+    :mod:`agent_sparring.visual_evidence`). Not a session or capacity
+    failure; retrying the same configuration cannot succeed."""
+
+
 # Matched case-insensitively against provider error data only (see
 # ProviderError.error_data), never agent-authored text. Only ever used to
 # *classify* a failure the adapter already raises; a match never turns a
@@ -263,6 +274,7 @@ class StructuredAgentAdapter(Protocol):
 
 
 __all__ = [
+    "ImageInputUnsupported",
     "LineSink",
     "ProviderError",
     "ProviderSessionUnresumable",

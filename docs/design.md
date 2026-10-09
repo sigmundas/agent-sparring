@@ -700,6 +700,38 @@ for repository changes afterwards.
 Web GPT remains an escalation/manual sparring target rather than something the
 local driver assumes it can wake automatically.
 
+## Visual evidence (contract only)
+
+Visual review is not wired into any run yet. What exists is the contract
+(`src/agent_sparring/visual_evidence.py`) and a proven image path through the
+Codex adapter:
+
+- **Image delivery.** `CodexCliAdapter.start`, `resume` and `start_structured`
+  take `images=`; each becomes one `--image=<absolute path>`. Verified live:
+  the configured reviewer reads pixels on fresh and resumed turns, and tells a
+  mismatched candidate from its reference without running any command
+  (`tests/test_visual_evidence_live.py`, opt-in with
+  `AGENT_SPARRING_LIVE_IMAGE_TEST=1`). Codex silently drops a missing or
+  non-image file, so the adapter structurally validates every PNG before it
+  launches anything.
+- **Manifest.** Version 1: per screenshot an `id`, a `path` relative to the
+  evidence directory, a `viewport` (`width`, `height`), a `status`
+  (`captured` or `failed`; a failed one has no path) and an optional
+  `reference` relative to the repository root. PNG only. Unknown keys and
+  versions are refused.
+- **Binding.** The engine, not the capture command, binds evidence to the
+  full committed candidate SHA, every sibling pin, and the SHA-256 of every
+  screenshot and reference. Any difference refuses the evidence, so a verdict
+  over images applies to exactly the candidate a textual verdict does.
+- **Unsupported.** An adapter must declare `supports_image_input`; the Codex
+  adapter also requires its pinned model to list `image` in Codex's own
+  catalog. Anything unproven -- Claude CLI, no pinned model, an unreadable
+  catalog -- is `ImageInputUnsupported`, raised before any turn runs. There is
+  no fallback that reviews without the pixels.
+- **Independence.** Capture is run by the engine outside every provider
+  session; the reviewer only receives files and keeps its read-only sandbox.
+  The contract names no capture technology.
+
 ---
 
 # Orchestrator

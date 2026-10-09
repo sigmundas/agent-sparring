@@ -440,6 +440,11 @@ class ClaudeCliAdapter:
     # discovering it by a failed call.
     supports_resume: bool = True
 
+    # Print mode takes no image attachment, and none has been verified, so
+    # visual review must refuse this adapter rather than send it images it
+    # would never see (see agent_sparring.visual_evidence).
+    supports_image_input: bool = False
+
     def __post_init__(self) -> None:
         # Refuse an unsupported effort at construction, which is always
         # before a provider process exists. The CLI would merely warn and

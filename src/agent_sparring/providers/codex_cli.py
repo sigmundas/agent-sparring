@@ -45,6 +45,21 @@ capability probe. Summary of what was actually confirmed on this machine:
   sandbox in both. This adapter therefore always passes
   ``-c sandbox_mode="<value>"``, never ``--sandbox``, for both start and
   resume.
+- Images (verified live against codex-cli 0.160.0 with gpt-6.1-sol, the
+  configured reviewer): both ``codex exec`` and ``codex exec resume`` accept
+  ``--image=<file>``, repeatable, attached to that turn's prompt. The model
+  reported per-quadrant colours of runtime-generated PNGs correctly, told a
+  mismatched pair apart, and on a resumed thread compared a newly attached
+  image against one from the earlier turn -- all without running a single
+  command, so from the pixels and not from the file. Two hazards, both also
+  observed: a missing path or a non-image file is *silently dropped* (exit
+  0, a normal turn, the model simply sees no image), and ``exec``'s ``-i``
+  is variadic, so a bare ``-i a.png <prompt>`` could swallow the prompt.
+  This adapter therefore validates every image itself before launching
+  (:func:`agent_sparring.visual_evidence.read_png`), passes each as a single
+  ``--image=<absolute path>`` token, and refuses a model Codex's catalog does
+  not list with ``image`` among its ``input_modalities``. See
+  ``tests/test_visual_evidence_live.py`` for the reproducible proof.
 - The VS Code Codex extension was not assumed to be programmatically
   controllable and was not used or probed further once this CLI's headless
   ``exec``/``exec resume`` surface was confirmed sufficient.
@@ -94,18 +109,20 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
 from agent_sparring.deferred_gate import CHECKPOINTS
 from agent_sparring.human_gate import HUMAN_GATE_CATEGORIES
 from agent_sparring.providers import (
+    ImageInputUnsupported,
     ProviderError,
     Runner,
     SparringAgentResult,
     classify_provider_error,
 )
 from agent_sparring.providers.subprocess_runner import LineSink, run_streaming
+from agent_sparring.visual_evidence import VisualEvidenceError, read_png
 
 DEFAULT_EXECUTABLE = "codex"
 DEFAULT_SANDBOX = "read-only"
@@ -154,6 +171,9 @@ class CatalogModel:
     display_name: str | None
     effort_levels: tuple[str, ...]
     default_effort: str | None
+    # As the catalog states them (e.g. ("text", "image")); empty when the
+    # catalog says nothing, which is not the same as "text only".
+    input_modalities: tuple[str, ...] = ()
 
 
 def list_models(executable: str = "codex") -> tuple[CatalogModel, ...]:
@@ -203,6 +223,9 @@ def list_models(executable: str = "codex") -> tuple[CatalogModel, ...]:
                     display_name=_str_or_none(entry.get("display_name")),
                     effort_levels=levels,
                     default_effort=_str_or_none(entry.get("default_reasoning_level")),
+                    input_modalities=tuple(
+                        m for m in entry.get("input_modalities") or () if isinstance(m, str)
+                    ),
                 ),
             )
         )
@@ -724,6 +747,11 @@ class CodexCliAdapter:
     # call.
     supports_resume: bool = True
 
+    # Codex can attach images to a fresh or a resumed turn (see module
+    # docstring). Whether the configured *model* can read them is a separate
+    # question, answered by image_input_problem().
+    supports_image_input: bool = True
+
     def __post_init__(self) -> None:
         # Refuse an unsupported effort at construction, which is always
         # before a provider process exists, and which also guarantees the
@@ -734,17 +762,52 @@ class CodexCliAdapter:
                 f"effort {self.effort!r} is not supported by {PROVIDER_ID}; "
                 f"supported levels: {', '.join(EFFORT_LEVELS)}"
             )
+        self._image_problem: tuple[str | None] | None = None
 
-    def start(self, prompt: str) -> SparringAgentResult:
-        return self._invoke(prompt, resume_session_id=None)
+    def image_input_problem(self) -> str | None:
+        """Why the configured model cannot be shown to read images, or ``None``.
 
-    def resume(self, session_id: str, prompt: str) -> SparringAgentResult:
+        Only Codex's own catalog can say a model accepts images. No pinned
+        model, an unreadable catalog, a model it does not list, or one whose
+        ``input_modalities`` omit ``image`` are all unsupported -- never
+        "probably fine". Asked once per adapter.
+        """
+
+        if self._image_problem is None:
+            self._image_problem = (self._find_image_problem(),)
+        return self._image_problem[0]
+
+    def _find_image_problem(self) -> str | None:
+        if not self.model:
+            return (
+                "no sparring model is pinned, so Codex's choice of model and "
+                "its image support are unknown"
+            )
+        try:
+            catalog = list_models(self.executable)
+        except ProviderError as exc:
+            return f"Codex's model catalog could not be read: {exc}"
+        entry = next((m for m in catalog if m.model == self.model), None)
+        if entry is None:
+            return f"Codex's model catalog does not list {self.model!r}"
+        if "image" not in entry.input_modalities:
+            return f"Codex's model catalog does not list image input for {self.model!r}"
+        return None
+
+    def start(
+        self, prompt: str, *, images: "Sequence[Path]" = ()
+    ) -> SparringAgentResult:
+        return self._invoke(prompt, resume_session_id=None, images=images)
+
+    def resume(
+        self, session_id: str, prompt: str, *, images: "Sequence[Path]" = ()
+    ) -> SparringAgentResult:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ProviderError(
                 "resume requires a non-empty session_id obtained from a prior "
                 "provider result, not an empty/invented value"
             )
-        return self._invoke(prompt, resume_session_id=session_id)
+        return self._invoke(prompt, resume_session_id=session_id, images=images)
 
     def converse(self, session_id: str, prompt: str) -> SparringAgentResult:
         """Resume the session for a free-form answer instead of a verdict.
@@ -764,7 +827,11 @@ class CodexCliAdapter:
         return self._invoke(prompt, resume_session_id=session_id, schema=False)
 
     def start_structured(
-        self, prompt: str, output_schema: Mapping[str, Any]
+        self,
+        prompt: str,
+        output_schema: Mapping[str, Any],
+        *,
+        images: "Sequence[Path]" = (),
     ) -> SparringAgentResult:
         """A fresh read-only session whose final message obeys ``output_schema``.
 
@@ -783,9 +850,37 @@ class CodexCliAdapter:
 
         if not isinstance(output_schema, Mapping) or not output_schema:
             raise ProviderError("start_structured requires a non-empty JSON schema object")
-        return self._invoke(prompt, resume_session_id=None, schema=output_schema)
+        return self._invoke(
+            prompt, resume_session_id=None, schema=output_schema, images=images
+        )
 
     # -- internals ----------------------------------------------------
+
+    def _checked_images(self, images: "Sequence[Path]") -> tuple[Path, ...]:
+        """Absolute paths of images verified before any process starts.
+
+        Codex drops a missing or non-image file without a word (see module
+        docstring), so a turn launched with one would look exactly like a
+        turn that inspected it. Refusing here is what keeps an unseen image
+        from ever reaching a verdict.
+        """
+
+        if not images:
+            return ()
+        problem = self.image_input_problem()
+        if problem is not None:
+            raise ImageInputUnsupported(f"cannot attach images: {problem}")
+        checked = []
+        for image in images:
+            path = Path(image)
+            if not path.is_absolute():
+                path = self.repo_root / path
+            try:
+                read_png(path)
+            except VisualEvidenceError as exc:
+                raise ImageInputUnsupported(f"refusing to attach image: {exc}") from exc
+            checked.append(path.resolve())
+        return tuple(checked)
 
     def _build_args(
         self,
@@ -793,6 +888,7 @@ class CodexCliAdapter:
         resume_session_id: str | None,
         schema_path: Path | None,
         output_path: Path,
+        images: tuple[Path, ...] = (),
     ) -> list[str]:
         """``schema_path`` of ``None`` asks for a free-form final message.
 
@@ -827,6 +923,9 @@ class CodexCliAdapter:
         args += ["-o", str(output_path)]
         if self.model:
             args += ["--model", self.model]
+        # One "--image=<path>" token each: "exec -i" is variadic, and the
+        # "=" form cannot consume the prompt that follows.
+        args += [f"--image={image}" for image in images]
         args.append(prompt)
         return args
 
@@ -836,10 +935,12 @@ class CodexCliAdapter:
         resume_session_id: str | None,
         *,
         schema: "bool | Mapping[str, Any]" = True,
+        images: "Sequence[Path]" = (),
     ) -> SparringAgentResult:
         """``schema``: ``True`` for the verdict schema, ``False`` for none, or
         a caller-supplied schema object (see :meth:`start_structured`)."""
 
+        attached = self._checked_images(images)
         with tempfile.TemporaryDirectory(prefix="agent-sparring-codex-") as tmp_dir:
             schema_path: Path | None = None
             if schema is not False:
@@ -848,7 +949,9 @@ class CodexCliAdapter:
                 schema_path.write_text(json.dumps(chosen), encoding="utf-8")
             output_path = Path(tmp_dir) / "last_message.txt"
 
-            args = self._build_args(prompt, resume_session_id, schema_path, output_path)
+            args = self._build_args(
+                prompt, resume_session_id, schema_path, output_path, attached
+            )
             translator = _CodexStreamTranslator(
                 self.activity,
                 self.repo_root,
