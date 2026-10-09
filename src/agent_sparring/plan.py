@@ -1436,6 +1436,17 @@ def _verify_source_unchanged(source: PlanSource, state: PlanRunState) -> tuple[P
             "refusing to continue against a different plan. Restore it as it was, or "
             "deliberately start over (see run-plan's refusal message for what to remove)."
         )
+    # Not in the digest (it is outside every stage section, and folding it in
+    # would change recorded digests of plans that already carry it), but it
+    # decides whether the plan may run here: an edit since this source was
+    # read is refused like any other change. A resume re-checks it against
+    # the home repository before anything runs (refuse_foreign_home).
+    if getattr(fresh, "declared_home", None) != getattr(source, "declared_home", None):
+        raise PlanRefusal(
+            OWNER_DECLARATION_INVALID,
+            f"the 'Repository:' line before the first stage of {state.plan} changed since this "
+            "run read it; refusing to continue against a different plan. Restore it as it was",
+        )
     return fresh.stages()
 
 

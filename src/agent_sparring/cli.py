@@ -2047,8 +2047,12 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool, source: PlanSou
         repo_root = _resolve_repo_root(args, sparring_dir)
         if source is None:
             source = _plan_source(args, repo_root)
+        home = _project_repository_name(args, sparring_dir, repo_root)
+        # Every start and every resume: the declared home is not in the
+        # digest, so it is re-checked whenever the plan is read for a run.
+        refuse_foreign_home(source, home)
         if not resume and _managed_record(args) is None:
-            refuse_foreign_owners(source, _project_repository_name(args, sparring_dir, repo_root))
+            refuse_foreign_owners(source, home)
         self_check = _resolve_self_check(sparring_dir)
         # Provider selection is checked once, before any run state exists;
         # the adapters themselves are built per planned stage (below) so

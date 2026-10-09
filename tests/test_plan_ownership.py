@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from agent_sparring.plan import (
     PlanRefusal,
     PlanRunState,
     PlanRunStatus,
+    _verify_source_unchanged,
     markdown_source_from_text,
     new_run_key,
     parse_plan,
@@ -210,6 +212,28 @@ class OutsideStageDeclarationTests(unittest.TestCase):
         self.assertIsNone(source.declared_home)
         self.assertEqual([(s.owner, s.gates_before) for s in source.stages()], [(None, ())])
 
+    def test_the_declared_home_is_not_in_the_digest_so_a_change_is_refused_on_reread(self):
+        # Legacy digests stay as they were: the preamble is outside every
+        # stage section. That is exactly why a re-read checks it separately.
+        path = Path(self._tmp()) / "p.md"
+        path.write_text("Repository: repo\n\n" + plan("Body."), encoding="utf-8")
+        source = markdown_source_from_text(path, "p.md", path.read_text(encoding="utf-8"))
+        state = PlanRunState(
+            plan="p.md", plan_digest=source.digest(), expected_branch="feature/x",
+            current_stage_index=0, current_stage=source.stages()[0].stage_id, status=PlanRunStatus.RUNNING,
+        )
+        self.assertEqual(_verify_source_unchanged(source, state), source.stages())
+        path.write_text("Repository: elsewhere\n\n" + plan("Body."), encoding="utf-8")
+        self.assertEqual(source.reload().digest(), source.digest())
+        with self.assertRaises(PlanRefusal) as ctx:
+            _verify_source_unchanged(source, state)
+        self.assertEqual(ctx.exception.code, OWNER_DECLARATION_INVALID)
+
+    def _tmp(self) -> str:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return directory.name
+
     def test_this_plans_own_preamble_declaration_parses(self):
         # The plan this stage implements declares its repository in its
         # preamble; it must stay runnable from that repository.
@@ -350,6 +374,30 @@ class WarningTests(unittest.TestCase):
         text = "# P\n\n## Stage 1 — sporely-landing pilot\n\nImplement in `sporely-landing`.\n"
         self.assertEqual(self._mentions(text), ("sporely-landing",))
 
+    def test_a_backticked_name_in_stage_prose_alone_fires(self):
+        text = "# P\n\n## Stage 1 — Pilot\n\nImplement in `sporely-landing`.\n"
+        self.assertEqual(self._mentions(text), ("sporely-landing",))
+
+    def test_a_backticked_name_in_a_heading_alone_fires(self):
+        text = "# P\n\n## Stage 1 — `sporely-landing` pilot\n\nImplement it.\n"
+        self.assertEqual(self._mentions(text), ("sporely-landing",))
+
+    def test_a_bare_heading_name_fires_when_the_document_corroborates_it(self):
+        heading = "# P\n\n## Stage 1 — sporely-landing pilot\n\nImplement it.\n"
+        # Same family as the home repository.
+        self.assertEqual(self._mentions(heading, home="sporely-web"), ("sporely-landing",))
+        # Backticked elsewhere in the document.
+        self.assertEqual(self._mentions("See `sporely-landing`.\n\n" + heading), ("sporely-landing",))
+        # Alone it is indistinguishable from "end-to-end" and does not warn.
+        self.assertEqual(self._mentions(heading), ())
+
+    def test_commands_identifiers_files_and_compound_words_do_not_fire(self):
+        text = plan(
+            "Run `sparring check-plan --json`, then `run-plan --managed`; see `input.kind`, "
+            "`plan_digest`, `docs/x-y.md`, `ui-screenshots.md` and `2026-09-19`.",
+        ).replace("## Stage 1 — S1", "## Stage 1 — end-to-end read-only dry-run")
+        self.assertEqual(self._mentions(text), ())
+
     def test_home_and_plain_words_do_not_fire(self):
         text = plan("Edit the repository and the repository-owned script in `agent-sparring`.")
         self.assertEqual(self._mentions(text), ())
@@ -475,6 +523,21 @@ class ManagedRefusalTests(_Cli, _ManagedRepoTestCase):
         code, out, _ = self._main("start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed", "--json")
         self.assertIn("[owner_declaration_invalid]", json.loads(out)["error"])
         self.assertEqual(self._records(), ())
+
+    def test_a_resume_refuses_a_preamble_changed_to_a_foreign_repository(self):
+        self.plan_path.write_text("Repository: repo\n\n" + plan("Build here."), encoding="utf-8")
+        _commit(self.repo, "home preamble")
+        code, _, err = self._start_managed()
+        (record,) = self._records()
+        state_path = record.sparring_dir / "plans" / f"{record.run_key}.json"
+        before = state_path.read_bytes()
+        plan_file = Path(record.worktree_path) / record.input_path
+        plan_file.chmod(0o644)
+        plan_file.write_text("Repository: elsewhere\n\n" + plan("Build here."), encoding="utf-8")
+        code, _, err = self._main("resume-plan", "--run-key", record.run_key)
+        self.assertEqual(code, 1)
+        self.assertIn("[owner_declaration_invalid]", err)
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_a_home_owned_declaration_runs_managed(self):
         self.plan_path.write_text(plan("Repository: repo\n\nBuild here."), encoding="utf-8")

@@ -908,39 +908,81 @@ def undeclared_repository_mentions(text: str, stage_sections: Iterable[str], hom
     declarations names in a heading or a stage section -- the shape of a
     cross-repository plan whose ownership was never declared.
 
-    A candidate is a name that is unmistakably a name (backticked, or
-    containing ``-``, ``_``, ``.``) and is either
+    Nothing configures which names are repositories, so candidates come from
+    how the document writes them. A candidate is any of:
 
-    - called a repository anywhere in the document ("**Pilot repository:**
-      `sporely-landing`", "the `web` repo"), or
-    - a qualified name in a heading that stage prose also backticks
-      ("## Stage 4 — sporely-landing pilot" ... "in `sporely-landing`").
+    - a name the document calls a repository ("**Pilot repository:**
+      `sporely-landing`", "the `web` repo");
+    - a lower-case hyphenated name backticked on its own in a heading or in
+      stage prose ("Implement in `sporely-landing`.");
+    - a lower-case hyphenated name in a heading, written bare ("## Stage 4 —
+      sporely-landing pilot"), when the document corroborates it as a name:
+      backticked somewhere, called a repository, or sharing its first part
+      with another candidate or with ``home``. Bare heading words alone
+      ("end-to-end", "read-only", "dry-run") are ordinary English as often
+      as they are names, and warning on every one would make the warning
+      noise.
 
-    It counts only if :func:`names_repository` finds it in a heading or a
-    stage section. "The repository" or "a repository-owned script" proposes
-    nothing. Advisory: a caller warns, never refuses.
+    Commands (``sparring run-plan``, ``npm run x``), flags, paths, files and
+    snake_case identifiers are not repository names. A candidate counts only
+    if :func:`names_repository` finds it in a heading or a stage section.
+    Advisory: a caller warns, never refuses.
     """
 
     sections = list(stage_sections)
-    headings = "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
-    candidates: set[str] = set()
+    lines = text.splitlines()
+    headings = "\n".join(line for line in lines if line.lstrip().startswith("#"))
+    called: set[str] = set()
     for pattern in _CALLED_REPOSITORY_RES:
         for match in pattern.finditer(text):
             name = match.group("name").rstrip(".-")
             if match.group("q") or re.search(r"[-_.]", name):
-                candidates.add(name)
-    prose = "\n".join(sections)
-    for token in re.findall(r"(?<![\w./-])[A-Za-z0-9][\w.-]*[-_.][\w.-]*[A-Za-z0-9]", headings):
-        if f"`{token}`" in prose:
-            candidates.add(token)
+                called.add(name)
+    backticked_anywhere = set(re.findall(r"`([^`\s]+)`", text))
+    backticked = {
+        name
+        for scope in (headings, *sections)
+        for name in re.findall(r"`([^`\s]+)`", scope)
+        if _HYPHENATED_NAME_RE.fullmatch(name)
+    }
+    bare = set(re.findall(r"(?<![\w./`-])[a-z0-9]+(?:-[a-z0-9]+)+(?![\w/`-])", headings))
+    known = called | backticked
+    families = {name.split("-", 1)[0] for name in known | {home}}
+    corroborated = {
+        name
+        for name in bare
+        if name in backticked_anywhere or name in called or (
+            name.split("-", 1)[0] in families and len(name.split("-", 1)[0]) > 2
+        )
+    }
+    commands = {
+        match.group(1)
+        for match in re.finditer(r"(?:\bsparring|\bnpm run|\bnpx|\bgit|\buv run|\bpnpm|\byarn)\s+([\w.-]+)", text)
+    } | set(re.findall(r"`([\w.-]+)\s+--", text))
+    candidates = {
+        name
+        for name in (known | corroborated) - commands
+        if not _FILE_LIKE_RE.search(name) and "/" not in name
+    }
     scopes = [headings, *sections]
     return tuple(
         sorted(
             name
             for name in candidates
-            if name.lower() != home.lower() and any(names_repository(scope, name) for scope in scopes)
+            if name.lower() != home.lower()
+            and not re.fullmatch(r"[\d.-]+", name)
+            and any(names_repository(scope, name) for scope in scopes)
         )
     )
+
+
+# A repository name as written in prose: lower-case words joined by hyphens.
+# Dotted (``input.kind``), snake_case and CamelCase spans are identifiers.
+_HYPHENATED_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+")
+_FILE_LIKE_RE = re.compile(
+    r"\.(md|py|toml|json|jsonl|ts|tsx|js|mjs|cjs|yml|yaml|sh|txt|png|jpg|svg|css|html|sql|lock|cfg|ini)$",
+    re.IGNORECASE,
+)
 
 
 def compile_context_for(
