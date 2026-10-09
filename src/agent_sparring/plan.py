@@ -896,6 +896,11 @@ def _write_once(path: Path, data: bytes) -> None:
             os.link(name, path)
         except FileExistsError as exc:
             raise PlanError(f"{path} already exists") from exc
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         Path(name).unlink(missing_ok=True)
 

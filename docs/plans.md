@@ -388,7 +388,12 @@ sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
   an absent branch is `remote_branch_absent` (success, no push), and if the
   remote target does not yet contain the candidate (no `--push-target`, say)
   the branch is kept with `remote_target_missing_candidate` — push the
-  target and re-run. A refused delete is classified from the push's own
+  target and re-run (`remote_target_unknown` when the remote target's commit
+  is not present locally: fetch first). That target read is point-in-time;
+  only the branch deletion itself is lease-guarded. A remote with several
+  push URLs is not deleted from (`remote_multiple_push_urls`: a per-URL
+  lease delete is not supported), and a push-only endpoint whose
+  `ls-remote` fails cannot use `delete_remote_branch` (`remote_unreachable`). A refused delete is classified from the push's own
   status: `remote_lease_mismatch` (stale info), `remote_delete_rejected`
   (the remote refused) or `remote_unreachable`. Every one of these keeps
   the branch, stops the finish at `delete_remote_branch` unfinished, and a

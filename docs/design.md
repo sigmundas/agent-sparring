@@ -1032,7 +1032,10 @@ server refuses unless the branch is exactly the merged candidate; that
 lease is the only force anywhere in finish. A read of the remote only
 informs: the branch is read at the push URL (absent needs no delete) and
 the remote target must already contain the candidate, else the branch is
-kept (`remote_target_missing_candidate`). A refusal is classified from the
+kept (`remote_target_missing_candidate`, or `remote_target_unknown` until
+fetched). That read is point-in-time; only the delete itself is
+lease-guarded. Several push URLs are refused (`remote_multiple_push_urls`),
+and a push-only endpoint that `ls-remote` cannot read cannot use the option. A refusal is classified from the
 push's own status line. A refused or unreachable delete keeps the branch
 and stops the finish unfinished; re-running resumes. With the option off the
 branch is kept and reported (`remote_delete_disabled`, plus the legacy

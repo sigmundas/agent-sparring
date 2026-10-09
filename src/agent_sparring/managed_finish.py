@@ -27,8 +27,9 @@ from agent_sparring.managed_run import ManagedRunError, ManagedRunRecord
 
 #: The ``finish`` object of ``runs --json`` / ``finish-run --dry-run``; its shape is unchanged.
 FINISH_SCHEMA_VERSION = 1
-#: The ``finish-run`` execution report (gained ``plan_removal`` and ``remote_branch``).
-FINISH_REPORT_SCHEMA_VERSION = 2
+#: The ``finish-run`` execution report. ``plan_removal`` and ``remote_branch``
+#: are additive fields within v1 (clients ignore unknown fields).
+FINISH_REPORT_SCHEMA_VERSION = 1
 MERGE_MODES = ("already_merged", "fast_forward", "merge_commit")
 
 
@@ -277,8 +278,13 @@ _IN_PROGRESS = (
 # push the remote is read at its push URL -- an absent branch needs no
 # delete, and a remote target not yet containing the candidate keeps the
 # branch (``remote_target_missing_candidate``) -- but those reads only
-# inform; the lease is the guard. A refused push is classified from its own
-# porcelain status line. Any refusal keeps the branch and stops the finish
+# inform; the lease is the guard. The "target contains the candidate" read
+# is point-in-time: the target may move after it, and only the branch
+# deletion itself is lease-guarded. A remote with several push URLs is not
+# deleted from (``remote_multiple_push_urls``: no per-URL lease), and a
+# push-only endpoint whose ``ls-remote`` fails cannot use the option
+# (``remote_unreachable``). A refused push is classified from its own
+# porcelain status lines; it is deleted only when every line says so. Any refusal keeps the branch and stops the finish
 # at ``delete_remote_branch``, unfinished, so a re-run resumes.
 #
 # When the policy is false the branch is kept and reported both with the
@@ -290,6 +296,7 @@ REMOTE_DELETE_UNAVAILABLE = "[finish] delete_remote_branch is not enabled, so th
 REMOTE_DELETE_LEASE = "--force-with-lease"
 REMOTE_KEEP_CODES = (
     "remote_lease_mismatch", "remote_unreachable", "remote_delete_rejected", "remote_target_missing_candidate",
+    "remote_target_unknown", "remote_multiple_push_urls",
 )
 
 
@@ -1192,8 +1199,14 @@ def _delete_remote_branch(repo_root: Path, record: ManagedRunRecord, candidate: 
 
     ref = f"refs/heads/{record.branch}"
     where = f"{record.remote}/{record.branch}"
-    push_url = managed_run._git(repo_root, "remote", "get-url", "--push", record.remote)
-    url = push_url.stdout.strip() if push_url.returncode == 0 and push_url.stdout.strip() else record.remote
+    push_urls = managed_run._git(repo_root, "remote", "get-url", "--push", "--all", record.remote)
+    urls = push_urls.stdout.split() if push_urls.returncode == 0 else []
+    if len(urls) > 1:
+        return "remote_multiple_push_urls", (
+            f"{record.remote} has {len(urls)} push URLs ({', '.join(urls)}); a per-URL lease delete is not "
+            f"supported, so nothing was read or pushed and {where} is kept"
+        )
+    url = urls[0] if urls else record.remote
     ok, branch_sha, error = _remote_sha(repo_root, url, record.branch)
     if not ok:
         return "remote_unreachable", f"{where} cannot be reached at {url} ({error}); the branch is kept"
@@ -1202,7 +1215,12 @@ def _delete_remote_branch(repo_root: Path, record: ManagedRunRecord, candidate: 
     ok, target_sha, error = _remote_sha(repo_root, url, record.target_branch)
     if not ok:
         return "remote_unreachable", f"{record.remote}/{record.target_branch} cannot be read at {url} ({error})"
-    if target_sha is None or _rev(repo_root, target_sha) is None or not _is_ancestor(repo_root, candidate, target_sha):
+    if target_sha is not None and _rev(repo_root, target_sha) is None:
+        return "remote_target_unknown", (
+            f"{record.remote}/{record.target_branch} at {url} is {target_sha}, which is not present locally; "
+            f"fetch first, then re-run. {where} is kept"
+        )
+    if target_sha is None or not _is_ancestor(repo_root, candidate, target_sha):
         return "remote_target_missing_candidate", (
             f"{record.remote}/{record.target_branch} at {url} is {target_sha or 'absent'} and does not contain "
             f"the merged candidate {candidate}; push the target (--push-target) and re-run. {where} is kept"
@@ -1210,16 +1228,20 @@ def _delete_remote_branch(repo_root: Path, record: ManagedRunRecord, candidate: 
     result = managed_run._git(
         repo_root, "push", "--porcelain", f"{REMOTE_DELETE_LEASE}={ref}:{candidate}", record.remote, "--delete", ref,
     )
-    status = next(
-        (line.split("\t") for line in result.stdout.splitlines() if line.count("\t") >= 2 and f":{ref}" in line),
-        None,
-    )
-    if result.returncode == 0 and status is not None and status[0] == "-":
-        return "remote_branch_deleted", f"{where} was exactly {candidate} and is deleted"
+    lines = result.stdout.splitlines()
+    sections = [line for line in lines if line.startswith("To ")]
+    statuses = [line.split("\t") for line in lines if line.count("\t") >= 2 and f":{ref}" in line]
     error = (result.stderr.strip() or result.stdout.strip() or "git push --delete failed").splitlines()[-1]
-    if status is None:
+    if not statuses:
         return "remote_unreachable", f"the delete of {where} did not reach the remote ({error}); the branch is kept"
-    summary = status[2]
+    if result.returncode == 0 and all(status[0] == "-" for status in statuses):
+        return "remote_branch_deleted", f"{where} was exactly {candidate} and is deleted"
+    summary = "; ".join(status[2] for status in statuses if status[0] != "-") or error
+    if len(sections) > 1 or len(statuses) > 1:
+        return "remote_delete_rejected", (
+            f"the delete of {where} went to {max(len(sections), len(statuses))} destinations and not every one "
+            f"deleted it ({summary}); it is not recorded deleted"
+        )
     if "stale info" in summary:
         return "remote_lease_mismatch", (
             f"{where} is no longer exactly the merged candidate {candidate}; the lease refused the delete "

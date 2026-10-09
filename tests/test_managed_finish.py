@@ -820,6 +820,64 @@ class RemoteBranchDeletionTests(_FinishTestCase):
         self.assertNotIn(record.branch, _git(self.repo, "ls-remote", str(mirror)))
         self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
 
+    def test_multiple_push_urls_stop_without_reading_or_pushing(self):
+        record, _ = self._complete()
+        head = self._set_policy(record, True)
+        second = self.remote.parent / "second.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(self.remote), str(second)], check=True, capture_output=True)
+        _run_git(self.repo, "push", "-q", "origin", "main")  # the target already contains the candidate
+        _run_git(second, "fetch", "-q", str(self.remote), "+refs/heads/*:refs/heads/*")
+        _run_git(self.repo, "remote", "set-url", "--add", "--push", "origin", str(self.remote))
+        _run_git(self.repo, "remote", "set-url", "--add", "--push", "origin", str(second))
+        patch, calls = self._on_delete(lambda: None)
+        with patch:
+            code, report, _ = self._finish(record)
+        self.assertEqual(calls, [])
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
+        self.assertEqual(report["remote_branch"]["code"], "remote_multiple_push_urls")
+        self.assertIn("per-URL lease", report["remote_branch"]["detail"])
+        self.assertEqual([k["code"] for k in report["kept"]], ["remote_multiple_push_urls"])
+        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
+        self.assertEqual(_git(second, "rev-parse", f"refs/heads/{record.branch}"), head)
+        events = self._events(record)
+        self.assertNotIn("remote_branch_deleted", events)
+        self.assertNotIn("finished", events)
+
+    def test_remote_target_not_present_locally_is_unknown(self):
+        record, _ = self._complete()
+        self._set_policy(record, True)
+        with self._fail_branch_delete_once():
+            code, report, _ = self._finish(record, "--push-target")
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_branch"))
+        # The remote target moves to a commit this repository has never fetched.
+        tree = _git(self.remote, "rev-parse", "main^{tree}")
+        unknown = _git(self.remote, "commit-tree", tree, "-p", "main", "-m", "only on the remote")
+        _run_git(self.remote, "update-ref", "refs/heads/main", unknown)
+        code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
+        self.assertEqual(report["remote_branch"]["code"], "remote_target_unknown")
+        self.assertIn("fetch", report["remote_branch"]["detail"])
+        self.assertTrue(self._remote_has(record))
+
+    def test_porcelain_with_two_destinations_is_never_deleted_unless_both_are(self):
+        record, _ = self._complete()
+        self._set_policy(record, True)
+        ref = f"refs/heads/{record.branch}"
+        real_git = managed_run._git
+
+        def two_sections(cwd, *args):
+            if "push" in args and "--delete" in args:
+                out = (f"To a\n-\t:{ref}\t[deleted]\nDone\n"
+                       f"To b\n!\t:{ref}\t[remote rejected] (hook declined)\nDone\n")
+                return subprocess.CompletedProcess(args, 0, out, "")
+            return real_git(cwd, *args)
+
+        with mock.patch.object(managed_run, "_git", side_effect=two_sections):
+            code, report, _ = self._finish(record, "--push-target")
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
+        self.assertEqual(report["remote_branch"]["code"], "remote_delete_rejected")
+        self.assertNotIn("remote_branch_deleted", self._events(record))
+
     def _hook(self, body: str):
         hook = self.remote / "hooks" / "pre-receive"
         hook.write_text("#!/bin/sh\n" + body, encoding="utf-8")
@@ -1317,15 +1375,15 @@ class ManifestPlanRemovalTests(_FinishTestCase):
 class FinishSchemaTests(_FinishTestCase):
     _finish = FinishExecutionTests._finish
 
-    def test_dry_run_and_runs_stay_at_1_and_execution_is_2(self):
+    def test_dry_run_runs_and_execution_all_stay_at_1(self):
         record, _ = self._complete()
         self.assertEqual(managed_finish.FINISH_SCHEMA_VERSION, 1)
-        self.assertEqual(managed_finish.FINISH_REPORT_SCHEMA_VERSION, 2)
+        self.assertEqual(managed_finish.FINISH_REPORT_SCHEMA_VERSION, 1)  # new fields are additive
         self.assertEqual(self._status(record)["finish"]["schema_version"], 1)
         (run,) = managed_finish.runs_report(self.repo)["runs"]
         self.assertEqual(run["finish"]["schema_version"], 1)
         code, report, err = self._finish(record)
-        self.assertEqual((code, report["schema_version"]), (0, 2), err)
+        self.assertEqual((code, report["schema_version"]), (0, 1), err)
         self.assertIn("plan_removal", report)
         self.assertIn("remote_branch", report)
 

@@ -491,8 +491,8 @@ rather than depending on the project's own wording.
 ## Managed-run JSON
 
 Every payload carries `schema_version` (records and `runs` currently `1`,
-the dry-run `finish` object `1`, the `finish-run` execution report `2`,
-`prune` with a selector `2`); a client refuses a
+the `finish` objects `1` — the execution report's `plan_removal` and
+`remote_branch` are additive fields in v1 — and `prune` with a selector `2`); a client refuses a
 version it does not know. Behavior: [plans.md](plans.md#managed-runs).
 
 **Record** — `<git-common-dir>/agent-sparring/worktrees/<run-key>.json`.
@@ -544,7 +544,7 @@ delete). `actions` also lists the plan removal when `remove_plan` is on.
 **`finish-run --json`** (execution):
 
 ```json
-{"schema_version": 2, "run_key": "…",
+{"schema_version": 1, "run_key": "…",
  "completed_steps": ["merge", "remove_plan", "push_target", "archive_state", "remove_worktree",
                      "delete_branch", "delete_remote_branch", "finished"],
  "stopped_at": "checks | <step> | null", "reason": "… | null",
@@ -563,7 +563,8 @@ or `plan_commit_failed` (stops at `remove_plan`). `remote_branch.code`:
 `remote_branch_deleted`, `remote_branch_absent`, `remote_delete_disabled`,
 `finish_config_unreadable`, `no_remote`, or `remote_lease_mismatch` /
 `remote_unreachable` / `remote_delete_rejected` /
-`remote_target_missing_candidate`
+`remote_target_missing_candidate` / `remote_target_unknown` (fetch first) /
+`remote_multiple_push_urls`
 (the branch is kept with that `kept[].code`, the finish stops at
 `delete_remote_branch` and the run is not finished). `null` means the step
 was not reached.
