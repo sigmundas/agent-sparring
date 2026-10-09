@@ -1,13 +1,15 @@
 import ast
 import json
+import struct
 import subprocess
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
 import conftest_path  # noqa: F401
-from png_fixture import png_bytes, write_quadrants
+from png_fixture import chunk, png_bytes, write_quadrants
 
 from agent_sparring import visual_evidence as ve
 from agent_sparring.providers import ImageInputUnsupported, ProviderError
@@ -299,6 +301,250 @@ class CodexImageInputTests(_Tmp):
         self.assertEqual(models["plain"].input_modalities, ())
 
 
+def _png(
+    width=2,
+    height=2,
+    *,
+    depth=8,
+    colour=2,
+    compression=0,
+    filter_method=0,
+    interlace=0,
+    scanlines=None,
+    before_idat=(),
+    idat=None,
+    after_idat=(),
+):
+    """Assemble a PNG chunk by chunk, so one field at a time can be wrong."""
+
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[colour]
+    row = (width * channels * depth + 7) // 8
+    if scanlines is None:
+        scanlines = b"".join(b"\x00" + bytes(row) for _ in range(height))
+    ihdr = struct.pack(">IIBBBBB", width, height, depth, colour, compression, filter_method, interlace)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + b"".join(before_idat)
+        + (idat if idat is not None else chunk(b"IDAT", zlib.compress(scanlines)))
+        + b"".join(after_idat)
+        + chunk(b"IEND", b"")
+    )
+
+
+def _unterminated(data: bytes) -> bytes:
+    """All of ``data``, flushed but with no end-of-stream marker."""
+
+    compressor = zlib.compressobj()
+    return compressor.compress(data) + compressor.flush(zlib.Z_SYNC_FLUSH)
+
+
+class PngDecoderConstraintTests(_Tmp):
+    """Images a decoder would refuse must be refused here first: Codex drops
+    an undecodable attachment silently (see providers/codex_cli.py)."""
+
+    def _check(self, data: bytes):
+        path = self.root / "x.png"
+        path.write_bytes(data)
+        return ve.read_png(path)
+
+    def test_well_formed_variants_are_accepted(self):
+        palette = chunk(b"PLTE", bytes(range(12)))
+        # Adam7 2x2: pass 1 is the top-left pixel, pass 6 the top-right,
+        # pass 7 the bottom row; passes 2-5 are empty and contribute nothing.
+        adam7 = b"\x00" + bytes(3) + b"\x00" + bytes(3) + b"\x00" + bytes(6)
+        accepted = {
+            "rgb": _png(),
+            "all filter types": _png(width=1, height=5, scanlines=b"".join(bytes([f, 0, 0, 0]) for f in range(5))),
+            "palette": _png(colour=3, before_idat=(palette,)),
+            "1-bit palette": _png(colour=3, depth=1, before_idat=(chunk(b"PLTE", bytes(6)),)),
+            "interlaced": _png(interlace=1, scanlines=adam7),
+            "split IDAT": _png(idat=chunk(b"IDAT", zlib.compress(bytes(14))[:5]) + chunk(b"IDAT", zlib.compress(bytes(14))[5:])),
+            "ancillary chunk": _png(after_idat=(chunk(b"tEXt", b"k\x00v"),)),
+            "rgb suggested palette": _png(before_idat=(palette,)),
+        }
+        for name, data in accepted.items():
+            with self.subTest(name):
+                self.assertEqual(self._check(data), ve.PngInfo(width=data[19], height=data[23]))
+
+    def test_decoder_relevant_violations_are_refused(self):
+        palette = chunk(b"PLTE", bytes(range(12)))
+        rejected = {
+            "scanline filter 5": _png(scanlines=b"\x05" + bytes(6) + b"\x00" + bytes(6)),
+            "late scanline filter 9": _png(scanlines=b"\x00" + bytes(6) + b"\x09" + bytes(6)),
+            "compression method 1": _png(compression=1),
+            "filter method 1": _png(filter_method=1),
+            "interlace method 2": _png(interlace=2),
+            "palette without PLTE": _png(colour=3),
+            "PLTE after IDAT": _png(colour=3, before_idat=(palette,), after_idat=(palette,)),
+            "PLTE in greyscale": _png(colour=0, before_idat=(palette,)),
+            "PLTE not a multiple of 3": _png(colour=3, before_idat=(chunk(b"PLTE", bytes(4)),)),
+            "PLTE too long for 1-bit": _png(colour=3, depth=1, before_idat=(chunk(b"PLTE", bytes(9)),)),
+            "two PLTE chunks": _png(colour=3, before_idat=(palette, palette)),
+            "unknown critical chunk": _png(before_idat=(chunk(b"ABCD", b""),)),
+            "invalid chunk type": _png(before_idat=(chunk(b"ab1d", b""),)),
+            "non-consecutive IDAT": _png(after_idat=(chunk(b"tEXt", b"k\x00v"), chunk(b"IDAT", b""))),
+            "trailing zlib data": _png(idat=chunk(b"IDAT", zlib.compress(bytes(14)) + b"xx")),
+            "unterminated zlib stream": _png(idat=chunk(b"IDAT", _unterminated(bytes(14)))),
+            "IEND with a body": _png()[:-12] + chunk(b"IEND", b"x"),
+            "invalid bit depth": _png(depth=4),
+            "absurd declared size": _png(width=0x7FFFFFFF, height=0x7FFFFFFF, scanlines=bytes(14)),
+        }
+        for name, data in rejected.items():
+            with self.subTest(name), self.assertRaises(ve.VisualEvidenceError):
+                self._check(data)
+
+    def test_adapter_refuses_each_invalid_png_before_running_codex(self):
+        rejected = {
+            "filter5.png": _png(scanlines=b"\x05" + bytes(6) + b"\x00" + bytes(6)),
+            "compression1.png": _png(compression=1),
+            "interlace2.png": _png(interlace=2),
+            "nopalette.png": _png(colour=3),
+        }
+        calls = []
+
+        def runner(args, cwd, timeout_seconds, on_line=None):
+            calls.append(args)
+            raise AssertionError("codex must not run")
+
+        good = write_quadrants(self.root / "good.png", ALL_RED, size=8)
+        adapter = CodexCliAdapter(repo_root=self.root, model="vision", runner=runner)
+        with _catalog(_model("vision")):
+            for name, data in rejected.items():
+                (self.root / name).write_bytes(data)
+                for call in (
+                    lambda: adapter.start("look", images=[good, self.root / name]),
+                    lambda: adapter.resume("t-1", "look", images=[self.root / name]),
+                    lambda: adapter.start_structured("s", {"type": "object"}, images=[self.root / name]),
+                ):
+                    with self.subTest(name), self.assertRaisesRegex(ImageInputUnsupported, "refusing to attach"):
+                        call()
+        self.assertEqual(calls, [])
+
+
+class BindingCoverageTests(_Tmp):
+    """A restored binding must hash exactly what its manifest names."""
+
+    def setUp(self):
+        super().setUp()
+        self.evidence = self.root / "evidence"
+        self.repo = self.root / "repo"
+        payload = _manifest()
+        payload["screenshots"].append(
+            {
+                "id": "panel-mobile",
+                "path": "panel-mobile.png",
+                "viewport": {"width": 375, "height": 812},
+                "status": "captured",
+                "reference": "mockups/panel-mobile.png",
+            }
+        )
+        write_quadrants(self.evidence / "panel-desktop.png", ALL_RED, size=8)
+        write_quadrants(self.evidence / "panel-mobile.png", ALL_RED, size=8)
+        write_quadrants(self.repo / "mockups" / "panel.png", ALL_RED, size=8)
+        write_quadrants(self.repo / "mockups" / "panel-mobile.png", ALL_RED, size=8)
+        manifest = ve.EvidenceManifest.from_dict(payload)
+        self.good = ve.bind_evidence(
+            manifest, evidence_root=self.evidence, repo_root=self.repo, candidate_sha=SHA_A
+        ).to_dict()
+
+    def _restore(self, mutate):
+        payload = json.loads(json.dumps(self.good))
+        mutate(payload)
+        return ve.EvidenceBinding.from_dict(payload)
+
+    def test_the_sendback_reproduction_is_refused(self):
+        def empty_hashes(p):
+            p["screenshots"] = []
+            p["references"] = []
+
+        with self.assertRaisesRegex(ve.VisualEvidenceError, "do not match its manifest"):
+            binding = self._restore(empty_hashes)
+            # Were it restored, it must not verify against roots that do not exist.
+            ve.verify_binding(
+                binding,
+                evidence_root=self.root / "nowhere",
+                repo_root=self.root / "nowhere",
+                candidate_sha=SHA_A,
+            )
+
+    def test_incomplete_extra_duplicate_or_reordered_hashes_are_refused(self):
+        digest = "0" * 64
+
+        def drop_first_shot(p):
+            del p["screenshots"][0]
+
+        def drop_reference(p):
+            del p["references"][1]
+
+        def extra_shot(p):
+            p["screenshots"].append({"path": "extra.png", "sha256": digest})
+
+        def duplicate_shot(p):
+            p["screenshots"][1] = dict(p["screenshots"][0])
+
+        def reorder_shots(p):
+            p["screenshots"].reverse()
+
+        def manifest_path_changed(p):
+            p["manifest"]["screenshots"][0]["path"] = "elsewhere.png"
+
+        def manifest_reference_changed(p):
+            p["manifest"]["screenshots"][1]["reference"] = "mockups/other.png"
+
+        def manifest_reference_dropped(p):
+            p["manifest"]["screenshots"][1]["reference"] = None
+
+        def bad_digest(p):
+            p["screenshots"][0]["sha256"] = "not-a-digest"
+
+        def uppercase_digest(p):
+            p["references"][0]["sha256"] = p["references"][0]["sha256"].upper()
+
+        def missing_digest(p):
+            del p["references"][0]["sha256"]
+
+        def unsorted_siblings(p):
+            p["siblings"] = [{"name": "b", "candidate_sha": SHA_B}, {"name": "a", "candidate_sha": SHA_C}]
+
+        def duplicate_siblings(p):
+            p["siblings"] = [{"name": "a", "candidate_sha": SHA_B}, {"name": "a", "candidate_sha": SHA_C}]
+
+        def short_candidate(p):
+            p["candidate_sha"] = "abc123"
+
+        def wrong_version(p):
+            p["version"] = 2
+
+        def siblings_not_objects(p):
+            p["siblings"] = ["a"]
+
+        for mutate in (
+            drop_first_shot, drop_reference, extra_shot, duplicate_shot, reorder_shots,
+            manifest_path_changed, manifest_reference_changed, manifest_reference_dropped,
+            bad_digest, uppercase_digest, missing_digest, unsorted_siblings,
+            duplicate_siblings, short_candidate, wrong_version, siblings_not_objects,
+        ):
+            with self.subTest(mutate.__name__), self.assertRaises(ve.VisualEvidenceError):
+                self._restore(mutate)
+
+    def test_direct_construction_is_checked_too(self):
+        good = ve.EvidenceBinding.from_dict(self.good)
+        with self.assertRaisesRegex(ve.VisualEvidenceError, "do not match its manifest"):
+            ve.EvidenceBinding(
+                candidate_sha=SHA_A,
+                siblings=(),
+                manifest=good.manifest,
+                screenshots=(),
+                references=good.references,
+            )
+
+    def test_complete_binding_still_round_trips_and_verifies(self):
+        binding = ve.EvidenceBinding.from_dict(self.good)
+        ve.verify_binding(binding, evidence_root=self.evidence, repo_root=self.repo, candidate_sha=SHA_A)
+        self.assertEqual(binding.to_dict(), self.good)
+
+
 class ContractIndependenceTests(unittest.TestCase):
     def test_contract_module_imports_no_capture_technology(self):
         source = Path(ve.__file__).read_text(encoding="utf-8")
@@ -310,7 +556,7 @@ class ContractIndependenceTests(unittest.TestCase):
                 imported.add(node.module.split(".")[0])
         self.assertLessEqual(
             imported,
-            {"__future__", "hashlib", "json", "struct", "zlib", "dataclasses", "pathlib", "typing", "agent_sparring"},
+            {"__future__", "hashlib", "json", "re", "struct", "zlib", "dataclasses", "pathlib", "typing", "agent_sparring"},
         )
 
 

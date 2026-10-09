@@ -13,7 +13,7 @@ COLOURS = {
 QUADRANTS = ("top_left", "top_right", "bottom_left", "bottom_right")
 
 
-def _chunk(kind: bytes, body: bytes) -> bytes:
+def chunk(kind: bytes, body: bytes) -> bytes:
     crc = zlib.crc32(kind + body) & 0xFFFFFFFF
     return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", crc)
 
@@ -24,9 +24,9 @@ def png_bytes(width: int, height: int, pixel) -> bytes:
     )
     return (
         b"\x89PNG\r\n\x1a\n"
-        + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-        + _chunk(b"IDAT", zlib.compress(rows))
-        + _chunk(b"IEND", b"")
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
     )
 
 
