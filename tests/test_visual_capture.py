@@ -95,9 +95,13 @@ class _StageAdapter:
 
 
 class _SparringAdapter:
+    # Visual review refuses a reviewer that cannot be shown images.
+    supports_image_input = True
+
     def __init__(self, actions):
         self.actions = list(actions)
         self.calls = 0
+        self.images = []
 
     def _verdict(self):
         action = self.actions[self.calls]
@@ -114,10 +118,12 @@ class _SparringAdapter:
         )
         return SparringAgentResult(session_id="spar", text=text, is_error=False)
 
-    def start(self, prompt):
+    def start(self, prompt, *, images=()):
+        self.images.append(tuple(images))
         return self._verdict()
 
-    def resume(self, session_id, prompt):
+    def resume(self, session_id, prompt, *, images=()):
+        self.images.append(tuple(images))
         return self._verdict()
 
 

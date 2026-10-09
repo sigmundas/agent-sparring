@@ -102,6 +102,9 @@ from agent_sparring.sessions import (
 )
 from agent_sparring.sparring_prompt import assemble_sparring_prompt
 from agent_sparring.stage import Stage
+from agent_sparring.visual_capture import VisualCaptureError
+from agent_sparring.visual_evidence import require_image_input
+from agent_sparring.visual_review import VisualDelivery, VisualReviewRequest, prepare_delivery
 
 
 class SparringAgentRunError(RuntimeError):
@@ -234,6 +237,7 @@ def run_sparring_agent(
     evidence_first: bool = False,
     review_candidate_set: str | None = None,
     pending_deferred: tuple[DeferredObligation, ...] = (),
+    visual: VisualReviewRequest | None = None,
 ) -> SparringAgentRunResult:
     """Start or resume the sparring agent for one turn.
 
@@ -255,6 +259,17 @@ def run_sparring_agent(
     than a sparrer, not less, and there is exactly one implementation of it.
     It cannot be combined with ``finalization``, which describes a commit
     turn a review-only stage never has.
+
+    ``visual`` makes this an image-aware review (see
+    :mod:`agent_sparring.visual_review`): the capture made for this
+    candidate is attached to the turn -- fresh or resumed alike -- with a
+    prompt section saying which image is which and how to judge them.
+    Before anything is written or any provider runs, the adapter must be
+    able to deliver images to its model
+    (:func:`~agent_sparring.visual_evidence.require_image_input`) and, inside
+    the worktree lock, the capture must still be the stage's current
+    evidence for the candidate as it is now. Either failing refuses the
+    turn: there is no review under visual review without the pixels.
 
     ``expected_branch`` is required, mirroring
     :func:`agent_sparring.stage_agent.run_stage_agent`: a local
@@ -325,6 +340,17 @@ def run_sparring_agent(
             "a turn cannot be both an independent review and a review of a finalization "
             "commit; a review-only stage has no commit turn"
         )
+    if visual is not None and review_candidate_set is not None:
+        raise SparringAgentRunError(
+            "visual evidence is not delivered to an independent review of a candidate set"
+        )
+    if visual is not None:
+        try:
+            require_image_input(adapter)
+        except ProviderError as exc:
+            raise SparringAgentRunError(
+                f"cannot review stage {stage.stage_id!r} visually: {exc}"
+            ) from exc
 
     try:
         with worktree_lock(repo_root):
@@ -338,6 +364,7 @@ def run_sparring_agent(
                 evidence_first=evidence_first,
                 review_candidate_set=review_candidate_set,
                 pending_deferred=pending_deferred,
+                visual=visual,
             )
     except WorktreeLockError as exc:
         raise SparringAgentRunError(
@@ -389,7 +416,21 @@ def _run_sparring_agent_locked(
     evidence_first: bool = False,
     review_candidate_set: str | None = None,
     pending_deferred: tuple[DeferredObligation, ...] = (),
+    visual: VisualReviewRequest | None = None,
 ) -> SparringAgentRunResult:
+    # Under the lock and before anything is recorded: the images handed to
+    # the provider are the stage's current evidence for the candidate as it
+    # is now, re-hashed, or the turn does not happen.
+    delivery: VisualDelivery | None = None
+    if visual is not None:
+        try:
+            delivery = prepare_delivery(repo_root, stage, visual)
+        except VisualCaptureError as exc:
+            raise SparringAgentRunError(
+                f"refusing to review stage {stage.stage_id!r} without its current visual "
+                f"evidence: {exc}"
+            ) from exc
+
     state = stage.read_state()
     # The current generation's session; a pending fresh generation has none
     # and is told it replaces an earlier reviewer conversation.
@@ -419,6 +460,7 @@ def _run_sparring_agent_locked(
             evidence_first=evidence_first,
             pending_deferred=pending_deferred,
             fresh=fresh,
+            visual=delivery,
         )
     prompt = assembled.text
 
@@ -443,6 +485,17 @@ def _run_sparring_agent_locked(
     activity = _sparrer_emitter(stage, adapter)
     resumed = resume_id is not None
     activity.emit("sparring.started", resumed=resumed, session_id=resume_id)
+    # Only passed when there is something to attach, so an adapter that has
+    # never heard of images is called exactly as before.
+    images = {"images": delivery.images} if delivery is not None else {}
+    if delivery is not None:
+        activity.emit(
+            "sparring.images_attached",
+            resumed=resumed,
+            summary=f"{delivery.screenshot_count()} screenshot(s) and "
+            f"{len(delivery.attachments) - delivery.screenshot_count()} reference(s) "
+            f"from {delivery.capture.capture_id}",
+        )
 
     result: SparringAgentResult | None = None
     provider_error: ProviderError | None = None
@@ -454,10 +507,10 @@ def _run_sparring_agent_locked(
     started_at = time.monotonic()
     try:
         if resume_id:
-            result = adapter.resume(resume_id, prompt)
+            result = adapter.resume(resume_id, prompt, **images)
         else:
             with _session_recorded_early(adapter, stage):
-                result = adapter.start(prompt)
+                result = adapter.start(prompt, **images)
     except ProviderError as exc:
         provider_error = exc
     duration_ms = int((time.monotonic() - started_at) * 1000)

@@ -131,6 +131,9 @@ from agent_sparring.usage import collect_stage_usage, render_report
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 from agent_sparring.stage_prompt import build_stage_prompt
 from agent_sparring.templates import render_project_config
+from agent_sparring.visual_capture import VisualCaptureError, run_capture
+from agent_sparring.visual_evidence import require_image_input
+from agent_sparring.visual_review import VisualReviewRequest
 
 # Said the same way by run-plan and resume-plan, because it is the same
 # permission: one run's own branch, to the remote branch the acceptance gate
@@ -1285,8 +1288,23 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
             effort=effective.effort,
             activity=stage.activity_log().bind("sparrer", provider=CODEX_PROVIDER_ID),
         )
+        # With visual review enabled, a standalone review is shown a fresh
+        # capture exactly as a loop review is; it never reviews without one.
+        visual = None
+        visual_review = _resolve_visual_review(sparring_dir)
+        if visual_review is not None:
+            require_image_input(adapter)
+            visual = VisualReviewRequest(
+                capture=run_capture(repo_root, stage, visual_review),
+                criteria=visual_review.criteria,
+            )
         run_result = run_sparring_agent(
-            stage, sparring_dir, repo_root, adapter, expected_branch=args.expected_branch
+            stage,
+            sparring_dir,
+            repo_root,
+            adapter,
+            expected_branch=args.expected_branch,
+            visual=visual,
         )
     except (
         StageError,
@@ -1295,6 +1313,7 @@ def _cmd_run_sparring(args: argparse.Namespace) -> int:
         GitContextError,
         ProviderError,
         NextTurnError,
+        VisualCaptureError,
     ) as exc:
         print(f"could not run sparring agent: {exc}", file=sys.stderr)
         if _refusal_cause(exc) is not None:

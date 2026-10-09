@@ -127,6 +127,7 @@ from agent_sparring.next_turn import (
     verify_candidate,
 )
 from agent_sparring.providers import (
+    ProviderError,
     SparringAgentAdapter,
     StageAgentAdapter,
     classify_failure_text,
@@ -142,6 +143,8 @@ from agent_sparring.stage import (
 )
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 from agent_sparring.visual_capture import VisualCaptureError, run_capture
+from agent_sparring.visual_evidence import require_image_input
+from agent_sparring.visual_review import VisualReviewRequest
 
 # A small, deliberately conservative default: enough headroom for a normal
 # correction cycle or two without risking an unattended run burning through
@@ -343,7 +346,13 @@ def run_unattended_loop(
     SEND_BACK is captured afresh, and earlier evidence is discarded before
     the new capture runs. A capture that fails raises :class:`LoopError`
     with the reviewer never started -- it can stop a run, never become a
-    verdict. With ``None`` nothing is captured and the loop is unchanged.
+    verdict. Each capture is then attached to the sparring turn it was made
+    for, with ``visual_review.criteria`` (see
+    :mod:`agent_sparring.visual_review`); after SEND_BACK the resumed
+    reviewer is shown the new capture, never the previous one. A sparring
+    adapter that cannot deliver images to its model is refused before any
+    turn runs, so no implementation turn is spent on a review that could
+    not look. With ``None`` nothing is captured and the loop is unchanged.
     """
 
     if max_send_back_cycles < 1:
@@ -359,6 +368,15 @@ def run_unattended_loop(
         raise LoopError(
             f"start_with must be 'stage', 'sparring' or 'finalization', got {start_with!r}"
         )
+
+    if visual_review is not None:
+        try:
+            require_image_input(sparring_adapter)
+        except ProviderError as exc:
+            raise LoopError(
+                f"stage {stage.stage_id!r} has visual review enabled, but its reviewer "
+                f"cannot be shown images: {exc}"
+            ) from exc
 
     cycle_records: list[LoopCycleRecord] = []
     send_back_count = 0
@@ -551,6 +569,7 @@ def run_unattended_loop(
                     raise CandidateRefused(str(exc)) from exc
                 raise LoopError(str(exc)) from exc
 
+        visual: VisualReviewRequest | None = None
         if visual_review is not None:
             # After the candidate is pinned and verified, so the evidence is
             # captured for -- and checked against -- exactly what the
@@ -571,6 +590,7 @@ def run_unattended_loop(
                 summary=f"{sum(s.captured for s in capture.manifest.screenshots)} screenshot(s) "
                 f"captured as {capture.capture_id}",
             )
+            visual = VisualReviewRequest(capture=capture, criteria=visual_review.criteria)
 
         try:
             sparring_run = run_sparring_agent(
@@ -582,6 +602,7 @@ def run_unattended_loop(
                 finalization=finalization_note,
                 evidence_first=evidence_first,
                 pending_deferred=pending_deferred,
+                visual=visual,
             )
         except SparringAgentRunError as exc:
             activity.emit("loop.stopped", cycle=cycle, summary="sparring-agent turn failed")

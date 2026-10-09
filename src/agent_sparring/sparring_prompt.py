@@ -36,6 +36,7 @@ from agent_sparring.stage import (
     Stage,
     StageError,
 )
+from agent_sparring.visual_review import VisualDelivery, visual_evidence_section
 
 
 def _stage_file(stage: Stage, filename: str) -> str:
@@ -429,6 +430,7 @@ def assemble_sparring_prompt(
     evidence_first: bool = False,
     pending_deferred: tuple[DeferredObligation, ...] = (),
     fresh: bool = False,
+    visual: VisualDelivery | None = None,
 ) -> AssembledPrompt:
     """Assemble the bounded prompt for one sparring-agent turn.
 
@@ -470,6 +472,12 @@ def assemble_sparring_prompt(
     :mod:`agent_sparring.sessions`): the full prompt, plus the previous
     sparring exchange as historical evidence and a notice that this reviewer
     replaces an earlier conversation. Its captured turn kind is ``fresh``.
+
+    ``visual`` is the verified evidence attached to this turn (see
+    :mod:`agent_sparring.visual_review`): it adds the engine's statement of
+    which attached image is which, the written visual criteria and how to
+    judge them. Only :func:`~agent_sparring.sparring_agent.run_sparring_agent`
+    passes it, and only alongside the images themselves.
 
     Returns the prompt as ordered, sourced sections (see
     :mod:`agent_sparring.prompt_sections`);
@@ -607,6 +615,9 @@ def assemble_sparring_prompt(
                 source=_stage_file(stage, SPARRING_FILENAME),
             )
         )
+
+    if visual is not None:
+        parts.append(visual_evidence_section(visual, stage))
 
     parts.append(section("Your task", [_VERDICT_INSTRUCTIONS]))
 

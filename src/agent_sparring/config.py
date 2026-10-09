@@ -110,10 +110,17 @@ class VisualReviewConfig:
     leaves behind (see :mod:`agent_sparring.visual_capture` for the output
     contract). ``timeout_seconds`` bounds one capture; a capture that
     overruns is killed and counts as failed.
+
+    ``criteria`` are the written visual acceptance criteria the reviewer
+    judges every screenshot against, alongside the images and whatever the
+    stage brief requires (see :mod:`agent_sparring.visual_review`). They are
+    prompt text, numbered ``V1``, ``V2``... in order so a finding can cite
+    one; nothing in the engine interprets them.
     """
 
     command: tuple[str, ...]
     timeout_seconds: int = 300
+    criteria: tuple[str, ...] = ()
 
 
 DEFAULT_VISUAL_TIMEOUT_SECONDS = 300
@@ -121,7 +128,9 @@ MAX_VISUAL_TIMEOUT_SECONDS = 3600
 
 # Closed for the same reason as ``_AGENT_ROLE_KEYS``: a misspelled
 # ``timeout`` must not silently leave the default in force.
-_VISUAL_REVIEW_KEYS: frozenset[str] = frozenset({"enabled", "command", "timeout_seconds"})
+_VISUAL_REVIEW_KEYS: frozenset[str] = frozenset(
+    {"enabled", "command", "timeout_seconds", "criteria"}
+)
 
 
 def _parse_visual_review(table: Mapping[str, Any], *, source: str) -> VisualReviewConfig | None:
@@ -158,11 +167,23 @@ def _parse_visual_review(table: Mapping[str, Any], *, source: str) -> VisualRevi
         raise ProjectConfigError(
             f"{where} field 'timeout_seconds' must be in 1..{MAX_VISUAL_TIMEOUT_SECONDS}"
         )
+    criteria = raw.get("criteria", [])
+    if not isinstance(criteria, list) or not all(
+        isinstance(item, str) and item.strip() for item in criteria
+    ):
+        raise ProjectConfigError(
+            f"{where} field 'criteria' must be an array of non-empty strings "
+            "(written visual acceptance criteria)"
+        )
     if not enabled:
         return None
     if command is None:
         raise ProjectConfigError(f"{where} is enabled but has no 'command'")
-    return VisualReviewConfig(command=tuple(command), timeout_seconds=timeout)
+    return VisualReviewConfig(
+        command=tuple(command),
+        timeout_seconds=timeout,
+        criteria=tuple(item.strip() for item in criteria),
+    )
 
 
 def _require_str(table: Mapping[str, Any], key: str, *, where: str) -> str:

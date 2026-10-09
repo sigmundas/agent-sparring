@@ -702,10 +702,11 @@ local driver assumes it can wake automatically.
 
 ## Visual evidence
 
-Screenshots are captured for every review when a project enables
-`[visual_review]` (below), but no reviewer is shown them yet. What exists is
-the contract (`src/agent_sparring/visual_evidence.py`), capture
-(`src/agent_sparring/visual_capture.py`) and a proven image path through the
+When a project enables `[visual_review]` (below), screenshots are captured
+for every review and shown to the sparrer with written visual criteria. The
+pieces are the contract (`src/agent_sparring/visual_evidence.py`), capture
+(`src/agent_sparring/visual_capture.py`), delivery to the review
+(`src/agent_sparring/visual_review.py`) and a proven image path through the
 Codex adapter:
 
 - **Image delivery.** `CodexCliAdapter.start`, `resume` and `start_structured`
@@ -741,6 +742,10 @@ Codex adapter:
 enabled = true                       # required; false keeps the table inert
 command = ["npm", "run", "screenshots"]  # argument vector, no shell
 timeout_seconds = 300                # optional, 1..3600
+criteria = [                         # optional written visual acceptance criteria
+  "The legend sits below the chart at every viewport.",
+  "No label or chart is clipped.",
+]
 ```
 
 With `enabled = false` or no table, nothing is captured and every stage runs
@@ -771,6 +776,52 @@ path and SHA-256, and each reference's hash. The binding's `candidate_sha` is
 the candidate's HEAD. `load_current_evidence` re-derives the candidate and
 re-hashes every file, refusing evidence for any other candidate or any file
 changed since.
+
+### Image-aware review
+
+Each capture is attached to the sparring turn it was made for, fresh or
+resumed alike. Inside the reviewer's worktree lock, before anything is
+recorded, `run_sparring_agent` reloads the stage's current evidence
+(re-hashed, for the candidate as it is now) and refuses the turn unless it
+is exactly the capture made for this review. It then attaches every captured
+screenshot and every distinct reference, a screenshot first and its
+reference right after it the first time it appears, and adds an
+engine-authored *Visual evidence* prompt section:
+
+- which attached image is which: screenshot id, viewport, file, and the
+  image number of its reference; a `failed` screenshot is listed as not
+  seen;
+- the written criteria, numbered `V1`, `V2`... so a finding can cite one,
+  together with whatever the stage brief requires;
+- what to compare (layout, proportions, clipping, responsive behaviour,
+  legibility, visual hierarchy), and the line between a structural mismatch
+  (a missing or rearranged element, wrong proportions, clipping, a layout
+  that does not adapt, an error or loading state) and a permitted variation
+  (different data, numbers, measurements or text; exact pixel sizes; font
+  rendering);
+- that every visual finding names the screenshot and the criterion, and an
+  objective defect is SEND_BACK;
+- that the handoff's or anyone's claim of visual success is not evidence,
+  and a criterion depending on an uncaptured screenshot is unverified;
+- that objective checks verified in the images need no manual layout check,
+  while subjective product and aesthetic choices stay a person's, through
+  the existing NEEDS_YOU gate or `deferred_human_gate`.
+
+The images replace any attached to an earlier turn: after SEND_BACK the
+same reviewer session is resumed with the correction's new capture, and the
+previous capture is already deleted. A reviewer that cannot be shown images
+is refused before any turn -- the loop checks before the first
+implementation turn, and `run_sparring_agent` again before its own -- so no
+verdict under visual review exists without the pixels. `sparring
+run-sparring` captures and attaches the same way when visual review is
+enabled. Independent-review stages (a review of an accepted candidate set)
+are not shown images.
+
+`tests/test_visual_review_live.py` (opt-in with
+`AGENT_SPARRING_LIVE_IMAGE_TEST=1`) runs this path against the configured
+Codex reviewer: a defective screenshot draws SEND_BACK naming the screenshot
+and criterion, and the corrected recapture draws READY on the resumed
+session with no human gate.
 
 ---
 
