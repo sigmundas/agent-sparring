@@ -135,22 +135,43 @@ def _is_ancestor(cwd: Path, ancestor: str, descendant: str) -> bool:
     return managed_run._git(cwd, "merge-base", "--is-ancestor", ancestor, descendant).returncode == 0
 
 
-def _final_candidate(record: ManagedRunRecord, state: Any) -> tuple[bool, str, str | None]:
+def _final_candidate(
+    record: ManagedRunRecord, state: Any, repo_root: Path | None = None
+) -> tuple[bool, str, str | None]:
     """``(every stage accepted, detail, last accepted stage's candidate)``
-    in plan order, read from the run's own stage states."""
+    in plan order, read from the run's own stage states.
 
-    from agent_sparring.plan import MarkdownPlanSource, load_plan_source
+    For one part of a logical plan (``state.scope``) only the stages in scope
+    count, and an input that is gone is read from the logical snapshot when
+    that snapshot is the plan this run executed."""
+
+    from agent_sparring.plan import MarkdownPlanSource, _in_scope, load_plan_source
     from agent_sparring.stage import Stage, StageStatus
 
     worktree = Path(record.worktree_path)
-    source = load_plan_source(Path(record.input_path), worktree, manifest=record.input_kind == "manifest")
-    if isinstance(source, MarkdownPlanSource):
-        source = source.in_namespace(record.run_key)
+    scope = getattr(state, "scope", None)
+    if scope is None:
+        source = load_plan_source(Path(record.input_path), worktree, manifest=record.input_kind == "manifest")
+        if isinstance(source, MarkdownPlanSource):
+            source = source.in_namespace(record.run_key)
+    else:
+        from agent_sparring import logical_plan
+
+        home = logical_plan.home_common_dir_for(record, Path(repo_root) if repo_root is not None else worktree)
+        logical = logical_plan.load(home, scope["logical_key"])
+        if Path(record.input_path).exists():
+            source = load_plan_source(Path(record.input_path), worktree, manifest=record.input_kind == "manifest")
+        else:
+            source = logical_plan.snapshot_source(home, logical)
+            if source.digest() != state.plan_digest:
+                return False, f"{record.input_path} is gone and the logical snapshot is not the plan this run executed", None
     if source.digest() != state.plan_digest:
         return False, f"{record.input_path} no longer matches the plan this run executed", None
+    if scope is not None:
+        source = logical_plan.scoped_source(source, logical, home, record.run_key)
     candidate: str | None = None
     unaccepted: list[str] = []
-    for planned in source.stages():
+    for planned in _in_scope(source.stages(), state):
         stage = Stage.resolve(record.sparring_dir, planned.stage_id)
         stage_state = stage.read_state() if stage.exists() else None
         if (
@@ -372,7 +393,7 @@ def finish_status(
             checks.add("run_not_complete", False, f"the run is {state.status.value}, not complete")
         else:
             try:
-                accepted, detail, candidate = _final_candidate(record, state)
+                accepted, detail, candidate = _final_candidate(record, state, repo_root)
             except Exception as exc:  # noqa: BLE001 -- any unreadable input or stage is "not complete"
                 accepted, detail = False, f"the run's stages cannot be read: {exc}"
             checks.add("run_not_complete", accepted, f"the run is complete; {detail}" if accepted else detail)

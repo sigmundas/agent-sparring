@@ -169,9 +169,11 @@ from agent_sparring.acceptance import (
 )
 from agent_sparring.activity import ActivityEmitter
 from agent_sparring.plan_obligations import (
+    CarriedObligation,
     PlanObligationError,
     carry as carry_plan_obligations,
     incomplete_slices,
+    mark_writeback_skipped,
     origin_of,
     owed as owed_plan_obligations,
     slice_context,
@@ -782,6 +784,12 @@ class PlanRunState:
     #: :mod:`agent_sparring.managed_run`). Omitted while ``False``, and
     #: absent from older states, which read as unmanaged.
     managed: bool = False
+    #: Which stages of a logical plan this run executes (see
+    #: :mod:`agent_sparring.logical_plan`): ``{"logical_key", "stage_ids"}``,
+    #: the run's stage ids in plan order. ``current_stage_index`` and the
+    #: run's ``total`` count only these. Omitted while ``None``, which is
+    #: every run that is a whole plan.
+    scope: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -810,6 +818,8 @@ class PlanRunState:
         payload.pop("left_provider_pause", None)
         if not self.managed:
             payload.pop("managed", None)
+        if self.scope is None:
+            payload.pop("scope", None)
         return payload
 
     # -- the obligation ledger -------------------------------------------
@@ -918,6 +928,7 @@ class PlanRunState:
                     else None
                 ),
                 managed=_managed_flag(payload.get("managed", False)),
+                scope=_scope(payload["scope"]) if "scope" in payload else None,
             )
         except (PushError, DeferredGateError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -943,6 +954,45 @@ def _managed_flag(value: Any) -> bool:
     if not isinstance(value, bool):
         raise PlanError(f"malformed plan-run state: managed must be true or false, not {value!r}")
     return value
+
+
+def _scope(value: Any) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"logical_key", "stage_ids"}
+        or not isinstance(value["logical_key"], str)
+        or not value["logical_key"]
+        or not isinstance(value["stage_ids"], list)
+        or not value["stage_ids"]
+        or not all(isinstance(entry, str) and entry for entry in value["stage_ids"])
+        or len(set(value["stage_ids"])) != len(value["stage_ids"])
+    ):
+        raise PlanError(f"malformed plan-run state: scope must be {{logical_key, stage_ids}}, not {value!r}")
+    return {"logical_key": value["logical_key"], "stage_ids": list(value["stage_ids"])}
+
+
+def _in_scope(stages: tuple[PlannedStage, ...], state: PlanRunState) -> tuple[PlannedStage, ...]:
+    """The stages this run executes: all of them, or only its recorded scope
+    (in plan order, original positions kept)."""
+
+    if state.scope is None:
+        return stages
+    by_id = {stage.stage_id: stage for stage in stages}
+    wanted = state.scope["stage_ids"]
+    missing = [stage_id for stage_id in wanted if stage_id not in by_id]
+    if missing:
+        raise PlanError(
+            f"plan run {_RunOwner.of(state).key} is scoped to stages its plan input does not have: "
+            f"{', '.join(missing)}"
+        )
+    return tuple(by_id[stage_id] for stage_id in wanted)
+
+
+def _run_namespace(state: PlanRunState) -> str:
+    """What this run's stage ids are prefixed with: the logical plan's key for
+    a scoped run, else the run's own."""
+
+    return state.scope["logical_key"] if state.scope is not None else _RunOwner.of(state).key
 
 
 def _awaiting_from_dict(
@@ -1575,6 +1625,14 @@ def start_plan(
             "flight."
         )
 
+    scope = getattr(source, "scope", None)
+    if scope is not None:
+        # One slice of a logical plan runs as exactly its slice's execution.
+        if run_key is not None and run_key != source.run_key:
+            raise PlanError(
+                f"refusing a fresh run of {label}: this part of the plan runs as {source.run_key}, not {run_key}"
+            )
+        run_key = source.run_key
     key = run_key or new_run_key(label)
     if isinstance(source, MarkdownPlanSource):
         # Stage ids are namespaced by the run that owns them, which is why
@@ -1635,6 +1693,7 @@ def start_plan(
         source=source.kind,
         run=key,
         managed=managed,
+        scope=dict(scope) if scope is not None else None,
     )
     if allow_push_for_run:
         try:
@@ -1668,6 +1727,35 @@ def start_plan(
         report=report,
         stop_after_stage=stop_after_stage,
     )
+
+
+def _scoped_for(source: PlanSource, state: PlanRunState, repo_root: Path) -> PlanSource:
+    """``source`` as the recorded run executes it: unchanged for a whole-plan
+    run; for one part of a logical plan, scoped by its logical record (whose
+    owners, not the source text's, are the stages' owners)."""
+
+    from agent_sparring.logical_plan import home_common_dir_for, load, scoped_source
+    from agent_sparring.managed_run import ManagedRunError, read_record
+
+    key = _RunOwner.of(state).key
+    scope = getattr(source, "scope", None)
+    if state.scope is None:
+        if scope is not None:
+            raise PlanError(f"plan run {key} executes its whole plan; refusing to resume it as one part of a plan")
+        return source
+    if scope is None:
+        try:
+            execution = read_record(repo_root, key) if state.managed else None
+            home = home_common_dir_for(execution, repo_root)
+            source = scoped_source(source, load(home, state.scope["logical_key"]), home, key)
+        except ManagedRunError as exc:
+            raise PlanError(f"cannot read the logical plan run {key} belongs to: {exc}") from exc
+    if getattr(source, "run_key", None) != key or source.scope != state.scope:
+        raise PlanError(
+            f"plan run {key} executes stages {', '.join(state.scope['stage_ids'])} of logical plan "
+            f"{state.scope['logical_key']}; the given input describes a different part"
+        )
+    return source
 
 
 def _require_managed_record(repo_root: Path, run_key: str, expected_branch: str) -> None:
@@ -2093,9 +2181,11 @@ def resume_plan(
         # The stage ids this resume works on are the *recorded run's*, never
         # the ones the document would generate on its own. That is the whole
         # of what makes a rerun of the same document a different run: its
-        # stages are namespaced by whichever run owns them.
-        source = source.in_namespace(owner.key)
-    stages = _verify_source_unchanged(source, state)
+        # stages are namespaced by whichever run owns them (by the logical
+        # plan's key, for one part of a logical plan).
+        source = source.in_namespace(_run_namespace(state))
+    source = _scoped_for(source, state, Path(repo_root))
+    stages = _in_scope(_verify_source_unchanged(source, state), state)
     if not 0 <= state.current_stage_index < len(stages):
         raise PlanError(
             f"recorded stage index {state.current_stage_index} is out of range for "
@@ -2821,6 +2911,7 @@ def _answer_deferred(
     # is worse than a refused resume.
     located = [_locate_deferred_check(asked, answer) for answer in answers]
 
+    skipped: list[tuple[CarriedObligation, str]] = []
     for answer, (obligation, check) in zip(answers, located):
         # Re-read: an earlier answer in this same call may have updated the
         # obligation this one also belongs to, and applying the stale copy
@@ -2839,6 +2930,25 @@ def _answer_deferred(
         stage = Stage.resolve(origin_dir, obligation.stage_id)
         if stage.exists():
             record_human_evidence(stage, _deferred_evidence_line(obligation, check, answer))
+        elif carried is not None and getattr(context, "records_skipped_writeback", False):
+            # The raising run has finished and its .sparring was archived:
+            # a removed worktree is never recreated to hold the answer. It is
+            # recorded in this run (its ledger and its current stage's notes)
+            # and the plan ledger says the write-back was skipped.
+            skipped.append((carried, check.id))
+            here = Stage.resolve(sparring_dir, state.current_stage)
+            if here.exists():
+                record_human_evidence(
+                    here,
+                    _deferred_evidence_line(obligation, check, answer)
+                    + f"\n  (recorded here: {obligation.stage_id} of run {carried.origin_run} was archived "
+                    "when that run finished)",
+                )
+            report(
+                f"the stage that raised gate instance {obligation.instance_id} ({obligation.stage_id} of run "
+                f"{carried.origin_run}) was archived when that run finished; its notes are not written, the "
+                "answer is recorded in this run and the plan ledger"
+            )
         report(
             f"recorded {answer.outcome.word} for deferred check {check.id!r} of gate "
             f"instance {obligation.instance_id} (raised by {obligation.stage_id})"
@@ -2846,6 +2956,12 @@ def _answer_deferred(
     state.save(state_path)
     if context is not None:
         sync_plan_obligations(context, state.deferred_human_checks, run=_RunOwner.of(state).key)
+        if skipped:
+            mark_writeback_skipped(
+                context,
+                tuple((entry.instance_id, check_id) for entry, check_id in skipped),
+                run=_RunOwner.of(state).key,
+            )
 
 
 def _locate_deferred_check(
@@ -4155,6 +4271,7 @@ def _drive(
     run that is stopping should leave behind.
     """
 
+    stages = _in_scope(stages, state)
     total = len(stages)
     accepted: list[tuple[str, str]] = []
     stop_index = _stop_index(stages, stop_after_stage)
@@ -4175,7 +4292,7 @@ def _drive(
                 last_activity.emit("plan.paused", summary=f"stopping after {stopped_after}")
             report(
                 f"plan {state.plan}: stopping after {stopped_after} as asked. The run is "
-                f"positioned at {plan_stage.stage_id} ({plan_stage.position}/{total}) and "
+                f"positioned at {plan_stage.stage_id} ({state.current_stage_index + 1}/{total}) and "
                 "nothing was run, created or briefed for it."
             )
             return PlanRunResult(
@@ -4257,7 +4374,8 @@ def _drive(
 
         _declare_mode(state, state_path, activity, stage, plan_stage)
 
-        position = f"{plan_stage.position}/{total}"
+        # Within this run: a part of a logical plan counts only its own stages.
+        position = f"{state.current_stage_index + 1}/{total}"
         if stage_state.status is StageStatus.ACCEPTED:
             # Already through the hard gate (by hand, or by a run that stopped
             # between accept and advance): nothing to run, just move on.

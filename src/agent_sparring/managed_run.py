@@ -42,6 +42,7 @@ EVENTS = (
     "branch_deleted",
     "remote_branch_deleted",
     "finished",
+    "rescoped",
 )
 _RUN_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -61,9 +62,13 @@ _RECORD_KEYS = frozenset(
         "events",
     }
 )
-#: Optional in schema v1 (absent means ``.sparring``): the project
-#: directory relative to the worktree, always contained in it.
-_OPTIONAL_KEYS = frozenset({"project_dir"})
+#: Optional in schema v1. ``project_dir`` (absent means ``.sparring``): the
+#: project directory relative to the worktree, always contained in it.
+#: ``slice`` (absent for every run that is not part of a logical plan):
+#: ``{logical_key, home_common_dir, index}``, see
+#: :mod:`agent_sparring.logical_plan`.
+_OPTIONAL_KEYS = frozenset({"project_dir", "slice"})
+_SLICE_KEYS = frozenset({"logical_key", "home_common_dir", "index"})
 DEFAULT_PROJECT_DIR = ".sparring"
 
 
@@ -200,6 +205,9 @@ class ManagedRunRecord:
     project_dir: str = DEFAULT_PROJECT_DIR
     created_by: str = "engine"
     events: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    #: Which slice of which logical plan this execution runs (the record's
+    #: ``slice`` key); ``None`` -- and omitted -- for every other run.
+    logical_slice: dict[str, Any] | None = None
 
     @property
     def lifecycle(self) -> str:
@@ -255,6 +263,7 @@ class ManagedRunRecord:
             "created_by": self.created_by,
             "project_dir": self.project_dir,
             "events": [dict(event) for event in self.events],
+            **({"slice": dict(self.logical_slice)} if self.logical_slice is not None else {}),
         }
 
     @classmethod
@@ -303,6 +312,9 @@ class ManagedRunRecord:
             raise bad("worktree_path must be absolute")
         if text("created_by") != "engine":
             raise bad("created_by must be 'engine'")
+        logical_slice = payload.get("slice")
+        if "slice" in payload and not valid_slice(logical_slice):
+            raise bad("slice must be {logical_key, home_common_dir (absolute), index (>= 1)}")
         events = payload["events"]
         if not isinstance(events, list):
             raise bad("events must be an array")
@@ -329,7 +341,21 @@ class ManagedRunRecord:
             project_dir=project_dir,
             created_by="engine",
             events=tuple(dict(event) for event in events),
+            logical_slice=dict(logical_slice) if logical_slice is not None else None,
         )
+
+
+def valid_slice(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == _SLICE_KEYS
+        and isinstance(value["logical_key"], str)
+        and bool(_RUN_KEY_RE.match(value["logical_key"]))
+        and isinstance(value["home_common_dir"], str)
+        and Path(value["home_common_dir"]).is_absolute()
+        and type(value["index"]) is int
+        and value["index"] >= 1
+    )
 
 
 def records_dir(repo_root: Path) -> Path:
@@ -361,6 +387,15 @@ def _load(path: Path) -> ManagedRunRecord:
 
 def read_record(repo_root: Path, run_key: str) -> ManagedRunRecord | None:
     path = record_path(repo_root, run_key)
+    return _load(path) if path.is_file() else None
+
+
+def read_record_in(common_dir: Path, run_key: str) -> ManagedRunRecord | None:
+    """:func:`read_record` addressed by a recorded git common dir rather than
+    a checkout -- how a logical plan reads another repository's execution."""
+
+    _check_run_key(run_key)
+    path = Path(common_dir) / RECORDS_SUBDIR / f"{run_key}.json"
     return _load(path) if path.is_file() else None
 
 

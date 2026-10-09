@@ -29,6 +29,16 @@ intake, so an intake prepared again for the same plan still finds what an
 earlier one carried. Nothing that lists intakes reads this directory: it
 has no ``intake.json``.
 
+A plan whose stages belong to several repositories runs as one *logical
+plan* (:mod:`agent_sparring.logical_plan`) with the same rule: its slices are
+its consecutive per-repository executions, and its ledger lives beside the
+logical record, in the home repository's common git directory::
+
+    <home git-common-dir>/agent-sparring/plans/<logical key>.obligations.json
+
+Both kinds of slice are a :class:`PlanSliceContext`; which slices are
+incomplete is each kind's own proof (:meth:`PlanSliceContext.incomplete_slices`).
+
 Identity is the gate instance throughout: carrying, claiming and answering
 never mint a new one, so an answer still belongs to the asking the reviewer
 raised. Every entry keeps the ``.sparring`` directory of the stage that
@@ -42,10 +52,10 @@ import contextlib
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Protocol, runtime_checkable
 
 from agent_sparring.deferred_gate import DeferredGateError, DeferredObligation
 
@@ -55,6 +65,23 @@ LEDGER_VERSION = 1
 
 class PlanObligationError(ValueError):
     """The plan-level obligation ledger is unreadable or could not be written."""
+
+
+@runtime_checkable
+class PlanSliceContext(Protocol):
+    """Where one slice's run sits within its plan, whatever split the plan."""
+
+    #: This slice's id, and every slice of the plan in order.
+    run_id: str
+    plan_label: str
+    run_ids: tuple[str, ...]
+
+    @property
+    def ledger_path(self) -> Path:
+        """The plan's obligation ledger."""
+
+    def incomplete_slices(self) -> tuple[str, ...]:
+        """The plan's other slices not proven complete."""
 
 
 @dataclass(frozen=True)
@@ -74,6 +101,58 @@ class SliceContext:
         # <home>/.sparring/intake/<intake id> -> <home>/.sparring/intake/obligations/
         return self.intake_dir.parent / LEDGER_DIRNAME / f"{plan_key(self.plan_label)}.json"
 
+    def incomplete_slices(self) -> tuple[str, ...]:
+        """The other run slices of this intake that are not proven complete.
+
+        Uses the same proof approval uses for an earlier slice (its sealed
+        run recorded complete with an accepted final candidate), so
+        "complete" means one thing everywhere.
+        """
+
+        from agent_sparring.intake import IntakeError, _completed_slice
+
+        pending: list[str] = []
+        for run_id in self.run_ids:
+            if run_id == self.run_id:
+                continue
+            try:
+                _completed_slice(self.intake_dir, run_id)
+            except IntakeError:
+                pending.append(run_id)
+        return tuple(pending)
+
+
+@dataclass(frozen=True)
+class LogicalSliceContext:
+    """Where one execution of a logical plan sits within it."""
+
+    home_common_dir: Path
+    logical_key: str
+    run_id: str
+    plan_label: str
+    run_ids: tuple[str, ...]
+    #: An answer whose raising stage was archived by a finish is recorded,
+    #: not written back (see :func:`mark_writeback_skipped`).
+    records_skipped_writeback: bool = True
+
+    @property
+    def ledger_path(self) -> Path:
+        from agent_sparring.logical_plan import ledger_path
+
+        return ledger_path(self.home_common_dir, self.logical_key)
+
+    def incomplete_slices(self) -> tuple[str, ...]:
+        """The plan's other executions not proven complete, from the status
+        derived from their own records and run states."""
+
+        from agent_sparring.logical_plan import ManagedRunError, derived_status, load
+
+        try:
+            status = derived_status(load(self.home_common_dir, self.logical_key))
+        except ManagedRunError as exc:
+            raise PlanObligationError(f"cannot derive the status of logical plan {self.logical_key}: {exc}") from exc
+        return status.incomplete(besides=self.run_id)
+
 
 @dataclass(frozen=True)
 class CarriedObligation:
@@ -88,6 +167,10 @@ class CarriedObligation:
     carried_at: str
     #: The run that answered it, once resolved; ``None`` while owed.
     resolved_by: str | None = None
+    #: Answers not written back to the raising stage's ``notes.md`` because
+    #: that run's ``.sparring`` was archived by its finish:
+    #: ``{"check_id", "run", "at"}`` each. Omitted while empty.
+    writeback_skipped: tuple[dict[str, str], ...] = field(default_factory=tuple)
 
     @property
     def instance_id(self) -> str:
@@ -101,6 +184,7 @@ class CarriedObligation:
             "origin_slice": self.origin_slice,
             "carried_at": self.carried_at,
             "resolved_by": self.resolved_by,
+            **({"writeback_skipped": [dict(entry) for entry in self.writeback_skipped]} if self.writeback_skipped else {}),
         }
 
     @classmethod
@@ -118,22 +202,38 @@ class CarriedObligation:
                 raise PlanObligationError(f"{where}: entry {obligation.instance_id} has no {name}")
             fields[name] = value
         resolved_by = payload.get("resolved_by")
+        skipped = payload.get("writeback_skipped") or []
+        if not isinstance(skipped, list) or not all(
+            isinstance(entry, dict) and all(isinstance(value, str) for value in entry.values()) for entry in skipped
+        ):
+            raise PlanObligationError(f"{where}: entry {obligation.instance_id} has a malformed writeback_skipped")
         return cls(
             obligation=obligation,
             resolved_by=resolved_by if isinstance(resolved_by, str) and resolved_by else None,
+            writeback_skipped=tuple(dict(entry) for entry in skipped),
             **fields,
         )
 
 
-def slice_context(source: Any) -> SliceContext | None:
-    """The slice context of an approved intake manifest source, else ``None``.
+def slice_context(source: Any) -> PlanSliceContext | None:
+    """The slice context of an approved intake manifest source or of one
+    execution of a logical plan, else ``None``.
 
     A Markdown plan or a hand-authored manifest is a whole plan in one run and
     has none: its own run ledger is the plan's.
     """
 
     from agent_sparring.intake_approval import IntakeManifestSource
+    from agent_sparring.logical_plan import ScopedPlanSource
 
+    if isinstance(source, ScopedPlanSource):
+        return LogicalSliceContext(
+            home_common_dir=source.home_common_dir,
+            logical_key=source.record.logical_key,
+            run_id=source.run_key,
+            plan_label=source.record.plan_label,
+            run_ids=tuple(entry.id for entry in source.record.slices),
+        )
     if not isinstance(source, IntakeManifestSource):
         return None
     # <intake dir>/runs/<slice>/manifest.json
@@ -160,25 +260,10 @@ def _intake_run_ids(intake_dir: Path) -> tuple[str, ...]:
     return ids
 
 
-def incomplete_slices(context: SliceContext) -> tuple[str, ...]:
-    """The other run slices of this intake that are not proven complete.
+def incomplete_slices(context: PlanSliceContext) -> tuple[str, ...]:
+    """The plan's other slices that are not proven complete."""
 
-    Uses the same proof approval uses for an earlier slice (its sealed run
-    recorded complete with an accepted final candidate), so "complete" means
-    one thing everywhere.
-    """
-
-    from agent_sparring.intake import IntakeError, _completed_slice
-
-    pending: list[str] = []
-    for run_id in context.run_ids:
-        if run_id == context.run_id:
-            continue
-        try:
-            _completed_slice(context.intake_dir, run_id)
-        except IntakeError:
-            pending.append(run_id)
-    return tuple(pending)
+    return context.incomplete_slices()
 
 
 def load_ledger(path: Path) -> tuple[CarriedObligation, ...]:
@@ -265,13 +350,7 @@ def carry(
             )
             if obligation.instance_id in index:
                 old = entries[index[obligation.instance_id]]
-                entries[index[obligation.instance_id]] = CarriedObligation(
-                    obligation=obligation,
-                    origin_run=old.origin_run,
-                    origin_sparring_dir=old.origin_sparring_dir,
-                    origin_slice=old.origin_slice,
-                    carried_at=old.carried_at,
-                )
+                entries[index[obligation.instance_id]] = replace(old, obligation=obligation, resolved_by=None)
             else:
                 entries.append(entry)
         _write_ledger(path, context.plan_label, tuple(entries))
@@ -306,27 +385,44 @@ def sync(context: SliceContext, obligations: tuple[DeferredObligation, ...], *, 
             updated = current.get(entry.instance_id)
             if updated is None:
                 continue
-            entries[position] = CarriedObligation(
-                obligation=updated,
-                origin_run=entry.origin_run,
-                origin_sparring_dir=entry.origin_sparring_dir,
-                origin_slice=entry.origin_slice,
-                carried_at=entry.carried_at,
-                resolved_by=run if updated.resolved else None,
-            )
+            entries[position] = replace(entry, obligation=updated, resolved_by=run if updated.resolved else None)
             changed = True
         if changed:
             _write_ledger(path, context.plan_label, tuple(entries))
 
 
+def mark_writeback_skipped(context: PlanSliceContext, skipped: tuple[tuple[str, str], ...], *, run: str) -> None:
+    """Record in the plan ledger that answers ``(instance id, check id)``
+    were not written back to their raising stage, whose ``.sparring`` was
+    archived when its run finished."""
+
+    if not skipped:
+        return
+    path = context.ledger_path
+    with _locked(path):
+        entries = list(load_ledger(path))
+        for position, entry in enumerate(entries):
+            mine = [check_id for instance_id, check_id in skipped if instance_id == entry.instance_id]
+            if mine:
+                entries[position] = replace(
+                    entry,
+                    writeback_skipped=entry.writeback_skipped
+                    + tuple({"check_id": check_id, "run": run, "at": _now()} for check_id in mine),
+                )
+        _write_ledger(path, context.plan_label, tuple(entries))
+
+
 __all__ = [
     "CarriedObligation",
     "LEDGER_DIRNAME",
+    "LogicalSliceContext",
     "PlanObligationError",
+    "PlanSliceContext",
     "SliceContext",
     "carry",
     "incomplete_slices",
     "load_ledger",
+    "mark_writeback_skipped",
     "origin_of",
     "owed",
     "slice_context",

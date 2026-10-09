@@ -61,7 +61,9 @@ class ArtifactOwnership:
 
     ``path`` is written as it appears relative to the project's
     ``.sparring`` directory, except for :data:`SOURCE_PLAN`, which is a
-    repository document and not a sparring artifact at all.
+    repository document and not a sparring artifact at all, and the
+    logical-plan files, which live in the home repository's git common
+    directory (``<home git-common-dir>/...``) where every worktree sees them.
 
     ``owner`` is the single party allowed to write it. ``lifetime`` says
     whether it is immutable, replaced in full, or appended to -- the thing a
@@ -140,6 +142,41 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
             "the exact bytes of the run's plan file (the Markdown plan or the manifest "
             "file, never its sidecars) and their sha256, which finish-run's opt-in "
             "remove_plan compares the target's bytes against"
+        ),
+    ),
+    ArtifactOwnership(
+        path="<home git-common-dir>/agent-sparring/plans/<logical>.json",
+        owner="engine",
+        provider_writable=False,
+        lifetime=(
+            "created once, exclusively, for a plan whose stages belong to more than one "
+            "repository; afterwards only its events are appended to"
+        ),
+        purpose=(
+            "the logical plan: input digest, every stage's resolved owner repository, "
+            "repository bindings and the per-repository slices; status is derived from "
+            "each slice's own managed record and run state, never stored here"
+        ),
+    ),
+    ArtifactOwnership(
+        path="<home git-common-dir>/agent-sparring/plans/<logical>.snapshot.<ext>",
+        owner="engine",
+        provider_writable=False,
+        lifetime="written once before the logical record is created; never rewritten",
+        purpose=(
+            "the exact bytes of the logical plan's input, which every execution reads "
+            "when the original input is gone and whose digest is every execution's"
+        ),
+    ),
+    ArtifactOwnership(
+        path="<home git-common-dir>/agent-sparring/plans/<logical>.obligations.json",
+        owner="engine",
+        provider_writable=False,
+        lifetime="rewritten as obligations are carried, claimed and answered",
+        purpose=(
+            "deferred checks owed by the logical plan's completion, carried from an "
+            "earlier execution to its last; records an answer not written back because "
+            "the raising run's state was archived by finish-run"
         ),
     ),
     ArtifactOwnership(
