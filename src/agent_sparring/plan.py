@@ -2610,6 +2610,7 @@ def _run_review(
     fresh_roles: tuple[str, ...] = (),
     fresh_reason: str | None = None,
     report: Reporter,
+    visual_review: VisualReviewConfig | None = None,
 ) -> ReviewResult:
     """Enter a review-only stage and run its one independent-review turn.
 
@@ -2624,7 +2625,30 @@ def _run_review(
     reviewer. The stage half is deliberately not used: a review-only stage
     has no implementation turn, so the one adapter that could write to the
     repository is never handed a prompt.
+
+    An independent review is never shown screenshots (see
+    :mod:`agent_sparring.visual_review`), so with ``visual_review`` enabled
+    the stage is refused before anything is entered or any provider runs:
+    a verdict reached without the pixels must not stand in for one that
+    looked at them.
     """
+
+    if visual_review is not None:
+        raise _fail(
+            state,
+            state_path,
+            activity,
+            why="review-only stage under visual review",
+            refusal=True,
+            message=(
+                f"plan {state.plan} stopped at stage {stage.stage_id!r} before any provider "
+                "turn: it is a review-only stage, and this project has [visual_review] "
+                "enabled, but an independent review of a candidate set is not shown "
+                "screenshots. Refusing rather than letting a review that never saw the "
+                "images return a verdict. Review the stage with visual review disabled "
+                "only if its acceptance does not depend on visual evidence."
+            ),
+        )
 
     preceding = tuple(
         (earlier, Stage.resolve(sparring_dir, earlier.stage_id))
@@ -3842,6 +3866,7 @@ def _drive(
                     fresh_roles=entering_fresh,
                     fresh_reason=fresh_reason,
                     report=report,
+                    visual_review=visual_review,
                 )
                 sparrer_first = False  # only the stage this resume entered
                 _retire_pending_evidence(state, state_path)

@@ -793,6 +793,9 @@ engine-authored *Visual evidence* prompt section:
   seen;
 - the written criteria, numbered `V1`, `V2`... so a finding can cite one,
   together with whatever the stage brief requires;
+- that an explicit requirement in a criterion or the brief (a label, a
+  minimum size, a position, a value) is checked as written and is never
+  waived by the default tolerances below;
 - what to compare (layout, proportions, clipping, responsive behaviour,
   legibility, visual hierarchy), and the line between a structural mismatch
   (a missing or rearranged element, wrong proportions, clipping, a layout
@@ -815,7 +818,9 @@ implementation turn, and `run_sparring_agent` again before its own -- so no
 verdict under visual review exists without the pixels. `sparring
 run-sparring` captures and attaches the same way when visual review is
 enabled. Independent-review stages (a review of an accepted candidate set)
-are not shown images.
+are not shown images, so with visual review enabled a plan refuses to run
+one: the run pauses before any provider turn rather than accept a verdict
+that never saw the screenshots.
 
 `tests/test_visual_review_live.py` (opt-in with
 `AGENT_SPARRING_LIVE_IMAGE_TEST=1`) runs this path against the configured

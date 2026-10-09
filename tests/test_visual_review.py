@@ -257,12 +257,36 @@ class DeliveryTests(VisualReviewTestCase):
                        "legibility", "visual hierarchy"):
             self.assertIn(f"**{aspect}**", text)
         self.assertIn("permitted variations and are not findings", text)
+        self.assertIn("Explicit requirements come first", text)
         self.assertIn("structural mismatches and are findings", text)
         self.assertIn("name the screenshot by id", text)
         self.assertIn("is a claim, not evidence", text)
         self.assertIn("need no manual layout check", text)
         self.assertIn("subjective product and aesthetic", text)
         self.assertIn("replace every image attached to an earlier turn", text)
+
+    def test_explicit_requirements_cannot_be_waived_by_the_default_tolerances(self):
+        criteria = ("The legend title reads exactly 'Spore length (µm)'.",
+                    "The chart is at least 600 px wide at desktop viewport.")
+        text = visual_evidence_section(
+            prepare_delivery(self.repo, self.stage, self.request(criteria=criteria)), self.stage
+        ).text
+        text = " ".join(text.split())
+        # The criteria that name text and sizes are shown...
+        self.assertIn(f"- `V1` -- {criteria[0]}", text)
+        self.assertIn(f"- `V2` -- {criteria[1]}", text)
+        # ...and the rule that they win is stated before, and qualifies,
+        # the defaults that would otherwise tolerate text and size changes.
+        rule = text.index("Explicit requirements come first.")
+        self.assertIn(
+            "a particular label or text, a minimum size, an exact position, a value shown", text
+        )
+        self.assertIn("nothing in the defaults below waives it", text)
+        defaults = text.index(
+            "Where no explicit requirement says differently, these are permitted variations"
+        )
+        self.assertLess(rule, defaults)
+        self.assertEqual(text.count("these are permitted variations"), 1)
 
     def test_without_criteria_the_brief_and_references_are_the_standard(self):
         text = visual_evidence_section(

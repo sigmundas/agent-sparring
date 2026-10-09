@@ -163,11 +163,18 @@ reference (when it has one) and with the criteria, for:
 - **visual hierarchy** -- headings, emphasis and primary actions read in the
   intended order of importance.
 
-A reference shows design intent, not a pixel target. These are permitted
-variations and are not findings: different data values, numbers,
-measurements, counts, dates or text content; exact pixel positions and
-sizes; font rendering and anti-aliasing; small spacing differences that
-leave the arrangement intact; placeholder content in the mockup. These are
+Explicit requirements come first. When a criterion above or the stage
+brief requires something specific -- a particular label or text, a
+minimum size, an exact position, a value shown -- check it as written: it
+is a finding when the image does not satisfy it, and nothing in the
+defaults below waives it.
+
+Otherwise, a reference shows design intent, not a pixel target. Where no
+explicit requirement says differently, these are permitted variations
+and are not findings: different data values, numbers, measurements,
+counts, dates or text content; exact pixel positions and sizes; font
+rendering and anti-aliasing; small spacing differences that leave the
+arrangement intact; placeholder content in the mockup. These are
 structural mismatches and are findings: a missing, extra or reordered
 element; a different arrangement (side by side instead of stacked, a
 column in the wrong place); materially different proportions between

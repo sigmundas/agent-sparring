@@ -21,6 +21,7 @@ from agent_sparring.acceptance import (
     StaleCandidateError,
     accept_reviewed_candidate,
 )
+from agent_sparring.config import VisualReviewConfig
 from agent_sparring.manifest import ManifestError, manifest_digest, parse_manifest
 from agent_sparring.plan import (
     PlanRunError,
@@ -344,6 +345,27 @@ class IndependentReviewRunTests(_ReviewRepoTestCase):
         self.assertIn(accepted, message)
         self.assertIn("not at the accepted candidate", message)
         self.assertIs(self.stage(REVIEW_STAGE).read_state().status, StageStatus.WORKING)
+
+    def test_visual_review_refuses_a_review_only_stage_before_the_reviewer_runs(self):
+        # An independent review is never shown screenshots, so under visual
+        # review it must not be able to return a verdict at all.
+        stage_adapter = _StageAdapter(self.repo, commit=True)
+        self.start(stage_adapter, _SparringAdapter([READY]), stop_after_stage=BUILD_STAGE)
+        self.assertIs(self.stage(BUILD_STAGE).read_state().status, StageStatus.ACCEPTED)
+
+        reviewer = _SparringAdapter([READY])
+        with self.assertRaises(PlanRunError) as ctx:
+            self.resume(
+                stage_adapter,
+                reviewer,
+                visual_review=VisualReviewConfig(command=("never-run",)),
+            )
+        self.assertIn("review-only stage", str(ctx.exception))
+        self.assertIn("[visual_review]", str(ctx.exception))
+        self.assertEqual(reviewer.start_calls, [])
+        self.assertEqual(reviewer.resume_calls, [])
+        self.assertIsNone(self.stage(REVIEW_STAGE).read_state().sparring_session_id)
+        self.assertIs(self.plan_state().status, PlanRunStatus.PAUSED)
 
     def test_an_unrepresented_working_tree_change_is_refused_before_the_reviewer_runs(self):
         stage_adapter = _StageAdapter(self.repo, commit=True)
