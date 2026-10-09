@@ -919,6 +919,36 @@ class RemoteBranchDeletionTests(_FinishTestCase):
         self.assertNotIn("remote_branch_deleted", self._events(record))
         self.assertNotIn("finished", self._events(record))
 
+    def test_a_record_naming_another_branch_is_never_deleted(self):
+        import dataclasses
+
+        record, _ = self._complete()
+        head = self._set_policy(record, True)
+        remote_main = _git(self.remote, "rev-parse", "refs/heads/main")
+        for branch in ("main", "someone-elses-branch"):
+            forged = dataclasses.replace(record, branch=branch)
+            code, detail = managed_finish._delete_remote_branch(self.repo, forged, head)
+            self.assertEqual(code, "remote_delete_rejected")
+            self.assertIn("managed branch", detail)
+            self.assertIsNotNone(managed_finish._foreign_branch(forged))
+        self.assertIsNone(managed_finish._foreign_branch(record))
+        legacy = dataclasses.replace(record, branch="sparring/feature-plan-0123abcd")
+        self.assertIsNone(managed_finish._foreign_branch(legacy))
+        self.assertIsNotNone(managed_finish._foreign_branch(dataclasses.replace(legacy, target_branch=legacy.branch)))
+        self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), remote_main)
+
+    def test_a_push_url_with_a_space_is_one_url(self):
+        record, _ = self._complete()
+        head = self._set_policy(record, True)
+        spaced = Path(str(self.remote) + " with space")
+        spaced.symlink_to(self.remote)
+        _run_git(self.repo, "remote", "set-url", "--push", "origin", str(spaced))
+        code, report, err = self._finish(record, "--push-target")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
+        self.assertFalse(self._remote_has(record))
+        self._assert_cleaned(record, head)
+
 
 class PlanRemovalTests(_FinishTestCase):
     """``[finish] remove_plan``: byte-exact removal of the plan on the target."""
@@ -1001,6 +1031,52 @@ class PlanRemovalTests(_FinishTestCase):
         self.assertIn("docs/plan.md", self._tracked())
         self.assertEqual(_git(self.repo, "rev-parse", "main"), head)
         self.assertEqual(self._events(record)[-1], "finished")
+
+    def test_a_removal_commit_whose_event_was_lost_is_reconciled_and_pushed(self):
+        record, _ = self._complete()
+        head = self._enable(record)
+        real = managed_run.append_event
+
+        def interrupted(repo_root, run_key, event, *args, **kwargs):
+            if event == "plan_removed":
+                raise KeyboardInterrupt("killed after the removal commit")
+            return real(repo_root, run_key, event, *args, **kwargs)
+
+        with mock.patch.object(managed_run, "append_event", side_effect=interrupted):
+            code, _, _ = self._finish(record, "--push-target")
+        self.assertNotEqual(code, 0)
+        removal = _git(self.repo, "rev-parse", "main")
+        self.assertEqual(_git(self.repo, "rev-parse", "main^"), head)
+        self.assertNotIn("plan_removed", self._events(record))
+        # The remote target already holds the candidate, but not the removal.
+        _run_git(self.repo, "push", "-q", "origin", f"{head}:refs/heads/main")
+        code, report, err = self._finish(record, "--push-target")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["plan_removal"]["code"], "plan_removed", report["plan_removal"])
+        self.assertEqual(report["plan_removal"]["commit"], removal)
+        (event,) = [e for e in managed_run.read_record(self.repo, record.run_key).events if e["event"] == "plan_removed"]
+        self.assertEqual(event["detail"]["commit"], removal)
+        self.assertTrue(event["detail"]["reconciled"])
+        self.assertNotIn("plan_removal_refused", self._events(record))
+        self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), removal)
+
+    def test_the_removal_commit_leaves_what_is_staged_meanwhile(self):
+        record, _ = self._complete()
+        head = self._enable(record)
+        real = managed_run._git
+
+        def stage_after_check(cwd, *args):
+            if args[:2] == ("rm", "-q"):
+                (Path(cwd) / "unrelated.txt").write_text("mine\n", encoding="utf-8")
+                real(cwd, "add", "unrelated.txt")
+            return real(cwd, *args)
+
+        with mock.patch.object(managed_run, "_git", side_effect=stage_after_check):
+            code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self._assert_removed(record, head, report)
+        self.assertNotIn("unrelated.txt", self._tracked())
+        self.assertEqual(_git(self.repo, "diff", "--cached", "--name-only"), "unrelated.txt")
 
     def _before_commit(self, action):
         real = managed_finish._commit_removal_in_checkout

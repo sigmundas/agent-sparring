@@ -1139,6 +1139,9 @@ def _finish_locked(
     branch_ref = f"refs/heads/{record.branch}"
     tip = _rev(repo_root, branch_ref)
     if tip is not None:
+        refused = _foreign_branch(record)
+        if refused:
+            raise _StepFailed("delete_branch", refused)
         target_tip = _rev(repo_root, f"refs/heads/{record.target_branch}")
         if target_tip is None or not _is_ancestor(repo_root, candidate, target_tip):
             raise _StepFailed("delete_branch", f"{record.target_branch} does not contain {candidate}")
@@ -1184,6 +1187,28 @@ def _finish_locked(
     return report(None, None), None
 
 
+def _foreign_branch(record: ManagedRunRecord) -> str | None:
+    """Why ``record.branch`` is not one finish may delete, or ``None``: only
+    a managed branch -- the run's own, or one in the engine's ``sparring/``
+    namespace (a record created under the earlier slug naming) -- and never
+    its target. The record lives in the git common dir, so this does not
+    trust it to name the branch."""
+
+    try:
+        own = managed_run.managed_branch(record.run_key)
+    except Exception as exc:  # an invalid run key cannot name a branch
+        return f"run key {record.run_key!r} has no managed branch ({exc})"
+    managed = record.branch == own or (
+        record.branch.startswith("sparring/") and len(record.branch) > len("sparring/")
+    )
+    if not managed or record.branch == record.target_branch:
+        return (
+            f"the record names branch {record.branch!r}, not a managed branch (such as {own!r}) "
+            "distinct from its target; refusing to delete it"
+        )
+    return None
+
+
 def _delete_remote_branch(repo_root: Path, record: ManagedRunRecord, candidate: str) -> tuple[str, str]:
     """Delete ``refs/heads/<branch>`` on the record's remote only while it is
     exactly ``candidate``: the lease is checked by the server at the delete
@@ -1199,8 +1224,11 @@ def _delete_remote_branch(repo_root: Path, record: ManagedRunRecord, candidate: 
 
     ref = f"refs/heads/{record.branch}"
     where = f"{record.remote}/{record.branch}"
+    refused = _foreign_branch(record)
+    if refused:
+        return "remote_delete_rejected", f"{refused}; nothing was read or pushed and {where} is kept"
     push_urls = managed_run._git(repo_root, "remote", "get-url", "--push", "--all", record.remote)
-    urls = push_urls.stdout.split() if push_urls.returncode == 0 else []
+    urls = [u for u in push_urls.stdout.splitlines() if u.strip()] if push_urls.returncode == 0 else []
     if len(urls) > 1:
         return "remote_multiple_push_urls", (
             f"{record.remote} has {len(urls)} push URLs ({', '.join(urls)}); a per-URL lease delete is not "
@@ -1275,6 +1303,7 @@ def _remove_plan_step(repo_root: Path, record: ManagedRunRecord, notes: dict[str
     if outcome["code"] == "plan_removed":
         record = managed_run.append_event(repo_root, record.run_key, "plan_removed", {
             "commit": outcome["commit"], "path": outcome["path"], "sha256": outcome["sha256"],
+            **({"reconciled": True} if outcome.get("reconciled") else {}),
         })
     else:
         record = managed_run.append_event(repo_root, record.run_key, "plan_removal_refused", {
@@ -1349,6 +1378,10 @@ def _remove_plan(repo_root: Path, record: ManagedRunRecord) -> dict[str, Any]:
         return _outcome("plan_commit_failed", f"git ls-tree failed: {listed.stderr.decode(errors='replace').strip()}")
     entry = listed.stdout.split(b"\0")[0].decode(errors="replace")
     if not entry:
+        commit = _recorded_removal_commit(repo_root, record, old, rel, data)
+        if commit is not None:
+            return _outcome("plan_removed", f"{rel} was removed from {record.target_branch} in {commit}",
+                            commit=commit, path=rel, sha256=digest, reconciled=True)
         return _outcome("plan_absent", f"{rel} is not in {record.target_branch} ({old}); nothing to remove")
     if entry.split(" ", 2)[:2] not in (["100644", "blob"], ["100755", "blob"]):
         return _outcome("plan_not_tracked", f"{rel} is not a tracked file in {record.target_branch}")
@@ -1382,6 +1415,28 @@ def _remove_plan(repo_root: Path, record: ManagedRunRecord) -> dict[str, Any]:
                     commit=new, path=rel, sha256=digest)
 
 
+def _recorded_removal_commit(repo_root: Path, record: ManagedRunRecord, tip: str, rel: str,
+                             data: bytes) -> str | None:
+    """This run's own removal commit on the target, when it was made but its
+    ``plan_removed`` event was not recorded (an interrupted finish): the
+    latest commit reachable from ``tip`` that carries the run's
+    ``Sparring-Run`` trailer, deletes ``rel``, and whose parent held exactly
+    the snapshot ``data`` there."""
+
+    listed = managed_run._git(
+        repo_root, "log", "--format=%H", "--fixed-strings", f"--grep=Sparring-Run: {record.run_key}",
+        "--diff-filter=D", "--no-renames", tip, "--", rel,
+    )
+    for commit in listed.stdout.split() if listed.returncode == 0 else []:
+        trailers = managed_run._git(repo_root, "log", "-1", "--format=%(trailers:key=Sparring-Run,valueonly)", commit)
+        if record.run_key not in trailers.stdout.split():
+            continue
+        parent = _git_bytes(repo_root, "cat-file", "blob", f"{commit}^:{rel}")
+        if parent.returncode == 0 and parent.stdout == data:
+            return commit
+    return None
+
+
 def _commit_removal_in_checkout(checkout: Path, rel: str, old: str, message: str) -> tuple[str | None, dict | None]:
     """In the checkout that has the target: an empty index and an unmodified
     plan are required; unrelated unstaged edits are left alone, never stashed."""
@@ -1403,7 +1458,7 @@ def _commit_removal_in_checkout(checkout: Path, rel: str, old: str, message: str
     removed = managed_run._git(checkout, "rm", "-q", "--", rel)
     if removed.returncode != 0:
         return None, _outcome("plan_commit_failed", f"git rm failed: {removed.stderr.strip()}")
-    committed = managed_run._git(checkout, "commit", "-q", "--no-verify", "-m", message)
+    committed = managed_run._git(checkout, "commit", "-q", "--no-verify", "--only", "-m", message, "--", rel)
     new = _rev(checkout, "HEAD")
     if committed.returncode != 0 or new == old:
         # Put back exactly what was removed; the index was empty before.

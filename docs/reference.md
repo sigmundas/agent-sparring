@@ -559,13 +559,16 @@ delete). `actions` also lists the plan removal when `remove_plan` is on.
 `plan_snapshot_mismatch`, `plan_not_tracked`, `plan_absent`,
 `plan_changed`, `target_checkout_dirty`, `target_operation_in_progress`,
 `git_identity_missing` (all non-stopping; a refusal is recorded and final)
-or `plan_commit_failed` (stops at `remove_plan`). `remote_branch.code`:
+or `plan_commit_failed` (stops at `remove_plan`). A removal commit made by an
+interrupted finish (its `Sparring-Run` trailer, deleting exactly the
+snapshot) is recognised on the re-run as `plan_removed`, not `plan_absent`. `remote_branch.code`:
 `remote_branch_deleted`, `remote_branch_absent`, `remote_delete_disabled`,
 `finish_config_unreadable`, `no_remote`, or `remote_lease_mismatch` /
 `remote_unreachable` / `remote_delete_rejected` /
 `remote_target_missing_candidate` / `remote_target_unknown` (fetch first) /
 `remote_multiple_push_urls`
-(the branch is kept with that `kept[].code`, the finish stops at
+(a record naming a branch outside the managed `sparring/` namespace, or its target, is
+`remote_delete_rejected` before anything is read or pushed; the branch is kept with that `kept[].code`, the finish stops at
 `delete_remote_branch` and the run is not finished). `null` means the step
 was not reached.
 
