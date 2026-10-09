@@ -31,7 +31,10 @@ wrongly:
   edited plan stops the run rather than becoming the new definition.
   Appending an implementation record to it is not a harmless annotation --
   a ``# Implementation record`` section holding a second ``## Stage 1``
-  makes the document unparseable as the plan it started as.
+  makes the document unparseable as the plan it started as. The engine
+  itself may delete the plan only at ``finish-run``, only when the project
+  opts in with ``[finish] remove_plan``, and only after the target's bytes
+  match the snapshot taken at run start byte for byte (``plans/<run>.source``).
 
 The prompt section below exists because that contract belongs to Agent
 Sparring and has to travel with the managed prompt. A consuming project's
@@ -78,7 +81,11 @@ SOURCE_PLAN = ArtifactOwnership(
     path="the plan document (e.g. docs/plans/active/<plan>.md)",
     owner="human / repository",
     provider_writable=False,
-    lifetime="immutable for the lifetime of a managed run",
+    lifetime=(
+        "immutable for the lifetime of a managed run; only finish-run may delete it, "
+        "by explicit [finish] remove_plan opt-in, after a byte-exact check against "
+        "the run's start snapshot"
+    ),
     purpose=(
         "the run's execution definition; its stage sections are digested at "
         "run start and re-checked before every acceptance and advance"
@@ -122,6 +129,17 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
         purpose=(
             "the run's position, expected branch and plan digest, plus the descriptive "
             "provider_pause record of a classified provider failure"
+        ),
+    ),
+    ArtifactOwnership(
+        path="plans/<run>.source and plans/<run>.source.sha256",
+        owner="engine",
+        provider_writable=False,
+        lifetime="written once at managed run start; never rewritten; archived by finish-run",
+        purpose=(
+            "the exact bytes of the run's plan file (the Markdown plan or the manifest "
+            "file, never its sidecars) and their sha256, which finish-run's opt-in "
+            "remove_plan compares the target's bytes against"
         ),
     ),
     ArtifactOwnership(

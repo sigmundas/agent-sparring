@@ -444,10 +444,11 @@ itself, which is an ordinary repository file.
 
 | Artifact | Owner | Provider-writable? | Lifetime | Purpose |
 | --- | --- | --- | --- | --- |
-| the plan document (`docs/plans/.../<plan>.md`) | human / repository | no | immutable for the lifetime of a managed run | the run's execution definition |
+| the plan document (`docs/plans/.../<plan>.md`) | human / repository | no | immutable for the lifetime of a managed run; only `finish-run` may delete it, by explicit `[finish] remove_plan` opt-in, after a byte-exact check against the run's start snapshot | the run's execution definition |
 | `PROJECT.md` | human / repository | no | edited between runs by a person | project context embedded in every prompt |
 | `project.toml` | human / repository | no | edited between runs by a person, by hand or through `sparring set-config` on their behalf | provider selection and engine configuration (model and effort are the person's own preferences, outside the repository) |
 | `plans/<run>.json` | engine | no | rewritten on every position/status change | the run's position, expected branch, plan digest, recorded push authorization and typed pause |
+| `plans/<run>.source`, `plans/<run>.source.sha256` | engine | no | written once at managed run start; archived by `finish-run` | the exact bytes of the run's plan file (Markdown plan or manifest file, never its sidecars) and their sha256, which `[finish] remove_plan` compares against |
 | `intake/<intake>/` | engine | no | written once by `prepare-plan` (the intake agent's answer is its structured result); never rewritten | a reviewable interpretation of a human plan; approval binds its exact bytes, so editing it refuses an approved run |
 | `intake/<intake>/decisions.json` | engine (`start-plan --answer`, on a person's answers) | no | written once at prepare time, inside the write-once intake; the answered intake is never written | a person's answers to an earlier intake's decisions, verbatim; `intake.json` records its digest, so approval seals it and `run-plan` re-checks it |
 | `intake/<intake>/runs/<slice>/` | engine (`approve-plan`, on a person's decision) | no | `manifest.json` replaceable until `approval.json` exists; `approval.json` created once, never rewritten | the intake manifest envelope and the approval `run-plan --manifest` verifies before running it |
@@ -489,14 +490,18 @@ rather than depending on the project's own wording.
 
 ## Managed-run JSON
 
-Every payload carries `schema_version` (currently `1`); a client refuses a
+Every payload carries `schema_version` (records and `runs` currently `1`,
+the `finish` objects `1` — the execution report's `plan_removal` and
+`remote_branch` are additive fields in v1 — and `prune` with a selector `2`); a client refuses a
 version it does not know. Behavior: [plans.md](plans.md#managed-runs).
 
 **Record** — `<git-common-dir>/agent-sparring/worktrees/<run-key>.json`.
 Fields other than `events` never change; lifecycle is derived from the
-append-only events (`created`, `merged` `{mode, target_sha}`,
-`target_pushed`, `state_archived`, `worktree_removed`, `branch_deleted`,
-`finished`; no `created` event means `creating`).
+append-only events (`created` `{plan_sha256}`, `merged` `{mode, target_sha, candidate}`,
+`plan_removed` `{commit, path, sha256}`, `plan_removal_refused` `{code, detail}` (final),
+`target_pushed`, `state_archived`,
+`worktree_removed`, `branch_deleted`, `remote_branch_deleted` `{code, detail,
+remote, candidate}`, `finished`; no `created` event means `creating`).
 
 ```json
 {"schema_version": 1, "run_key": "…", "plan_label": "docs/plans/foo.md",
@@ -530,19 +535,51 @@ worktree_removed | finished`), `run_status` (the run state's status, or
  "summary": "…"}
 ```
 
+In the dry run, `kept` lists `keep_remote_branch` whenever the record has
+a remote: code `remote_delete_unavailable` (the option is off — a
+compatibility alias kept for one release and removed in the next) or
+`remote_delete_planned` (the option is on; `actions` then lists the leased
+delete). `actions` also lists the plan removal when `remove_plan` is on.
+
 **`finish-run --json`** (execution):
 
 ```json
 {"schema_version": 1, "run_key": "…",
- "completed_steps": ["merge", "push_target", "archive_state", "remove_worktree", "delete_branch", "finished"],
+ "completed_steps": ["merge", "remove_plan", "push_target", "archive_state", "remove_worktree",
+                     "delete_branch", "delete_remote_branch", "finished"],
  "stopped_at": "checks | <step> | null", "reason": "… | null",
- "remaining": ["…"], "deleted_ignored_paths": ["…"], "kept": [{"action": "…", "code": "…", "detail": "…"}]}
+ "remaining": ["…"], "deleted_ignored_paths": ["…"], "kept": [{"action": "…", "code": "…", "detail": "…"}],
+ "plan_removal": {"code": "… | null", "detail": "…", "commit": "<sha, on plan_removed>"},
+ "remote_branch": {"code": "… | null", "detail": "…"}}
 ```
+
+`remove_plan` and `delete_remote_branch` appear only when enabled.
+`plan_removal.code`: `plan_removed`, `plan_removal_disabled`,
+`finish_config_unreadable`, `plan_snapshot_missing`,
+`plan_snapshot_mismatch`, `plan_not_tracked`, `plan_absent`,
+`plan_changed`, `target_checkout_dirty`, `target_operation_in_progress`,
+`git_identity_missing` (all non-stopping; a refusal is recorded and final)
+or `plan_commit_failed` (stops at `remove_plan`). A removal commit made by an
+interrupted finish (its `Sparring-Run` trailer, deleting exactly the
+snapshot) is recognised on the re-run as `plan_removed`, not `plan_absent`. `remote_branch.code`:
+`remote_branch_deleted`, `remote_branch_absent`, `remote_delete_disabled`,
+`finish_config_unreadable`, `no_remote`, or `remote_lease_mismatch` /
+`remote_unreachable` / `remote_delete_rejected` /
+`remote_target_missing_candidate` / `remote_target_unknown` (fetch first) /
+`remote_multiple_push_urls`
+(a record naming a branch outside the managed `sparring/` namespace, or its target, is
+`remote_delete_rejected` before anything is read or pushed; the branch is kept with that `kept[].code`, the finish stops at
+`delete_remote_branch` and the run is not finished). `null` means the step
+was not reached.
+
+**`[finish]` in `project.toml`** (read from the reviewed candidate):
+`delete_remote_branch` (bool, default `false`) and `remove_plan` (bool,
+default `false`); any other key is refused.
 
 Exit codes: `0` done (or eligible, for a dry run), `3` refused by its
 checks, `1` a step or the command failed.
 
-**`prune --dry-run --json`** — read-only; nothing is deleted:
+**`prune --dry-run --json`** (no selector) — read-only; nothing is deleted:
 
 ```json
 {"schema_version": 1, "dry_run": true,
@@ -554,3 +591,26 @@ checks, `1` a step or the command failed.
 Only engine-recorded state appears. `engine_snapshots` is always empty
 today: no snapshot is recorded, and an unrecorded worktree is never named
 (see `docs/design.md`, "Engine snapshots").
+
+**`prune [--dry-run] [--older-than DAYS] [--keep N] --json`** — with a
+selector (required unless `--dry-run`):
+
+```json
+{"schema_version": 2, "dry_run": false,
+ "criteria": {"older_than_days": 30, "keep": null},
+ "items": [{"kind": "record | archive", "run_key": "…", "path": "/abs/…",
+            "action": "deleted | would_delete | kept | report_only",
+            "reason": "finished | worktree_missing | within_keep | too_recent | unfinished | delete_failed",
+            "detail": "…"}],
+ "summary_path": "<git-common-dir>/agent-sparring/runs/pruned.jsonl"}
+```
+
+Exit `1` when any item is `delete_failed` or the existing summary is
+unreadable (`prune_summary_corrupt`; nothing is deleted), `2` for a
+deletion without a selector or a non-finite `--older-than`. Before deleting, one line per run (once per `run_key`) is appended
+and fsynced to `pruned.jsonl`: `schema_version` (`1`), `run_key`,
+`plan_label`, `input_kind`, `target_branch`, `branch`, `remote`, `base_sha`,
+`final_candidate`, `merge` `{mode, target_sha}`, `plan_sha256`,
+`plan_removed_commit?`, `remote_branch_code?`, `created_at`, `finished_at`,
+`pruned_at`, `archive_digest` (sha256 over the sorted per-file digests). No
+per-stage outcomes are kept.

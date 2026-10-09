@@ -51,10 +51,13 @@ class ProjectConfig:
     # not opt in -- every migration command then refuses with a clear
     # "not configured" message rather than guessing a default.
     migrations: "MigrationsConfig | None" = None
-    # ``[finish] delete_remote_branch``: parsed for compatibility but never
-    # honoured -- ``finish-run`` always keeps the remote branch and reports
-    # ``remote_delete_unavailable`` (see ``managed_finish.REMOTE_DELETE_UNAVAILABLE``).
+    # ``[finish] delete_remote_branch``: ``finish-run`` deletes the remote
+    # managed branch with a compare-and-delete lease on the merged candidate
+    # (see ``managed_finish``). Read from the reviewed candidate's config.
     finish_delete_remote_branch: bool = False
+    # ``[finish] remove_plan``: ``finish-run`` commits the removal of the plan
+    # file on the target, only when its bytes match the run's start snapshot.
+    finish_remove_plan: bool = False
 
     def command(self, name: str) -> str | None:
         """Return a configured project command by name, if any."""
@@ -315,13 +318,14 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
     migrations = _parse_migrations(table, source=source)
 
     finish_table = _optional_table(table, "finish", where=source)
-    unknown_finish = sorted(set(finish_table) - {"delete_remote_branch"})
+    unknown_finish = sorted(set(finish_table) - {"delete_remote_branch", "remove_plan"})
     if unknown_finish:
         raise ProjectConfigError(
             f"{source} [finish] has unknown field(s) {', '.join(repr(key) for key in unknown_finish)}; "
-            "supported fields: delete_remote_branch"
+            "supported fields: delete_remote_branch, remove_plan"
         )
     delete_remote = _optional_bool(finish_table, "delete_remote_branch", where=f"{source} [finish]")
+    remove_plan = _optional_bool(finish_table, "remove_plan", where=f"{source} [finish]")
 
     return ProjectConfig(
         project=project_name,
@@ -334,6 +338,7 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
         obsolete_agent_settings=obsolete,
         migrations=migrations,
         finish_delete_remote_branch=bool(delete_remote),
+        finish_remove_plan=bool(remove_plan),
     )
 
 

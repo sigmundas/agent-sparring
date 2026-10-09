@@ -25,7 +25,11 @@ from agent_sparring import managed_run
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.managed_run import ManagedRunError, ManagedRunRecord
 
+#: The ``finish`` object of ``runs --json`` / ``finish-run --dry-run``; its shape is unchanged.
 FINISH_SCHEMA_VERSION = 1
+#: The ``finish-run`` execution report. ``plan_removal`` and ``remote_branch``
+#: are additive fields within v1 (clients ignore unknown fields).
+FINISH_REPORT_SCHEMA_VERSION = 1
 MERGE_MODES = ("already_merged", "fast_forward", "merge_commit")
 
 
@@ -264,25 +268,58 @@ _IN_PROGRESS = (
     ("BISECT_LOG", "a bisect"),
 )
 
-# Remote branch deletion policy: no code path deletes a remote branch.
-# Deleting it safely needs an atomic compare-and-swap ("delete only if it is
-# still the candidate"), which git offers only as ``push --force-with-lease``,
-# and this engine never force-pushes. A check-then-delete would race with a
-# concurrent push and could drop someone's commits. So the remote managed
-# branch is always kept, ``[finish] delete_remote_branch`` is parsed but not
-# honoured, and the outcome is reported as ``remote_delete_unavailable``.
-REMOTE_DELETE_UNAVAILABLE = (
-    "atomic remote deletion is not available under the current safety policy, so the remote branch is kept"
+# Remote branch deletion policy. The remote managed branch is deleted only
+# when the reviewed candidate's ``[finish] delete_remote_branch`` is true,
+# and only as a compare-and-delete at the mutation itself:
+# ``git push --force-with-lease=refs/heads/<b>:<candidate> <remote> --delete
+# refs/heads/<b>`` -- the server refuses the delete unless the ref is
+# exactly the merged candidate, so a concurrent push is never dropped. This
+# is the single use of force in this module (a test pins it). Before the
+# push the remote is read at its push URL -- an absent branch needs no
+# delete, and a remote target not yet containing the candidate keeps the
+# branch (``remote_target_missing_candidate``) -- but those reads only
+# inform; the lease is the guard. The "target contains the candidate" read
+# is point-in-time: the target may move after it, and only the branch
+# deletion itself is lease-guarded. A remote with several push URLs is not
+# deleted from (``remote_multiple_push_urls``: no per-URL lease), and a
+# push-only endpoint whose ``ls-remote`` fails cannot use the option
+# (``remote_unreachable``). A refused push is classified from its own
+# porcelain status lines; it is deleted only when every line says so. Any refusal keeps the branch and stops the finish
+# at ``delete_remote_branch``, unfinished, so a re-run resumes.
+#
+# When the policy is false the branch is kept and reported both with the
+# precise ``remote_branch.code`` ``remote_delete_disabled`` and with the
+# legacy ``kept`` entry ``keep_remote_branch``/``remote_delete_unavailable``:
+# that code is a compatibility alias kept for one release and removed in
+# the next.
+REMOTE_DELETE_UNAVAILABLE = "[finish] delete_remote_branch is not enabled, so the remote branch is kept"
+REMOTE_DELETE_LEASE = "--force-with-lease"
+REMOTE_KEEP_CODES = (
+    "remote_lease_mismatch", "remote_unreachable", "remote_delete_rejected", "remote_target_missing_candidate",
+    "remote_target_unknown", "remote_multiple_push_urls",
 )
 
 
-def _kept_remote(repo_root: Path, record: ManagedRunRecord, candidate: str | None) -> list[dict[str, str]]:
+def _kept_remote(repo_root: Path, record: ManagedRunRecord, candidate: str | None,
+                 code: str | None = None, detail: str | None = None) -> list[dict[str, str]]:
+    """The ``keep_remote_branch`` entry for a record with a remote.
+
+    ``code`` names why the branch is still there: a refusal of the delete,
+    or -- when ``None`` -- the policy: ``remote_delete_planned`` when the
+    candidate's config enables deletion (it is still kept until finish
+    deletes it), else the alias ``remote_delete_unavailable``."""
+
     if not record.remote:
         return []
-    detail = f"{record.remote}/{record.branch}: {REMOTE_DELETE_UNAVAILABLE}"
-    if candidate and _delete_remote_policy(repo_root, record, candidate)[0]:
-        detail += "; [finish] delete_remote_branch = true is not honoured"
-    return [{"action": "keep_remote_branch", "code": "remote_delete_unavailable", "detail": detail}]
+    where = f"{record.remote}/{record.branch}"
+    if code is None:
+        if candidate and _finish_policy(repo_root, record, candidate)["delete_remote_branch"]:
+            code = "remote_delete_planned"
+            detail = f"kept until finish-run deletes it with a lease on {candidate}"
+        else:
+            code = "remote_delete_unavailable"
+            detail = REMOTE_DELETE_UNAVAILABLE
+    return [{"action": "keep_remote_branch", "code": code, "detail": f"{where}: {detail}"}]
 
 
 # Checks that block only cleanup; a merge (``--merge-only``) may still run.
@@ -505,13 +542,24 @@ def finish_status(
         actions.append(f"fast-forward {record.target_branch} to {candidate}")
     elif merge_mode == "merge_commit":
         actions.append(f"merge {candidate} into {record.target_branch} with a merge commit")
+    policy = _finish_policy(repo_root, record, candidate)
+    if policy["remove_plan"]:
+        actions.append(
+            f"remove the plan {record.input_path} from {record.target_branch} in a commit of its own, "
+            "only if its bytes match the run's start snapshot"
+        )
     if cleanup:
         actions += [
             f"archive every ignored file under {record.project_dir} of run {record.run_key}",
             f"remove worktree {record.worktree_path}",
             f"delete local branch {record.branch}",
         ]
-        actions += [f"keep remote branch {record.remote}/{record.branch} ({item['code']})" for item in kept]
+        if record.remote and policy["delete_remote_branch"]:
+            actions.append(
+                f"delete remote branch {record.remote}/{record.branch} only while it is exactly {candidate} (lease)"
+            )
+        else:
+            actions += [f"keep remote branch {record.remote}/{record.branch} ({item['code']})" for item in kept]
     return {"git": git, "finish": _finish(
         record.run_key, managed=True, checks=checks, merge_mode=merge_mode,
         eligible_merge=True, eligible_cleanup=cleanup, actions=actions,
@@ -534,21 +582,35 @@ def runs_report(repo_root: Path) -> dict[str, Any]:
 
 FINISH_STEPS = (
     "merge",
+    "remove_plan",
     "push_target",
     "archive_state",
     "remove_worktree",
     "delete_branch",
+    "delete_remote_branch",
     "finished",
 )
 # The step each recorded event proves done, for reporting a finished run.
 _EVENT_STEPS = (
     ("merged", "merge"),
+    ("plan_removed", "remove_plan"),
+    ("plan_removal_refused", "remove_plan"),
     ("target_pushed", "push_target"),
     ("state_archived", "archive_state"),
     ("worktree_removed", "remove_worktree"),
     ("branch_deleted", "delete_branch"),
+    ("remote_branch_deleted", "delete_remote_branch"),
     ("finished", "finished"),
 )
+
+
+def _planned_steps(*, merge_only: bool, push_target: bool, remove_plan: bool, delete_remote: bool) -> list[str]:
+    steps = ["merge"] + (["remove_plan"] if remove_plan else []) + (["push_target"] if push_target else [])
+    if not merge_only:
+        steps += ["archive_state", "remove_worktree", "delete_branch"]
+        steps += ["delete_remote_branch"] if delete_remote else []
+        steps.append("finished")
+    return steps
 ARCHIVE_SUBDIR = Path("agent-sparring") / "runs"
 
 
@@ -703,8 +765,9 @@ def _worktree_gone(repo_root: Path, record: ManagedRunRecord) -> bool:
     )
 
 
-def _delete_remote_policy(repo_root: Path, record: ManagedRunRecord, candidate: str) -> tuple[bool, str]:
-    """The reviewed candidate's own ``[finish] delete_remote_branch``."""
+def _candidate_config(repo_root: Path, record: ManagedRunRecord, candidate: str) -> tuple[Any, str]:
+    """``(the reviewed candidate's own project config or None, detail)``: the
+    configuration the finished run was reviewed with, never a checkout's copy."""
 
     from agent_sparring.config import CONFIG_FILENAME, ProjectConfigError, parse_project_config
 
@@ -713,12 +776,23 @@ def _delete_remote_policy(repo_root: Path, record: ManagedRunRecord, candidate: 
         ["git", "-C", str(repo_root), "show", spec], capture_output=True, check=False
     )
     if result.returncode != 0:
-        return False, f"{spec} cannot be read"
+        return None, f"{spec} cannot be read"
     try:
-        config = parse_project_config(result.stdout, source=spec)
+        return parse_project_config(result.stdout, source=spec), spec
     except ProjectConfigError as exc:
-        return False, str(exc)
-    return config.finish_delete_remote_branch, "[finish] delete_remote_branch"
+        return None, str(exc)
+
+
+def _finish_policy(repo_root: Path, record: ManagedRunRecord, candidate: str | None) -> dict[str, Any]:
+    """The candidate's ``[finish]`` opt-ins; both false when unreadable,
+    with ``error`` saying why (reported as ``finish_config_unreadable``)."""
+
+    config, detail = _candidate_config(repo_root, record, candidate) if candidate else (None, "no candidate")
+    return {
+        "delete_remote_branch": bool(config is not None and config.finish_delete_remote_branch),
+        "remove_plan": bool(config is not None and config.finish_remove_plan),
+        "error": None if config is not None or not candidate else detail,
+    }
 
 
 def _merge(record: ManagedRunRecord, git: dict[str, Any], merge_mode: str, repo_root: Path) -> dict[str, Any]:
@@ -820,11 +894,16 @@ def _refuse_untracked_collisions(checkout: Path, old_tip: str, candidate: str, m
         )
 
 
+def _outcome(code: str | None, detail: str, **extra: Any) -> dict[str, Any]:
+    return {"code": code, "detail": detail, **extra}
+
+
 def _report(run_key: str, completed: list[str], stopped_at: str | None, reason: str | None,
             planned: list[str], *, deleted_ignored: list[str] | None = None,
-            kept: list[dict[str, str]] | None = None) -> dict[str, Any]:
+            kept: list[dict[str, str]] | None = None, plan_removal: dict[str, Any] | None = None,
+            remote_branch: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
-        "schema_version": FINISH_SCHEMA_VERSION,
+        "schema_version": FINISH_REPORT_SCHEMA_VERSION,
         "run_key": run_key,
         "completed_steps": completed,
         "stopped_at": stopped_at,
@@ -832,6 +911,8 @@ def _report(run_key: str, completed: list[str], stopped_at: str | None, reason: 
         "remaining": [step for step in planned if step not in completed],
         "deleted_ignored_paths": deleted_ignored or [],
         "kept": kept or [],
+        "plan_removal": plan_removal or _outcome(None, "not reached"),
+        "remote_branch": remote_branch or _outcome(None, "not reached"),
     }
 
 
@@ -852,13 +933,13 @@ def finish_run(
     Holds the worktree lock throughout, re-reads the record under it and
     re-runs every eligibility check itself. Each step is skipped when its
     event is recorded and still true, appends its event when done, and the
-    first failure stops everything after it."""
+    first failure stops everything after it. The opt-in steps
+    (``remove_plan``, ``delete_remote_branch``) are planned once the merged
+    candidate -- whose own config enables them -- is known."""
 
-    planned = ["merge"] + (["push_target"] if push_target else [])
-    if not merge_only:
-        planned += ["archive_state", "remove_worktree", "delete_branch", "finished"]
+    planned = _planned_steps(merge_only=merge_only, push_target=push_target, remove_plan=False, delete_remote=False)
     completed: list[str] = []
-    notes: dict[str, Any] = {"deleted_ignored": [], "kept": []}
+    notes: dict[str, Any] = {"deleted_ignored": [], "kept": [], "plan_removal": None, "remote_branch": None}
     try:
         record = managed_run.read_record(repo_root, run_key)
     except (ManagedRunError, OSError) as exc:
@@ -869,7 +950,8 @@ def finish_run(
 
     def report(stopped_at: str | None, reason: str | None) -> dict[str, Any]:
         return _report(run_key, completed, stopped_at, reason, planned,
-                       deleted_ignored=notes["deleted_ignored"], kept=notes["kept"])
+                       deleted_ignored=notes["deleted_ignored"], kept=notes["kept"],
+                       plan_removal=notes["plan_removal"], remote_branch=notes["remote_branch"])
 
     try:
         with worktree_lock(Path(record.worktree_path)):
@@ -882,15 +964,20 @@ def finish_run(
             if not _owned(locked) or locked.worktree_path != record.worktree_path:
                 status = finish_status(repo_root, run_key, lock_held=True)
                 return report("checks", status["finish"]["summary"]), status["finish"]
-            # The remote branch is kept whatever happens below: report it on
-            # every return, including --merge-only, refusals and failures.
+            # The remote branch is reported on every return, including
+            # --merge-only, refusals and failures, until it is deleted.
             merged = _events(locked, "merged")
-            notes["kept"] = _kept_remote(repo_root, locked, merged[-1]["detail"].get("candidate") if merged else None)
+            merged_candidate = merged[-1]["detail"].get("candidate") if merged else None
+            notes["kept"] = _kept_remote(repo_root, locked, merged_candidate)
             if _events(locked, "finished"):
                 # Report only what the record shows actually happened.
                 recorded = {event["event"] for event in locked.events}
                 completed[:] = [step for event, step in _EVENT_STEPS if event in recorded]
                 planned[:] = list(completed)
+                notes["plan_removal"] = _recorded_plan_removal(locked)
+                notes["remote_branch"] = _recorded_remote_branch(locked)
+                if notes["remote_branch"]["code"] in ("remote_branch_deleted", "remote_branch_absent"):
+                    notes["kept"] = []
                 return report(None, "the run is already finished"), None
             return _finish_locked(repo_root, locked, planned, completed, notes, merge_only=merge_only,
                                   allow_merge_commit=allow_merge_commit, push_target=push_target)
@@ -905,6 +992,28 @@ def finish_run(
         return report(stopped, f"{type(exc).__name__}: {exc}"), None
 
 
+def _recorded_plan_removal(record: ManagedRunRecord) -> dict[str, Any]:
+    removed = _events(record, "plan_removed")
+    if removed:
+        detail = removed[-1]["detail"]
+        return _outcome("plan_removed", f"removed {detail.get('path')}", commit=detail.get("commit"))
+    refused = _events(record, "plan_removal_refused")
+    if refused:
+        detail = refused[-1]["detail"]
+        return _outcome(detail.get("code"), f"recorded refusal (final): {detail.get('detail', '')}")
+    return _outcome(None, "no plan removal is recorded")
+
+
+def _recorded_remote_branch(record: ManagedRunRecord) -> dict[str, Any]:
+    deleted = _events(record, "remote_branch_deleted")
+    if deleted:
+        detail = deleted[-1]["detail"]
+        return _outcome(detail.get("code", "remote_branch_deleted"), detail.get("detail", "recorded"))
+    if not record.remote:
+        return _outcome("no_remote", "the record has no remote")
+    return _outcome(None, "no remote branch deletion is recorded")
+
+
 def _finish_locked(
     repo_root: Path, record: ManagedRunRecord, planned: list[str], completed: list[str],
     notes: dict[str, Any], *, merge_only: bool, allow_merge_commit: bool, push_target: bool,
@@ -913,7 +1022,27 @@ def _finish_locked(
 
     def report(stopped_at: str | None, reason: str | None) -> dict[str, Any]:
         return _report(run_key, completed, stopped_at, reason, planned,
-                       deleted_ignored=notes["deleted_ignored"], kept=notes["kept"])
+                       deleted_ignored=notes["deleted_ignored"], kept=notes["kept"],
+                       plan_removal=notes["plan_removal"], remote_branch=notes["remote_branch"])
+
+    def plan_steps(candidate: str) -> dict[str, bool]:
+        policy = _finish_policy(repo_root, record, candidate)
+        planned[:] = _planned_steps(
+            merge_only=merge_only, push_target=push_target, remove_plan=policy["remove_plan"],
+            delete_remote=policy["delete_remote_branch"] and bool(record.remote),
+        )
+        unreadable = policy["error"] and _outcome(
+            "finish_config_unreadable", f"the candidate's [finish] config cannot be read: {policy['error']}"
+        )
+        if not policy["remove_plan"]:
+            notes["plan_removal"] = unreadable or _outcome(
+                "plan_removal_disabled", "[finish] remove_plan is not enabled"
+            )
+        if not record.remote:
+            notes["remote_branch"] = _outcome("no_remote", "the record has no remote; nothing to delete")
+        elif not policy["delete_remote_branch"]:
+            notes["remote_branch"] = unreadable or _outcome("remote_delete_disabled", REMOTE_DELETE_UNAVAILABLE)
+        return policy
 
     removed = bool(_events(record, "worktree_removed"))
     if removed and not _worktree_gone(repo_root, record):
@@ -945,7 +1074,11 @@ def _finish_locked(
         target_tip = _rev(repo_root, f"refs/heads/{record.target_branch}")
         if target_tip is None or not _is_ancestor(repo_root, candidate, target_tip):
             raise _StepFailed("merge", f"{record.target_branch} no longer contains the merged candidate {candidate}")
+        policy = plan_steps(candidate)
         completed.append("merge")
+        if policy["remove_plan"]:
+            record = _remove_plan_step(repo_root, record, notes)
+            completed.append("remove_plan")
         if push_target:
             record = _push_target(repo_root, record, candidate)
             completed.append("push_target")
@@ -962,6 +1095,7 @@ def _finish_locked(
         if not finish["eligible"]["merge"] or (not merge_only and not finish["eligible"]["cleanup"]):
             return report("checks", finish["summary"]), finish
         candidate = git["final_candidate"]
+        policy = plan_steps(candidate)
         # 1. merge
         if finish["merge_mode"] == "already_merged":
             if not _events(record, "merged"):
@@ -973,20 +1107,24 @@ def _finish_locked(
                 repo_root, run_key, "merged", _merge(record, git, finish["merge_mode"], repo_root)
             )
         completed.append("merge")
-        # 2. push target
+        # 2. remove the plan (opt-in; refusals are reported, not stops)
+        if policy["remove_plan"]:
+            record = _remove_plan_step(repo_root, record, notes)
+            completed.append("remove_plan")
+        # 3. push target
         if push_target:
             record = _push_target(repo_root, record, candidate)
             completed.append("push_target")
         if merge_only:
             return report(None, "--merge-only: cleanup was not requested"), None
-        # 3. archive every ignored file under the project directory
+        # 4. archive every ignored file under the project directory
         destination, archived = _archive_state(repo_root, record)
         if not _archive_readable(repo_root, record):
             raise _StepFailed("archive_state", "unarchived_project_state: the archived run state is unreadable")
         if not _events(record, "state_archived"):
             record = managed_run.append_event(repo_root, run_key, "state_archived", {"path": str(destination)})
         completed.append("archive_state")
-        # 4. remove worktree -- only what is archived or reported may go
+        # 5. remove worktree -- only what is archived or reported may go
         _verify_archived(record, archived)
         deleted_ignored = _deleted_ignored(record)
         result = managed_run._git(repo_root, "worktree", "remove", record.worktree_path)
@@ -997,10 +1135,13 @@ def _finish_locked(
         record = managed_run.append_event(repo_root, run_key, "worktree_removed")
     completed.append("remove_worktree")
 
-    # 5. delete local branch
+    # 6. delete local branch
     branch_ref = f"refs/heads/{record.branch}"
     tip = _rev(repo_root, branch_ref)
     if tip is not None:
+        refused = _foreign_branch(record)
+        if refused:
+            raise _StepFailed("delete_branch", refused)
         target_tip = _rev(repo_root, f"refs/heads/{record.target_branch}")
         if target_tip is None or not _is_ancestor(repo_root, candidate, target_tip):
             raise _StepFailed("delete_branch", f"{record.target_branch} does not contain {candidate}")
@@ -1019,22 +1160,364 @@ def _finish_locked(
         record = managed_run.append_event(repo_root, run_key, "branch_deleted")
     completed.append("delete_branch")
 
-    # 6. finished
+    # 7. delete the remote branch (opt-in; compare-and-delete on the candidate)
+    if "delete_remote_branch" in planned:
+        merged = _events(record, "merged")
+        merged_candidate = merged[-1]["detail"].get("candidate") if merged else None
+        if not merged_candidate:
+            raise _StepFailed("delete_remote_branch", "the record has no merged candidate")
+        if _events(record, "remote_branch_deleted"):
+            notes["remote_branch"] = _recorded_remote_branch(record)
+        else:
+            code, detail = _delete_remote_branch(repo_root, record, merged_candidate)
+            notes["remote_branch"] = _outcome(code, detail)
+            if code in REMOTE_KEEP_CODES:
+                notes["kept"] = _kept_remote(repo_root, record, merged_candidate, code=code, detail=detail)
+                raise _StepFailed("delete_remote_branch", f"{code}: {detail}")
+            record = managed_run.append_event(
+                repo_root, run_key, "remote_branch_deleted",
+                {"code": code, "detail": detail, "remote": record.remote, "candidate": merged_candidate},
+            )
+        notes["kept"] = []
+        completed.append("delete_remote_branch")
+
+    # 8. finished
     managed_run.append_event(repo_root, run_key, "finished")
     completed.append("finished")
     return report(None, None), None
 
 
+def _foreign_branch(record: ManagedRunRecord) -> str | None:
+    """Why ``record.branch`` is not one finish may delete, or ``None``: only
+    a managed branch -- the run's own, or one in the engine's ``sparring/``
+    namespace (a record created under the earlier slug naming) -- and never
+    its target. The record lives in the git common dir, so this does not
+    trust it to name the branch."""
+
+    try:
+        own = managed_run.managed_branch(record.run_key)
+    except Exception as exc:  # an invalid run key cannot name a branch
+        return f"run key {record.run_key!r} has no managed branch ({exc})"
+    managed = record.branch == own or (
+        record.branch.startswith("sparring/") and len(record.branch) > len("sparring/")
+    )
+    if not managed or record.branch == record.target_branch:
+        return (
+            f"the record names branch {record.branch!r}, not a managed branch (such as {own!r}) "
+            "distinct from its target; refusing to delete it"
+        )
+    return None
+
+
+def _delete_remote_branch(repo_root: Path, record: ManagedRunRecord, candidate: str) -> tuple[str, str]:
+    """Delete ``refs/heads/<branch>`` on the record's remote only while it is
+    exactly ``candidate``: the lease is checked by the server at the delete
+    itself. ``(code, detail)``.
+
+    Before the push, the remote is read at its **push** URL (where the
+    delete goes, after ``pushurl``/``pushInsteadOf``): an absent branch is
+    success without a push, and a remote target that does not yet contain
+    the candidate keeps the branch (``remote_target_missing_candidate``).
+    Those reads inform only; the lease is the guard. A refused push is
+    classified from its own ``--porcelain`` status line, never by reading
+    the remote again, so a refusal is never reported as absent or deleted."""
+
+    ref = f"refs/heads/{record.branch}"
+    where = f"{record.remote}/{record.branch}"
+    refused = _foreign_branch(record)
+    if refused:
+        return "remote_delete_rejected", f"{refused}; nothing was read or pushed and {where} is kept"
+    push_urls = managed_run._git(repo_root, "remote", "get-url", "--push", "--all", record.remote)
+    urls = [u for u in push_urls.stdout.splitlines() if u.strip()] if push_urls.returncode == 0 else []
+    if len(urls) > 1:
+        return "remote_multiple_push_urls", (
+            f"{record.remote} has {len(urls)} push URLs ({', '.join(urls)}); a per-URL lease delete is not "
+            f"supported, so nothing was read or pushed and {where} is kept"
+        )
+    url = urls[0] if urls else record.remote
+    ok, branch_sha, error = _remote_sha(repo_root, url, record.branch)
+    if not ok:
+        return "remote_unreachable", f"{where} cannot be reached at {url} ({error}); the branch is kept"
+    if branch_sha is None:
+        return "remote_branch_absent", f"{where} does not exist at {url}; nothing to delete"
+    ok, target_sha, error = _remote_sha(repo_root, url, record.target_branch)
+    if not ok:
+        return "remote_unreachable", f"{record.remote}/{record.target_branch} cannot be read at {url} ({error})"
+    if target_sha is not None and _rev(repo_root, target_sha) is None:
+        return "remote_target_unknown", (
+            f"{record.remote}/{record.target_branch} at {url} is {target_sha}, which is not present locally; "
+            f"fetch first, then re-run. {where} is kept"
+        )
+    if target_sha is None or not _is_ancestor(repo_root, candidate, target_sha):
+        return "remote_target_missing_candidate", (
+            f"{record.remote}/{record.target_branch} at {url} is {target_sha or 'absent'} and does not contain "
+            f"the merged candidate {candidate}; push the target (--push-target) and re-run. {where} is kept"
+        )
+    result = managed_run._git(
+        repo_root, "push", "--porcelain", f"{REMOTE_DELETE_LEASE}={ref}:{candidate}", record.remote, "--delete", ref,
+    )
+    lines = result.stdout.splitlines()
+    sections = [line for line in lines if line.startswith("To ")]
+    statuses = [line.split("\t") for line in lines if line.count("\t") >= 2 and f":{ref}" in line]
+    error = (result.stderr.strip() or result.stdout.strip() or "git push --delete failed").splitlines()[-1]
+    if not statuses:
+        return "remote_unreachable", f"the delete of {where} did not reach the remote ({error}); the branch is kept"
+    if result.returncode == 0 and all(status[0] == "-" for status in statuses):
+        return "remote_branch_deleted", f"{where} was exactly {candidate} and is deleted"
+    summary = "; ".join(status[2] for status in statuses if status[0] != "-") or error
+    if len(sections) > 1 or len(statuses) > 1:
+        return "remote_delete_rejected", (
+            f"the delete of {where} went to {max(len(sections), len(statuses))} destinations and not every one "
+            f"deleted it ({summary}); it is not recorded deleted"
+        )
+    if "stale info" in summary:
+        return "remote_lease_mismatch", (
+            f"{where} is no longer exactly the merged candidate {candidate}; the lease refused the delete "
+            f"({summary}) and it is kept"
+        )
+    return "remote_delete_rejected", f"the remote refused deleting {where}: {summary}; the branch is kept"
+
+
+# -- plan removal ------------------------------------------------------------------
+
+#: Refusals reported in ``plan_removal`` that do not stop the finish.
+PLAN_REMOVAL_REPORTED = (
+    "plan_snapshot_missing", "plan_snapshot_mismatch", "plan_not_tracked", "plan_absent", "plan_changed",
+    "target_checkout_dirty", "target_operation_in_progress", "git_identity_missing",
+)
+
+
+def _remove_plan_step(repo_root: Path, record: ManagedRunRecord, notes: dict[str, Any]) -> ManagedRunRecord:
+    """Run ``remove_plan`` unless its outcome is recorded. A refusal is
+    final: it is recorded as ``plan_removal_refused`` and every later resume
+    reports it without retrying. Only an unexpected git failure
+    (``plan_commit_failed``) stops the finish, and that is retried."""
+
+    if _events(record, "plan_removed") or _events(record, "plan_removal_refused"):
+        notes["plan_removal"] = _recorded_plan_removal(record)
+        return record
+    outcome = _remove_plan(repo_root, record)
+    notes["plan_removal"] = outcome
+    if outcome["code"] == "plan_commit_failed":
+        raise _StepFailed("remove_plan", f"plan_commit_failed: {outcome['detail']}")
+    if outcome["code"] == "plan_removed":
+        record = managed_run.append_event(repo_root, record.run_key, "plan_removed", {
+            "commit": outcome["commit"], "path": outcome["path"], "sha256": outcome["sha256"],
+            **({"reconciled": True} if outcome.get("reconciled") else {}),
+        })
+    else:
+        record = managed_run.append_event(repo_root, record.run_key, "plan_removal_refused", {
+            "code": outcome["code"], "detail": outcome["detail"],
+        })
+    return record
+
+
+def _plan_snapshot(repo_root: Path, record: ManagedRunRecord) -> tuple[bytes, str] | None:
+    """The run's start snapshot, from its project state or -- once the
+    worktree is gone -- its archive."""
+
+    from agent_sparring.plan import read_plan_snapshot
+
+    for root in (record.sparring_dir, archive_dir(repo_root, record.run_key)):
+        snapshot = read_plan_snapshot(root, record.run_key)
+        if snapshot is not None:
+            return snapshot
+    return None
+
+
+def _git_bytes(cwd: Path, *args: str, env: dict[str, str] | None = None,
+               stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, check=False, input=stdin,
+        env={**os.environ, **env} if env else None,
+    )
+
+
+def _git_identity(repo_root: Path) -> str | None:
+    """Why the user's git identity is unusable, or ``None`` when it is set."""
+
+    missing = []
+    for env_name, key in (("GIT_AUTHOR_NAME", "user.name"), ("GIT_AUTHOR_EMAIL", "user.email")):
+        if os.environ.get(env_name):
+            continue
+        if not managed_run._git(repo_root, "config", "--get", key).stdout.strip():
+            missing.append(key)
+    return ", ".join(missing) + " is not set" if missing else None
+
+
+def _remove_plan(repo_root: Path, record: ManagedRunRecord) -> dict[str, Any]:
+    """Commit the removal of the run's plan file on the target, only when
+    the target's bytes are byte-for-byte the run's start snapshot."""
+
+    snapshot = _plan_snapshot(repo_root, record)
+    # 1. the repo-relative path: only an input the run read inside its worktree
+    try:
+        rel = Path(record.input_path).relative_to(record.worktree_path).as_posix()
+    except ValueError:
+        return _outcome("plan_not_tracked", f"{record.input_path} is not a repository file the run read; it is left")
+    # 2. the snapshot
+    recorded = managed_run.created_plan_sha256(record)
+    if snapshot is None or recorded is None:
+        what = "no plan snapshot" if snapshot is None else "no plan digest in its record"
+        return _outcome("plan_snapshot_missing", f"run {record.run_key} has {what}; {rel} is left")
+    data, digest = snapshot
+    # Tamper evidence: the snapshot in the worktree must match the digest
+    # recorded outside it when the run was created.
+    if digest != recorded or hashlib.sha256(data).hexdigest() != recorded:
+        return _outcome(
+            "plan_snapshot_mismatch",
+            f"the run's plan snapshot does not match the digest in its record; {rel} is left",
+        )
+    target_ref = f"refs/heads/{record.target_branch}"
+    old = _rev(repo_root, target_ref)
+    if old is None:
+        return _outcome("plan_commit_failed", f"{target_ref} does not exist")
+    # 3./4. tracked at the target tip, as a regular file
+    listed = _git_bytes(repo_root, "ls-tree", "-z", old, "--", rel)
+    if listed.returncode != 0:
+        return _outcome("plan_commit_failed", f"git ls-tree failed: {listed.stderr.decode(errors='replace').strip()}")
+    entry = listed.stdout.split(b"\0")[0].decode(errors="replace")
+    if not entry:
+        commit = _recorded_removal_commit(repo_root, record, old, rel, data)
+        if commit is not None:
+            return _outcome("plan_removed", f"{rel} was removed from {record.target_branch} in {commit}",
+                            commit=commit, path=rel, sha256=digest, reconciled=True)
+        return _outcome("plan_absent", f"{rel} is not in {record.target_branch} ({old}); nothing to remove")
+    if entry.split(" ", 2)[:2] not in (["100644", "blob"], ["100755", "blob"]):
+        return _outcome("plan_not_tracked", f"{rel} is not a tracked file in {record.target_branch}")
+    # 5. byte-exact
+    shown = _git_bytes(repo_root, "cat-file", "blob", f"{old}:{rel}")
+    if shown.returncode != 0:
+        return _outcome("plan_commit_failed", f"git cat-file failed: {shown.stderr.decode(errors='replace').strip()}")
+    if hashlib.sha256(shown.stdout).hexdigest() != digest or shown.stdout != data:
+        return _outcome(
+            "plan_changed", f"{rel} in {record.target_branch} differs from the run's start snapshot; it is left"
+        )
+    # 7. identity
+    identity = _git_identity(repo_root)
+    if identity:
+        return _outcome("git_identity_missing", f"git {identity}; {rel} is left")
+    message = (
+        f"sparring: remove finished plan {record.plan_label} (run {record.run_key})\n\n"
+        f"Sparring-Run: {record.run_key}\n"
+    )
+    checkout = next(
+        (e["path"] for e in managed_run.worktree_list(repo_root) if e["branch"] == record.target_branch), None
+    )
+    # 6. commit
+    if checkout is not None:
+        new, failure = _commit_removal_in_checkout(Path(checkout), rel, old, message)
+    else:
+        new, failure = _commit_removal_by_plumbing(repo_root, target_ref, rel, old, message)
+    if failure is not None:
+        return failure
+    return _outcome("plan_removed", f"removed {rel} from {record.target_branch} in {new}",
+                    commit=new, path=rel, sha256=digest)
+
+
+def _recorded_removal_commit(repo_root: Path, record: ManagedRunRecord, tip: str, rel: str,
+                             data: bytes) -> str | None:
+    """This run's own removal commit on the target, when it was made but its
+    ``plan_removed`` event was not recorded (an interrupted finish): the
+    latest commit reachable from ``tip`` that carries the run's
+    ``Sparring-Run`` trailer, deletes ``rel``, and whose parent held exactly
+    the snapshot ``data`` there."""
+
+    listed = managed_run._git(
+        repo_root, "log", "--format=%H", "--fixed-strings", f"--grep=Sparring-Run: {record.run_key}",
+        "--diff-filter=D", "--no-renames", tip, "--", rel,
+    )
+    for commit in listed.stdout.split() if listed.returncode == 0 else []:
+        trailers = managed_run._git(repo_root, "log", "-1", "--format=%(trailers:key=Sparring-Run,valueonly)", commit)
+        if record.run_key not in trailers.stdout.split():
+            continue
+        parent = _git_bytes(repo_root, "cat-file", "blob", f"{commit}^:{rel}")
+        if parent.returncode == 0 and parent.stdout == data:
+            return commit
+    return None
+
+
+def _commit_removal_in_checkout(checkout: Path, rel: str, old: str, message: str) -> tuple[str | None, dict | None]:
+    """In the checkout that has the target: an empty index and an unmodified
+    plan are required; unrelated unstaged edits are left alone, never stashed."""
+
+    operations = _operations_in_progress(checkout)
+    if operations:
+        return None, _outcome(
+            "target_operation_in_progress", f"{checkout} has {', '.join(operations)} in progress; the plan is left"
+        )
+    if _rev(checkout, "HEAD") != old:
+        return None, _outcome("plan_commit_failed", f"{checkout} is not at {old}")
+    staged = managed_run._git(checkout, "diff", "--cached", "--quiet")
+    plan_changed = managed_run._git(checkout, "diff", "--quiet", "--", rel)
+    if staged.returncode != 0 or plan_changed.returncode != 0 or not (checkout / rel).is_file():
+        return None, _outcome(
+            "target_checkout_dirty",
+            f"{checkout} has staged changes or a modified {rel}; the plan is left",
+        )
+    removed = managed_run._git(checkout, "rm", "-q", "--", rel)
+    if removed.returncode != 0:
+        return None, _outcome("plan_commit_failed", f"git rm failed: {removed.stderr.strip()}")
+    committed = managed_run._git(checkout, "commit", "-q", "--no-verify", "--only", "-m", message, "--", rel)
+    new = _rev(checkout, "HEAD")
+    if committed.returncode != 0 or new == old:
+        # Put back exactly what was removed; the index was empty before.
+        managed_run._git(checkout, "reset", "-q", "--", rel)
+        managed_run._git(checkout, "checkout", "--", rel)
+        return None, _outcome("plan_commit_failed", f"git commit failed: {committed.stderr.strip()}")
+    return new, None
+
+
+def _commit_removal_by_plumbing(repo_root: Path, target_ref: str, rel: str, old: str,
+                                message: str) -> tuple[str | None, dict | None]:
+    """No checkout has the target: build the commit from ``old``'s tree
+    without the plan and compare-and-swap the target from ``old``."""
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as scratch:
+        env = {"GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        steps = (
+            ("read-tree", old),
+            ("update-index", "--index-info"),
+            ("write-tree",),
+        )
+        tree = ""
+        for args in steps:
+            stdin = f"0 {'0' * 40}\t{rel}\n".encode() if args[0] == "update-index" else None
+            result = _git_bytes(repo_root, *args, env=env, stdin=stdin)
+            if result.returncode != 0:
+                return None, _outcome(
+                    "plan_commit_failed", f"git {args[0]} failed: {result.stderr.decode(errors='replace').strip()}"
+                )
+            tree = result.stdout.decode().strip()
+    commit = managed_run._git(repo_root, "commit-tree", tree, "-p", old, "-m", message)
+    if commit.returncode != 0:
+        return None, _outcome("plan_commit_failed", f"git commit-tree failed: {commit.stderr.strip()}")
+    new = commit.stdout.strip()
+    swapped = managed_run._git(repo_root, "update-ref", target_ref, new, old)
+    if swapped.returncode != 0:
+        return None, _outcome("plan_commit_failed", f"{target_ref} moved: {swapped.stderr.strip()}")
+    return new, None
+
+
 def _push_target(repo_root: Path, record: ManagedRunRecord, candidate: str) -> ManagedRunRecord:
     """Push the target unless the remote target already contains the
-    candidate; never forced, so a rejection stops the finish here."""
+    candidate (and a recorded plan-removal commit); never forced, so a
+    rejection stops the finish here."""
 
     if not record.remote:
         raise _StepFailed("push_target", "the record has no remote to push the target to")
     ok, remote_tip, error = _remote_sha(repo_root, record.remote, record.target_branch)
     if not ok:
         raise _StepFailed("push_target", error)
-    if remote_tip is None or _rev(repo_root, remote_tip) is None or not _is_ancestor(repo_root, candidate, remote_tip):
+    removal = _events(record, "plan_removed")
+    must_contain = [candidate] + ([removal[-1]["detail"]["commit"]] if removal else [])
+    if (
+        remote_tip is None
+        or _rev(repo_root, remote_tip) is None
+        or not all(_is_ancestor(repo_root, sha, remote_tip) for sha in must_contain)
+    ):
         result = managed_run._git(
             repo_root, "-c", "push.followTags=false", "push", record.remote,
             f"refs/heads/{record.target_branch}:refs/heads/{record.target_branch}",
@@ -1046,20 +1529,22 @@ def _push_target(repo_root: Path, record: ManagedRunRecord, candidate: str) -> M
     return record
 
 
-# -- prune report (read-only) ----------------------------------------------------
+# -- prune ------------------------------------------------------------------------
 
-PRUNE_SCHEMA_VERSION = 1
+PRUNE_SCHEMA_VERSION = 2
+PRUNE_SUMMARY_SCHEMA_VERSION = 1
+PRUNE_SUMMARY_NAME = "pruned.jsonl"
 
 
-def prune_report(repo_root: Path) -> dict[str, Any]:
-    """Managed-run state believed unused, each item with why. Never deletes.
+def prune_summary_path(repo_root: Path) -> Path:
+    """``<git-common-dir>/agent-sparring/runs/pruned.jsonl``."""
 
-    Only engine-recorded state is reported: records (finished, or whose
-    worktree directory is gone) and finish archives. Nothing is inferred from
-    directory or branch names, so no unrecorded worktree -- an engine snapshot
-    among them -- is ever named here."""
+    return managed_run.git_common_dir(repo_root) / ARCHIVE_SUBDIR / PRUNE_SUMMARY_NAME
 
-    records = {record.run_key: record for record in managed_run.list_records(repo_root)}
+
+def _legacy_items(repo_root: Path, records: dict[str, ManagedRunRecord]) -> list[dict[str, Any]]:
+    """The read-only report as it has always been (schema 1 items)."""
+
     items: list[dict[str, Any]] = []
     for run_key, record in records.items():
         path = str(managed_run.record_path(repo_root, run_key))
@@ -1088,9 +1573,306 @@ def prune_report(repo_root: Path) -> dict[str, Any]:
                 "detail": f"archived project state of run {entry.name}, which {state}; "
                           "no unfinished run reads it",
             })
+    return items
+
+
+def prune_report(repo_root: Path) -> dict[str, Any]:
+    """Managed-run state believed unused, each item with why. Never deletes.
+
+    Only engine-recorded state is reported: records (finished, or whose
+    worktree directory is gone) and finish archives. Nothing is inferred from
+    directory or branch names, so no unrecorded worktree -- an engine snapshot
+    among them -- is ever named here."""
+
+    records = {record.run_key: record for record in managed_run.list_records(repo_root)}
     return {
-        "schema_version": PRUNE_SCHEMA_VERSION,
+        "schema_version": 1,
         "dry_run": True,
-        "items": items,
+        "items": _legacy_items(repo_root, records),
         "engine_snapshots": [],
     }
+
+
+def _parse_time(text: str | None) -> float | None:
+    from datetime import datetime
+
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _finished_at(record: ManagedRunRecord | None, archive: Path | None) -> tuple[float | None, str | None]:
+    """When the run finished: its ``finished`` event, else the archive mtime."""
+
+    from datetime import datetime, timezone
+
+    if record is not None:
+        finished = _events(record, "finished")
+        if finished:
+            at = finished[-1].get("at")
+            stamp = _parse_time(at)
+            if stamp is not None:
+                return stamp, at
+    if archive is not None and archive.is_dir():
+        stamp = archive.stat().st_mtime
+        return stamp, datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+    return None, None
+
+
+def _archive_digest(archive: Path) -> str | None:
+    if not archive.is_dir():
+        return None
+    digests = _tree_digests(archive)
+    joined = "".join(f"{rel}\0{digest}\n" for rel, digest in sorted(digests.items()))
+    return hashlib.sha256(joined.encode()).hexdigest()
+
+
+def _summary_line(repo_root: Path, run_key: str, record: ManagedRunRecord | None, archive: Path,
+                  finished_at: str | None, now: str) -> dict[str, Any]:
+    from agent_sparring.plan import read_plan_snapshot
+
+    snapshot = read_plan_snapshot(archive, run_key) if archive.is_dir() else None
+    line: dict[str, Any] = {
+        "schema_version": PRUNE_SUMMARY_SCHEMA_VERSION,
+        "run_key": run_key,
+        "plan_label": record.plan_label if record else None,
+        "input_kind": record.input_kind if record else None,
+        "target_branch": record.target_branch if record else None,
+        "branch": record.branch if record else None,
+        "remote": record.remote if record else None,
+        "base_sha": record.base_sha if record else None,
+        "final_candidate": None,
+        "merge": None,
+        "plan_sha256": snapshot[1] if snapshot else None,
+        "created_at": record.created_at if record else None,
+        "finished_at": finished_at,
+        "pruned_at": now,
+        "archive_digest": _archive_digest(archive),
+    }
+    if record is not None:
+        merged = _events(record, "merged")
+        if merged:
+            detail = merged[-1]["detail"]
+            line["final_candidate"] = detail.get("candidate")
+            line["merge"] = {"mode": detail.get("mode"), "target_sha": detail.get("target_sha")}
+        removed = _events(record, "plan_removed")
+        if removed:
+            line["plan_removed_commit"] = removed[-1]["detail"].get("commit")
+        remote = _events(record, "remote_branch_deleted")
+        if remote:
+            line["remote_branch_code"] = remote[-1]["detail"].get("code", "remote_branch_deleted")
+    return line
+
+
+def _append_summaries(path: Path, lines: list[dict[str, Any]]) -> None:
+    """Append and fsync one JSON line per run not already summarised.
+    Raises :class:`OSError` (the caller then deletes nothing), or
+    :class:`ManagedRunError` ``prune_summary_corrupt`` for an unreadable
+    existing summary, which is never rewritten."""
+
+    import json
+
+    existing: set[str] = set()
+    if path.is_file():
+        try:
+            for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if raw.strip():
+                    existing.add(str(json.loads(raw)["run_key"]))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ManagedRunError(
+                "prune_summary_corrupt",
+                f"{path} cannot be read ({type(exc).__name__}: {exc}); nothing was deleted",
+            ) from exc
+    fresh = [line for line in lines if line["run_key"] not in existing]
+    if not fresh:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = not path.exists()
+    with open(path, "a", encoding="utf-8") as handle:
+        for line in fresh:
+            handle.write(json.dumps(line, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    if created:
+        # Make the new file's directory entry durable too.
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def prune(repo_root: Path, *, dry_run: bool, older_than_days: float | None = None,
+          keep: int | None = None, now: float | None = None) -> dict[str, Any]:
+    """Select finished runs' records and archives by age and/or recency and
+    delete them -- or, with ``dry_run``, say what would go.
+
+    Only records whose lifecycle is finished, and archives whose record is
+    finished or missing, are eligible; everything else is ``kept`` or
+    ``report_only``. Before anything is deleted, one summary line per run is
+    appended to ``pruned.jsonl`` and fsynced; if that fails nothing is
+    deleted. Deletions run under the records lock with the lifecycle re-read."""
+
+    import time
+    from datetime import datetime, timezone
+
+    now = time.time() if now is None else now
+    now_text = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    records = {record.run_key: record for record in managed_run.list_records(repo_root)}
+    archives_root = managed_run.git_common_dir(repo_root) / ARCHIVE_SUBDIR
+    archives: dict[str, Path] = {}
+    if archives_root.is_dir():
+        for entry in sorted(archives_root.iterdir()):
+            if entry.is_dir() and not entry.name.startswith(".") and managed_run._RUN_KEY_RE.match(entry.name):
+                archives[entry.name] = entry
+
+    # Candidates per run key: finished records and finished/orphan archives.
+    runs: dict[str, dict[str, Any]] = {}
+    items: list[dict[str, Any]] = []
+    for run_key in sorted(set(records) | set(archives)):
+        record, archive = records.get(run_key), archives.get(run_key)
+        finished = record is not None and record.lifecycle == "finished"
+        if record is not None and not finished:
+            if not Path(record.worktree_path).is_dir():
+                items.append({
+                    "kind": "record", "run_key": run_key, "path": str(managed_run.record_path(repo_root, run_key)),
+                    "action": "report_only", "reason": "worktree_missing",
+                    "detail": f"the worktree directory {record.worktree_path} of run {run_key} "
+                              f"({record.lifecycle}) no longer exists; never pruned",
+                })
+            else:
+                items.append({
+                    "kind": "record", "run_key": run_key, "path": str(managed_run.record_path(repo_root, run_key)),
+                    "action": "kept", "reason": "unfinished", "detail": f"run {run_key} is {record.lifecycle}",
+                })
+            continue
+        stamp, stamp_text = _finished_at(record if finished else None, archive)
+        runs[run_key] = {"record": record if finished else None, "archive": archive,
+                         "stamp": stamp, "finished_at": stamp_text}
+
+    order = sorted(runs, key=lambda key: (runs[key]["stamp"] or 0.0), reverse=True)
+    within_keep = set(order[:keep]) if keep is not None else set()
+    selected: list[str] = []
+    for run_key in order:
+        info = runs[run_key]
+        reason = None
+        if keep is not None and run_key in within_keep:
+            reason = "within_keep"
+        elif older_than_days is not None and (
+            info["stamp"] is None or now - info["stamp"] < older_than_days * 86400
+        ):
+            reason = "too_recent"
+        elif keep is None and older_than_days is None:
+            reason = "no_selector"
+        info["reason"] = reason
+        if reason is None:
+            selected.append(run_key)
+
+    def paths(run_key: str) -> list[tuple[str, Path]]:
+        info = runs[run_key]
+        found = []
+        if info["record"] is not None:
+            found.append(("record", managed_run.record_path(repo_root, run_key)))
+        if info["archive"] is not None:
+            found.append(("archive", info["archive"]))
+        return found
+
+    summary = prune_summary_path(repo_root)
+    deleting = not dry_run and bool(selected)
+    if deleting:
+        try:
+            with _records_lock(repo_root):
+                # Re-check under the lock: a run unfinished now is never touched.
+                current = {record.run_key: record for record in managed_run.list_records(repo_root)}
+                for run_key in list(selected):
+                    record = current.get(run_key)
+                    if record is not None and record.lifecycle != "finished":
+                        selected.remove(run_key)
+                        runs[run_key]["reason"] = "unfinished"
+                lines = [
+                    _summary_line(repo_root, key, current.get(key),
+                                  runs[key]["archive"] or archive_dir(repo_root, key), runs[key]["finished_at"], now_text)
+                    for key in selected
+                ]
+                try:
+                    _append_summaries(summary, lines)
+                except OSError as exc:
+                    for run_key in selected:
+                        runs[run_key]["reason"] = "delete_failed"
+                        runs[run_key]["error"] = f"the prune summary could not be written: {exc}"
+                    selected = []
+                for run_key in selected:
+                    for kind, path in paths(run_key):
+                        try:
+                            if kind == "archive":
+                                if path.parent != archives_root or not managed_run._RUN_KEY_RE.match(path.name):
+                                    raise OSError(f"{path} is not a run archive")
+                                shutil.rmtree(path)
+                            else:
+                                path.unlink()
+                        except OSError as exc:
+                            runs[run_key]["reason"] = "delete_failed"
+                            runs[run_key]["error"] = str(exc)
+        except _PruneLockError as exc:
+            raise ManagedRunError("prune_locked", str(exc)) from exc
+
+    for run_key in order:
+        info = runs[run_key]
+        reason = info["reason"]
+        for kind, path in paths(run_key):
+            if reason is None:
+                action, why = ("would_delete" if dry_run else "deleted"), "finished"
+                detail = f"run {run_key} finished at {info['finished_at']}"
+            elif reason == "delete_failed":
+                action, why, detail = "kept", "delete_failed", info.get("error", "")
+            else:
+                action, why = "kept", reason
+                detail = {
+                    "within_keep": f"one of the {keep} most recently finished runs",
+                    "too_recent": f"finished at {info['finished_at']}, within {older_than_days} day(s)",
+                    "unfinished": f"run {run_key} is no longer finished",
+                    "no_selector": "no selector given",
+                }[reason]
+            if kind == "archive" and info["record"] is None and reason is None:
+                detail += " (its record is missing)"
+            items.append({"kind": kind, "run_key": run_key, "path": str(path),
+                          "action": action, "reason": why, "detail": detail})
+    return {
+        "schema_version": PRUNE_SCHEMA_VERSION,
+        "dry_run": dry_run,
+        "criteria": {"older_than_days": older_than_days, "keep": keep},
+        "items": items,
+        "summary_path": str(summary),
+    }
+
+
+class _PruneLockError(Exception):
+    pass
+
+
+def _records_lock(repo_root: Path):
+    """An exclusive, non-blocking ``flock`` on ``<records dir>/.prune.lock``.
+    Only prune takes it, so two prunes never run their deletions at once;
+    nothing else (finish included) takes this lock."""
+
+    import contextlib
+    import fcntl
+
+    @contextlib.contextmanager
+    def held():
+        directory = managed_run.records_dir(repo_root)
+        directory.mkdir(parents=True, exist_ok=True)
+        with open(directory / ".prune.lock", "w") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise _PruneLockError(f"another prune holds {directory / '.prune.lock'}") from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    return held()

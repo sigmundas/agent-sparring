@@ -38,6 +38,16 @@ class OwnershipDeclarationTests(unittest.TestCase):
         self.assertIn("immutable", artifact_ownership.SOURCE_PLAN.lifetime)
         self.assertFalse(artifact_ownership.SOURCE_PLAN.provider_writable)
 
+    def test_the_plan_snapshot_is_engine_owned_and_written_once(self):
+        (snapshot,) = [a for a in ARTIFACTS if a.path.startswith("plans/<run>.source")]
+        self.assertEqual(snapshot.owner, "engine")
+        self.assertFalse(snapshot.provider_writable)
+        self.assertIn("written once", snapshot.lifetime)
+        # The source plan may be removed only by an opted-in, byte-exact finish.
+        lifetime = artifact_ownership.SOURCE_PLAN.lifetime
+        self.assertIn("remove_plan", lifetime)
+        self.assertIn("byte-exact", lifetime)
+
     def test_every_engine_artifact_lives_under_the_sparring_directory(self):
         # A relative sparring path or a repository document, never an
         # absolute path: the table is read next to a real project.

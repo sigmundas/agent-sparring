@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shlex
 import sys
 from dataclasses import replace
@@ -2374,22 +2375,40 @@ def _cmd_runs(args: argparse.Namespace) -> int:
 
 
 def _cmd_prune(args: argparse.Namespace) -> int:
+    selectors = args.older_than is not None or args.keep is not None
+    if not args.dry_run and not selectors:
+        print("sparring prune: deleting needs --older-than DAYS and/or --keep N (or use --dry-run)",
+              file=sys.stderr)
+        return 2
+    if (args.older_than is not None and not (math.isfinite(args.older_than) and args.older_than >= 0)) or (
+        args.keep is not None and args.keep < 0
+    ):
+        print("sparring prune: --older-than must be a finite number of days and --keep not negative",
+              file=sys.stderr)
+        return 2
     try:
         repo_root = Path(args.repo_root) if args.repo_root else Path(".")
-        payload = managed_finish.prune_report(repo_root)
+        if args.dry_run and not selectors:
+            payload = managed_finish.prune_report(repo_root)  # the unchanged schema-1 report
+        else:
+            payload = managed_finish.prune(
+                repo_root, dry_run=args.dry_run, older_than_days=args.older_than, keep=args.keep
+            )
     except ManagedRunError as exc:
-        print(f"could not report prunable state: {exc}", file=sys.stderr)
+        print(f"could not prune: {exc}", file=sys.stderr)
         return 1
+    failed = any(item.get("reason") == "delete_failed" for item in payload["items"])
     if args.json:
         json.dump(payload, sys.stdout, indent=2)
         print()
-        return 0
+        return 1 if failed else 0
     if not payload["items"]:
         print("nothing believed unused")
     for item in payload["items"]:
-        print(f"{item['kind']} {item['run_key']} ({item['reason']}): {item['path']}")
+        action = f"{item['action']} " if "action" in item else ""
+        print(f"{action}{item['kind']} {item['run_key']} ({item['reason']}): {item['path']}")
         print(f"  {item['detail']}")
-    return 0
+    return 1 if failed else 0
 
 
 def _cmd_finish_run(args: argparse.Namespace) -> int:
@@ -2452,6 +2471,9 @@ def _execute_finish_run(args: argparse.Namespace) -> int:
             print(f"  deleted ignored: {path}")  # only paths a completed removal deleted
         for kept in report["kept"]:
             print(f"  kept ({kept['code']}): {kept['detail']}")
+        for name in ("plan_removal", "remote_branch"):
+            if report[name]["code"] is not None:
+                print(f"  {name} ({report[name]['code']}): {report[name]['detail']}")
     if report["stopped_at"] is None:
         return 0
     return 3 if report["stopped_at"] == "checks" else 1
@@ -4177,12 +4199,20 @@ def build_parser() -> argparse.ArgumentParser:
     prune_parser = subparsers.add_parser(
         "prune",
         help=(
-            "report engine-recorded managed-run state believed unused, with why "
-            "(read-only: --dry-run is required; nothing is deleted)"
+            "delete finished managed runs' records and archives selected by "
+            "--older-than and/or --keep (a summary line per run is kept in "
+            "pruned.jsonl first); --dry-run only reports"
         ),
     )
     prune_parser.add_argument("--repo-root", default=None, help=repo_root_help)
-    prune_parser.add_argument("--dry-run", action="store_true", required=True, help="report only (required)")
+    prune_parser.add_argument("--dry-run", action="store_true", help="report only; delete nothing")
+    prune_parser.add_argument(
+        "--older-than", type=float, default=None, metavar="DAYS",
+        help="select runs finished more than DAYS days ago",
+    )
+    prune_parser.add_argument(
+        "--keep", type=int, default=None, metavar="N", help="keep the N most recently finished runs",
+    )
     prune_parser.add_argument("--json", action="store_true", help="report as JSON")
     prune_parser.set_defaults(func=_cmd_prune)
 

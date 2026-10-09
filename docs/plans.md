@@ -335,8 +335,9 @@ sparring resume-plan --run-key <run-key> [--evidence "..."]
 sparring runs [--json]
 sparring finish-run --run-key <run-key> --dry-run [--json]       # exit 0 eligible, 3 not
 sparring finish-run --run-key <run-key> [--push-target] [--allow-merge-commit] [--merge-only] [--json]
-# what is believed unused (never deletes)
+# what is believed unused (--dry-run reports; deleting needs a selector)
 sparring prune --dry-run [--json]
+sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
 ```
 
 - The record lives at `<git-common-dir>/agent-sparring/worktrees/<run-key>.json`;
@@ -346,16 +347,74 @@ sparring prune --dry-run [--json]
   run managed, and only in a single repository.
 - `finish-run` re-makes every check, then in order: merges into the target
   (fast-forward; a merge commit only with `--allow-merge-commit`; never a
-  rebase), pushes the target with `--push-target` (never forced), archives
+  rebase), with `[finish] remove_plan = true` commits the plan file's
+  removal on the target (below), pushes the target with `--push-target`
+  (never forced; one push carries the merge and the removal), archives
   the worktree's `.sparring/` state to `<git-common-dir>/agent-sparring/runs/<run-key>/`,
   removes the worktree (`git worktree remove`, never `--force`), deletes the
-  local branch (`git branch -d`, never `-D`) and records the run finished.
-  It stops at the first failure, leaving the rest in place and saying what
-  remains; running it again continues. A remote branch is never deleted —
-  it is reported as kept. `--merge-only` stops after the merge (and push).
-- `prune --dry-run` reports finished records, records whose worktree
-  directory is gone and finish archives, each with its reason. It names
-  nothing the engine did not record.
+  local branch (`git branch -d`, never `-D`), with `[finish]
+  delete_remote_branch = true` deletes the remote branch, and records the
+  run finished. Each step records its event; it stops at the first failure,
+  leaving the rest in place and saying what remains; running it again
+  continues, skipping only steps whose event is recorded. `--merge-only`
+  runs the merge, the plan removal and the push.
+- Both `[finish]` options default to false and are read from the reviewed
+  candidate's own `.sparring/project.toml`.
+- **Plan removal** (`plan_removal.code`): the run snapshots the plan file's
+  exact bytes when it starts (the manifest file for a manifest run, never
+  its sidecars). At finish the plan is removed only when the target's bytes
+  equal that snapshot byte for byte — no stage-digest comparison. The
+  commit is `sparring: remove finished plan <label> (run <run-key>)` with a
+  `Sparring-Run: <run-key>` trailer, under your git identity; in the
+  checkout that has the target it needs an empty index and an unmodified
+  plan (other unstaged edits are left alone, nothing is stashed), and with
+  no such checkout it is built and compare-and-swapped onto the target.
+  The snapshot's sha256 is also kept in the record's `created` event,
+  outside the worktree; the target bytes, the snapshot and that digest must
+  all agree. Only a regular file (mode 100644/100755) is removed.
+  `plan_removed` on success; `plan_snapshot_missing` (no snapshot, or no
+  digest in the record), `plan_snapshot_mismatch`, `plan_not_tracked`,
+  `plan_absent`, `plan_changed`, `target_checkout_dirty`,
+  `target_operation_in_progress` and `git_identity_missing` leave the file
+  and are reported without stopping the finish. Such a refusal is final: it
+  is recorded (`plan_removal_refused`) and a resumed or replayed finish
+  reports it and never retries. Only `plan_commit_failed` stops the finish
+  (and is retried). `plan_removal_disabled` when the option is off,
+  `finish_config_unreadable` when the candidate's config cannot be read.
+- **Remote branch** (`remote_branch.code`): deleted only as a
+  compare-and-delete, `git push --force-with-lease=refs/heads/<b>:<candidate>
+  <remote> --delete refs/heads/<b>`, so the server refuses unless it is
+  exactly the merged candidate. First the remote is read at its push URL:
+  an absent branch is `remote_branch_absent` (success, no push), and if the
+  remote target does not yet contain the candidate (no `--push-target`, say)
+  the branch is kept with `remote_target_missing_candidate` — push the
+  target and re-run (`remote_target_unknown` when the remote target's commit
+  is not present locally: fetch first). That target read is point-in-time;
+  only the branch deletion itself is lease-guarded. A remote with several
+  push URLs is not deleted from (`remote_multiple_push_urls`: a per-URL
+  lease delete is not supported), and a push-only endpoint whose
+  `ls-remote` fails cannot use `delete_remote_branch` (`remote_unreachable`). A refused delete is classified from the push's own
+  status: `remote_lease_mismatch` (stale info), `remote_delete_rejected`
+  (the remote refused) or `remote_unreachable`. Every one of these keeps
+  the branch, stops the finish at `delete_remote_branch` unfinished, and a
+  re-run resumes. `remote_branch_deleted` on success.
+  `remote_delete_disabled` when the option is off (the branch is kept),
+  `no_remote` when the record has none. While kept it is also listed in
+  `kept` as `keep_remote_branch`; with the option off its code is
+  `remote_delete_unavailable`, a compatibility alias kept for one release
+  and removed in the next.
+- `prune --dry-run` (no selector) reports finished records, records whose
+  worktree directory is gone and finish archives, each with its reason,
+  exactly as before. With `--older-than DAYS` and/or `--keep N` it selects
+  finished runs (records with lifecycle finished, archives whose record is
+  finished or missing) by their `finished` time (else the archive's mtime);
+  `--keep N` keeps the N most recently finished, and with both an item must
+  meet both. Without `--dry-run` it first appends one summary line per run
+  to `<git-common-dir>/agent-sparring/runs/pruned.jsonl` (fsynced; if that
+  fails nothing is deleted), then deletes the selected records and
+  archives. Unfinished runs are never touched; a record whose worktree is
+  gone stays `report_only`. Nothing runs automatically. It names nothing
+  the engine did not record.
 
 **Finish checks** (each reported with `ok` and a sentence; any failure makes
 the run ineligible to merge, except `unarchived_project_state`, which only
@@ -383,8 +442,8 @@ plan: …`, everything left in place): `expected_branch_with_managed`,
 `worktree_unregistered` (run state and record disagree: an integrity
 refusal), and `record_malformed` / `record_unreadable` /
 `record_schema_unknown`. Finish execution steps report `stopped_at` as one
-of `merge`, `push_target`, `archive_state`, `remove_worktree`,
-`delete_branch`. JSON shapes: [reference](reference.md#managed-run-json).
+of `merge`, `remove_plan`, `push_target`, `archive_state`, `remove_worktree`,
+`delete_branch`, `delete_remote_branch`. JSON shapes: [reference](reference.md#managed-run-json).
 
 ## Marking stages in a plan — or handing over an execution manifest
 
