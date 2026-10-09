@@ -500,7 +500,8 @@ sparring runs [--json]
 - `runs --json` lists each plan this repository takes part in under
   `plans`: its stages in order with their repository and state, its gates,
   and `next` — what moves it forward (`finish`, `continue`, `resume` or
-  `gate`) and where. Its shape is in the
+  `gate`, with whether the gate takes `--deferred-result` or `--evidence`)
+  and where. Its shape is in the
   [reference](reference.md#managed-run-json).
 
 Every refusal names a stable code and leaves everything in place:

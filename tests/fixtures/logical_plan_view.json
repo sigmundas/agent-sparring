@@ -55,7 +55,8 @@
         "next": {
           "repository": "repo",
           "target_branch": "main",
-          "action": "finish"
+          "action": "finish",
+          "answer": null
         }
       }
     },
@@ -106,7 +107,8 @@
         "next": {
           "repository": "web",
           "target_branch": "main",
-          "action": "continue"
+          "action": "continue",
+          "answer": null
         }
       }
     },
@@ -157,7 +159,8 @@
         "next": {
           "repository": "web",
           "target_branch": "main",
-          "action": "gate"
+          "action": "gate",
+          "answer": "deferred_result"
         }
       }
     },
@@ -208,7 +211,8 @@
         "next": {
           "repository": "web",
           "target_branch": "main",
-          "action": "gate"
+          "action": "gate",
+          "answer": "deferred_result"
         }
       }
     },
@@ -259,7 +263,8 @@
         "next": {
           "repository": "web",
           "target_branch": "main",
-          "action": "finish"
+          "action": "finish",
+          "answer": null
         }
       }
     },

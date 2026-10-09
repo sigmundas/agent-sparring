@@ -21,7 +21,7 @@ from agent_sparring import logical_plan, managed_finish
 from agent_sparring.plan_obligations import load_ledger
 from test_cross_repository import K, K2, _CrossCase
 from test_deferred_human_verification import READY_WITH_DEFERRAL
-from test_plan import READY, _run_git
+from test_plan import NEEDS_YOU, READY, _run_git
 from test_plan_ownership import plan
 
 FIXTURE = Path(__file__).parent / "fixtures" / "logical_plan_view.json"
@@ -81,7 +81,7 @@ class LogicalViewEndToEndTests(_CrossCase):
         self.assertEqual(carried.origin_slice, K)
         view = self.step(
             "started", state=["accepted", "not_started", "not_started"],
-            next_={"repository": "repo", **main, "action": "finish"}, gates=["pending"],
+            next_={"repository": "repo", **main, "action": "finish", "answer": None}, gates=["pending"],
         )
         self.assertEqual([s["repository"] for s in view["stages"]], ["repo", "web", "web"])
         self.assertEqual([s["run_key"] for s in view["stages"]], [K, None, None])
@@ -95,7 +95,7 @@ class LogicalViewEndToEndTests(_CrossCase):
         self.finish_first()
         self.step(
             "home_part_finished", state=["accepted", "not_started", "not_started"],
-            next_={"repository": "web", **main, "action": "continue"}, gates=["pending"],
+            next_={"repository": "web", **main, "action": "continue", "answer": None}, gates=["pending"],
         )
 
         # continue: authorized with the token; Stage 2 runs, the gate stops it.
@@ -104,7 +104,7 @@ class LogicalViewEndToEndTests(_CrossCase):
         self.assertEqual(code, 0, err)
         view = self.step(
             "stopped_at_gate", state=["accepted", "accepted", "not_started"],
-            next_={"repository": "web", **main, "action": "gate"}, gates=["open"],
+            next_={"repository": "web", **main, "action": "gate", "answer": "deferred_result"}, gates=["open"],
         )
         self.assertEqual([s["run_key"] for s in view["stages"]], [K, K2, K2])
         (web_run,) = self.runs(self.web)["runs"]
@@ -124,7 +124,7 @@ class LogicalViewEndToEndTests(_CrossCase):
         self.assertEqual(code, 0, out + err)
         self.step(
             "plan_obligation_owed", state=["accepted", "accepted", "accepted"],
-            next_={"repository": "web", **main, "action": "gate"}, gates=["passed"],
+            next_={"repository": "web", **main, "action": "gate", "answer": "deferred_result"}, gates=["passed"],
         )
         self.assertFalse(logical_plan.derived_status(self.logical()).complete)
 
@@ -138,7 +138,7 @@ class LogicalViewEndToEndTests(_CrossCase):
         self.assertEqual((answered.instance_id, answered.resolved_by), (carried.instance_id, K2))
         self.step(
             "last_part_complete", state=["accepted", "accepted", "accepted"],
-            next_={"repository": "web", **main, "action": "finish"}, gates=["passed"],
+            next_={"repository": "web", **main, "action": "finish", "answer": None}, gates=["passed"],
         )
 
         # finish the last part: the whole plan is integrated.
@@ -188,3 +188,76 @@ class PlanKeysTests(_CrossCase):
         self.assertEqual(code, 0, err)
         (entry,) = json.loads(out)["plans"]
         self.assertEqual((entry["logical_key"], entry["error"]["code"]), (K, "record_schema_unknown"))
+
+
+class ReviewerPauseTests(_CrossCase):
+    """A reviewer's NEEDS_YOU in a later part is a gate answered with
+    evidence -- not a plain resume, and not a deferred result."""
+
+    verdicts = [READY, NEEDS_YOU, READY]
+
+    def next_(self) -> dict:
+        (view,) = json.loads(self.run_cli("runs", "--json", "--repo-root", str(self.web))[1])["plans"]
+        return view["next"]
+
+    def test_needs_you_is_a_gate_released_by_evidence(self):
+        self.assertEqual(self.start()[0], 0)
+        self.finish_first()
+        token = self.status_json()["confirm_token"]
+        code, out, err = self.run_cli("resume-plan", "--run-key", K, "--confirm", token, "--repo-root", str(self.repo))
+        self.assertEqual(code, 0, out + err)
+        expected = {"repository": "web", "target_branch": "main", "action": "gate", "answer": "evidence"}
+        self.assertEqual(self.next_(), expected)
+
+        # A plain resume keeps the pause, and the view says so still.
+        self.run_cli("resume-plan", "--run-key", K, "--repo-root", str(self.repo))
+        self.assertEqual(self.next_(), expected)
+
+        code, out, err = self.run_cli(
+            "resume-plan", "--run-key", K, "--evidence", "checked by hand", "--repo-root", str(self.repo)
+        )
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(
+            self.next_(), {"repository": "web", "target_branch": "main", "action": "finish", "answer": None}
+        )
+
+
+class SnapshotTests(_CrossCase):
+    """The view shows only the snapshot the record names; anything else is
+    a structured error for that plan, never a crashed listing."""
+
+    def setUp(self):
+        super().setUp()
+        self.plan_path.write_text(GATED_CROSS, encoding="utf-8")
+        _run_git(self.repo, "commit", "-qam", "gated cross plan")
+        self.assertEqual(self.start()[0], 0)
+        self.snapshot = logical_plan.snapshot_path(self.home_common(), self.logical())
+
+    def plan_error(self) -> dict:
+        code, out, err = self.run_cli("runs", "--json", "--repo-root", str(self.repo))
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(len(payload["runs"]), 1)  # the rest of the listing stands
+        (entry,) = payload["plans"]
+        self.assertEqual(set(entry), {"logical_key", "error"})
+        return entry["error"]
+
+    def test_changed_gate_text_is_refused(self):
+        self.snapshot.write_text(GATED_CROSS.replace("canary = true", "canary = false"), encoding="utf-8")
+        self.assertEqual(self.plan_error()["code"], "snapshot_mismatch")
+
+    def test_a_snapshot_missing_a_stage_is_refused_even_with_a_matching_hash(self):
+        import hashlib
+
+        text = plan("Build here.", "Repository: web\n\nBuild there.")
+        self.snapshot.write_text(text, encoding="utf-8")
+        # Even a record naming its bytes does not make it this plan's input.
+        path = logical_plan.record_path(self.home_common(), K)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["input"]["sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(self.plan_error()["code"], "logical_digest_mismatch")
+
+    def test_a_missing_snapshot_is_refused(self):
+        self.snapshot.unlink()
+        self.assertEqual(self.plan_error()["code"], "snapshot_missing")

@@ -606,17 +606,24 @@ the editor shows too:
  "gates": [{"id": "…", "title": "…", "reason": "…", "before_stage": "<stage id> | null",
             "repository": "…", "state": "pending | open | failed | passed",
             "instance_id": "<to answer> | null"}],
- "next": {"repository": "…", "target_branch": "main", "action": "finish | continue | resume | gate"}}
+ "next": {"repository": "…", "target_branch": "main", "action": "finish | continue | resume | gate",
+          "answer": "deferred_result | evidence | null"}}
 ```
 
 `status` is `complete` once every stage is proven accepted; `next` is
 `null` only once every part is also integrated. `action`: `resume` the
-current part, answer its open `gate` (a plan gate, or the plan's own
-obligation at its end) with `--deferred-result`, `finish` a complete part,
+current part; answer its `gate` — `answer: "deferred_result"` for a plan
+gate or the plan's own obligation at its end (`resume-plan
+--deferred-result`), `answer: "evidence"` for a reviewer's NEEDS_YOU or
+ESCALATE, which a plain resume keeps paused (`resume-plan --evidence`);
+`finish` a complete part;
 or `continue` into the next repository (`target_branch` is then the branch
 checked out there, which `--target-branch` may override). `before_stage:
 null` is a manifest completion gate. A plan that cannot be read is
-`{"logical_key", "error": {"code", "detail"}}`. Every step of an end-to-end
+`{"logical_key", "error": {"code", "detail"}}` — among others when its
+snapshot is not exactly the one its record names (`snapshot_missing`,
+`snapshot_mismatch`, `logical_digest_mismatch`, `logical_stages_mismatch`);
+the rest of the listing is unaffected. Every step of an end-to-end
 plan is published as `tests/fixtures/logical_plan_view.json` for client
 parity tests.
 

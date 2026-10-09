@@ -1170,16 +1170,23 @@ def _next(record: LogicalPlanRecord, executions: tuple[_Execution, ...]) -> dict
     is resumed (or its open gate answered), a complete part not yet
     integrated is finished, and a part with no execution is continued into."""
 
-    from agent_sparring.deferred_gate import DeferredVerificationRequired
-
     for found in executions:
         entry = found.status
         if found.record is not None and not entry.complete:
-            awaiting = getattr(found.state, "awaiting", None)
-            action = "gate" if isinstance(awaiting, DeferredVerificationRequired) else "resume"
-            return {"repository": entry.repository, "target_branch": found.record.target_branch, "action": action}
+            answer = _awaited_answer(found)
+            return {
+                "repository": entry.repository,
+                "target_branch": found.record.target_branch,
+                "action": "resume" if answer is None else "gate",
+                "answer": answer,
+            }
         if found.record is not None and not entry.integrated:
-            return {"repository": entry.repository, "target_branch": found.record.target_branch, "action": "finish"}
+            return {
+                "repository": entry.repository,
+                "target_branch": found.record.target_branch,
+                "action": "finish",
+                "answer": None,
+            }
         if found.record is None and not entry.complete:
             target: str | None = None
             if entry.lifecycle is None:
@@ -1188,15 +1195,72 @@ def _next(record: LogicalPlanRecord, executions: tuple[_Execution, ...]) -> dict
                 except ManagedRunError:
                     target = None
             action = "continue" if entry.lifecycle is None else "resume"
-            return {"repository": entry.repository, "target_branch": target, "action": action}
+            return {"repository": entry.repository, "target_branch": target, "action": action, "answer": None}
     return None
+
+
+def _awaited_answer(found: _Execution) -> str | None:
+    """How a person releases the paused part, from structured records only:
+    ``deferred_result`` when the run state awaits deferred verification (a
+    plan gate, or the plan's obligation at its end); ``evidence`` when the
+    current stage's recorded verdict is NEEDS_YOU or ESCALATE, which
+    ordinary resumption keeps paused; else ``None`` (plain resume)."""
+
+    from agent_sparring.deferred_gate import DeferredVerificationRequired
+    from agent_sparring.plan import PlanRunStatus
+    from agent_sparring.sparring_exchange import read_recorded_outcome
+    from agent_sparring.stage import Stage, StageError, StageStatus
+
+    state = found.state
+    if state is None or state.status is not PlanRunStatus.PAUSED:
+        return None
+    if isinstance(state.awaiting, DeferredVerificationRequired):
+        return "deferred_result"
+    if state.awaiting is not None or found.record is None:
+        return None  # a push stop: answered by resume's own push options
+    try:
+        stage = Stage.resolve(found.record.sparring_dir, state.current_stage)
+        if not stage.exists() or stage.read_state().status is StageStatus.ACCEPTED:
+            return None
+    except (StageError, ManagedRunError):
+        return None
+    outcome = read_recorded_outcome(stage)
+    return "evidence" if outcome is not None and outcome.awaits_a_human else None
+
+
+def verified_snapshot_source(home_common_dir: Path, record: LogicalPlanRecord) -> PlanSource:
+    """:func:`snapshot_source`, refused unless the snapshot is exactly what
+    the record names: its bytes' sha256 (``snapshot_missing`` /
+    ``snapshot_mismatch``), the logical input digest
+    (``logical_digest_mismatch``) and the recorded stages, in order, with the
+    same ids, labels and titles (``logical_stages_mismatch``)."""
+
+    path = snapshot_path(home_common_dir, record)
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise LogicalPlanError("snapshot_missing", f"logical plan {record.logical_key} has no snapshot at {path}") from exc
+    if hashlib.sha256(data).hexdigest() != record.snapshot_sha256:
+        raise LogicalPlanError("snapshot_mismatch", f"snapshot {path} does not match the record's sha256")
+    source = snapshot_source(home_common_dir, record)
+    if source.digest() != record.input_digest:
+        raise LogicalPlanError("logical_digest_mismatch", f"the logical snapshot {path} is not this plan's input")
+    found = [(stage.stage_id, stage.label, stage.title) for stage in source.stages()]
+    if found != [(stage.stage_id, stage.label, stage.title) for stage in record.stages]:
+        raise LogicalPlanError(
+            "logical_stages_mismatch", f"the logical snapshot {path} does not yield the stages the record holds"
+        )
+    return source
 
 
 def view(home_common_dir: Path, record: LogicalPlanRecord) -> dict[str, Any]:
     """The logical plan as people see it: its stages in order, each with its
     owner repository, its state and the run key executing it; its gates;
-    and ``next`` -- ``{repository, target_branch, action}`` with ``action``
-    one of :data:`NEXT_ACTIONS`, or ``None`` once every part is integrated.
+    and ``next`` -- ``{repository, target_branch, action, answer}`` with
+    ``action`` one of :data:`NEXT_ACTIONS` and ``answer`` how a ``gate`` is
+    released (``deferred_result`` or ``evidence``, else ``None``), or ``None``
+    once every part is integrated. Refuses (:class:`LogicalPlanError`) when
+    the snapshot is not exactly the record's (:func:`verified_snapshot_source`).
 
     Derived on every call from the record, its snapshot and each part's own
     execution record and run state (:func:`derived_status`); writes nothing.
@@ -1207,7 +1271,7 @@ def view(home_common_dir: Path, record: LogicalPlanRecord) -> dict[str, Any]:
     status = derived_status(record)
     executions = tuple(_read_execution(record, entry) for entry in status.slices)
     by_stage = {stage_id: found for found in executions for stage_id in found.status.stages}
-    source = snapshot_source(home_common_dir, record)
+    source = verified_snapshot_source(home_common_dir, record)
     planned = {stage.stage_id: stage for stage in source.stages()}
 
     stages: list[dict[str, Any]] = []
@@ -1329,6 +1393,7 @@ __all__ = [
     "snapshot_input",
     "snapshot_path",
     "snapshot_source",
+    "verified_snapshot_source",
     "view",
     "write_pointers",
 ]
