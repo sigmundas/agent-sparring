@@ -108,6 +108,9 @@ class StartRequest:
     #: token binds the target and its tip instead of ``expected_branch``.
     managed: bool = False
     target_branch: str | None = None
+    #: ``--repository NAME=PATH``: where each repository a managed plan's
+    #: stages declare (``Repository: <name>``) is checked out.
+    repositories: Mapping[str, Path] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -192,6 +195,11 @@ def evaluate(request: StartRequest, *, prepare: Prepare | None) -> StartStatus:
 
     payload = _base(request)
     try:
+        if request.repositories and not request.managed:
+            raise StartPlanError(
+                "--repository: a plan whose stages belong to other repositories runs only --managed "
+                "[cross_repository_requires_managed]"
+            )
         if request.managed:
             managed_preflight(request, payload)
         else:
@@ -211,13 +219,10 @@ def evaluate(request: StartRequest, *, prepare: Prepare | None) -> StartStatus:
         if direct is not None:
             if not request.managed:
                 refuse_foreign_owners(direct, request.primary_repository)
-            foreign = foreign_stages(direct.stages(), request.primary_repository)
-            if request.managed and foreign:
-                raise StartPlanError(
-                    f"{foreign[0].display} belongs to {foreign[0].owner!r}, not "
-                    f"{request.primary_repository!r}; running a plan across repositories is not "
-                    "supported yet [cross_repository_not_yet]"
-                )
+            if request.managed and (foreign_stages(direct.stages(), request.primary_repository) or request.repositories):
+                payload["repositories"] = [
+                    {"name": binding.name, **binding.to_dict()} for binding in plan_bindings(request, direct)
+                ]
             if request.answers:
                 raise StartPlanError("--answer: this plan runs directly, and asks no decisions")
             if request.repository_branches:
@@ -226,6 +231,11 @@ def evaluate(request: StartRequest, *, prepare: Prepare | None) -> StartStatus:
                     "sibling repositories to put on a branch"
                 )
             return _direct_status(request, payload, direct, text)
+        if request.repositories:
+            raise StartPlanError(
+                "--repository: only a '## Stage <n>' plan run --managed declares stage repositories "
+                "[repository_unknown]"
+            )
         if request.managed:
             raise StartPlanError(
                 "--managed runs only a plan that runs directly ('## Stage <n>' sections); the "
@@ -305,12 +315,47 @@ def managed_preflight(request: StartRequest, payload: dict[str, Any]) -> None:
     }
 
 
+def plan_bindings(request: StartRequest, source) -> tuple[Any, ...]:
+    """The repository bindings a managed cross-repository plan records:
+    this project (``primary_repository``, at its target tip) and every
+    ``--repository`` its stages declare. Refuses with the binding's code."""
+
+    from agent_sparring.logical_plan import LogicalPlanError, bind_repository, resolve_bindings
+
+    owners = {stage.owner or request.primary_repository for stage in source.stages()}
+    try:
+        home, _, _ = bind_repository(
+            request.primary_repository, Path(request.repo_root), target_branch=request.target_branch
+        )
+        return resolve_bindings(home, request.repositories, owners)
+    except LogicalPlanError as exc:
+        raise StartPlanError(str(exc)) from exc
+
+
 # -- direct route -----------------------------------------------------------------
 
 
 def _direct_status(request: StartRequest, payload: dict[str, Any], source, text: str) -> StartStatus:
     # ``source`` was parsed from ``text``: the digests below are of what runs.
     stages = source.stages()
+    later: list[dict[str, Any]] = []
+    if payload.get("repositories"):
+        # A plan across repositories: this part is the first run of
+        # consecutive stages one repository owns; the rest continue later.
+        from agent_sparring.logical_plan import derive_slices, resolve_stages
+
+        parts = derive_slices("pending", resolve_stages(stages, request.primary_repository))
+        first = set(parts[0].stages)
+        later = [
+            {
+                "run_id": None,
+                "primary_repository": part.primary_repository,
+                "stages": [stage.label for stage in stages if stage.stage_id in part.stages],
+            }
+            for part in parts[1:]
+        ]
+        stages = tuple(stage for stage in stages if stage.stage_id in first)
+    payload["later_slices"] = later
     payload.update(
         route=ROUTE_DIRECT,
         status=STATUS_READY,
@@ -359,12 +404,135 @@ def _direct_status(request: StartRequest, payload: dict[str, Any], source, text:
                     for name, path in sorted(request.context_repositories.items())
                 ),
             ],
+            # Only when stages declare repositories: a single-repository
+            # token is unchanged.
+            **({"bound_repositories": payload["repositories"]} if payload.get("repositories") else {}),
             "models": dict(request.models),
             "allow_push_for_run": bool(request.allow_push_for_run),
             "execution": dict(request.execution),
         }
     )
     return StartStatus(payload=payload, source=source)
+
+
+# -- continuing a plan across repositories ------------------------------------
+
+
+@dataclass(frozen=True)
+class ContinuationStatus:
+    """``resume-plan --run-key <logical>`` when the plan's next part has no
+    execution yet: where it would run and the token that authorizes it.
+    ``payload`` is the ``--json`` shape; ``index`` the part to create."""
+
+    payload: dict[str, Any]
+    index: int | None = None
+
+    @property
+    def token(self) -> str | None:
+        return self.payload["confirm_token"]
+
+
+def _slice_payload(entry) -> dict[str, Any]:
+    return {
+        "index": entry.index,
+        "run_key": entry.id,
+        "repository": entry.repository,
+        "stages": list(entry.stages),
+        "lifecycle": entry.lifecycle,
+        "run_status": entry.run_status,
+        "integrated": entry.integrated,
+        "complete": entry.complete,
+        "proof": entry.proof,
+    }
+
+
+def continuation_status(
+    home_common_dir: Path, record, *, target_branch: str | None, allow_push_for_run: bool
+) -> ContinuationStatus:
+    """The derived status of logical plan ``record`` and, when its next part
+    has no execution and the part before it is integrated, the destination
+    (repository, target branch and its tip) with a confirm token binding
+    the repository's path, git common dir and committed ``project``, the
+    target branch, ``base_sha``, the run key and the push flag. Identical
+    from every worktree of every involved repository; writes nothing."""
+
+    from agent_sparring.logical_plan import (
+        LogicalPlanError,
+        check_binding_now,
+        derived_status,
+        next_slice,
+        previous_integration,
+    )
+    from agent_sparring.managed_run import ManagedRunError, dirty_paths
+
+    status = derived_status(record)
+    titles = {stage.stage_id: stage for stage in record.stages}
+    payload: dict[str, Any] = {
+        "schema_version": STATUS_VERSION,
+        "status": STATUS_REFUSED,
+        "plan": {"label": record.plan_label, "logical_key": record.logical_key},
+        "slices": [_slice_payload(entry) for entry in status.slices],
+        "next": None,
+        "allow_push_for_run": bool(allow_push_for_run),
+        "confirm_token": None,
+        "error": None,
+        "code": None,
+    }
+    entry = next_slice(status)
+    if entry is None:
+        payload.update(status="complete")
+        return ContinuationStatus(payload=payload)
+    binding = record.binding(entry.repository)
+    payload["next"] = {
+        "index": entry.index,
+        "run_key": entry.id,
+        "repository": entry.repository,
+        "path": binding.path,
+        "git_common_dir": binding.git_common_dir,
+        "project": binding.project,
+        "target_branch": None,
+        "base_sha": None,
+        "exists": entry.lifecycle is not None,
+        "stages": [
+            {"stage_id": stage_id, "label": titles[stage_id].label, "title": titles[stage_id].title}
+            for stage_id in entry.stages
+        ],
+        "not_part_of_this_run": [],
+    }
+    if entry.lifecycle is not None:
+        payload.update(status="exists")
+        return ContinuationStatus(payload=payload, index=entry.index)
+    try:
+        refusal = previous_integration(record, status, entry.index)
+        if refusal is not None:
+            raise LogicalPlanError("previous_not_integrated", refusal)
+        target, base_sha = check_binding_now(binding, target_branch)
+        uncommitted = dirty_paths(Path(binding.path))
+    except ManagedRunError as exc:
+        payload.update(error=str(exc), code=exc.code)
+        return ContinuationStatus(payload=payload, index=entry.index)
+    payload["next"].update(target_branch=target, base_sha=base_sha, not_part_of_this_run=list(uncommitted))
+    payload.update(
+        status=STATUS_READY,
+        confirm_token=confirm_token(
+            {
+                "route": "continue",
+                "logical_key": record.logical_key,
+                "input_digest": record.input_digest,
+                "index": entry.index,
+                "run_key": entry.id,
+                "stage_ids": list(entry.stages),
+                "repository": entry.repository,
+                "path": binding.path,
+                "git_common_dir": binding.git_common_dir,
+                "project": binding.project,
+                "target_branch": target,
+                "base_sha": base_sha,
+                "allow_push_for_run": bool(allow_push_for_run),
+            }
+        ),
+    )
+    return ContinuationStatus(payload=payload, index=entry.index)
 
 
 # -- intake route -----------------------------------------------------------------
@@ -639,8 +807,11 @@ __all__ = [
     "StartRequest",
     "StartStatus",
     "TOKEN_VERSION",
+    "ContinuationStatus",
     "confirm_token",
+    "continuation_status",
     "evaluate",
+    "plan_bindings",
     "locate_intake",
     "preflight",
     "refused_payload",

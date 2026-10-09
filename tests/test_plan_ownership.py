@@ -508,16 +508,16 @@ class ManagedRefusalTests(_Cli, _ManagedRepoTestCase):
         self.plan_path.write_text(FOREIGN, encoding="utf-8")
         _commit(self.repo, "foreign plan")
 
-    def test_run_plan_managed_refuses_a_foreign_owner_until_stage_3(self):
+    def test_run_plan_managed_refuses_a_foreign_owner_without_its_repository(self):
         code, _, err = self._start_managed()
         self.assertEqual(code, 1)
-        self.assertIn("[cross_repository_not_yet]", err)
+        self.assertIn("[repository_unknown]", err)
         self.assertEqual(self._records(), ())
 
-    def test_start_plan_managed_refuses_a_foreign_owner(self):
+    def test_start_plan_managed_refuses_a_foreign_owner_without_its_repository(self):
         code, out, _ = self._main("start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed", "--json")
         self.assertEqual(code, 1)
-        self.assertIn("[cross_repository_not_yet]", json.loads(out)["error"])
+        self.assertIn("[repository_unknown]", json.loads(out)["error"])
         self.assertEqual(self._records(), ())
 
     def test_a_home_owned_declaration_runs_managed(self):

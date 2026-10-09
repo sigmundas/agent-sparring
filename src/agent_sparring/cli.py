@@ -66,7 +66,7 @@ from agent_sparring.intake import (
     undeclared_repository_mentions,
 )
 from agent_sparring.manifest import ManifestError
-from agent_sparring import managed_finish, managed_run
+from agent_sparring import logical_plan, managed_finish, managed_run
 from agent_sparring.managed_run import ManagedRunError
 from agent_sparring.migration_history import MigrationHistoryError, record_history_snapshot
 from agent_sparring.migration_status import REPORT_VERSION as MIGRATION_REPORT_VERSION
@@ -81,6 +81,7 @@ from agent_sparring.plan import (
     PlanRunStatus,
     PAUSE_SESSION_UNRESUMABLE,
     ProviderPause,
+    load_markdown_source,
     load_plan_source,
     plan_label,
     plan_state_not_ignored_message,
@@ -1809,6 +1810,14 @@ def _note_managed_identity(args: argparse.Namespace, repo_root: Path, run: str) 
         args.managed_record = record
 
 
+def _resume_key(record: managed_run.ManagedRunRecord) -> str:
+    """A part of a logical plan is resumed through the plan's key, which
+    every involved repository resolves; any other managed run by its own."""
+
+    logical_slice = getattr(record, "logical_slice", None)
+    return logical_slice["logical_key"] if logical_slice is not None else record.run_key
+
+
 def _resume_command(args: argparse.Namespace, run: str = "") -> str:
     """The copyable ``resume-plan`` command for this run, without the
     situation-specific flags a caller appends.
@@ -1819,7 +1828,7 @@ def _resume_command(args: argparse.Namespace, run: str = "") -> str:
 
     record = _managed_record(args)
     if record is not None:
-        return f"sparring resume-plan --run-key {record.run_key}"
+        return f"sparring resume-plan --run-key {_resume_key(record)}"
     return (
         f"sparring resume-plan {_plan_input_args(args, run)} --repo-root {args.repo_root or '.'} "
         f"--expected-branch {args.expected_branch}"
@@ -1831,14 +1840,47 @@ def _resume_retry_parts(args: argparse.Namespace, run: str | None) -> list[str]:
 
     record = _managed_record(args)
     if record is not None:
-        return ["resume-plan", "--run-key", record.run_key]
+        return ["resume-plan", "--run-key", _resume_key(record)]
     return ["resume-plan", *_plan_command_parts(args), *(["--run-key", run] if run else [])]
+
+
+def _following_part(args: argparse.Namespace):
+    """``(first stage, repository)`` of the logical plan's part after this
+    managed run's, or ``None`` (not a part, the last one, or unreadable)."""
+
+    record = _managed_record(args)
+    if record is None or getattr(record, "logical_slice", None) is None:
+        return None
+    try:
+        logical = logical_plan.load(
+            Path(record.logical_slice["home_common_dir"]), record.logical_slice["logical_key"]
+        )
+    except ManagedRunError:
+        return None
+    index = record.logical_slice["index"]
+    if index >= len(logical.slices):
+        return None
+    following = logical.slices[index]
+    first = next(stage for stage in logical.stages if stage.stage_id == following.stages[0])
+    return first, following.primary_repository
 
 
 def _report_plan_result(
     result: PlanRunResult, args: argparse.Namespace, sparring_dir: Path
 ) -> None:
     if result.status is PlanRunStatus.COMPLETE:
+        following = _following_part(args)
+        if following is not None:
+            # The end of this repository's part, not of the plan.
+            stage, repository = following
+            record = _managed_record(args)
+            print(f"part of plan complete: {result.plan}")
+            for stage_id, sha in result.accepted:
+                print(f"  accepted {stage_id} at {sha}")
+            print(f"Stage {stage.label} belongs to {repository}. Finish this part, then continue the plan.")
+            print(f"  sparring finish-run --run-key {record.run_key} --repo-root {record.worktree_path}")
+            print(f"  sparring resume-plan --run-key {_resume_key(record)}")
+            return
         print(f"plan complete: {result.plan}")
         for stage_id, sha in result.accepted:
             print(f"  accepted {stage_id} at {sha}")
@@ -2252,8 +2294,9 @@ def _cross_repository_warnings(source: PlanSource, home: str) -> list[str]:
 def _cmd_run_plan(args: argparse.Namespace) -> int:
     if args.managed:
         return _run_managed_plan(args)
-    if args.target_branch:
-        print("could not run plan: --target-branch is for --managed runs", file=sys.stderr)
+    if args.target_branch or args.repository:
+        flag = "--target-branch" if args.target_branch else "--repository"
+        print(f"could not run plan: {flag} is for --managed runs", file=sys.stderr)
         return 1
     if not args.expected_branch:
         print("could not run plan: --expected-branch is required (or use --managed)", file=sys.stderr)
@@ -2262,17 +2305,35 @@ def _cmd_run_plan(args: argparse.Namespace) -> int:
 
 
 def _cmd_resume_plan(args: argparse.Namespace) -> int:
+    logical = None
     if args.run_key:
         try:
             repo_root = _resolve_repo_root(args, Path(args.sparring_dir))
             record = managed_run.read_record(repo_root, args.run_key)
+            logical = logical_plan.find(repo_root, args.run_key)
         except (ManagedRunError, ProjectConfigError) as exc:
             if not (isinstance(exc, ManagedRunError) and exc.code == "not_a_repository"):
                 print(f"could not resume plan: {exc}", file=sys.stderr)
                 return 1
             record = None
+        if logical is not None:
+            return _continue_logical_plan(args, *logical)
+        if args.confirm or args.target_branch or args.json:
+            print(
+                "could not resume plan: --confirm, --target-branch and --json continue a plan across "
+                f"repositories, and {args.run_key} is not one",
+                file=sys.stderr,
+            )
+            return 1
         if record is not None:
             return _resume_managed_plan(args, repo_root, record)
+    if args.confirm or args.target_branch or args.json:
+        print(
+            "could not resume plan: --confirm, --target-branch and --json need --run-key naming a plan "
+            "across repositories",
+            file=sys.stderr,
+        )
+        return 1
     if not args.expected_branch:
         print(
             "could not resume plan: --expected-branch is required (a managed run is resumed "
@@ -2293,7 +2354,8 @@ def _managed_input(args: argparse.Namespace) -> tuple[str, Path]:
 
 
 def _check_managed_source(source: PlanSource, home: str) -> None:
-    """Single repository first; intake manifests are follow-up work."""
+    """Intake manifests and sibling repositories are follow-up work. Stages
+    another repository owns run there, as later parts of one logical plan."""
 
     if source.kind not in managed_run.INPUT_KINDS:
         raise ManagedRunError(
@@ -2305,24 +2367,59 @@ def _check_managed_source(source: PlanSource, home: str) -> None:
             "sibling_repositories",
             "this plan input declares sibling repositories; a managed run is single-repository for now",
         )
-    foreign = foreign_stages(source.stages(), home)
-    if foreign:
-        raise ManagedRunError(
-            "cross_repository_not_yet",
-            f"{foreign[0].display} belongs to {foreign[0].owner!r}, not {home!r}; running a plan "
-            "across repositories is not supported yet",
-        )
+
+
+def _given_repositories(args: argparse.Namespace) -> dict[str, Path]:
+    try:
+        return {name: Path(path) for name, path in _pairs(getattr(args, "repository", None), "--repository").items()}
+    except IntakeError as exc:
+        raise ManagedRunError("repository_unknown", str(exc)) from exc
+
+
+def _create_logical_plan(
+    args: argparse.Namespace, repo_root: Path, sparring_dir: Path, prepared, read_path: Path, source: PlanSource
+):
+    """For a plan whose stages belong to other repositories: bind them,
+    snapshot the input and create the logical record (key = this run's),
+    then return ``prepared`` as its first execution. ``None`` otherwise."""
+
+    home = _project_repository_name(args, sparring_dir, repo_root)
+    given = _given_repositories(args)
+    if not foreign_stages(source.stages(), home) and not given:
+        return None
+    key = prepared.record.run_key
+    owners = {stage.owner or home for stage in source.stages()}
+    home_binding, _, _ = logical_plan.bind_repository(home, repo_root, target_branch=prepared.record.target_branch)
+    bindings = logical_plan.resolve_bindings(home_binding, given, owners)
+    home_common = managed_run.git_common_dir(repo_root)
+    if logical_plan.record_path(home_common, key).exists():
+        raise ManagedRunError("logical_record_exists", f"logical plan {key} already exists; nothing was created")
+    if source.kind == "markdown":
+        named = load_markdown_source(read_path, prepared.record.plan_label, namespace=key)
+    else:
+        named = source
+    snapshot, sha = logical_plan.snapshot_input(home_common, key, read_path)
+    record = logical_plan.new_record(
+        logical_key=key, source=named, input_path=read_path, home=home,
+        repositories=bindings, snapshot=snapshot, snapshot_sha256=sha,
+    )
+    logical_plan.create(home_common, record)
+    logical_slice = {"logical_key": key, "home_common_dir": str(home_common), "index": 1}
+    return replace(prepared, record=replace(prepared.record, logical_slice=logical_slice))
 
 
 def _run_managed_plan(
     args: argparse.Namespace, *, base_sha: str | None = None, expected_digest: str | None = None
 ) -> int:
     """run-plan --managed: preflight, create the record + branch + worktree,
-    then run there exactly as run-plan does."""
+    then run there exactly as run-plan does. A plan whose stages belong to
+    other repositories (``--repository NAME=PATH``) first gets its logical
+    record; this run is its first part."""
 
     from agent_sparring.plan import new_run_key
 
     sparring_dir = Path(args.sparring_dir)
+    read: dict[str, object] = {}
     try:
         if args.expected_branch:
             raise ManagedRunError(
@@ -2337,6 +2434,7 @@ def _run_managed_plan(
             _check_managed_source(source, _project_repository_name(args, sparring_dir, repo_root))
             if expected_digest is not None and source.digest() != expected_digest:
                 raise ManagedRunError("plan_changed", "the plan changed since it was confirmed; run start-plan again")
+            read.update(path=read_path, source=source)
             if kind == "manifest":
                 return source.label
             # Relative: read inside the worktree, so labelled as there.
@@ -2353,7 +2451,14 @@ def _run_managed_plan(
             new_run_key=new_run_key,
             base_sha=base_sha,
         )
+        first_part = _create_logical_plan(args, repo_root, sparring_dir, prepared, read["path"], read["source"])
+        if first_part is not None:
+            prepared = first_part
         record = managed_run.create_managed_worktree(repo_root, prepared)
+        if record.logical_slice is not None:
+            logical_plan.record_slice_created(
+                Path(record.logical_slice["home_common_dir"]), record.run_key, 1, record.run_key
+            )
     except (ManagedRunError, PlanError, ProjectConfigError, GitContextError) as exc:
         print(f"could not run plan: {exc}", file=sys.stderr)
         return 1
@@ -2384,7 +2489,21 @@ def _run_in_record(args: argparse.Namespace, record: managed_run.ManagedRunRecor
     run_args.plan_path = record.input_path if record.input_kind == "markdown" else None
     run_args.manifest = record.input_path if record.input_kind == "manifest" else None
     run_args.managed_record = record
-    return _run_plan_command(run_args, resume=resume)
+    source = None
+    if record.logical_slice is not None:
+        # One part of a logical plan: its stages, owners and label are the
+        # logical record's, whatever file the execution reads the input from.
+        try:
+            home = Path(record.logical_slice["home_common_dir"])
+            logical = logical_plan.load(home, record.logical_slice["logical_key"])
+            inner = load_plan_source(
+                Path(record.input_path), Path(record.worktree_path), manifest=record.input_kind == "manifest"
+            )
+            source = logical_plan.scoped_source(inner, logical, home, record.run_key)
+        except (ManagedRunError, PlanError) as exc:
+            print(f"could not {'resume' if resume else 'run'} plan: {exc}", file=sys.stderr)
+            return 1
+    return _run_plan_command(run_args, resume=resume, source=source)
 
 
 def _resume_managed_plan(args: argparse.Namespace, repo_root: Path, record: managed_run.ManagedRunRecord) -> int:
@@ -2416,6 +2535,132 @@ def _resume_managed_plan(args: argparse.Namespace, repo_root: Path, record: mana
         return 1
     # An interrupted first start: the worktree exists, the run does not yet.
     return _run_in_record(args, record, resume=started)
+
+
+def _continue_logical_plan(args: argparse.Namespace, home: Path, logical) -> int:
+    """resume-plan --run-key <logical>, from any worktree of any involved
+    repository: resume the plan's current part where it has an execution;
+    else show where the next part would run with a confirm token, and with
+    ``--confirm TOKEN`` re-check, create that execution in its repository
+    and run it. Every cross-repository step is a person's explicit choice."""
+
+    from agent_sparring.plan_start import continuation_status
+
+    status = continuation_status(
+        home, logical, target_branch=args.target_branch, allow_push_for_run=bool(args.allow_push_for_run)
+    )
+    payload = status.payload
+    if payload["status"] == "exists":
+        if args.target_branch:
+            print(
+                f"could not resume plan: part {payload['next']['index']} of this plan already has its branch; "
+                "--target-branch only chooses where a part not yet created starts",
+                file=sys.stderr,
+            )
+            return 1
+        if args.json:
+            return _print_continuation(args, logical, payload, error=None)
+        return _resume_logical_part(args, home, logical, payload["next"])
+    error = payload["error"]
+    if args.confirm and payload["status"] == "complete":
+        error = "every part of this plan is complete; there is nothing to continue"
+    elif args.confirm and payload["status"] == "ready" and args.confirm != status.token:
+        error = (
+            "the confirm token does not match what resume-plan computes now: the destination repository, "
+            "its target branch or tip, or the push choice changed since it was shown. Nothing was created. "
+            "Confirm the new token below"
+        )
+    if error or not args.confirm:
+        if error and args.confirm and payload["status"] == "ready":
+            # Refused, with the status as it is now (its new token included).
+            payload = {**payload, "status": "refused", "error": error, "code": "confirm_mismatch"}
+        return _print_continuation(args, logical, payload, error=error)
+
+    # Confirmed: create exactly what was shown, in its own repository.
+    nxt = payload["next"]
+    try:
+        prepared = logical_plan.plan_slice_execution(
+            home, logical, nxt["index"], target_branch=nxt["target_branch"], base_sha=nxt["base_sha"]
+        )
+        record = managed_run.create_managed_worktree(Path(nxt["path"]), prepared)
+        logical_plan.record_slice_created(home, logical.logical_key, nxt["index"], record.run_key)
+    except (ManagedRunError, PlanError) as exc:
+        print(f"could not continue the plan: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"continuing {logical.plan_label} in {nxt['repository']}: branch {record.branch} from "
+        f"{record.target_branch} ({record.base_sha[:12]}) in {record.worktree_path}",
+        file=sys.stderr,
+    )
+    if prepared.uncommitted:
+        print(
+            f"uncommitted changes in {nxt['path']} are not part of this run: {', '.join(prepared.uncommitted)}",
+            file=sys.stderr,
+        )
+    run_args = argparse.Namespace(**vars(args))
+    run_args.adopt = False
+    return _run_in_record(run_args, record, resume=False)
+
+
+def _resume_logical_part(args: argparse.Namespace, home: Path, logical, nxt: dict) -> int:
+    """The plan's current part has an execution: reconcile an interrupted
+    creation (its record proven, then ``slice_created`` once) and resume it."""
+
+    binding = logical.binding(nxt["repository"])
+    repo_root = Path(binding.path)
+    try:
+        record = managed_run.read_record(repo_root, nxt["run_key"])
+        if record is None:
+            raise ManagedRunError("managed_record_missing", f"part {nxt['index']} has no execution record")
+        record = managed_run.confirm_creation(repo_root, record)
+        logical_plan.record_slice_created(home, logical.logical_key, nxt["index"], record.run_key)
+    except ManagedRunError as exc:
+        print(f"could not resume plan: {exc}", file=sys.stderr)
+        return 1
+    part_args = argparse.Namespace(**vars(args))
+    # The part's own repository and record address it, not the invoking checkout.
+    part_args.repo_root = None
+    part_args.confirm = None
+    return _resume_managed_plan(part_args, repo_root, record)
+
+
+def _print_continuation(args: argparse.Namespace, logical, payload: dict, *, error: str | None) -> int:
+    if args.json:
+        json.dump(payload, sys.stdout, indent=2)
+        print()
+        return 1 if error else 0
+    titles = {stage.stage_id: stage for stage in logical.stages}
+    print(f"plan {logical.plan_label}")
+    for part in payload["slices"]:
+        state = "done" if part["complete"] else (part["run_status"] or part["lifecycle"] or "not started")
+        for stage_id in part["stages"]:
+            stage = titles[stage_id]
+            print(f"  Stage {stage.label} — {stage.title} ({part['repository']}): {state}")
+    nxt = payload["next"]
+    if error:
+        print(f"could not continue the plan: {error}", file=sys.stderr)
+    if payload["status"] == "complete":
+        print("every stage is done")
+        return 1 if error else 0
+    if nxt is None or not payload["confirm_token"]:
+        return 1 if error else 0
+    first = titles[nxt["stages"][0]["stage_id"]]
+    print()
+    print(f"Stage {first.label} belongs to {nxt['repository']}. Continue the plan there:")
+    print(f"  repository: {nxt['repository']} ({nxt['path']})")
+    print(f"  target branch: {nxt['target_branch']} at {nxt['base_sha']}")
+    print("  stages: " + ", ".join(f"Stage {s['label']} — {s['title']}" for s in nxt["stages"]))
+    if nxt["not_part_of_this_run"]:
+        print(f"  uncommitted changes there are not part of this run: {', '.join(nxt['not_part_of_this_run'])}")
+    print("Continue with:")
+    command = ["sparring", "resume-plan", "--run-key", logical.logical_key, "--confirm", payload["confirm_token"]]
+    if args.target_branch:
+        command[3:3] = ["--target-branch", args.target_branch]
+    if payload["allow_push_for_run"]:
+        command.append("--allow-push-for-run")
+    print("  " + shlex.join(command))
+    print(f"Technical details: execution {nxt['run_key']}")
+    return 1 if error else 0
 
 
 def _cmd_runs(args: argparse.Namespace) -> int:
@@ -2905,6 +3150,8 @@ def _start_plan_command(args: argparse.Namespace, repo_root: Path, *, answers: d
         parts += ["--context-repository", value]
     for value in args.repository_branch or []:
         parts += ["--repository-branch", value]
+    for value in getattr(args, "repository", None) or []:
+        parts += ["--repository", value]
     for flag, attr in _START_OVERRIDES:
         if getattr(args, attr, None):
             parts += [flag, str(getattr(args, attr))]
@@ -3012,6 +3259,9 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
             execution=_start_execution(args),
             managed=bool(args.managed),
             target_branch=args.target_branch,
+            repositories={
+                name: Path(path) for name, path in _pairs(args.repository, "--repository").items()
+            },
         )
 
         def prepare(parent: Path | None, given: dict, validate) -> Path:
@@ -3142,6 +3392,11 @@ def _print_start_status(payload: dict | None, args: argparse.Namespace, repo_roo
     for gate in run["completion_gates"]:
         print(f"  pause before completion for {gate['kind']} gate {gate['id']}: {gate['title']}")
     for later in payload["later_slices"]:
+        if later["run_id"] is None:
+            # A later part of this plan, continued after this one is finished.
+            stages = ", ".join(f"Stage {label}" for label in later["stages"])
+            print(f"then in {later['primary_repository']}: {stages}; continued after this part is finished")
+            continue
         print(f"later slice {later['run_id']} ({later['primary_repository']}): {', '.join(later['stages'])}; start it separately")
     answers = dict(intake["answers"]) if intake else {}
     print("start the run with:")
@@ -4032,6 +4287,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="BRANCH",
         help="with --managed: the branch the managed run starts from (default: the branch checked out at --repo-root)",
     )
+    start.add_argument(
+        "--repository",
+        action="append",
+        metavar="NAME=PATH",
+        help=(
+            "with --managed: where a repository the plan's stages declare (Repository: NAME) is "
+            "checked out; recorded with the plan, which continues there after this part. Repeatable"
+        ),
+    )
     start.add_argument("--allow-push-for-run", action="store_true", help=_ALLOW_RUN_HELP)
     start.set_defaults(func=_cmd_start_plan)
 
@@ -4139,6 +4403,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="BRANCH",
         help="with --managed: the branch the managed run starts from (default: the branch checked out at --repo-root)",
+    )
+    run_plan.add_argument(
+        "--repository",
+        action="append",
+        metavar="NAME=PATH",
+        help=(
+            "with --managed: where a repository the plan's stages declare (Repository: NAME) is "
+            "checked out; recorded with the plan, which continues there after this part. Repeatable"
+        ),
     )
     run_plan.add_argument("--allow-push-for-run", action="store_true", help=_ALLOW_RUN_HELP)
     run_plan.add_argument(
@@ -4254,8 +4527,30 @@ def build_parser() -> argparse.ArgumentParser:
             "at a time without giving up its position, digest and acceptance handling"
         ),
     )
+    resume_plan_parser.add_argument(
+        "--confirm",
+        default=None,
+        metavar="TOKEN",
+        help=(
+            "with --run-key naming a plan across repositories: the token resume-plan printed for its "
+            "next part; re-checked, then that part's branch and worktree are created in its repository "
+            "and it runs. Refused on any difference"
+        ),
+    )
+    resume_plan_parser.add_argument(
+        "--target-branch",
+        default=None,
+        metavar="BRANCH",
+        help=(
+            "with --run-key naming a plan across repositories: the branch its next part starts from "
+            "(default: the branch checked out in that repository)"
+        ),
+    )
+    resume_plan_parser.add_argument(
+        "--json", action="store_true", help="with --run-key naming a plan across repositories: its status as JSON"
+    )
     _add_recovery_arguments(resume_plan_parser)
-    resume_plan_parser.set_defaults(func=_cmd_resume_plan, adopt=False, managed=False, target_branch=None)
+    resume_plan_parser.set_defaults(func=_cmd_resume_plan, adopt=False, managed=False, repository=None)
 
     runs_parser = subparsers.add_parser(
         "runs", help="list this repository's managed runs (read-only)"

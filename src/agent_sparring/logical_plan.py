@@ -793,6 +793,225 @@ def home_common_dir_for(execution: ManagedRunRecord | None, repo_root: Path) -> 
     return managed_run.git_common_dir(Path(repo_root))
 
 
+# -- repository bindings -----------------------------------------------------
+
+
+def committed_project_name(top: Path, tip: str) -> str | None:
+    """The ``project`` of ``.sparring/project.toml`` committed at ``tip``, or
+    ``None`` when there is none (not committed, unreadable, no name)."""
+
+    import subprocess
+    import tomllib
+
+    shown = subprocess.run(
+        ["git", "-C", str(top), "show", f"{tip}:{managed_run.DEFAULT_PROJECT_DIR}/project.toml"],
+        capture_output=True,
+        check=False,
+    )
+    if shown.returncode != 0:
+        return None
+    try:
+        value = tomllib.loads(shown.stdout.decode("utf-8")).get("project")
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def bind_repository(name: str, path: Path, *, target_branch: str | None = None) -> tuple[RepositoryBinding, str, str]:
+    """``(binding, target branch, its tip)`` for ``name`` at ``path``: a git
+    work tree whose ``.sparring/project.toml`` committed at the target tip
+    (``target_branch``, else the branch checked out there) says
+    ``project = "<name>"``. Refuses ``repository_mismatch`` otherwise."""
+
+    given = Path(path).expanduser()
+    if not given.is_dir():
+        raise LogicalPlanError("repository_mismatch", f"repository {name!r}: {given} is not a directory")
+    try:
+        top = managed_run.worktree_top(given)
+        common = managed_run.git_common_dir(top)
+        target, tip = managed_run.resolve_target(top, target_branch)
+    except ManagedRunError as exc:
+        raise LogicalPlanError(
+            "repository_mismatch", f"repository {name!r}: {given} is not a usable git work tree ({exc})"
+        ) from exc
+    project = committed_project_name(top, tip)
+    if project != name:
+        found = f"says project = {project!r}" if project else "is not committed"
+        raise LogicalPlanError(
+            "repository_mismatch",
+            f"repository {name!r}: {top}'s .sparring/project.toml at {target} ({tip[:12]}) {found}, "
+            f"not project = {name!r}",
+        )
+    return RepositoryBinding(name=name, path=str(top), git_common_dir=str(common), project=project), target, tip
+
+
+def resolve_bindings(
+    home: RepositoryBinding, given: Mapping[str, Path], owners: set[str] | frozenset[str]
+) -> tuple[RepositoryBinding, ...]:
+    """The home binding plus one per foreign ``owners`` name, from ``given``
+    (``--repository NAME=PATH``). Every foreign owner must be given and
+    every given name must own a stage (``repository_unknown``); a name given
+    for the home must be the home's repository (``repository_mismatch``); two
+    names may not share a git common dir (``repository_ambiguous``)."""
+
+    foreign = sorted(set(owners) - {home.name})
+    unused = sorted(set(given) - set(owners) - {home.name})
+    if unused:
+        raise LogicalPlanError(
+            "repository_unknown",
+            f"--repository names {unused}, which no stage of this plan belongs to; its repositories are "
+            f"{sorted(set(owners) | {home.name})}",
+        )
+    missing = [name for name in foreign if name not in given]
+    if missing:
+        raise LogicalPlanError(
+            "repository_unknown",
+            f"stages of this plan belong to {missing}; say where with --repository NAME=PATH",
+        )
+    bindings = [home]
+    if home.name in given:
+        try:
+            common = managed_run.git_common_dir(managed_run.worktree_top(Path(given[home.name])))
+        except ManagedRunError as exc:
+            raise LogicalPlanError("repository_mismatch", f"repository {home.name!r}: {exc}") from exc
+        if str(common) != home.git_common_dir:
+            raise LogicalPlanError(
+                "repository_mismatch",
+                f"--repository {home.name}={given[home.name]} is not this project's repository ({home.path})",
+            )
+    for name in foreign:
+        bindings.append(bind_repository(name, Path(given[name]))[0])
+    seen: dict[str, str] = {}
+    for binding in bindings:
+        other = seen.setdefault(binding.git_common_dir, binding.name)
+        if other != binding.name:
+            raise LogicalPlanError(
+                "repository_ambiguous",
+                f"repositories {other!r} and {binding.name!r} are the same git repository "
+                f"({binding.git_common_dir})",
+            )
+    return tuple(bindings)
+
+
+def check_binding_now(binding: RepositoryBinding, target_branch: str | None) -> tuple[str, str]:
+    """``(target branch, its tip)`` of a recorded binding, re-checked now:
+    still the same git repository, its committed project still the name."""
+
+    current, target, tip = bind_repository(binding.name, Path(binding.path), target_branch=target_branch)
+    if current.git_common_dir != binding.git_common_dir:
+        raise LogicalPlanError(
+            "repository_mismatch",
+            f"repository {binding.name!r} at {binding.path} is now {current.git_common_dir}, not the recorded "
+            f"{binding.git_common_dir}",
+        )
+    if current.project != binding.project:
+        raise LogicalPlanError(
+            "repository_mismatch", f"repository {binding.name!r} is now project {current.project!r}, not {binding.project!r}"
+        )
+    return target, tip
+
+
+# -- continuation ------------------------------------------------------------
+
+
+def find(repo_root: Path, logical_key: str) -> tuple[Path, LogicalPlanRecord] | None:
+    """``(home common dir, record)`` of logical plan ``logical_key`` as seen
+    from any worktree of an involved repository: its record in this
+    repository's common dir (the home), else the home named by an execution
+    of it recorded here. ``None`` when neither exists."""
+
+    managed_run._check_run_key(logical_key)
+    common = managed_run.git_common_dir(Path(repo_root))
+    if record_path(common, logical_key).is_file():
+        return common, load(common, logical_key)
+    try:
+        executions = managed_run.list_records(Path(repo_root))
+    except ManagedRunError:
+        return None
+    for execution in executions:
+        found = execution.logical_slice
+        if found is not None and found["logical_key"] == logical_key:
+            home = Path(found["home_common_dir"])
+            return home, load(home, logical_key)
+    return None
+
+
+def next_slice(status: LogicalStatus) -> SliceStatus | None:
+    """The first slice, in order, not proven complete; ``None`` when done."""
+
+    return next((entry for entry in status.slices if not entry.complete), None)
+
+
+def previous_integration(record: LogicalPlanRecord, status: LogicalStatus, index: int) -> str | None:
+    """Why slice ``index`` may not be prepared yet, or ``None``: the slice
+    before it must be integrated -- its record shows ``merged`` and its
+    target branch contains the merged candidate."""
+
+    if index == 1:
+        return None
+    previous = status.slices[index - 2]
+    if not previous.integrated:
+        return (
+            f"part {previous.index} of the plan ({previous.repository}) is not integrated into its target "
+            f"branch yet: finish it first (sparring finish-run --run-key {previous.id})"
+        )
+    binding = record.binding(previous.repository)
+    execution = managed_run.read_record_in(Path(binding.git_common_dir), previous.id)
+    merged = [event for event in execution.events if event["event"] == "merged"] if execution else []
+    candidate = merged[-1]["detail"].get("candidate") if merged else None
+    if not isinstance(candidate, str) or execution is None:
+        return f"part {previous.index}'s merge names no candidate"
+    contained = managed_run._git(
+        Path(binding.path), "merge-base", "--is-ancestor", candidate, f"refs/heads/{execution.target_branch}"
+    )
+    if contained.returncode != 0:
+        return f"{execution.target_branch} in {binding.name} does not contain part {previous.index}'s candidate {candidate}"
+    return None
+
+
+def plan_slice_execution(
+    home_common_dir: Path, record: LogicalPlanRecord, index: int, *, target_branch: str | None, base_sha: str | None = None
+) -> managed_run.ManagedRunPlan:
+    """Preflight execution ``index`` in its own repository; writes nothing.
+    Its input is the logical snapshot, its run key :func:`slice_run_key`, its
+    record names this logical plan (``slice``)."""
+
+    entry = record.slices[index - 1]
+    binding = record.binding(entry.primary_repository)
+    target, _ = check_binding_now(binding, target_branch)
+    snapshot = snapshot_path(home_common_dir, record)
+
+    def source_label(read_path: Path, mapped: Path) -> str:
+        source = snapshot_source(home_common_dir, record)
+        if source.digest() != record.input_digest:
+            raise LogicalPlanError("logical_digest_mismatch", f"the logical snapshot {snapshot} is not this plan's input")
+        return record.plan_label
+
+    prepared = managed_run.plan_managed_run(
+        Path(binding.path),
+        Path(binding.path) / managed_run.DEFAULT_PROJECT_DIR,
+        source_label=source_label,
+        input_kind=record.input_kind,
+        input_path=snapshot,
+        target_branch=target,
+        run_key=entry.id,
+        new_run_key=lambda label: entry.id,
+        base_sha=base_sha,
+    )
+    logical_slice = {"logical_key": record.logical_key, "home_common_dir": str(Path(home_common_dir)), "index": index}
+    return replace(prepared, record=replace(prepared.record, logical_slice=logical_slice))
+
+
+def record_slice_created(home_common_dir: Path, logical_key: str, index: int, run_key: str) -> LogicalPlanRecord:
+    """Append ``slice_created`` for ``index`` once: a retried or interrupted
+    creation reconciles to one event."""
+
+    record = load(home_common_dir, logical_key)
+    if any(event["event"] == "slice_created" and event["detail"].get("index") == index for event in record.events):
+        return record
+    return append_event(home_common_dir, logical_key, "slice_created", {"index": index, "run_key": run_key})
+
+
 __all__ = [
     "EVENTS",
     "LogicalPlanError",
@@ -804,14 +1023,23 @@ __all__ = [
     "ScopedPlanSource",
     "SliceStatus",
     "append_event",
+    "bind_repository",
+    "check_binding_now",
+    "committed_project_name",
     "create",
     "derive_slices",
     "derived_status",
+    "find",
     "home_common_dir_for",
     "ledger_path",
     "load",
     "new_record",
+    "next_slice",
+    "plan_slice_execution",
+    "previous_integration",
     "record_path",
+    "record_slice_created",
+    "resolve_bindings",
     "resolve_stages",
     "scoped_source",
     "slice_run_key",
