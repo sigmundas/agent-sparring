@@ -304,6 +304,71 @@ class SliceRunTests(_LogicalCase):
         with self.assertRaisesRegex(PlanError, "different part"):
             self.resume_second(source=self.scoped(K))
 
+    def tamper_first(self, mutate):
+        path = run_state_path(self.sparring_dir, K)
+        state = PlanRunState.load(path)
+        mutate(state)
+        state.save(path)
+
+    def first_status(self):
+        return logical_plan.derived_status(self.record).slices[0]
+
+    def test_a_complete_state_proves_nothing_unless_it_is_this_part_of_this_plan(self):
+        self.run_first()
+        self.assertTrue(self.first_status().complete, self.first_status().proof)
+        original = run_state_path(self.sparring_dir, K).read_bytes()
+        for mutate, why in (
+            (lambda s: setattr(s, "plan_digest", "0" * 64), "different plan input"),
+            (lambda s: setattr(s, "scope", None), "not scoped"),
+            (lambda s: setattr(s, "scope", {"logical_key": "other", "stage_ids": s.scope["stage_ids"]}), "not scoped"),
+            (lambda s: setattr(s, "run", "someone-else"), "not plan-logical"),
+        ):
+            run_state_path(self.sparring_dir, K).write_bytes(original)
+            self.tamper_first(mutate)
+            status = self.first_status()
+            self.assertFalse(status.complete, why)
+            self.assertIn(why, status.proof)
+
+    def test_a_complete_state_with_an_unaccepted_stage_in_scope_is_not_complete(self):
+        self.run_first()
+        stage = Stage.resolve(self.sparring_dir, f"{K}-stage-1-foundation")
+        state = stage.read_state()
+        state.status = StageStatus.WORKING
+        stage.write_state(state)
+        status = self.first_status()
+        self.assertFalse(status.complete)
+        self.assertIn("not accepted", status.proof)
+
+    def test_an_unproven_earlier_part_is_not_counted_so_the_check_is_not_claimed(self):
+        self.run_first()
+        self.tamper_first(lambda s: setattr(s, "plan_digest", "0" * 64))
+        result = self.run_second()
+        self.assertIsNone(result.awaiting, "nothing claimed while slice 1 is unproven")
+        (entry,) = self.ledger()
+        self.assertIsNone(entry.resolved_by)
+        self.assertEqual(slice_context(self.scoped(K2)).incomplete_slices(), (K,))
+
+    def test_an_integrated_part_stays_complete_after_its_state_is_archived(self):
+        self.run_first()
+        run_state_path(self.sparring_dir, K).unlink()
+        self.assertFalse(self.first_status().complete)
+        managed_run.append_event(self.repo, K, "merged", {})
+        status = self.first_status()
+        self.assertTrue(status.complete, status.proof)
+
+    def test_an_execution_that_does_not_name_this_plan_is_not_its_part(self):
+        path = managed_run.record_path(self.web, K2)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for bad in (None, {**payload["slice"], "index": 3}, {**payload["slice"], "home_common_dir": "/elsewhere"}):
+            changed = {k: v for k, v in payload.items() if k != "slice"}
+            if bad is not None:
+                changed["slice"] = bad
+            changed["events"] = payload["events"] + [{"at": "t", "event": "merged", "detail": {}}]
+            path.write_text(json.dumps(changed), encoding="utf-8")
+            second = logical_plan.derived_status(self.record).slices[1]
+            self.assertTrue(second.integrated)
+            self.assertFalse(second.complete, bad)
+
     def test_the_slice_context_is_the_logical_plans(self):
         context = slice_context(self.scoped(K2))
         self.assertIsInstance(context, LogicalSliceContext)
@@ -387,6 +452,73 @@ class ScopedFinishTests(_ManagedRepoTestCase):
         check = self.run_check()
         self.assertFalse(check["ok"])
         self.assertIn("logical snapshot is not the plan", check["detail"])
+
+
+class ScopedFinishSliceMismatchTests(ScopedFinishTests):
+    """One slice holding both stages: a state scoped to less, or to the same
+    stages in another order, is not that slice."""
+
+    def setUp(self):
+        _ManagedRepoTestCase.setUp(self)
+        self._start_managed()
+        (self.managed,) = self._records()
+        self.worktree = Path(self.managed.worktree_path)
+        key = self.managed.run_key
+        common = managed_run.git_common_dir(self.repo)
+        input_path = Path(self.managed.input_path)
+        snapshot, sha = logical_plan.snapshot_input(common, key, input_path)
+        source = load_markdown_source(input_path, self.managed.plan_label, namespace=key)
+        record = logical_plan.new_record(
+            logical_key=key, source=source, input_path=input_path, home="repo",
+            repositories=(RepositoryBinding("repo", str(self.repo.resolve()), str(common), "repo"),),
+            snapshot=snapshot, snapshot_sha256=sha,
+        )
+        logical_plan.create(common, record)
+        self.first, self.second = (s.stage_id for s in source.stages())
+        self.state_path = self.managed.sparring_dir / "plans" / f"{key}.json"
+
+    def scope(self, stage_ids):
+        state = PlanRunState.load(self.state_path)
+        state.scope = {"logical_key": self.managed.run_key, "stage_ids": stage_ids}
+        state.status = PlanRunStatus.COMPLETE
+        state.awaiting = None
+        state.save(self.state_path)
+
+    def test_eligible_once_every_stage_in_scope_is_accepted(self):
+        self.scope([self.first, self.second])
+        self.accept(self.first)
+        self.assertFalse(self.run_check()["ok"])
+        self.accept(self.second)
+        self.assertTrue(self.run_check()["ok"], self.run_check())
+
+    def test_refused_while_a_stage_in_scope_is_not_accepted(self):
+        self.scope([self.first, self.second])
+        self.accept(self.second)
+        check = self.run_check()
+        self.assertFalse(check["ok"])
+        self.assertIn(self.first, check["detail"])
+
+    def test_a_gone_input_is_read_from_the_logical_snapshot_when_it_is_the_executed_plan(self):
+        self.scope([self.first, self.second])
+        self.accept(self.first)
+        self.accept(self.second)
+        Path(self.managed.input_path).unlink()
+        self.assertTrue(self.run_check()["ok"])
+
+    def test_a_scope_omitting_a_stage_of_the_slice_is_refused(self):
+        self.accept(self.first)
+        self.scope([self.first])
+        check = self.run_check()
+        self.assertFalse(check["ok"])
+        self.assertIn("scope", check["detail"])
+
+    def test_a_reordered_scope_is_refused(self):
+        self.accept(self.first)
+        self.accept(self.second)
+        self.scope([self.second, self.first])
+        check = self.run_check()
+        self.assertFalse(check["ok"])
+        self.assertIn("scope", check["detail"])
 
 
 class SingleRepositoryBytesTests(_PlanRepoTestCase):

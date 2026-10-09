@@ -530,10 +530,10 @@ class SliceStatus:
     run_status: str | None
     #: Its record shows ``merged``: integrated into its target branch.
     integrated: bool
-
-    @property
-    def complete(self) -> bool:
-        return self.integrated or self.run_status == "complete"
+    #: Whether this slice is *proven* complete (see :func:`_completion_proof`).
+    complete: bool = False
+    #: Why it is, or is not.
+    proof: str = "no execution exists"
 
 
 @dataclass(frozen=True)
@@ -549,6 +549,60 @@ class LogicalStatus:
         return tuple(entry.id for entry in self.slices if not entry.complete and entry.id != besides)
 
 
+def _belongs(record: LogicalPlanRecord, index: int, execution: ManagedRunRecord) -> str | None:
+    """Why ``execution`` is not slice ``index`` of ``record``, or ``None``.
+
+    The first execution is the logical key's own run (a rescoped run has no
+    ``slice`` key); every later one names this logical plan, its home and its
+    index in its ``slice`` key."""
+
+    if not execution.owns_git_state:
+        return f"its record is {execution.lifecycle}, not an engine-created execution"
+    if execution.run_key != slice_run_key(record.logical_key, index):
+        return f"its run key is {execution.run_key}, not {slice_run_key(record.logical_key, index)}"
+    found = execution.logical_slice
+    if found is None:
+        return None if index == 1 else "its record does not name this logical plan"
+    if found["logical_key"] != record.logical_key or found["index"] != index:
+        return f"its record names slice {found['index']} of {found['logical_key']}, not {index} of {record.logical_key}"
+    home = Path(record.binding(record.home).git_common_dir).resolve()
+    if Path(found["home_common_dir"]).resolve() != home:
+        return f"its record names the home {found['home_common_dir']}, not {home}"
+    return None
+
+
+def _completion_proof(record: LogicalPlanRecord, entry: LogicalSlice, execution: ManagedRunRecord, state: Any) -> str | None:
+    """Why ``state`` does not prove ``entry`` complete, or ``None``: it must
+    be this execution's run of this plan's input over exactly this slice,
+    recorded complete, with every stage in scope accepted by it."""
+
+    from agent_sparring.plan import PlanRunStatus
+    from agent_sparring.stage import Stage, StageError, StageStatus
+
+    if (state.run or execution.run_key) != entry.id:
+        return f"its run state is run {state.run}, not {entry.id}"
+    if state.plan_digest != record.input_digest:
+        return "its run state executed a different plan input"
+    if state.scope != {"logical_key": record.logical_key, "stage_ids": list(entry.stages)}:
+        return "its run state is not scoped to exactly this part of the plan"
+    if state.status is not PlanRunStatus.COMPLETE:
+        return f"its run is {state.status.value}"
+    for stage_id in entry.stages:
+        stage = Stage.resolve(execution.sparring_dir, stage_id)
+        try:
+            stage_state = stage.read_state() if stage.exists() else None
+        except StageError:
+            stage_state = None
+        if (
+            stage_state is None
+            or stage_state.status is not StageStatus.ACCEPTED
+            or not stage_state.candidate_sha
+            or stage_state.run != entry.id
+        ):
+            return f"{stage_id} is not accepted by {entry.id}"
+    return None
+
+
 def _slice_status(record: LogicalPlanRecord, index: int, entry: LogicalSlice) -> SliceStatus:
     from agent_sparring.plan import PlanError, PlanRunState
 
@@ -556,19 +610,35 @@ def _slice_status(record: LogicalPlanRecord, index: int, entry: LogicalSlice) ->
     lifecycle: str | None = None
     run_status: str | None = None
     integrated = False
+    complete = False
+    proof = "no execution exists"
     try:
         execution = managed_run.read_record_in(common, entry.id)
-    except ManagedRunError:
-        execution, lifecycle = None, "unreadable"
+    except ManagedRunError as exc:
+        execution, lifecycle, proof = None, "unreadable", f"its record is unreadable: {exc}"
     if execution is not None:
         lifecycle = execution.lifecycle
         integrated = any(event["event"] == "merged" for event in execution.events)
+        mismatch = _belongs(record, index, execution)
         state_path = _state_path(execution)
+        state = None
         if state_path is not None and state_path.is_file():
             try:
-                run_status = PlanRunState.load(state_path).status.value
+                state = PlanRunState.load(state_path)
+                run_status = state.status.value
             except PlanError:
                 run_status = "unreadable"
+        if mismatch is not None:
+            proof = mismatch
+        elif integrated:
+            # Merged only after finish proved this scope accepted; its run
+            # state may since have been archived with its worktree.
+            complete, proof = True, "integrated into its target branch"
+        elif state is None:
+            proof = f"its run state is {run_status or 'missing'}"
+        else:
+            failure = _completion_proof(record, entry, execution, state)
+            complete, proof = failure is None, failure or "every stage in scope is accepted"
     return SliceStatus(
         index=index,
         id=entry.id,
@@ -577,6 +647,8 @@ def _slice_status(record: LogicalPlanRecord, index: int, entry: LogicalSlice) ->
         lifecycle=lifecycle,
         run_status=run_status,
         integrated=integrated,
+        complete=complete,
+        proof=proof,
     )
 
 

@@ -169,6 +169,11 @@ def _final_candidate(
         return False, f"{record.input_path} no longer matches the plan this run executed", None
     if scope is not None:
         source = logical_plan.scoped_source(source, logical, home, record.run_key)
+        if scope != source.scope:
+            return False, (
+                f"the run state's scope is not {record.run_key}'s part of logical plan {logical.logical_key} "
+                f"({', '.join(source.stage_ids)})"
+            ), None
     candidate: str | None = None
     unaccepted: list[str] = []
     for planned in _in_scope(source.stages(), state):
