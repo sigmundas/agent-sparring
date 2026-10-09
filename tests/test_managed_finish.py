@@ -83,7 +83,7 @@ class ManagedFinishTests(_FinishTestCase):
         record, head = self._complete()
         status = self._status(record)
         finish = status["finish"]
-        self.assertEqual(finish["schema_version"], 2)
+        self.assertEqual(finish["schema_version"], 1)
         self.assertTrue(finish["managed"])
         self.assertEqual(finish["eligible"], {"merge": True, "cleanup": True}, finish["checks"])
         self.assertEqual(finish["merge_mode"], "fast_forward")
@@ -670,7 +670,7 @@ class RemoteBranchDeletionTests(_FinishTestCase):
         self.assertEqual([k["code"] for k in finish["kept"]], ["remote_delete_planned"])
         patch, calls = self._on_delete(lambda: None)
         with patch:
-            code, report, err = self._finish(record)
+            code, report, err = self._finish(record, "--push-target")
         self.assertEqual(code, 0, err)
         self.assertEqual(calls, [(
             "push", "--porcelain", f"--force-with-lease=refs/heads/{record.branch}:{head}",
@@ -737,7 +737,7 @@ class RemoteBranchDeletionTests(_FinishTestCase):
 
         patch, calls = self._on_delete(advance)
         with patch:
-            code, report, _ = self._finish(record)
+            code, report, _ = self._finish(record, "--push-target")
         self.assertEqual(len(calls), 1)
         self.assertEqual(code, 1)
         self.assertEqual(report["stopped_at"], "delete_remote_branch")
@@ -766,7 +766,7 @@ class RemoteBranchDeletionTests(_FinishTestCase):
 
         patch, _ = self._on_delete(unreachable)
         with patch:
-            code, report, _ = self._finish(record)
+            code, report, _ = self._finish(record, "--push-target")
         self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
         self.assertEqual(report["remote_branch"]["code"], "remote_unreachable")
         self.assertEqual([k["code"] for k in report["kept"]], ["remote_unreachable"])
@@ -777,6 +777,89 @@ class RemoteBranchDeletionTests(_FinishTestCase):
         self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
         self.assertFalse(self._remote_has(record))
         self._assert_cleaned(record, head)
+
+
+    def test_remote_target_missing_candidate_stops_then_push_and_rerun_completes(self):
+        record, _ = self._complete()
+        head = self._set_policy(record, True)
+        patch, calls = self._on_delete(lambda: None)
+        with patch:
+            code, report, _ = self._finish(record)  # no --push-target
+        self.assertEqual(calls, [])  # informs only: no delete was attempted
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
+        self.assertEqual(report["remote_branch"]["code"], "remote_target_missing_candidate")
+        self.assertEqual([k["code"] for k in report["kept"]], ["remote_target_missing_candidate"])
+        self.assertTrue(self._remote_has(record))
+        self.assertNotIn("finished", self._events(record))
+        _run_git(self.repo, "push", "-q", "origin", "main")
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
+        self._assert_cleaned(record, head)
+
+    def test_push_url_differs_from_fetch_url(self):
+        record, _ = self._complete()
+        head = self._set_policy(record, True)
+        mirror = self.remote.parent / "push.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(self.remote), str(mirror)], check=True, capture_output=True)
+        raced = _git(self.repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "moved on the push remote")
+        _run_git(self.repo, "push", "-q", str(mirror), f"{raced}:refs/heads/{record.branch}")
+        _run_git(self.repo, "remote", "set-url", "--push", "origin", str(mirror))
+        code, report, _ = self._finish(record, "--push-target")
+        # The fetch URL still shows the candidate; the push URL has moved on.
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
+        self.assertEqual(report["remote_branch"]["code"], "remote_lease_mismatch")
+        self.assertEqual(_git(mirror, "rev-parse", f"refs/heads/{record.branch}"), raced)
+        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
+        self.assertNotIn("remote_branch_deleted", self._events(record))
+        # The push URL now agrees with the candidate: the delete goes there.
+        _run_git(self.repo, "push", "-q", "--force", str(mirror), f"{head}:refs/heads/{record.branch}")
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
+        self.assertNotIn(record.branch, _git(self.repo, "ls-remote", str(mirror)))
+        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
+
+    def _hook(self, body: str):
+        hook = self.remote / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        hook.chmod(0o755)
+
+    def test_remote_delete_rejected_by_a_hook(self):
+        record, _ = self._complete()
+        head = self._set_policy(record, True)
+        self._hook(
+            "while read old new ref; do\n"
+            "  case $new in 0000000000000000000000000000000000000000) echo 'deletes forbidden'; exit 1;; esac\n"
+            "done\nexit 0\n"
+        )
+        code, report, _ = self._finish(record, "--push-target")
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
+        self.assertEqual(report["remote_branch"]["code"], "remote_delete_rejected")
+        self.assertEqual([k["code"] for k in report["kept"]], ["remote_delete_rejected"])
+        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
+        self.assertNotIn("finished", self._events(record))
+
+    def test_server_side_race_after_advertisement_keeps_the_branch(self):
+        record, _ = self._complete()
+        head = self._set_policy(record, True)
+        raced = _git(self.repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "landed mid-push")
+        _run_git(self.repo, "push", "-q", "origin", f"{raced}:refs/heads/raced-src")
+        # After the client saw the candidate advertised, the server moves the
+        # ref before the delete is applied.
+        self._hook(
+            "while read old new ref; do\n"
+            "  case $new in 0000000000000000000000000000000000000000)\n"
+            f"    env -u GIT_QUARANTINE_PATH git update-ref $ref {raced};;\n"
+            "  esac\n"
+            "done\nexit 0\n"
+        )
+        code, report, _ = self._finish(record, "--push-target")
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
+        self.assertIn(report["remote_branch"]["code"], managed_finish.REMOTE_KEEP_CODES)
+        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), raced)
+        self.assertNotIn("remote_branch_deleted", self._events(record))
+        self.assertNotIn("finished", self._events(record))
 
 
 class PlanRemovalTests(_FinishTestCase):
@@ -947,6 +1030,91 @@ class PlanRemovalTests(_FinishTestCase):
         self.assertEqual(_git(self.repo, "rev-parse", "main"), head)
 
 
+    def test_a_refusal_is_final_even_after_the_condition_is_fixed(self):
+        record, _ = self._complete()
+        head = self._enable(record)
+        with self._before_commit(lambda: (self.repo / "docs" / "plan.md").write_text("mine\n", encoding="utf-8")):
+            _run_git(self.repo, "worktree", "lock", record.worktree_path)
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "remove_worktree"))
+        self.assertEqual(report["plan_removal"]["code"], "target_checkout_dirty")
+        self.assertIn("plan_removal_refused", self._events(record))
+        # Fix the condition, then resume: the refusal stands.
+        _run_git(self.repo, "checkout", "--", "docs/plan.md")
+        _run_git(self.repo, "worktree", "unlock", record.worktree_path)
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["plan_removal"]["code"], "target_checkout_dirty")
+        self.assertIn("docs/plan.md", self._tracked())
+        self.assertTrue((self.repo / "docs" / "plan.md").is_file())
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), head)
+        # Replaying the finished run shows the recorded code.
+        code, report, err = self._finish(record)
+        self.assertEqual((code, report["plan_removal"]["code"]), (0, "target_checkout_dirty"))
+
+    def test_snapshot_not_matching_the_record_digest_is_refused(self):
+        from agent_sparring.plan import plan_snapshot_paths
+
+        record, _ = self._complete()
+        head = self._enable(record)
+        source_path, digest_path = plan_snapshot_paths(record.sparring_dir, record.run_key)
+        forged = b"forged\n"
+        source_path.write_bytes(forged)
+        digest_path.write_text(hashlib.sha256(forged).hexdigest() + "\n", encoding="utf-8")
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["plan_removal"]["code"], "plan_snapshot_mismatch")
+        self.assertIn("docs/plan.md", self._tracked())
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), head)
+
+    def test_record_without_a_digest_is_snapshot_missing(self):
+        record, _ = self._complete()
+        self._enable(record)
+        path = managed_run.record_path(self.repo, record.run_key)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for event in payload["events"]:
+            event["detail"].pop("plan_sha256", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["plan_removal"]["code"], "plan_snapshot_missing")
+        self.assertIn("docs/plan.md", self._tracked())
+
+    def test_git_identity_missing_is_refused(self):
+        record, _ = self._complete()
+        head = self._enable(record)
+        _run_git(self.repo, "config", "--unset", "user.name")
+        _run_git(self.repo, "config", "--unset", "user.email")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+                            "EMAIL")}
+        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["plan_removal"]["code"], "git_identity_missing")
+        self.assertIn("docs/plan.md", self._tracked())
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), head)
+
+    def test_a_symlinked_plan_at_the_target_is_not_removed(self):
+        record, _ = self._complete()
+        self._enable(record)
+        real = managed_finish._git_bytes
+
+        def as_symlink(cwd, *args, **kwargs):
+            result = real(cwd, *args, **kwargs)
+            if args[:1] == ("ls-tree",):
+                result = subprocess.CompletedProcess(
+                    result.args, 0, result.stdout.replace(b"100644 blob", b"120000 blob", 1), result.stderr
+                )
+            return result
+
+        with mock.patch.object(managed_finish, "_git_bytes", side_effect=as_symlink):
+            code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["plan_removal"]["code"], "plan_not_tracked")
+        self.assertIn("docs/plan.md", self._tracked())
+
 class PruneTests(_FinishTestCase):
     """``sparring prune``: selection, the summary first, nothing unfinished."""
 
@@ -1070,6 +1238,24 @@ class PruneTests(_FinishTestCase):
         self.assertTrue(managed_run.record_path(self.repo, "a").is_file())
         self.assertTrue(managed_finish.archive_dir(self.repo, "a").is_dir())
 
+    def test_non_finite_older_than_is_refused(self):
+        self._fake("a", finished_days_ago=40)
+        for value in ("nan", "inf"):
+            code, _, err = self._main("prune", "--older-than", value, "--repo-root", str(self.repo))
+            self.assertEqual(code, 2, value)
+        self.assertTrue(managed_run.record_path(self.repo, "a").is_file())
+
+    def test_corrupt_summary_is_a_clean_error_and_deletes_nothing(self):
+        self._fake("a", finished_days_ago=40)
+        path = managed_finish.prune_summary_path(self.repo)
+        path.write_bytes(b"{not json\n")
+        code, out, err = self._main("prune", "--older-than", "10", "--repo-root", str(self.repo))
+        self.assertEqual(code, 1)
+        self.assertIn("prune_summary_corrupt", err)
+        self.assertNotIn("Traceback", err)
+        self.assertTrue(managed_run.record_path(self.repo, "a").is_file())
+        self.assertEqual(path.read_bytes(), b"{not json\n")
+
     def test_summary_is_idempotent_per_run(self):
         self._fake("a", finished_days_ago=40)
         lines = [{"run_key": "a", "schema_version": 1}]
@@ -1079,6 +1265,69 @@ class PruneTests(_FinishTestCase):
         self._prune(dry_run=False, older_than_days=10)
         self.assertEqual([line["run_key"] for line in self._summary()], ["a"])
         self.assertFalse(managed_run.record_path(self.repo, "a").exists())
+
+
+
+class ManifestPlanRemovalTests(_FinishTestCase):
+    """A manifest run removes only the manifest file, never its sidecars."""
+
+    _finish = FinishExecutionTests._finish
+
+    def test_only_the_manifest_file_is_removed(self):
+        stage = {"stage_id": "m-stage-1", "label": "1", "title": "One", "brief": "Do one.", "mode": "implementation"}
+        manifest = self.repo / "docs" / "run.json"
+        manifest.write_text(json.dumps({"version": 1, "plan_label": "docs/run.json", "source_digest": "0" * 64,
+                                        "stages": [stage]}), encoding="utf-8")
+        sidecar = self.repo / "docs" / "run.json.approval"
+        sidecar.write_text("approved\n", encoding="utf-8")
+        _run_git(self.repo, "add", "docs/run.json", "docs/run.json.approval")
+        _run_git(self.repo, "commit", "-q", "-m", "manifest")
+        _run_git(self.repo, "push", "-q", "origin", "main")
+        code, _, err = self._main("run-plan", "--manifest", str(manifest), "--repo-root", str(self.repo), "--managed")
+        self.assertEqual(code, 0, err)
+        (record,) = self._records()
+        worktree = Path(record.worktree_path)
+        toml = worktree / ".sparring" / "project.toml"
+        toml.write_text(toml.read_text(encoding="utf-8") + "\n[finish]\nremove_plan = true\n", encoding="utf-8")
+        _run_git(worktree, "add", ".sparring/project.toml")
+        _run_git(worktree, "commit", "-q", "-m", "policy")
+        _run_git(worktree, "push", "-q", "origin", record.branch)
+        head = _git(worktree, "rev-parse", "HEAD")
+        source = load_plan_source(Path(record.input_path), worktree, manifest=True)
+        for planned in source.stages():
+            stage_obj = Stage.resolve(record.sparring_dir, planned.stage_id)
+            if not stage_obj.exists():
+                stage_obj.create(run=record.run_key)
+            state = stage_obj.read_state()
+            state.status, state.candidate_sha, state.run = StageStatus.ACCEPTED, head, record.run_key
+            stage_obj.write_state(state)
+        state_path = record.sparring_dir / "plans" / f"{record.run_key}.json"
+        run_state = PlanRunState.load(state_path)
+        run_state.status, run_state.awaiting, run_state.evidence_pending = PlanRunStatus.COMPLETE, None, None
+        run_state.save(state_path)
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["plan_removal"]["code"], "plan_removed", report)
+        tracked = _git(self.repo, "ls-tree", "-r", "--name-only", "main").splitlines()
+        self.assertNotIn("docs/run.json", tracked)
+        self.assertIn("docs/run.json.approval", tracked)
+        self.assertEqual(_git(self.repo, "rev-parse", "main^"), head)
+
+
+class FinishSchemaTests(_FinishTestCase):
+    _finish = FinishExecutionTests._finish
+
+    def test_dry_run_and_runs_stay_at_1_and_execution_is_2(self):
+        record, _ = self._complete()
+        self.assertEqual(managed_finish.FINISH_SCHEMA_VERSION, 1)
+        self.assertEqual(managed_finish.FINISH_REPORT_SCHEMA_VERSION, 2)
+        self.assertEqual(self._status(record)["finish"]["schema_version"], 1)
+        (run,) = managed_finish.runs_report(self.repo)["runs"]
+        self.assertEqual(run["finish"]["schema_version"], 1)
+        code, report, err = self._finish(record)
+        self.assertEqual((code, report["schema_version"]), (0, 2), err)
+        self.assertIn("plan_removal", report)
+        self.assertIn("remote_branch", report)
 
 
 class FinishConfigTests(unittest.TestCase):

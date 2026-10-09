@@ -231,6 +231,39 @@ class ManagedRunTests(_ManagedRepoTestCase):
         (record,) = self._records()
         self._assert_snapshot(record, manifest.read_bytes())
 
+    def test_created_event_records_the_plan_digest(self):
+        self._start_managed()
+        (record,) = self._records()
+        self.assertEqual(managed_run.created_plan_sha256(record), hashlib.sha256(self.plan_path.read_bytes()).hexdigest())
+
+    def test_leftover_snapshot_is_reused_only_when_identical(self):
+        from agent_sparring import plan as plan_module
+
+        real_save = plan_module.PlanRunState.save
+        calls = []
+
+        def fail_first(state, path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise plan_module.PlanError("interrupted after the snapshot")
+            return real_save(state, path)
+
+        with mock.patch.object(plan_module.PlanRunState, "save", autospec=True, side_effect=fail_first):
+            self._start_managed()
+        (record,) = self._records()
+        source_path, _ = plan_module.plan_snapshot_paths(record.sparring_dir, record.run_key)
+        self.assertTrue(source_path.is_file())
+        self.assertFalse((record.sparring_dir / "plans" / f"{record.run_key}.json").exists())
+        code, _, err = self._main("resume-plan", "--run-key", record.run_key)
+        self.assertEqual(code, 0, err)
+        self._assert_snapshot(record, self.plan_path.read_bytes())
+        # Different leftover bytes refuse.
+        with self.assertRaises(plan_module.PlanError):
+            source_path.chmod(0o644)
+            (record.sparring_dir / "plans" / f"{record.run_key}.json").unlink()
+            source_path.write_bytes(b"other\n")
+            plan_module._write_plan_snapshot(Path(record.worktree_path), record.sparring_dir, record.run_key)
+
     def test_managed_with_sibling_repositories_refuses(self):
         manifest = self._manifest(
             repositories=[{"name": "other", "path": "../other", "branch": "main", "candidate_sha": None}]

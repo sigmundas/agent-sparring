@@ -491,13 +491,15 @@ rather than depending on the project's own wording.
 ## Managed-run JSON
 
 Every payload carries `schema_version` (records and `runs` currently `1`,
-the `finish` objects `2`, `prune` with a selector `2`); a client refuses a
+the dry-run `finish` object `1`, the `finish-run` execution report `2`,
+`prune` with a selector `2`); a client refuses a
 version it does not know. Behavior: [plans.md](plans.md#managed-runs).
 
 **Record** — `<git-common-dir>/agent-sparring/worktrees/<run-key>.json`.
 Fields other than `events` never change; lifecycle is derived from the
-append-only events (`created`, `merged` `{mode, target_sha, candidate}`,
-`plan_removed` `{commit, path, sha256}`, `target_pushed`, `state_archived`,
+append-only events (`created` `{plan_sha256}`, `merged` `{mode, target_sha, candidate}`,
+`plan_removed` `{commit, path, sha256}`, `plan_removal_refused` `{code, detail}` (final),
+`target_pushed`, `state_archived`,
 `worktree_removed`, `branch_deleted`, `remote_branch_deleted` `{code, detail,
 remote, candidate}`, `finished`; no `created` event means `creating`).
 
@@ -524,7 +526,7 @@ worktree_removed | finished`), `run_status` (the run state's status, or
 **`finish-run --dry-run --json`** (the `finish` object):
 
 ```json
-{"schema_version": 2, "run_key": "…", "managed": true,
+{"schema_version": 1, "run_key": "…", "managed": true,
  "eligible": {"merge": true, "cleanup": true},
  "merge_mode": "already_merged | fast_forward | merge_commit | null",
  "actions": ["…"], "checks": [{"code": "…", "ok": true, "detail": "…"}],
@@ -553,12 +555,15 @@ delete). `actions` also lists the plan removal when `remove_plan` is on.
 
 `remove_plan` and `delete_remote_branch` appear only when enabled.
 `plan_removal.code`: `plan_removed`, `plan_removal_disabled`,
-`plan_snapshot_missing`, `plan_not_tracked`, `plan_absent`, `plan_changed`,
-`target_checkout_dirty`, `target_operation_in_progress`,
-`git_identity_missing` (all non-stopping) or `plan_commit_failed` (stops at
-`remove_plan`). `remote_branch.code`: `remote_branch_deleted`,
-`remote_branch_absent`, `remote_delete_disabled`, `no_remote`, or
-`remote_lease_mismatch` / `remote_unreachable` / `remote_delete_rejected`
+`finish_config_unreadable`, `plan_snapshot_missing`,
+`plan_snapshot_mismatch`, `plan_not_tracked`, `plan_absent`,
+`plan_changed`, `target_checkout_dirty`, `target_operation_in_progress`,
+`git_identity_missing` (all non-stopping; a refusal is recorded and final)
+or `plan_commit_failed` (stops at `remove_plan`). `remote_branch.code`:
+`remote_branch_deleted`, `remote_branch_absent`, `remote_delete_disabled`,
+`finish_config_unreadable`, `no_remote`, or `remote_lease_mismatch` /
+`remote_unreachable` / `remote_delete_rejected` /
+`remote_target_missing_candidate`
 (the branch is kept with that `kept[].code`, the finish stops at
 `delete_remote_branch` and the run is not finished). `null` means the step
 was not reached.
@@ -596,8 +601,9 @@ selector (required unless `--dry-run`):
  "summary_path": "<git-common-dir>/agent-sparring/runs/pruned.jsonl"}
 ```
 
-Exit `1` when any item is `delete_failed`, `2` for a deletion without a
-selector. Before deleting, one line per run (once per `run_key`) is appended
+Exit `1` when any item is `delete_failed` or the existing summary is
+unreadable (`prune_summary_corrupt`; nothing is deleted), `2` for a
+deletion without a selector or a non-finite `--older-than`. Before deleting, one line per run (once per `run_key`) is appended
 and fsynced to `pruned.jsonl`: `schema_version` (`1`), `run_key`,
 `plan_label`, `input_kind`, `target_branch`, `branch`, `remote`, `base_sha`,
 `final_candidate`, `merge` `{mode, target_sha}`, `plan_sha256`,

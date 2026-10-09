@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shlex
 import sys
 from dataclasses import replace
@@ -2379,8 +2380,11 @@ def _cmd_prune(args: argparse.Namespace) -> int:
         print("sparring prune: deleting needs --older-than DAYS and/or --keep N (or use --dry-run)",
               file=sys.stderr)
         return 2
-    if (args.older_than is not None and args.older_than < 0) or (args.keep is not None and args.keep < 0):
-        print("sparring prune: --older-than and --keep must not be negative", file=sys.stderr)
+    if (args.older_than is not None and not (math.isfinite(args.older_than) and args.older_than >= 0)) or (
+        args.keep is not None and args.keep < 0
+    ):
+        print("sparring prune: --older-than must be a finite number of days and --keep not negative",
+              file=sys.stderr)
         return 2
     try:
         repo_root = Path(args.repo_root) if args.repo_root else Path(".")

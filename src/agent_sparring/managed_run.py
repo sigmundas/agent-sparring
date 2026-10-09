@@ -16,6 +16,7 @@ and cleanup are not implemented here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,7 @@ EVENTS = (
     "creation_failed",
     "merged",
     "plan_removed",
+    "plan_removal_refused",
     "target_pushed",
     "state_archived",
     "worktree_removed",
@@ -668,9 +670,32 @@ def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRun
             + (f" branch {record.branch}" if branch_left else "")
             + (f" path {record.worktree_path}" if path_left else ""),
         )
-    created = append_event(repo_root, record.run_key, "created", {})
+    created = append_event(repo_root, record.run_key, "created", _created_detail(record))
     _release_lock(repo_root, created)
     return created
+
+
+def _created_detail(record: ManagedRunRecord, **extra: Any) -> dict[str, Any]:
+    """The ``created`` event's detail: the sha256 of the run's input file as
+    created, kept here -- outside the worktree -- as the tamper-evident
+    reference ``finish-run``'s opt-in plan removal checks."""
+
+    detail: dict[str, Any] = dict(extra)
+    try:
+        detail["plan_sha256"] = hashlib.sha256(Path(record.input_path).read_bytes()).hexdigest()
+    except OSError:
+        pass  # no digest: plan removal then refuses as plan_snapshot_missing
+    return detail
+
+
+def created_plan_sha256(record: ManagedRunRecord) -> str | None:
+    """The input digest recorded in the ``created`` event, if any."""
+
+    for event in record.events:
+        if event["event"] == "created":
+            value = event.get("detail", {}).get("plan_sha256")
+            return value if isinstance(value, str) else None
+    return None
 
 
 def _release_lock(repo_root: Path, record: ManagedRunRecord) -> None:
@@ -735,7 +760,9 @@ def confirm_creation(repo_root: Path, record: ManagedRunRecord) -> ManagedRunRec
         if failure is None:
             current = read_record(repo_root, record.run_key)
             if current is None or not current.owns_git_state:
-                current = append_event(repo_root, record.run_key, "created", {"confirmed_on_resume": True})
+                current = append_event(
+                    repo_root, record.run_key, "created", _created_detail(record, confirmed_on_resume=True)
+                )
             _release_lock(repo_root, current)
             return current
         raise ManagedRunError(

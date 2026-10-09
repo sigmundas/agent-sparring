@@ -369,18 +369,30 @@ sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
   checkout that has the target it needs an empty index and an unmodified
   plan (other unstaged edits are left alone, nothing is stashed), and with
   no such checkout it is built and compare-and-swapped onto the target.
-  `plan_removed` on success; `plan_snapshot_missing`, `plan_not_tracked`,
+  The snapshot's sha256 is also kept in the record's `created` event,
+  outside the worktree; the target bytes, the snapshot and that digest must
+  all agree. Only a regular file (mode 100644/100755) is removed.
+  `plan_removed` on success; `plan_snapshot_missing` (no snapshot, or no
+  digest in the record), `plan_snapshot_mismatch`, `plan_not_tracked`,
   `plan_absent`, `plan_changed`, `target_checkout_dirty`,
   `target_operation_in_progress` and `git_identity_missing` leave the file
-  and are reported without stopping the finish; only `plan_commit_failed`
-  stops it. `plan_removal_disabled` when the option is off.
+  and are reported without stopping the finish. Such a refusal is final: it
+  is recorded (`plan_removal_refused`) and a resumed or replayed finish
+  reports it and never retries. Only `plan_commit_failed` stops the finish
+  (and is retried). `plan_removal_disabled` when the option is off,
+  `finish_config_unreadable` when the candidate's config cannot be read.
 - **Remote branch** (`remote_branch.code`): deleted only as a
   compare-and-delete, `git push --force-with-lease=refs/heads/<b>:<candidate>
   <remote> --delete refs/heads/<b>`, so the server refuses unless it is
-  exactly the merged candidate. `remote_branch_deleted` or
-  `remote_branch_absent` succeed; `remote_lease_mismatch`,
-  `remote_unreachable` and `remote_delete_rejected` keep it, stop the
-  finish at `delete_remote_branch` unfinished, and a re-run resumes.
+  exactly the merged candidate. First the remote is read at its push URL:
+  an absent branch is `remote_branch_absent` (success, no push), and if the
+  remote target does not yet contain the candidate (no `--push-target`, say)
+  the branch is kept with `remote_target_missing_candidate` — push the
+  target and re-run. A refused delete is classified from the push's own
+  status: `remote_lease_mismatch` (stale info), `remote_delete_rejected`
+  (the remote refused) or `remote_unreachable`. Every one of these keeps
+  the branch, stops the finish at `delete_remote_branch` unfinished, and a
+  re-run resumes. `remote_branch_deleted` on success.
   `remote_delete_disabled` when the option is off (the branch is kept),
   `no_remote` when the record has none. While kept it is also listed in
   `kept` as `keep_remote_branch`; with the option off its code is

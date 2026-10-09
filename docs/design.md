@@ -1015,12 +1015,13 @@ candidate's own config.
 **Plan removal is byte-exact.** The plan is the human's document, so the
 engine may delete it only here, only by opt-in, and only when the target's
 bytes equal the exact bytes snapshotted when the run started (stored as
-engine state under `plans/` and archived with the run) — never by stage
+engine state under `plans/` and archived with the run, with its digest also
+in the record's `created` event outside the worktree) — never by stage
 digest or any semantic comparison, and never by reconciling a plan that is
 already gone. Any reason not to remove it (no snapshot, not tracked,
 absent, changed, a dirty target checkout, an operation in progress, no git
-identity) is reported and the finish continues; only an unexpected git
-failure stops it. A manifest run removes only the manifest file. The
+identity) is recorded as final and the finish continues — a resume never
+retries it; only an unexpected git failure stops it. A manifest run removes only the manifest file. The
 removal commit sits one commit past the candidate; every later check uses
 ancestry, so it is still "contains the candidate".
 
@@ -1029,8 +1030,11 @@ with a concurrent push and drop someone's commits, so the delete is a
 `push --force-with-lease=refs/heads/<b>:<candidate> --delete`, which the
 server refuses unless the branch is exactly the merged candidate; that
 lease is the only force anywhere in finish. A read of the remote only
-classifies a refusal. A refused or unreachable delete keeps the branch and
-stops the finish unfinished; re-running resumes. With the option off the
+informs: the branch is read at the push URL (absent needs no delete) and
+the remote target must already contain the candidate, else the branch is
+kept (`remote_target_missing_candidate`). A refusal is classified from the
+push's own status line. A refused or unreachable delete keeps the branch
+and stops the finish unfinished; re-running resumes. With the option off the
 branch is kept and reported (`remote_delete_disabled`, plus the legacy
 `remote_delete_unavailable` kept entry for one release).
 

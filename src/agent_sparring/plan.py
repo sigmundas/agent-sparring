@@ -839,8 +839,9 @@ def plan_snapshot_paths(sparring_dir: Path, run_key: str) -> tuple[Path, Path]:
 
 def _write_plan_snapshot(repo_root: Path, sparring_dir: Path, run_key: str) -> None:
     """Snapshot the exact bytes of the managed run's recorded input file (the
-    Markdown plan or the manifest file; never its sidecars). Written once:
-    an existing snapshot refuses."""
+    Markdown plan or the manifest file; never its sidecars). Written once,
+    atomically; a leftover snapshot from an interrupted start is reused only
+    when its bytes are exactly the plan's, else it refuses."""
 
     from agent_sparring.managed_run import ManagedRunError, read_record
 
@@ -855,14 +856,48 @@ def _write_plan_snapshot(repo_root: Path, sparring_dir: Path, run_key: str) -> N
     except OSError as exc:
         raise PlanError(f"cannot snapshot the plan {record.input_path}: {exc}") from exc
     source_path, digest_path = plan_snapshot_paths(sparring_dir, run_key)
-    source_path.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(data).hexdigest()
+    if source_path.exists() or digest_path.exists():
+        # A start interrupted after the snapshot but before the run state
+        # (the caller has already refused an existing run state): reuse it
+        # only when it is exactly these bytes, else refuse.
+        try:
+            existing = source_path.read_bytes()
+        except OSError as exc:
+            raise PlanError(f"a partial plan snapshot for run {run_key} exists at {digest_path}") from exc
+        if existing != data:
+            raise PlanError(
+                f"a plan snapshot for run {run_key} already exists at {source_path} with different bytes"
+            )
+        if digest_path.exists():
+            if digest_path.read_text(encoding="utf-8").strip() != digest:
+                raise PlanError(f"the plan snapshot digest {digest_path} does not match its bytes")
+            return
+    else:
+        _write_once(source_path, data)
+    _write_once(digest_path, (digest + "\n").encode("utf-8"))
+
+
+def _write_once(path: Path, data: bytes) -> None:
+    """Write ``data`` to a temp file beside ``path`` and link it into place:
+    atomic, and never over an existing file."""
+
+    import os
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
     try:
-        with open(source_path, "xb") as handle:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(data)
-        with open(digest_path, "x", encoding="utf-8") as handle:
-            handle.write(hashlib.sha256(data).hexdigest() + "\n")
-    except FileExistsError as exc:
-        raise PlanError(f"a plan snapshot for run {run_key} already exists at {exc.filename}") from exc
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(name, path)
+        except FileExistsError as exc:
+            raise PlanError(f"{path} already exists") from exc
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def read_plan_snapshot(sparring_dir: Path, run_key: str) -> tuple[bytes, str] | None:
