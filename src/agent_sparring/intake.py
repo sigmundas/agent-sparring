@@ -895,6 +895,37 @@ def names_repository(text: str, name: str) -> bool:
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
 
 
+# A name the document itself calls a repository: "**Pilot repository:**
+# `sporely-landing`", "the `web` repo", "repository sporely-web".
+_CALLED_REPOSITORY_RES = (
+    re.compile(r"\b(?:repository|repo)\b[\s:*]{0,6}(?P<q>`?)(?P<name>[A-Za-z0-9][\w.-]*)(?P=q)", re.IGNORECASE),
+    re.compile(r"(?P<q>`?)(?P<name>[A-Za-z0-9][\w.-]*)(?P=q)\s+(?:repository|repo)\b", re.IGNORECASE),
+)
+
+
+def undeclared_repository_mentions(text: str, stage_sections: Iterable[str], home: str) -> tuple[str, ...]:
+    """Repositories other than ``home`` that a plan without ``Repository:``
+    declarations names in a heading or a stage section -- the shape of a
+    cross-repository plan whose ownership was never declared.
+
+    Candidates are names the document itself calls a repository, kept only
+    when unmistakably a name (backticked, or containing ``-``, ``_``, ``.``):
+    "the repository" or "a repository-owned script" proposes nothing. Each
+    candidate then counts only if :func:`names_repository` finds it in a
+    heading or a stage section. Advisory: a caller warns, never refuses.
+    """
+
+    candidates: set[str] = set()
+    for pattern in _CALLED_REPOSITORY_RES:
+        for match in pattern.finditer(text):
+            name = match.group("name").rstrip(".-")
+            if (match.group("q") or re.search(r"[-_.]", name)) and name.lower() != home.lower():
+                candidates.add(name)
+    headings = "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
+    scopes = [headings, *stage_sections]
+    return tuple(sorted(name for name in candidates if any(names_repository(scope, name) for scope in scopes)))
+
+
 def compile_context_for(
     interpretation: Interpretation,
     source: SourcePlan,

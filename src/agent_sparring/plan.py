@@ -222,7 +222,14 @@ from agent_sparring.intake_approval import (
     load_intake_manifest,
     refuse_intake_identities,
 )
-from agent_sparring.plan_model import ManifestGate, PlanSource, PlannedStage, digest_planned_stages
+from agent_sparring.plan_model import (
+    ManifestGate,
+    PlannedStage,
+    PlanSource,
+    digest_planned_stages,
+    foreign_stages,
+    is_repository_name,
+)
 from agent_sparring.push_gate import (
     PushAuthorization,
     PushError,
@@ -282,6 +289,27 @@ _STAGE_HEADING_RE = re.compile(
 )
 _SECTION_BOUNDARY_RE = re.compile(r"^#{1,2}\s")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
+# A line that *looks like* an ownership or gate declaration is claimed by the
+# convention the same way: it either is one, in its place, or it is refused.
+_OWNER_LIKE_RE = re.compile(r"^\s*\**\s*repository\s*\**\s*:", re.IGNORECASE)
+_OWNER_RE = re.compile(r"^(?:\*\*Repository:\*\*|\*\*Repository\*\*:|Repository:)[ \t]*(?P<rest>.*?)\s*$")
+# Bare: the name ends the line. Backticked: the name may be followed by a
+# sentence ("`agent-sparring`. **Depends on:** none.").
+_OWNER_BARE_RE = re.compile(r"(?P<name>[A-Za-z0-9._-]*[A-Za-z0-9_-])")
+_OWNER_QUOTED_RE = re.compile(r"`(?P<name>[A-Za-z0-9._-]+)`(?:[.,;](?:\s.*)?)?")
+_GATE_LIKE_RE = re.compile(r"^\s*\**\s*gate\s+before\b", re.IGNORECASE)
+_GATE_RE = re.compile(
+    r"^(?:\*\*Gate before:\*\*|\*\*Gate before\*\*:|Gate before:)[ \t]*"
+    r"(?P<id>[A-Za-z0-9._-]+)(?:[ \t]*[—–][ \t]*|[ \t]+-[ \t]+)(?P<title>\S.*?)\s*$"
+)
+_QUOTE_RE = re.compile(r"^>(?: ?)(?P<text>.*)$")
+#: The kind a Markdown ``Gate before:`` declares: an ordinary human gate.
+MARKDOWN_GATE_KIND = "human"
+#: Stable refusal codes for a stage's ownership and gate declarations.
+OWNER_DECLARATION_INVALID = "owner_declaration_invalid"
+GATE_DECLARATION_INVALID = "gate_declaration_invalid"
+#: A gate id becomes a check id a person answers; same bound as a manifest's.
+_MAX_GATE_ID_LENGTH = 128
 
 Reporter = Callable[[str], None]
 
@@ -294,6 +322,15 @@ AdapterFactory = Callable[[Stage], tuple[StageAgentAdapter, SparringAgentAdapter
 
 class PlanError(ValueError):
     """A malformed plan, or plan-run state that cannot be started/resumed."""
+
+
+class PlanRefusal(PlanError):
+    """A :class:`PlanError` with a stable ``code``, appended to the message
+    the way :class:`~agent_sparring.managed_run.ManagedRunError` does."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{message} [{code}]")
+        self.code = code
 
 
 class PlanRunError(RuntimeError):
@@ -354,6 +391,10 @@ class PlanStage:
     title: str
     stage_id: str
     section: str  # heading line plus body, verbatim
+    #: ``Repository: <name>``, the section's first line; ``None`` if absent.
+    owner: str | None = None
+    #: ``Gate before:`` blocks directly after the heading / ``Repository:``.
+    gates_before: tuple[ManifestGate, ...] = ()
 
 
 def _slug(title: str) -> str:
@@ -437,6 +478,7 @@ def parse_plan(text: str, *, plan_key: str | None = None) -> tuple[PlanStage, ..
         section_lines = lines[start:end]
         if not "".join(section_lines[1:]).strip():
             raise PlanError(f"'Stage {number} — {title}' (line {start + 1}) has no content")
+        owner, gates = _stage_declarations(lines, start, end, f"Stage {number} — {title}")
 
         stages.append(
             PlanStage(
@@ -444,13 +486,116 @@ def parse_plan(text: str, *, plan_key: str | None = None) -> tuple[PlanStage, ..
                 title=title,
                 stage_id=_stage_id_for(number, title, plan_key),
                 section="\n".join(section_lines).rstrip() + "\n",
+                owner=owner,
+                gates_before=gates,
             )
         )
 
     ids = [stage.stage_id for stage in stages]
     if len(set(ids)) != len(ids):
         raise PlanError(f"stage ids are not unique: {ids}")
+    gate_ids = [gate.id for stage in stages for gate in stage.gates_before]
+    repeated = sorted({gate_id for gate_id in gate_ids if gate_ids.count(gate_id) > 1})
+    if repeated:
+        raise PlanRefusal(GATE_DECLARATION_INVALID, f"gate ids must be unique across the plan; repeated: {repeated}")
     return tuple(stages)
+
+
+def _stage_declarations(
+    lines: list[str], start: int, end: int, where: str
+) -> tuple[str | None, tuple[ManifestGate, ...]]:
+    """The owner and gates a stage section declares in its header.
+
+    The header is, in order and each optional: ``Repository: <name>`` as
+    the first non-blank line after the heading, then one or more
+    ``Gate before: <id> — <title>`` lines, each immediately followed by its
+    reason as a ``>`` blockquote (kept verbatim, minus the ``> `` prefix).
+    A declaration-shaped line anywhere else in the section, or one that does
+    not parse, is refused: a gate or owner the engine silently ignored would
+    be worse than a refusal.
+    """
+
+    def skip_blank(index: int) -> int:
+        while index < end and not lines[index].strip():
+            index += 1
+        return index
+
+    owner: str | None = None
+    gates: list[ManifestGate] = []
+    index = skip_blank(start + 1)
+    if index < end and _OWNER_LIKE_RE.match(lines[index]):
+        owner = _owner_name(lines[index], index, where)
+        index = skip_blank(index + 1)
+    while index < end and _GATE_LIKE_RE.match(lines[index]):
+        gate_line = index
+        match = _GATE_RE.match(lines[index])
+        if match is None:
+            raise PlanRefusal(
+                GATE_DECLARATION_INVALID,
+                f"{where}: line {index + 1} does not follow 'Gate before: <id> — <title>' "
+                f"(id of letters, digits, '.', '_' or '-'): {lines[index]!r}",
+            )
+        index += 1
+        reason: list[str] = []
+        while index < end and (quoted := _QUOTE_RE.match(lines[index])):
+            reason.append(quoted.group("text"))
+            index += 1
+        text = "\n".join(reason).strip("\n")
+        if not text.strip():
+            raise PlanRefusal(
+                GATE_DECLARATION_INVALID,
+                f"{where}: the gate on line {gate_line + 1} needs its reason as a '>' blockquote "
+                "directly below it",
+            )
+        if len(match.group("id")) > _MAX_GATE_ID_LENGTH:
+            raise PlanRefusal(
+                GATE_DECLARATION_INVALID,
+                f"{where}: gate id on line {gate_line + 1} is longer than {_MAX_GATE_ID_LENGTH} characters",
+            )
+        gates.append(
+            ManifestGate(id=match.group("id"), title=match.group("title"), kind=MARKDOWN_GATE_KIND, reason=text)
+        )
+        index = skip_blank(index)
+
+    in_fence = False
+    for rest in range(index, end):
+        line = lines[rest]
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if _OWNER_LIKE_RE.match(line):
+            raise PlanRefusal(
+                OWNER_DECLARATION_INVALID,
+                f"{where}: 'Repository:' on line {rest + 1} is misplaced; a stage declares its "
+                "repository only as the first line after its heading",
+            )
+        if _GATE_LIKE_RE.match(line):
+            raise PlanRefusal(
+                GATE_DECLARATION_INVALID,
+                f"{where}: 'Gate before:' on line {rest + 1} is misplaced; gates come directly "
+                "after the heading or the 'Repository:' line",
+            )
+    return owner, tuple(gates)
+
+
+def _owner_name(line: str, index: int, where: str) -> str:
+    match = _OWNER_RE.match(line)
+    rest = match.group("rest") if match else ""
+    name = None
+    for pattern in (_OWNER_QUOTED_RE, _OWNER_BARE_RE):
+        found = pattern.fullmatch(rest)
+        if found:
+            name = found.group("name")
+            break
+    if match is None or name is None or not is_repository_name(name):
+        raise PlanRefusal(
+            OWNER_DECLARATION_INVALID,
+            f"{where}: line {index + 1} does not declare a repository as 'Repository: <name>' "
+            f"(letters, digits, '.', '_' or '-'): {line!r}",
+        )
+    return name
 
 
 def _section_end(lines: list[str], start: int) -> int:
@@ -1030,6 +1175,8 @@ class MarkdownPlanSource:
                 title=stage.title,
                 stage_id=stage.stage_id,
                 brief=render_brief(self.label, stage, total),
+                gates_before=stage.gates_before,
+                owner=stage.owner,
             )
             for stage in self.parsed
         )
@@ -1102,6 +1249,23 @@ def load_plan_source(path: Path, repo_root: Path, *, manifest: bool = False) -> 
         except ManifestError as exc:
             raise PlanError(str(exc)) from exc
     return load_markdown_source(Path(path), plan_label(Path(path), Path(repo_root)))
+
+
+CROSS_REPOSITORY_REQUIRES_MANAGED = "cross_repository_requires_managed"
+
+
+def refuse_foreign_owners(source: PlanSource, home: str) -> None:
+    """Refuse to run, in this checkout, a plan with a stage another
+    repository owns: a current-checkout run cannot leave its repository."""
+
+    foreign = foreign_stages(source.stages(), home)
+    if foreign:
+        listed = ", ".join(f"{stage.display} ({stage.owner})" for stage in foreign)
+        raise PlanRefusal(
+            CROSS_REPOSITORY_REQUIRES_MANAGED,
+            f"this plan has stages owned by another repository than {home!r}: {listed}; "
+            "a cross-repository plan runs only as a managed run",
+        )
 
 
 def _coerce_source(plan: "Path | str | PlanSource", repo_root: Path) -> PlanSource:
@@ -4676,9 +4840,14 @@ def _drive(
 
 __all__ = [
     "AdapterFactory",
+    "CROSS_REPOSITORY_REQUIRES_MANAGED",
+    "GATE_DECLARATION_INVALID",
+    "MARKDOWN_GATE_KIND",
+    "OWNER_DECLARATION_INVALID",
     "PLANS_DIRNAME",
     "MarkdownPlanSource",
     "PlanError",
+    "PlanRefusal",
     "PlanRunError",
     "PlanRunResult",
     "PlanRunState",
@@ -4698,6 +4867,7 @@ __all__ = [
     "plan_label",
     "plan_state_not_ignored_message",
     "record_human_evidence",
+    "refuse_foreign_owners",
     "new_run_key",
     "render_brief",
     "resume_plan",

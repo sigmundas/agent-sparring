@@ -55,7 +55,15 @@ from agent_sparring.intake import (
     sha256_text,
 )
 from agent_sparring.intake_approval import APPROVAL_FILENAME, RUNS_DIRNAME, sha256_bytes
-from agent_sparring.plan import PlanError, find_runs, markdown_source_from_text, plan_label
+from agent_sparring.plan import (
+    PlanError,
+    PlanRefusal,
+    find_runs,
+    markdown_source_from_text,
+    plan_label,
+    refuse_foreign_owners,
+)
+from agent_sparring.plan_model import foreign_stages
 from agent_sparring.sparring_agent import repo_fingerprint
 
 #: The ``start-plan --json`` status shape (documented in docs/intake.md).
@@ -194,9 +202,21 @@ def evaluate(request: StartRequest, *, prepare: Prepare | None) -> StartStatus:
             raise StartPlanError(f"cannot read plan {request.plan_path}: {exc}") from exc
         try:
             direct = markdown_source_from_text(Path(request.plan_path), payload["plan"]["label"], text)
+        except PlanRefusal:
+            # A stage plan whose ownership or gate declaration is wrong is
+            # refused as such, never re-read by intake.
+            raise
         except PlanError:
             direct = None
         if direct is not None:
+            if not request.managed:
+                refuse_foreign_owners(direct, request.primary_repository)
+            elif foreign := foreign_stages(direct.stages(), request.primary_repository):
+                raise StartPlanError(
+                    f"{foreign[0].display} belongs to {foreign[0].owner!r}, not "
+                    f"{request.primary_repository!r}; running a plan across repositories is not "
+                    "supported yet [cross_repository_not_yet]"
+                )
             if request.answers:
                 raise StartPlanError("--answer: this plan runs directly, and asks no decisions")
             if request.repository_branches:
@@ -304,7 +324,10 @@ def _direct_status(request: StartRequest, payload: dict[str, Any], source, text:
                     "title": stage.title,
                     "mode": stage.mode.value,
                     "plan_stage_label": stage.label,
-                    "gates_before": [],
+                    "gates_before": [
+                        {"id": gate.id, "title": gate.title, "kind": gate.kind, "reason": gate.reason}
+                        for gate in stage.gates_before
+                    ],
                 }
                 for stage in stages
             ],

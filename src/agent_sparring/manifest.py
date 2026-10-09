@@ -55,6 +55,16 @@ manifest says ``"mode": "independent_review"`` for it. Which agent runs is
 too consequential to hang on a word in a heading, and the caller that
 interprets the plan document is the one that knows.
 
+``owner_repository``
+--------------------
+
+Optional, in every version: the repository the stage belongs to
+(``[A-Za-z0-9._-]+``), the manifest form of a Markdown stage's
+``Repository: <name>`` line. Absent or null means the home repository -- the
+one the plan is run from. It is digested only when present, so a manifest
+without it digests exactly as before. It is not ``repositories``, which pins
+sibling candidates of a single stage.
+
 ``source_digest`` is opaque provenance: the engine never recomputes it (it
 does not know how the caller digested the document), but it is part of this
 manifest's own digest, so re-emitting a manifest from an edited plan changes
@@ -104,7 +114,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from agent_sparring.plan_model import ManifestGate, PlannedStage, digest_planned_stages
+from agent_sparring.plan_model import ManifestGate, PlannedStage, digest_planned_stages, is_repository_name
 from agent_sparring.stage import (
     CandidateRepository,
     StageError,
@@ -123,7 +133,7 @@ _TOP_LEVEL_KEYS_V2 = _TOP_LEVEL_KEYS | {"completion_gates"}
 #: in (see :mod:`agent_sparring.intake_approval`). Named here only so the
 #: plain reader can refuse one by name instead of as an unknown key.
 INTAKE_ENVELOPE_KEY = "intake_manifest"
-_STAGE_KEYS = frozenset({"stage_id", "label", "title", "brief", "mode", "repositories"})
+_STAGE_KEYS = frozenset({"stage_id", "label", "title", "brief", "mode", "repositories", "owner_repository"})
 _STAGE_KEYS_V2 = _STAGE_KEYS | {"gates_before"}
 _GATE_KEYS = frozenset({"id", "title", "kind", "reason"})
 #: A gate id becomes the id of the check a person answers, so it obeys the
@@ -242,7 +252,22 @@ def _stage(entry: Any, position: int, *, gated: bool = False) -> PlannedStage:
         repositories=_repositories(entry.get("repositories"), where),
         mode=_mode(entry.get("mode"), f"{where} ({stage_id})"),
         gates_before=_gates(entry.get("gates_before"), f"{where} ({stage_id}) gates_before"),
+        owner=_owner(entry.get("owner_repository"), f"{where} ({stage_id})"),
     )
+
+
+def _owner(raw: Any, where: str) -> str | None:
+    """The stage's declared owner repository; absent or null is undeclared
+    (the home repository)."""
+
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not is_repository_name(raw):
+        raise ManifestError(
+            f"{where}: 'owner_repository' must be a repository name of letters, digits, "
+            f"'.', '_' or '-', got {raw!r}"
+        )
+    return raw
 
 
 def _gates(raw: Any, where: str) -> tuple[ManifestGate, ...]:
@@ -351,6 +376,10 @@ def manifest_digest(manifest: ExecutionManifest) -> str:
     digest, in both directions -- so a stage cannot be flipped between the
     two lifecycles under a run that is already under way.
 
+    A declared ``owner_repository`` is digested (marked) only when present,
+    by the same rule as a non-default mode: a manifest without one digests
+    exactly as before.
+
     A v2 manifest additionally digests each stage's ``gates_before`` (marked
     and counted, so a gate cannot move between stages or into
     ``completion_gates`` without changing the digest) and the completion
@@ -362,6 +391,8 @@ def manifest_digest(manifest: ExecutionManifest) -> str:
         parts += [stage.stage_id, stage.label, stage.title, stage.brief]
         if stage.mode is not StageMode.IMPLEMENTATION:
             parts.append(stage.mode.value)
+        if stage.owner is not None:
+            parts += ["owner_repository", stage.owner]
         for repository in stage.repositories:
             parts += [
                 repository.name,

@@ -28,6 +28,7 @@ and before advancing.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -90,8 +91,14 @@ class PlannedStage:
     repositories: tuple[CandidateRepository, ...] = field(default_factory=tuple)
     mode: StageMode = StageMode.IMPLEMENTATION
     #: Gates owed after the preceding stage is accepted and before this one
-    #: is created (manifest v2; always empty for every other plan input).
+    #: is created (manifest v2, or a Markdown ``Gate before:`` block).
     gates_before: tuple[ManifestGate, ...] = field(default_factory=tuple)
+    #: The repository this stage belongs to, as the plan declares it
+    #: (Markdown ``Repository: <name>``, manifest ``owner_repository``).
+    #: ``None`` is undeclared: the stage belongs to the home repository, the
+    #: one the plan is run from. Never inferred, and not
+    #: :attr:`repositories`, which pins sibling candidates of one stage.
+    owner: str | None = None
 
     @property
     def review_only(self) -> bool:
@@ -154,4 +161,60 @@ def digest_planned_stages(*parts: str) -> str:
     return digest.hexdigest()
 
 
-__all__ = ["ManifestGate", "PlanSource", "PlannedStage", "StageMode", "digest_planned_stages"]
+_REPOSITORY_NAME_RE = re.compile(r"[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def is_repository_name(name: str) -> bool:
+    """Is ``name`` a declarable stage owner (``[A-Za-z0-9._-]+``, not only
+    punctuation)?"""
+
+    return bool(_REPOSITORY_NAME_RE.fullmatch(name))
+
+
+def stage_owner(stage: PlannedStage, home: str) -> str:
+    """The repository ``stage`` belongs to: its declared owner, else ``home``."""
+
+    return stage.owner or home
+
+
+def foreign_stages(stages: tuple[PlannedStage, ...], home: str) -> tuple[PlannedStage, ...]:
+    """The stages owned by a repository other than ``home``."""
+
+    return tuple(stage for stage in stages if stage_owner(stage, home) != home)
+
+
+@dataclass(frozen=True)
+class Execution:
+    """A run of consecutive stages owned by one repository: what one managed
+    execution would cover. Derived, never declared or stored."""
+
+    repository: str
+    positions: tuple[int, ...]
+
+
+def derive_executions(stages: tuple[PlannedStage, ...], home: str) -> tuple[Execution, ...]:
+    """Group ``stages`` into consecutive same-owner executions, in order."""
+
+    executions: list[Execution] = []
+    for stage in stages:
+        owner = stage_owner(stage, home)
+        if executions and executions[-1].repository == owner:
+            last = executions[-1]
+            executions[-1] = Execution(owner, (*last.positions, stage.position))
+        else:
+            executions.append(Execution(owner, (stage.position,)))
+    return tuple(executions)
+
+
+__all__ = [
+    "Execution",
+    "ManifestGate",
+    "PlanSource",
+    "PlannedStage",
+    "StageMode",
+    "derive_executions",
+    "digest_planned_stages",
+    "foreign_stages",
+    "is_repository_name",
+    "stage_owner",
+]

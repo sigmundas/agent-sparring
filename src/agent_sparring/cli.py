@@ -63,6 +63,7 @@ from agent_sparring.intake import (
     approve_plan,
     intake_not_ignored_message,
     prepare_plan,
+    undeclared_repository_mentions,
 )
 from agent_sparring.manifest import ManifestError
 from agent_sparring import managed_finish, managed_run
@@ -73,6 +74,7 @@ from agent_sparring.migration_status import MigrationStatusError, classify
 from agent_sparring.migration_status import render_report as render_migration_report
 from agent_sparring.plan import (
     PLANS_DIRNAME,
+    MarkdownPlanSource,
     PlanError,
     PlanRunError,
     PlanRunResult,
@@ -82,6 +84,7 @@ from agent_sparring.plan import (
     load_plan_source,
     plan_label,
     plan_state_not_ignored_message,
+    refuse_foreign_owners,
     resume_plan,
     start_plan,
 )
@@ -91,7 +94,7 @@ from agent_sparring.deferred_gate import (
     DeferredGateError,
     DeferredVerificationRequired,
 )
-from agent_sparring.plan_model import PlanSource
+from agent_sparring.plan_model import ManifestGate, PlanSource, derive_executions, foreign_stages, stage_owner
 from agent_sparring.push_gate import PUSH_AUTHORIZATION_REQUIRED
 from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
@@ -2043,6 +2046,8 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool, source: PlanSou
         repo_root = _resolve_repo_root(args, sparring_dir)
         if source is None:
             source = _plan_source(args, repo_root)
+        if not resume and _managed_record(args) is None:
+            refuse_foreign_owners(source, _project_repository_name(args, sparring_dir, repo_root))
         self_check = _resolve_self_check(sparring_dir)
         # Provider selection is checked once, before any run state exists;
         # the adapters themselves are built per planned stage (below) so
@@ -2154,9 +2159,13 @@ def _cmd_check_plan(args: argparse.Namespace) -> int:
         repo_root = _resolve_repo_root(args, sparring_dir)
         source = load_plan_source(Path(args.plan_path), repo_root, manifest=args.manifest)
         stages = source.stages()
+        home = _project_repository_name(args, sparring_dir, repo_root)
+        warnings = _cross_repository_warnings(source, home)
     except (PlanError, ProjectConfigError, OSError) as exc:
         if args.json:
-            json.dump({"valid": False, "error": str(exc)}, sys.stdout, indent=2)
+            json.dump(
+                {"valid": False, "error": str(exc), "code": getattr(exc, "code", None)}, sys.stdout, indent=2
+            )
             print()
         else:
             print(f"plan is not runnable: {exc}", file=sys.stderr)
@@ -2166,6 +2175,7 @@ def _cmd_check_plan(args: argparse.Namespace) -> int:
             "valid": True,
             "kind": source.kind,
             "label": source.label,
+            "home_repository": home,
             "stages": [
                 {
                     "position": stage.position,
@@ -2173,9 +2183,17 @@ def _cmd_check_plan(args: argparse.Namespace) -> int:
                     "title": stage.title,
                     "mode": stage.mode.value,
                     "repositories": [repository.name for repository in stage.repositories],
+                    "repository": stage_owner(stage, home),
+                    "gates_before": [_gate_payload(gate) for gate in stage.gates_before],
                 }
                 for stage in stages
             ],
+            "completion_gates": [_gate_payload(gate) for gate in getattr(source, "completion_gates", ())],
+            "executions": [
+                {"repository": execution.repository, "stages": list(execution.positions)}
+                for execution in derive_executions(stages, home)
+            ],
+            "warnings": warnings,
             "error": None,
         }
         json.dump(payload, sys.stdout, indent=2)
@@ -2183,10 +2201,43 @@ def _cmd_check_plan(args: argparse.Namespace) -> int:
         return 0
     print(f"{source.label}: {len(stages)} stage(s), read as {source.kind}")
     for stage in stages:
+        for gate in stage.gates_before:
+            print(f"  gate before: {gate.title} ({gate.id})")
         suffix = " (review only)" if stage.review_only else ""
-        print(f"  {stage.display}{suffix}")
+        owner = stage_owner(stage, home)
+        repository = f" [{owner}]" if owner != home else ""
+        print(f"  {stage.display}{repository}{suffix}")
+    for gate in getattr(source, "completion_gates", ()):
+        print(f"  gate before completion: {gate.title} ({gate.id})")
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     print("nothing was run or approved")
     return 0
+
+
+def _gate_payload(gate: ManifestGate) -> dict:
+    return {"id": gate.id, "title": gate.title, "kind": gate.kind, "reason": gate.reason}
+
+
+def _cross_repository_warnings(source: PlanSource, home: str) -> list[str]:
+    """Advisory: a plan that declares no stage owner but names another
+    repository in a heading or stage prose probably belongs partly there."""
+
+    stages = source.stages()
+    if any(stage.owner for stage in stages):
+        return []
+    if isinstance(source, MarkdownPlanSource):
+        sections = [stage.section for stage in source.parsed]
+        text = source.path.read_text(encoding="utf-8")
+    else:
+        sections = [stage.brief for stage in stages]
+        text = "\n".join(sections)
+    return [
+        f"the plan names repository {name!r} but declares no stage owner, so every stage runs in "
+        f"{home!r}; if a stage belongs to {name!r}, put 'Repository: {name}' as the first line "
+        "after its heading"
+        for name in undeclared_repository_mentions(text, sections, home)
+    ]
 
 
 def _cmd_run_plan(args: argparse.Namespace) -> int:
@@ -2232,7 +2283,7 @@ def _managed_input(args: argparse.Namespace) -> tuple[str, Path]:
     return ("manifest", Path(args.manifest)) if args.manifest else ("markdown", Path(args.plan_path))
 
 
-def _check_managed_source(source: PlanSource) -> None:
+def _check_managed_source(source: PlanSource, home: str) -> None:
     """Single repository first; intake manifests are follow-up work."""
 
     if source.kind not in managed_run.INPUT_KINDS:
@@ -2244,6 +2295,13 @@ def _check_managed_source(source: PlanSource) -> None:
         raise ManagedRunError(
             "sibling_repositories",
             "this plan input declares sibling repositories; a managed run is single-repository for now",
+        )
+    foreign = foreign_stages(source.stages(), home)
+    if foreign:
+        raise ManagedRunError(
+            "cross_repository_not_yet",
+            f"{foreign[0].display} belongs to {foreign[0].owner!r}, not {home!r}; running a plan "
+            "across repositories is not supported yet",
         )
 
 
@@ -2267,7 +2325,7 @@ def _run_managed_plan(
 
         def source_label(read_path: Path, mapped: Path) -> str:
             source = load_plan_source(read_path, repo_root, manifest=kind == "manifest")
-            _check_managed_source(source)
+            _check_managed_source(source, _project_repository_name(args, sparring_dir, repo_root))
             if expected_digest is not None and source.digest() != expected_digest:
                 raise ManagedRunError("plan_changed", "the plan changed since it was confirmed; run start-plan again")
             if kind == "manifest":
