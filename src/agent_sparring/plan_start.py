@@ -467,10 +467,11 @@ def continuation_status(
         LogicalPlanError,
         check_binding_now,
         derived_status,
+        membership,
         next_slice,
         previous_integration,
     )
-    from agent_sparring.managed_run import ManagedRunError, dirty_paths
+    from agent_sparring.managed_run import ManagedRunError, dirty_paths, read_record_in
 
     status = derived_status(record)
     titles = {stage.stage_id: stage for stage in record.stages}
@@ -507,6 +508,20 @@ def continuation_status(
         "not_part_of_this_run": [],
     }
     if entry.lifecycle is not None:
+        # Only this plan's own execution of the part is resumed: a run that
+        # merely uses the derived key is refused, never adopted.
+        try:
+            execution = read_record_in(Path(binding.git_common_dir), entry.id)
+            mismatch = membership(record, entry.index, execution) if execution is not None else "it has no record"
+        except ManagedRunError as exc:
+            mismatch = f"its record is unreadable: {exc}"
+        if mismatch is not None:
+            payload.update(
+                error=f"{entry.id} in {entry.repository} is not part {entry.index} of this plan: {mismatch}; "
+                "nothing was changed [execution_not_in_plan]",
+                code="execution_not_in_plan",
+            )
+            return ContinuationStatus(payload=payload, index=entry.index)
         payload.update(status="exists")
         return ContinuationStatus(payload=payload, index=entry.index)
     try:

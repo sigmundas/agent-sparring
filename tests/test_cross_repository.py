@@ -586,3 +586,86 @@ class EarlyInterruptionTests(_CrossCase):
         self.assertEqual(after.lifecycle, "creating")
         self.assertFalse(Path(execution.worktree_path).exists())
         self.assertEqual([e["detail"]["index"] for e in self.slice_events()], [1])
+
+
+class CollisionTests(_CrossCase):
+    """A run in the target that merely uses the part's derived key is
+    refused, never adopted, recovered or resumed."""
+
+    def setUp(self):
+        super().setUp()
+        code, _, err = self.start()
+        self.assertEqual(code, 0, err)
+        self.finish_first()
+        self.token = self.status_json()["confirm_token"]
+        other_plan = self.web / "docs" / "other.md"
+        other_plan.parent.mkdir()
+        other_plan.write_text(plan("Other work."), encoding="utf-8")
+        _run_git(self.web, "add", ".")
+        _run_git(self.web, "commit", "-qm", "other plan")
+        self.prepared = managed_run.plan_managed_run(
+            self.web, self.web / ".sparring", source_label=lambda read, mapped: "docs/other.md",
+            input_kind="markdown", input_path=other_plan, target_branch="main", run_key=K2,
+            new_run_key=lambda label: K2,
+        )
+
+    def collide(self, logical_slice=None, *, git_state=True):
+        from dataclasses import replace
+
+        record = replace(self.prepared.record, logical_slice=logical_slice)
+        if git_state:
+            created = managed_run.create_managed_worktree(self.web, replace(self.prepared, record=record))
+            state = Path(created.worktree_path) / ".sparring" / "plans" / f"{K2}.json"
+            state.parent.mkdir(parents=True)
+            state.write_text('{"status": "running"}\n', encoding="utf-8")
+        else:
+            managed_run.create_record(self.web, record)
+
+    def snapshot(self):
+        record = managed_run.read_record(self.web, K2)
+        worktree = Path(record.worktree_path)
+        files = (
+            {str(p.relative_to(worktree)): p.read_bytes() for p in sorted(worktree.rglob("*"))
+             if p.is_file() and ".git" not in p.parts}
+            if worktree.exists() else None
+        )
+        return (
+            managed_run.record_path(self.web, K2).read_bytes(), files, worktree.exists(),
+            managed_run.branch_exists(self.web, record.branch),
+            logical_plan.record_path(self.home_common(), K).read_bytes(),
+        )
+
+    def assert_refused_everywhere(self):
+        before = self.snapshot()
+        adapters_before = set(self.stage_adapters)
+        status = self.status_json()
+        self.assertEqual((status["_code"], status["status"], status["code"]), (1, "refused", "execution_not_in_plan"))
+        for where in ("home", "web"):
+            argv = ["resume-plan", "--run-key", K, "--evidence", "x"]
+            code, _, err = self.run_cli(*argv, "--repo-root", str(self.repo)) if where == "home" else self.from_web(*argv)
+            self.assertEqual(code, 1)
+            self.assertIn("execution_not_in_plan", err)
+        code, _, err = self.run_cli(
+            "resume-plan", "--run-key", K, "--confirm", self.token, "--allow-push-for-run", "--repo-root", str(self.repo)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual([e["detail"]["index"] for e in self.slice_events()], [1])
+        self.assertEqual(set(self.stage_adapters), adapters_before)  # no agent ran
+
+    def test_an_ordinary_run_with_the_derived_key(self):
+        self.collide()
+        self.assert_refused_everywhere()
+
+    def test_a_run_naming_another_logical_plan(self):
+        self.collide({"logical_key": "plan-other-0002", "home_common_dir": str(self.home_common()), "index": 2})
+        self.assert_refused_everywhere()
+
+    def test_a_run_naming_another_home(self):
+        self.collide({"logical_key": K, "home_common_dir": str(managed_run.git_common_dir(self.web)), "index": 2})
+        self.assert_refused_everywhere()
+
+    def test_an_unrelated_interrupted_creation_is_not_recovered(self):
+        self.collide(git_state=False)
+        self.assert_refused_everywhere()
+        self.assertFalse(Path(managed_run.read_record(self.web, K2).worktree_path).exists())

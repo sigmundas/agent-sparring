@@ -2615,6 +2615,12 @@ def _resume_logical_part(args: argparse.Namespace, home: Path, logical, nxt: dic
         record = managed_run.read_record(repo_root, nxt["run_key"])
         if record is None:
             raise ManagedRunError("managed_record_missing", f"part {nxt['index']} has no execution record")
+        # Re-checked here, before anything is repaired, recovered or resumed.
+        mismatch = logical_plan.membership(logical, nxt["index"], record)
+        if mismatch is not None:
+            raise ManagedRunError(
+                "execution_not_in_plan", f"{record.run_key} is not part {nxt['index']} of this plan: {mismatch}"
+            )
         logical_plan.write_pointers(home, logical)
         record = managed_run.complete_creation(repo_root, record)
         logical_plan.record_slice_created(home, logical.logical_key, nxt["index"], record.run_key)

@@ -550,14 +550,24 @@ class LogicalStatus:
 
 
 def _belongs(record: LogicalPlanRecord, index: int, execution: ManagedRunRecord) -> str | None:
-    """Why ``execution`` is not slice ``index`` of ``record``, or ``None``.
+    """Why ``execution`` is not slice ``index`` of ``record``, or ``None``:
+    it must be engine-created and :func:`membership` must hold."""
+
+    if not execution.owns_git_state:
+        return f"its record is {execution.lifecycle}, not an engine-created execution"
+    return membership(record, index, execution)
+
+
+def membership(record: LogicalPlanRecord, index: int, execution: ManagedRunRecord) -> str | None:
+    """Why ``execution``'s record does not *name* it slice ``index`` of
+    ``record``, or ``None`` -- its metadata only, whatever its lifecycle, so
+    an interrupted creation of this slice stays recoverable while a run that
+    merely shares the derived key is never adopted.
 
     The first execution is the logical key's own run (a rescoped run has no
     ``slice`` key); every later one names this logical plan, its home and its
     index in its ``slice`` key."""
 
-    if not execution.owns_git_state:
-        return f"its record is {execution.lifecycle}, not an engine-created execution"
     if execution.run_key != slice_run_key(record.logical_key, index):
         return f"its run key is {execution.run_key}, not {slice_run_key(record.logical_key, index)}"
     found = execution.logical_slice
@@ -1108,6 +1118,7 @@ __all__ = [
     "home_common_dir_for",
     "ledger_path",
     "load",
+    "membership",
     "new_record",
     "next_slice",
     "plan_slice_execution",
