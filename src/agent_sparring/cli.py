@@ -84,6 +84,7 @@ from agent_sparring.plan import (
     load_plan_source,
     plan_label,
     plan_state_not_ignored_message,
+    refuse_foreign_home,
     refuse_foreign_owners,
     resume_plan,
     start_plan,
@@ -2160,6 +2161,7 @@ def _cmd_check_plan(args: argparse.Namespace) -> int:
         source = load_plan_source(Path(args.plan_path), repo_root, manifest=args.manifest)
         stages = source.stages()
         home = _project_repository_name(args, sparring_dir, repo_root)
+        refuse_foreign_home(source, home)
         warnings = _cross_repository_warnings(source, home)
     except (PlanError, ProjectConfigError, OSError) as exc:
         if args.json:
@@ -2220,11 +2222,11 @@ def _gate_payload(gate: ManifestGate) -> dict:
 
 
 def _cross_repository_warnings(source: PlanSource, home: str) -> list[str]:
-    """Advisory: a plan that declares no stage owner but names another
-    repository in a heading or stage prose probably belongs partly there."""
+    """Advisory: a plan that declares no repository at all but names
+    another in a heading or stage prose probably belongs partly there."""
 
     stages = source.stages()
-    if any(stage.owner for stage in stages):
+    if getattr(source, "declared_home", None) or any(stage.owner for stage in stages):
         return []
     if isinstance(source, MarkdownPlanSource):
         sections = [stage.section for stage in source.parsed]
@@ -2286,6 +2288,10 @@ def _managed_input(args: argparse.Namespace) -> tuple[str, Path]:
 def _check_managed_source(source: PlanSource, home: str) -> None:
     """Single repository first; intake manifests are follow-up work."""
 
+    try:
+        refuse_foreign_home(source, home)
+    except PlanError as exc:
+        raise ManagedRunError(getattr(exc, "code", "plan_invalid"), str(exc).rsplit(" [", 1)[0]) from exc
     if source.kind not in managed_run.INPUT_KINDS:
         raise ManagedRunError(
             "input_kind_unsupported",

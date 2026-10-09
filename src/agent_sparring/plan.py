@@ -291,7 +291,12 @@ _SECTION_BOUNDARY_RE = re.compile(r"^#{1,2}\s")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # A line that *looks like* an ownership or gate declaration is claimed by the
 # convention the same way: it either is one, in its place, or it is refused.
+# In a stage's header position any case counts; elsewhere only the declared
+# capitalisation does, so a wrapped prose line ("... in the same\nrepository:
+# ...") is never mistaken for one.
 _OWNER_LIKE_RE = re.compile(r"^\s*\**\s*repository\s*\**\s*:", re.IGNORECASE)
+_OWNER_MENTION_RE = re.compile(r"^\s*\**\s*Repository\s*\**\s*:")
+_GATE_MENTION_RE = re.compile(r"^\s*\**\s*Gate\s+[Bb]efore\b")
 _OWNER_RE = re.compile(r"^(?:\*\*Repository:\*\*|\*\*Repository\*\*:|Repository:)[ \t]*(?P<rest>.*?)\s*$")
 # Bare: the name ends the line. Backticked: the name may be followed by a
 # sentence ("`agent-sparring`. **Depends on:** none.").
@@ -426,6 +431,10 @@ def _stage_id_for(number: int, title: str, plan_key: str | None) -> str:
 
 
 def parse_plan(text: str, *, plan_key: str | None = None) -> tuple[PlanStage, ...]:
+    return _parse_plan(text, plan_key=plan_key)[0]
+
+
+def _parse_plan(text: str, *, plan_key: str | None = None) -> tuple[tuple[PlanStage, ...], str | None]:
     """Split a reviewed plan into its explicit stages, or refuse.
 
     ``plan_key`` (see :func:`plan_key`), when given, prefixes every stage id
@@ -498,7 +507,50 @@ def parse_plan(text: str, *, plan_key: str | None = None) -> tuple[PlanStage, ..
     repeated = sorted({gate_id for gate_id in gate_ids if gate_ids.count(gate_id) > 1})
     if repeated:
         raise PlanRefusal(GATE_DECLARATION_INVALID, f"gate ids must be unique across the plan; repeated: {repeated}")
-    return tuple(stages)
+    return tuple(stages), _outside_stage_declarations(lines, heading_indices)
+
+
+def _outside_stage_declarations(lines: list[str], heading_indices: list[int]) -> str | None:
+    """Refuse a declaration-shaped line outside every stage section, and
+    return the one place one is allowed: a well-formed ``Repository:``
+    before the first stage, declaring the repository the whole plan is run
+    from (checked against the home repository by
+    :func:`refuse_foreign_owners`). Fenced examples are prose.
+    """
+
+    inside = {
+        index
+        for start in heading_indices
+        for index in range(start, _section_end(lines, start + 1))
+    }
+    declared: set[str] = set()
+    in_fence = False
+    for index, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence or index in inside:
+            continue
+        if _GATE_MENTION_RE.match(line):
+            raise PlanRefusal(
+                GATE_DECLARATION_INVALID,
+                f"'Gate before:' on line {index + 1} is outside every stage; a gate goes directly "
+                "after a stage heading or its 'Repository:' line",
+            )
+        if _OWNER_MENTION_RE.match(line):
+            if index > heading_indices[0]:
+                raise PlanRefusal(
+                    OWNER_DECLARATION_INVALID,
+                    f"'Repository:' on line {index + 1} is outside every stage; a stage declares its "
+                    "repository as the first line after its heading",
+                )
+            declared.add(_owner_name(line, index, "before the first stage"))
+    if len(declared) > 1:
+        raise PlanRefusal(
+            OWNER_DECLARATION_INVALID,
+            f"the plan declares more than one repository before its first stage: {sorted(declared)}",
+        )
+    return next(iter(declared), None)
 
 
 def _stage_declarations(
@@ -540,7 +592,7 @@ def _stage_declarations(
         while index < end and (quoted := _QUOTE_RE.match(lines[index])):
             reason.append(quoted.group("text"))
             index += 1
-        text = "\n".join(reason).strip("\n")
+        text = "\n".join(reason)
         if not text.strip():
             raise PlanRefusal(
                 GATE_DECLARATION_INVALID,
@@ -565,13 +617,13 @@ def _stage_declarations(
             continue
         if in_fence:
             continue
-        if _OWNER_LIKE_RE.match(line):
+        if _OWNER_MENTION_RE.match(line):
             raise PlanRefusal(
                 OWNER_DECLARATION_INVALID,
                 f"{where}: 'Repository:' on line {rest + 1} is misplaced; a stage declares its "
                 "repository only as the first line after its heading",
             )
-        if _GATE_LIKE_RE.match(line):
+        if _GATE_MENTION_RE.match(line):
             raise PlanRefusal(
                 GATE_DECLARATION_INVALID,
                 f"{where}: 'Gate before:' on line {rest + 1} is misplaced; gates come directly "
@@ -1139,6 +1191,9 @@ class MarkdownPlanSource:
     #: :meth:`reload`. ``None`` produces the bare ``stage-<n>-<slug>`` ids,
     #: which is what a caller that is not a managed run gets.
     namespace: str | None = None
+    #: ``Repository: <name>`` before the first stage: the repository the
+    #: whole plan says it is run from. ``None`` when the plan says nothing.
+    declared_home: str | None = None
 
     def digest(self) -> str:
         return plan_digest(self.parsed)
@@ -1215,11 +1270,13 @@ def markdown_source_from_text(
     ``plan_path``, so a caller that checked that text runs exactly it."""
 
     prefix = namespace if namespace is not None else legacy_run_key(label)
+    parsed, declared_home = _parse_plan(text, plan_key=prefix)
     return MarkdownPlanSource(
         path=Path(plan_path),
         label=label,
-        parsed=parse_plan(text, plan_key=prefix),
+        parsed=parsed,
         namespace=prefix,
+        declared_home=declared_home,
     )
 
 
@@ -1254,10 +1311,25 @@ def load_plan_source(path: Path, repo_root: Path, *, manifest: bool = False) -> 
 CROSS_REPOSITORY_REQUIRES_MANAGED = "cross_repository_requires_managed"
 
 
+def refuse_foreign_home(source: PlanSource, home: str) -> None:
+    """Refuse a plan whose ``Repository:`` before its first stage names a
+    repository other than ``home``: it says it is run from elsewhere."""
+
+    declared = getattr(source, "declared_home", None)
+    if declared is not None and declared != home:
+        raise PlanRefusal(
+            OWNER_DECLARATION_INVALID,
+            f"the plan declares 'Repository: {declared}' before its first stage, but is run from "
+            f"{home!r}; run it from {declared!r}, or declare each stage's repository on the first "
+            "line after its heading",
+        )
+
+
 def refuse_foreign_owners(source: PlanSource, home: str) -> None:
     """Refuse to run, in this checkout, a plan with a stage another
     repository owns: a current-checkout run cannot leave its repository."""
 
+    refuse_foreign_home(source, home)
     foreign = foreign_stages(source.stages(), home)
     if foreign:
         listed = ", ".join(f"{stage.display} ({stage.owner})" for stage in foreign)
@@ -4867,6 +4939,7 @@ __all__ = [
     "plan_label",
     "plan_state_not_ignored_message",
     "record_human_evidence",
+    "refuse_foreign_home",
     "refuse_foreign_owners",
     "new_run_key",
     "render_brief",

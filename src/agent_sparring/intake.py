@@ -908,22 +908,39 @@ def undeclared_repository_mentions(text: str, stage_sections: Iterable[str], hom
     declarations names in a heading or a stage section -- the shape of a
     cross-repository plan whose ownership was never declared.
 
-    Candidates are names the document itself calls a repository, kept only
-    when unmistakably a name (backticked, or containing ``-``, ``_``, ``.``):
-    "the repository" or "a repository-owned script" proposes nothing. Each
-    candidate then counts only if :func:`names_repository` finds it in a
-    heading or a stage section. Advisory: a caller warns, never refuses.
+    A candidate is a name that is unmistakably a name (backticked, or
+    containing ``-``, ``_``, ``.``) and is either
+
+    - called a repository anywhere in the document ("**Pilot repository:**
+      `sporely-landing`", "the `web` repo"), or
+    - a qualified name in a heading that stage prose also backticks
+      ("## Stage 4 — sporely-landing pilot" ... "in `sporely-landing`").
+
+    It counts only if :func:`names_repository` finds it in a heading or a
+    stage section. "The repository" or "a repository-owned script" proposes
+    nothing. Advisory: a caller warns, never refuses.
     """
 
+    sections = list(stage_sections)
+    headings = "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
     candidates: set[str] = set()
     for pattern in _CALLED_REPOSITORY_RES:
         for match in pattern.finditer(text):
             name = match.group("name").rstrip(".-")
-            if (match.group("q") or re.search(r"[-_.]", name)) and name.lower() != home.lower():
+            if match.group("q") or re.search(r"[-_.]", name):
                 candidates.add(name)
-    headings = "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
-    scopes = [headings, *stage_sections]
-    return tuple(sorted(name for name in candidates if any(names_repository(scope, name) for scope in scopes)))
+    prose = "\n".join(sections)
+    for token in re.findall(r"(?<![\w./-])[A-Za-z0-9][\w.-]*[-_.][\w.-]*[A-Za-z0-9]", headings):
+        if f"`{token}`" in prose:
+            candidates.add(token)
+    scopes = [headings, *sections]
+    return tuple(
+        sorted(
+            name
+            for name in candidates
+            if name.lower() != home.lower() and any(names_repository(scope, name) for scope in scopes)
+        )
+    )
 
 
 def compile_context_for(

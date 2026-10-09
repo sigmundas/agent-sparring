@@ -31,6 +31,7 @@ from agent_sparring.plan import (
     parse_plan,
     plan_digest,
     plan_key,
+    refuse_foreign_home,
     refuse_foreign_owners,
     resume_plan,
     run_state_path,
@@ -160,12 +161,74 @@ class OwnerDeclarationTests(unittest.TestCase):
         self.assertEqual((stage.owner, stage.gates_before), (None, ()))
 
 
+class OutsideStageDeclarationTests(unittest.TestCase):
+    """Nothing declaration-shaped outside a stage header is ever silently
+    ignored: it is the plan-level home declaration, or it is refused."""
+
+    def _source(self, text: str):
+        return markdown_source_from_text(Path("p.md"), "p.md", text)
+
+    def test_a_preamble_declaration_is_the_plan_level_home(self):
+        text = "# Plan\n\n**Repository:** `app`  \n\n" + plan("Body.")
+        source = self._source(text)
+        self.assertEqual(source.declared_home, "app")
+        self.assertEqual([s.owner for s in source.stages()], [None])
+        refuse_foreign_owners(source, "app")
+        refuse_foreign_home(source, "app")
+
+    def test_a_foreign_preamble_declaration_is_refused_at_run_time(self):
+        source = self._source("Repository: foreign\n\n" + plan("Body."))
+        for refuse in (refuse_foreign_home, refuse_foreign_owners):
+            with self.subTest(refuse.__name__), self.assertRaises(PlanRefusal) as ctx:
+                refuse(source, "app")
+            self.assertEqual(ctx.exception.code, OWNER_DECLARATION_INVALID)
+
+    def test_malformed_or_conflicting_preamble_declarations_are_refused(self):
+        for preamble in ("Repository: a/b", "Repository: two words", "Repository: a\n\nRepository: b"):
+            with self.subTest(preamble):
+                self.assertEqual(refusal(f"{preamble}\n\n" + plan("Body.")).code, OWNER_DECLARATION_INVALID)
+
+    def test_declarations_after_a_non_stage_heading_are_refused(self):
+        for text, code in (
+            (plan("Body.") + "\n## Notes\n\nRepository: foreign\n", OWNER_DECLARATION_INVALID),
+            ("# Run A\n\n" + plan("Body.") + "\n# Run B\n\n**Repository:** web\n\n## Stage 2 — B\n\nx\n",
+             OWNER_DECLARATION_INVALID),
+            ("Gate before: g — G\n> why\n\n" + plan("Body."), GATE_DECLARATION_INVALID),
+            (plan("Body.") + "\n## Closeout\n\nGate before: g — G\n> why\n", GATE_DECLARATION_INVALID),
+        ):
+            with self.subTest(text):
+                self.assertEqual(refusal(text).code, code)
+
+    def test_fenced_examples_and_wrapped_prose_outside_stages_are_prose(self):
+        text = (
+            "# Plan\n\nThe engine records it in the\nrepository: never elsewhere.\n\n"
+            "```markdown\nRepository: web\nGate before: g — G\n> why\n```\n\n"
+            + plan("Body in the same\nrepository: still prose.")
+            + "\n## Notes\n\n~~~\nRepository: x\n~~~\n"
+        )
+        source = self._source(text)
+        self.assertIsNone(source.declared_home)
+        self.assertEqual([(s.owner, s.gates_before) for s in source.stages()], [(None, ())])
+
+    def test_this_plans_own_preamble_declaration_parses(self):
+        # The plan this stage implements declares its repository in its
+        # preamble; it must stay runnable from that repository.
+        path = Path(__file__).resolve().parent.parent / "docs" / "plans" / "repository-slices.md"
+        source = markdown_source_from_text(path, "docs/plans/repository-slices.md", path.read_text(encoding="utf-8"))
+        self.assertEqual(source.declared_home, "agent-sparring")
+        refuse_foreign_owners(source, "agent-sparring")
+
+
 class MarkdownGateTests(unittest.TestCase):
     def test_a_multi_line_reason_survives_verbatim(self):
         _, second = parse_plan(GATED)
         (gate,) = second.gates_before
         self.assertEqual((gate.id, gate.title, gate.kind), ("canary", "Staging canary", "human"))
         self.assertEqual(gate.reason, REASON)
+
+    def test_leading_and_trailing_quoted_blank_lines_are_kept(self):
+        (stage,) = parse_plan(plan("Gate before: g — G\n>\n> set this:\n>    indented\n>\n\nBody."))
+        self.assertEqual(stage.gates_before[0].reason, "\nset this:\n   indented\n")
 
     def test_gates_follow_the_repository_line_and_may_repeat(self):
         body = (
@@ -283,6 +346,10 @@ class WarningTests(unittest.TestCase):
         text = UI_SCREENSHOTS_SHAPED.replace("`sporely-landing` can", "It can")
         self.assertEqual(self._mentions(text), ("sporely-landing",))
 
+    def test_a_qualified_heading_name_backticked_in_stage_prose_fires(self):
+        text = "# P\n\n## Stage 1 — sporely-landing pilot\n\nImplement in `sporely-landing`.\n"
+        self.assertEqual(self._mentions(text), ("sporely-landing",))
+
     def test_home_and_plain_words_do_not_fire(self):
         text = plan("Edit the repository and the repository-owned script in `agent-sparring`.")
         self.assertEqual(self._mentions(text), ())
@@ -333,6 +400,15 @@ class CheckPlanTests(_Cli, _PlanRepoTestCase):
         code, _, err = self._check(UI_SCREENSHOTS_SHAPED)
         self.assertEqual(code, 0)
         self.assertIn("warning: the plan names repository 'sporely-landing'", err)
+
+    def test_a_foreign_preamble_declaration_is_invalid(self):
+        code, out, _ = self._check("Repository: elsewhere\n\n" + plan("Body."), "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)["code"], OWNER_DECLARATION_INVALID)
+        code, out, err = self._check("Repository: repo\n\n" + UI_SCREENSHOTS_SHAPED, "--json")
+        self.assertEqual(code, 0, err)
+        # Declared, so not the undeclared shape the warning is for.
+        self.assertEqual(json.loads(out)["warnings"], [])
 
     def test_a_malformed_declaration_is_reported_with_its_code(self):
         code, out, _ = self._check(plan("Repository: two words\n\nBody."), "--json")
@@ -388,6 +464,16 @@ class ManagedRefusalTests(_Cli, _ManagedRepoTestCase):
         code, out, _ = self._main("start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed", "--json")
         self.assertEqual(code, 1)
         self.assertIn("[cross_repository_not_yet]", json.loads(out)["error"])
+        self.assertEqual(self._records(), ())
+
+    def test_a_foreign_preamble_declaration_refuses_managed(self):
+        self.plan_path.write_text("Repository: elsewhere\n\n" + plan("Build here."), encoding="utf-8")
+        _commit(self.repo, "foreign preamble")
+        code, _, err = self._start_managed()
+        self.assertEqual(code, 1)
+        self.assertIn("[owner_declaration_invalid]", err)
+        code, out, _ = self._main("start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed", "--json")
+        self.assertIn("[owner_declaration_invalid]", json.loads(out)["error"])
         self.assertEqual(self._records(), ())
 
     def test_a_home_owned_declaration_runs_managed(self):
