@@ -61,7 +61,6 @@ from agent_sparring.plan import (
     find_runs,
     markdown_source_from_text,
     plan_label,
-    refuse_foreign_home,
     refuse_foreign_owners,
 )
 from agent_sparring.plan_model import foreign_stages
@@ -212,8 +211,6 @@ def evaluate(request: StartRequest, *, prepare: Prepare | None) -> StartStatus:
         if direct is not None:
             if not request.managed:
                 refuse_foreign_owners(direct, request.primary_repository)
-            else:
-                refuse_foreign_home(direct, request.primary_repository)
             foreign = foreign_stages(direct.stages(), request.primary_repository)
             if request.managed and foreign:
                 raise StartPlanError(

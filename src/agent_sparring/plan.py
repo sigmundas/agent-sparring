@@ -513,9 +513,9 @@ def _parse_plan(text: str, *, plan_key: str | None = None) -> tuple[tuple[PlanSt
 def _outside_stage_declarations(lines: list[str], heading_indices: list[int]) -> str | None:
     """Refuse a declaration-shaped line outside every stage section, and
     return the one place one is allowed: a well-formed ``Repository:``
-    before the first stage, declaring the repository the whole plan is run
-    from (checked against the home repository by
-    :func:`refuse_foreign_owners`). Fenced examples are prose.
+    before the first stage, which plans already use to say where they
+    belong. It is context (see :attr:`MarkdownPlanSource.declared_home`),
+    never an execution constraint. Fenced examples are prose.
     """
 
     inside = {
@@ -1191,8 +1191,10 @@ class MarkdownPlanSource:
     #: :meth:`reload`. ``None`` produces the bare ``stage-<n>-<slug>`` ids,
     #: which is what a caller that is not a managed run gets.
     namespace: str | None = None
-    #: ``Repository: <name>`` before the first stage: the repository the
-    #: whole plan says it is run from. ``None`` when the plan says nothing.
+    #: ``Repository: <name>`` before the first stage: context only. It is
+    #: outside every stage section, so not in the digest, and it decides
+    #: nothing -- every stage is owned by its own declaration or by home.
+    #: ``check-plan`` warns when it differs from home. ``None`` if absent.
     declared_home: str | None = None
 
     def digest(self) -> str:
@@ -1311,25 +1313,10 @@ def load_plan_source(path: Path, repo_root: Path, *, manifest: bool = False) -> 
 CROSS_REPOSITORY_REQUIRES_MANAGED = "cross_repository_requires_managed"
 
 
-def refuse_foreign_home(source: PlanSource, home: str) -> None:
-    """Refuse a plan whose ``Repository:`` before its first stage names a
-    repository other than ``home``: it says it is run from elsewhere."""
-
-    declared = getattr(source, "declared_home", None)
-    if declared is not None and declared != home:
-        raise PlanRefusal(
-            OWNER_DECLARATION_INVALID,
-            f"the plan declares 'Repository: {declared}' before its first stage, but is run from "
-            f"{home!r}; run it from {declared!r}, or declare each stage's repository on the first "
-            "line after its heading",
-        )
-
-
 def refuse_foreign_owners(source: PlanSource, home: str) -> None:
     """Refuse to run, in this checkout, a plan with a stage another
     repository owns: a current-checkout run cannot leave its repository."""
 
-    refuse_foreign_home(source, home)
     foreign = foreign_stages(source.stages(), home)
     if foreign:
         listed = ", ".join(f"{stage.display} ({stage.owner})" for stage in foreign)
@@ -1435,17 +1422,6 @@ def _verify_source_unchanged(source: PlanSource, state: PlanRunState) -> tuple[P
             f"the executable content of {state.plan} has changed since this run started; "
             "refusing to continue against a different plan. Restore it as it was, or "
             "deliberately start over (see run-plan's refusal message for what to remove)."
-        )
-    # Not in the digest (it is outside every stage section, and folding it in
-    # would change recorded digests of plans that already carry it), but it
-    # decides whether the plan may run here: an edit since this source was
-    # read is refused like any other change. A resume re-checks it against
-    # the home repository before anything runs (refuse_foreign_home).
-    if getattr(fresh, "declared_home", None) != getattr(source, "declared_home", None):
-        raise PlanRefusal(
-            OWNER_DECLARATION_INVALID,
-            f"the 'Repository:' line before the first stage of {state.plan} changed since this "
-            "run read it; refusing to continue against a different plan. Restore it as it was",
         )
     return fresh.stages()
 
@@ -4950,7 +4926,6 @@ __all__ = [
     "plan_label",
     "plan_state_not_ignored_message",
     "record_human_evidence",
-    "refuse_foreign_home",
     "refuse_foreign_owners",
     "new_run_key",
     "render_brief",

@@ -28,12 +28,12 @@ from agent_sparring.plan import (
     PlanRunState,
     PlanRunStatus,
     _verify_source_unchanged,
+    load_markdown_source,
     markdown_source_from_text,
     new_run_key,
     parse_plan,
     plan_digest,
     plan_key,
-    refuse_foreign_home,
     refuse_foreign_owners,
     resume_plan,
     run_state_path,
@@ -165,25 +165,20 @@ class OwnerDeclarationTests(unittest.TestCase):
 
 class OutsideStageDeclarationTests(unittest.TestCase):
     """Nothing declaration-shaped outside a stage header is ever silently
-    ignored: it is the plan-level home declaration, or it is refused."""
+    ignored: it is the preamble's contextual ``Repository:`` line, or it is
+    refused. The preamble line decides nothing about execution."""
 
     def _source(self, text: str):
         return markdown_source_from_text(Path("p.md"), "p.md", text)
 
-    def test_a_preamble_declaration_is_the_plan_level_home(self):
-        text = "# Plan\n\n**Repository:** `app`  \n\n" + plan("Body.")
-        source = self._source(text)
-        self.assertEqual(source.declared_home, "app")
-        self.assertEqual([s.owner for s in source.stages()], [None])
-        refuse_foreign_owners(source, "app")
-        refuse_foreign_home(source, "app")
-
-    def test_a_foreign_preamble_declaration_is_refused_at_run_time(self):
-        source = self._source("Repository: foreign\n\n" + plan("Body."))
-        for refuse in (refuse_foreign_home, refuse_foreign_owners):
-            with self.subTest(refuse.__name__), self.assertRaises(PlanRefusal) as ctx:
-                refuse(source, "app")
-            self.assertEqual(ctx.exception.code, OWNER_DECLARATION_INVALID)
+    def test_a_preamble_declaration_is_context_only(self):
+        for name in ("app", "foreign"):
+            with self.subTest(name):
+                source = self._source(f"# Plan\n\n**Repository:** `{name}`  \n\n" + plan("Body."))
+                self.assertEqual(source.declared_home, name)
+                # No stage is owned by it, and nothing is refused for it.
+                self.assertEqual([s.owner for s in source.stages()], [None])
+                refuse_foreign_owners(source, "app")
 
     def test_malformed_or_conflicting_preamble_declarations_are_refused(self):
         for preamble in ("Repository: a/b", "Repository: two words", "Repository: a\n\nRepository: b"):
@@ -212,22 +207,29 @@ class OutsideStageDeclarationTests(unittest.TestCase):
         self.assertIsNone(source.declared_home)
         self.assertEqual([(s.owner, s.gates_before) for s in source.stages()], [(None, ())])
 
-    def test_the_declared_home_is_not_in_the_digest_so_a_change_is_refused_on_reread(self):
-        # Legacy digests stay as they were: the preamble is outside every
-        # stage section. That is exactly why a re-read checks it separately.
+    def test_changing_the_preamble_between_invocations_changes_no_execution(self):
+        # Run state recorded against a plan with a preamble line; a separate
+        # invocation then reads the plan with the line changed or removed.
+        # Because the line is context, there is nothing to protect: the
+        # digest, stage ids, owners and refusals are all as they were.
         path = Path(self._tmp()) / "p.md"
-        path.write_text("Repository: repo\n\n" + plan("Body."), encoding="utf-8")
-        source = markdown_source_from_text(path, "p.md", path.read_text(encoding="utf-8"))
+        body = plan("Body.", "Repository: web\n\nThere.")
+        path.write_text("Repository: repo\n\n" + body, encoding="utf-8")
+        recorded = load_markdown_source(path, "p.md")
         state = PlanRunState(
-            plan="p.md", plan_digest=source.digest(), expected_branch="feature/x",
-            current_stage_index=0, current_stage=source.stages()[0].stage_id, status=PlanRunStatus.RUNNING,
+            plan="p.md", plan_digest=recorded.digest(), expected_branch="feature/x",
+            current_stage_index=0, current_stage=recorded.stages()[0].stage_id, status=PlanRunStatus.PAUSED,
         )
-        self.assertEqual(_verify_source_unchanged(source, state), source.stages())
-        path.write_text("Repository: elsewhere\n\n" + plan("Body."), encoding="utf-8")
-        self.assertEqual(source.reload().digest(), source.digest())
-        with self.assertRaises(PlanRefusal) as ctx:
-            _verify_source_unchanged(source, state)
-        self.assertEqual(ctx.exception.code, OWNER_DECLARATION_INVALID)
+        for preamble in ("Repository: elsewhere\n\n", ""):
+            with self.subTest(preamble or "removed"):
+                path.write_text(preamble + body, encoding="utf-8")
+                later = load_markdown_source(path, "p.md")
+                self.assertEqual(later.digest(), state.plan_digest)
+                self.assertEqual(_verify_source_unchanged(later, state), recorded.stages())
+                self.assertEqual(
+                    [(s.stage_id, s.owner) for s in later.stages()],
+                    [(s.stage_id, s.owner) for s in recorded.stages()],
+                )
 
     def _tmp(self) -> str:
         directory = tempfile.TemporaryDirectory()
@@ -449,10 +451,14 @@ class CheckPlanTests(_Cli, _PlanRepoTestCase):
         self.assertEqual(code, 0)
         self.assertIn("warning: the plan names repository 'sporely-landing'", err)
 
-    def test_a_foreign_preamble_declaration_is_invalid(self):
-        code, out, _ = self._check("Repository: elsewhere\n\n" + plan("Body."), "--json")
-        self.assertEqual(code, 1)
-        self.assertEqual(json.loads(out)["code"], OWNER_DECLARATION_INVALID)
+    def test_a_foreign_preamble_declaration_warns(self):
+        code, out, err = self._check("Repository: elsewhere\n\n" + plan("Body."), "--json")
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        self.assertEqual(report["executions"], [{"repository": "repo", "stages": [1]}])
+        (warning,) = report["warnings"]
+        self.assertIn("'Repository: elsewhere' before its first stage", warning)
+        self.assertIn("context only", warning)
         code, out, err = self._check("Repository: repo\n\n" + UI_SCREENSHOTS_SHAPED, "--json")
         self.assertEqual(code, 0, err)
         # Declared, so not the undeclared shape the warning is for.
@@ -513,31 +519,6 @@ class ManagedRefusalTests(_Cli, _ManagedRepoTestCase):
         self.assertEqual(code, 1)
         self.assertIn("[cross_repository_not_yet]", json.loads(out)["error"])
         self.assertEqual(self._records(), ())
-
-    def test_a_foreign_preamble_declaration_refuses_managed(self):
-        self.plan_path.write_text("Repository: elsewhere\n\n" + plan("Build here."), encoding="utf-8")
-        _commit(self.repo, "foreign preamble")
-        code, _, err = self._start_managed()
-        self.assertEqual(code, 1)
-        self.assertIn("[owner_declaration_invalid]", err)
-        code, out, _ = self._main("start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed", "--json")
-        self.assertIn("[owner_declaration_invalid]", json.loads(out)["error"])
-        self.assertEqual(self._records(), ())
-
-    def test_a_resume_refuses_a_preamble_changed_to_a_foreign_repository(self):
-        self.plan_path.write_text("Repository: repo\n\n" + plan("Build here."), encoding="utf-8")
-        _commit(self.repo, "home preamble")
-        code, _, err = self._start_managed()
-        (record,) = self._records()
-        state_path = record.sparring_dir / "plans" / f"{record.run_key}.json"
-        before = state_path.read_bytes()
-        plan_file = Path(record.worktree_path) / record.input_path
-        plan_file.chmod(0o644)
-        plan_file.write_text("Repository: elsewhere\n\n" + plan("Build here."), encoding="utf-8")
-        code, _, err = self._main("resume-plan", "--run-key", record.run_key)
-        self.assertEqual(code, 1)
-        self.assertIn("[owner_declaration_invalid]", err)
-        self.assertEqual(state_path.read_bytes(), before)
 
     def test_a_home_owned_declaration_runs_managed(self):
         self.plan_path.write_text(plan("Repository: repo\n\nBuild here."), encoding="utf-8")
