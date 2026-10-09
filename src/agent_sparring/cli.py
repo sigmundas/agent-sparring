@@ -2388,6 +2388,7 @@ def _create_logical_plan(
     if not foreign_stages(source.stages(), home) and not given:
         return None
     key = prepared.record.run_key
+    logical_plan.require_home_first(logical_plan.resolve_stages(source.stages(), home), home)
     owners = {stage.owner or home for stage in source.stages()}
     home_binding, _, _ = logical_plan.bind_repository(home, repo_root, target_branch=prepared.record.target_branch)
     bindings = logical_plan.resolve_bindings(home_binding, given, owners)
@@ -2403,7 +2404,8 @@ def _create_logical_plan(
         logical_key=key, source=named, input_path=read_path, home=home,
         repositories=bindings, snapshot=snapshot, snapshot_sha256=sha,
     )
-    logical_plan.create(home_common, record)
+    created = logical_plan.create(home_common, record)
+    logical_plan.write_pointers(home_common, created)
     logical_slice = {"logical_key": key, "home_common_dir": str(home_common), "index": 1}
     return replace(prepared, record=replace(prepared.record, logical_slice=logical_slice))
 
@@ -2579,6 +2581,7 @@ def _continue_logical_plan(args: argparse.Namespace, home: Path, logical) -> int
     # Confirmed: create exactly what was shown, in its own repository.
     nxt = payload["next"]
     try:
+        logical_plan.write_pointers(home, logical)  # an interrupted start may have left some unwritten
         prepared = logical_plan.plan_slice_execution(
             home, logical, nxt["index"], target_branch=nxt["target_branch"], base_sha=nxt["base_sha"]
         )
@@ -2612,7 +2615,8 @@ def _resume_logical_part(args: argparse.Namespace, home: Path, logical, nxt: dic
         record = managed_run.read_record(repo_root, nxt["run_key"])
         if record is None:
             raise ManagedRunError("managed_record_missing", f"part {nxt['index']} has no execution record")
-        record = managed_run.confirm_creation(repo_root, record)
+        logical_plan.write_pointers(home, logical)
+        record = managed_run.complete_creation(repo_root, record)
         logical_plan.record_slice_created(home, logical.logical_key, nxt["index"], record.run_key)
     except ManagedRunError as exc:
         print(f"could not resume plan: {exc}", file=sys.stderr)

@@ -441,3 +441,148 @@ class InterruptionTests(_CrossCase):
         self.assertEqual(code, 0, err)
         self.assertIn("recorded human evidence", err)
         self.assertEqual(len(self.web_records()), 1)
+
+
+FOREIGN_FIRST = plan("Repository: web\n\nBuild there.", "Build here.")
+
+
+class HomeFirstTests(_CrossCase):
+    def setUp(self):
+        super().setUp()
+        self.plan_path.write_text(FOREIGN_FIRST, encoding="utf-8")
+        _run_git(self.repo, "commit", "-qam", "foreign first")
+
+    def assert_nothing_created(self):
+        self.assertEqual(managed_run.list_records(self.repo), ())
+        self.assertEqual(self.web_records(), ())
+        self.assertFalse(logical_plan.records_dir(self.home_common()).exists())
+        self.assertFalse(logical_plan.records_dir(managed_run.git_common_dir(self.web)).exists())
+
+    def test_run_plan_refuses_a_plan_whose_first_stage_is_not_home(self):
+        code, _, err = self.start()
+        self.assertEqual(code, 1)
+        self.assertIn("[first_stage_not_home]", err)
+        self.assert_nothing_created()
+
+    def test_start_plan_refuses_a_plan_whose_first_stage_is_not_home(self):
+        code, out, _ = self.run_cli(
+            "start-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed",
+            "--repository", f"web={self.web}", "--json",
+        )
+        status = json.loads(out)
+        self.assertEqual((code, status["status"], status["confirm_token"]), (1, "refused", None))
+        self.assertIn("[first_stage_not_home]", status["error"])
+        self.assert_nothing_created()
+
+
+class DiscoveryTests(_CrossCase):
+    def setUp(self):
+        super().setUp()
+        code, _, err = self.start()
+        self.assertEqual(code, 0, err)
+
+    def test_the_target_names_the_home_from_the_start(self):
+        pointer = logical_plan.pointer_path(managed_run.git_common_dir(self.web), K)
+        self.assertEqual(
+            json.loads(pointer.read_text(encoding="utf-8")),
+            {"schema_version": 1, "logical_key": K, "home_common_dir": str(self.home_common())},
+        )
+        self.assertFalse(logical_plan.pointer_path(self.home_common(), K).exists())
+
+    def test_status_and_confirmation_from_the_target_before_its_part_exists(self):
+        refused = self.status_json(where="web")
+        self.assertEqual((refused["status"], refused["code"]), ("refused", "previous_not_integrated"))
+        self.finish_first()
+        from_home = self.status_json()
+        from_web = self.status_json(where="web")
+        for payload in (from_home, from_web):
+            payload.pop("_err")
+        self.assertEqual(from_home, from_web)
+        self.assertEqual(from_web["status"], "ready")
+        self.assertEqual(self.web_records(), ())
+
+        code, out, err = self.from_web("resume-plan", "--run-key", K, "--confirm", from_web["confirm_token"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("plan complete", out)
+        self.assertEqual([r.run_key for r in self.web_records()], [K2])
+        self.assertTrue(logical_plan.derived_status(self.logical()).complete)
+
+    def test_a_pointer_to_a_plan_that_does_not_bind_the_repository_is_refused(self):
+        other = _make_repo(self.repo.parent, "other", "other")
+        pointer = logical_plan.pointer_path(managed_run.git_common_dir(other), K)
+        pointer.parent.mkdir(parents=True)
+        pointer.write_bytes(logical_plan.pointer_path(managed_run.git_common_dir(self.web), K).read_bytes())
+        code, _, err = self.run_cli(
+            "resume-plan", "--run-key", K, "--json", "--repo-root", str(other), sparring_dir=other / ".sparring"
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("does not bind this repository", err)
+
+
+class EarlyInterruptionTests(_CrossCase):
+    verdicts = [READY, NEEDS_YOU, NEEDS_YOU]
+
+    def setUp(self):
+        super().setUp()
+        code, _, err = self.start()
+        self.assertEqual(code, 0, err)
+        self.finish_first()
+        self.token = self.status_json()["confirm_token"]
+        self.branch = managed_run.managed_branch(K2)
+
+    def interrupt_at(self, git_step: tuple[str, ...]):
+        real = managed_run._git
+
+        def crash(cwd, *args):
+            if args[: len(git_step)] == git_step:
+                raise managed_run.ManagedRunError("interrupted", "boom")
+            return real(cwd, *args)
+
+        with mock.patch.object(managed_run, "_git", side_effect=crash):
+            code, _, _ = self.run_cli(
+                "resume-plan", "--run-key", K, "--confirm", self.token, "--repo-root", str(self.repo)
+            )
+        self.assertEqual(code, 1)
+        (execution,) = self.web_records()
+        self.assertEqual(execution.lifecycle, "creating")
+        self.assertFalse(Path(execution.worktree_path).exists())
+        return execution
+
+    def resume(self):
+        return self.run_cli("resume-plan", "--run-key", K, "--repo-root", str(self.repo))
+
+    def assert_one_execution(self):
+        (execution,) = self.web_records()
+        self.assertEqual(execution.lifecycle, "created")
+        self.assertEqual(len([e for e in managed_run.worktree_list(self.web) if e["branch"] == self.branch]), 1)
+        self.assertEqual([e["detail"]["index"] for e in self.slice_events()], [1, 2])
+        self.assertEqual(_git(Path(execution.worktree_path), "symbolic-ref", "--short", "HEAD"), self.branch)
+
+    def test_interrupted_right_after_the_record(self):
+        self.interrupt_at(("update-ref",))
+        self.assertFalse(managed_run.branch_exists(self.web, self.branch))
+        code, _, err = self.resume()
+        self.assertEqual(code, 0, err)
+        self.assert_one_execution()
+        code, _, err = self.resume()  # and again: still one
+        self.assertEqual(code, 0, err)
+        self.assert_one_execution()
+
+    def test_interrupted_after_the_branch(self):
+        execution = self.interrupt_at(("worktree", "add"))
+        self.assertTrue(managed_run.branch_exists(self.web, self.branch))
+        self.assertEqual(_git(self.web, "rev-parse", f"refs/heads/{self.branch}"), execution.base_sha)
+        code, _, err = self.resume()
+        self.assertEqual(code, 0, err)
+        self.assert_one_execution()
+
+    def test_a_branch_not_made_by_the_engine_is_never_attributed(self):
+        execution = self.interrupt_at(("update-ref",))
+        _run_git(self.web, "branch", self.branch, execution.base_sha)
+        code, _, err = self.resume()
+        self.assertEqual(code, 1)
+        self.assertIn("creation_incomplete", err)
+        (after,) = self.web_records()
+        self.assertEqual(after.lifecycle, "creating")
+        self.assertFalse(Path(execution.worktree_path).exists())
+        self.assertEqual([e["detail"]["index"] for e in self.slice_events()], [1])

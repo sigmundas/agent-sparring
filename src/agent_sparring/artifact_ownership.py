@@ -169,6 +169,20 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
         ),
     ),
     ArtifactOwnership(
+        path="<other git-common-dir>/agent-sparring/plans/<logical>.home.json",
+        owner="engine",
+        provider_writable=False,
+        lifetime=(
+            "written once, exclusively, in every other repository the logical plan binds, "
+            "when the logical record is created; never rewritten"
+        ),
+        purpose=(
+            "where that logical plan's record lives (its home git common dir), so "
+            "resume-plan --run-key <logical> resolves it from that repository before "
+            "any part of the plan runs there; trusted only when the record binds this repository"
+        ),
+    ),
+    ArtifactOwnership(
         path="<home git-common-dir>/agent-sparring/plans/<logical>.obligations.json",
         owner="engine",
         provider_writable=False,

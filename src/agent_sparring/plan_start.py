@@ -320,10 +320,17 @@ def plan_bindings(request: StartRequest, source) -> tuple[Any, ...]:
     this project (``primary_repository``, at its target tip) and every
     ``--repository`` its stages declare. Refuses with the binding's code."""
 
-    from agent_sparring.logical_plan import LogicalPlanError, bind_repository, resolve_bindings
+    from agent_sparring.logical_plan import (
+        LogicalPlanError,
+        bind_repository,
+        require_home_first,
+        resolve_bindings,
+        resolve_stages,
+    )
 
     owners = {stage.owner or request.primary_repository for stage in source.stages()}
     try:
+        require_home_first(resolve_stages(source.stages(), request.primary_repository), request.primary_repository)
         home, _, _ = bind_repository(
             request.primary_repository, Path(request.repo_root), target_branch=request.target_branch
         )

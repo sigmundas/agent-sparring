@@ -662,14 +662,27 @@ def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRun
     the run (the record does not :attr:`~ManagedRunRecord.owns_git_state`)."""
 
     record = plan.record
-    path = create_record(repo_root, record)
+    create_record(repo_root, record)
+    return _make_git_state(repo_root, record, make_branch=True)
+
+
+def _make_git_state(repo_root: Path, record: ManagedRunRecord, *, make_branch: bool) -> ManagedRunRecord:
+    """The branch (unless ``make_branch`` is false: it is already proven the
+    engine's), then the worktree, then ``created`` -- for a record already
+    written. Failure handling is :func:`create_managed_worktree`'s."""
+
+    path = record_path(repo_root, record.run_key)
     mark = creation_mark(record)
     # The branch first, exclusively (old value empty: it must not exist),
     # carrying the engine's mark in its reflog; then the worktree, locked with
     # the same mark until ``created`` is recorded.
-    result = _git(
-        Path(repo_root), "update-ref", "--create-reflog", "-m", mark,
-        f"refs/heads/{record.branch}", record.base_sha, "",
+    result = (
+        _git(
+            Path(repo_root), "update-ref", "--create-reflog", "-m", mark,
+            f"refs/heads/{record.branch}", record.base_sha, "",
+        )
+        if make_branch
+        else subprocess.CompletedProcess([], 0, "", "")
     )
     if result.returncode == 0:
         result = _git(
@@ -810,6 +823,33 @@ def confirm_creation(repo_root: Path, record: ManagedRunRecord) -> ManagedRunRec
         f"run {record.run_key}'s creation failed; it owns no branch or worktree and cannot be resumed "
         "(start a new run)",
     )
+
+
+def complete_creation(repo_root: Path, record: ManagedRunRecord) -> ManagedRunRecord:
+    """:func:`confirm_creation`, also finishing a creation interrupted
+    before its worktree existed -- the creation an authorized ``creating``
+    record already stands for, at its recorded ``base_sha``:
+
+    - neither branch nor path exists (interrupted right after the record):
+      the branch and worktree are made exactly as creation makes them;
+    - the branch exists, the path does not: the branch is used only when its
+      whole reflog is the engine's creation mark at ``base_sha`` and its tip
+      is still ``base_sha``; then the worktree is added.
+
+    Anything else is :func:`confirm_creation`'s to prove or refuse, so a
+    branch or path made any other way is never attributed to the run and a
+    second worktree is never made."""
+
+    if record.lifecycle != "creating" or os.path.lexists(record.worktree_path):
+        return confirm_creation(repo_root, record)
+    if any(entry["branch"] == record.branch for entry in worktree_list(repo_root)):
+        return confirm_creation(repo_root, record)  # checked out elsewhere: refused there
+    if not branch_exists(Path(repo_root), record.branch):
+        return _make_git_state(repo_root, record, make_branch=True)
+    tip = _git_out(Path(repo_root), "rev-parse", f"refs/heads/{record.branch}^{{commit}}")
+    if _branch_is_engines(Path(repo_root), record) and tip == record.base_sha:
+        return _make_git_state(repo_root, record, make_branch=False)
+    return confirm_creation(repo_root, record)
 
 
 # -- resume ------------------------------------------------------------------

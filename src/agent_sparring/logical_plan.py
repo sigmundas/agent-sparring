@@ -914,25 +914,100 @@ def check_binding_now(binding: RepositoryBinding, target_branch: str | None) -> 
 # -- continuation ------------------------------------------------------------
 
 
+def require_home_first(stages: tuple[LogicalStage, ...], home: str) -> None:
+    """A plan across repositories starts in its home: the first part runs
+    where it is started. Refuses ``first_stage_not_home`` otherwise."""
+
+    if stages and stages[0].owner != home:
+        raise LogicalPlanError(
+            "first_stage_not_home",
+            f"Stage {stages[0].label} belongs to {stages[0].owner!r}; a plan across repositories starts in the "
+            f"repository its first stage belongs to, so start it from {stages[0].owner!r}, not {home!r}",
+        )
+
+
+def pointer_path(common_dir: Path, logical_key: str) -> Path:
+    """In another bound repository: where the logical plan's home is named."""
+
+    managed_run._check_run_key(logical_key)
+    return records_dir(common_dir) / f"{logical_key}.home.json"
+
+
+def write_pointers(home_common_dir: Path, record: LogicalPlanRecord) -> None:
+    """Name the home in every other bound repository's common dir, once and
+    exclusively, so each resolves the plan before any part runs there. An
+    existing pointer is kept when it names this home; any other refuses."""
+
+    payload = {"schema_version": SCHEMA_VERSION, "logical_key": record.logical_key,
+               "home_common_dir": str(Path(home_common_dir))}
+    home = Path(home_common_dir).resolve()
+    for binding in record.repositories:
+        common = Path(binding.git_common_dir)
+        if common.resolve() == home:
+            continue
+        path = pointer_path(common, record.logical_key)
+        temp = managed_run._write_temp(path.parent, payload)
+        try:
+            os.link(temp, path)
+        except FileExistsError:
+            if _pointer_home(path, record.logical_key) != home:
+                raise LogicalPlanError(
+                    "pointer_conflict", f"{path} names another home for logical plan {record.logical_key}"
+                ) from None
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+def _pointer_home(path: Path, logical_key: str) -> Path | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"schema_version", "logical_key", "home_common_dir"}
+        or payload["schema_version"] != SCHEMA_VERSION
+        or payload["logical_key"] != logical_key
+        or not isinstance(payload["home_common_dir"], str)
+        or not Path(payload["home_common_dir"]).is_absolute()
+    ):
+        return None
+    return Path(payload["home_common_dir"]).resolve()
+
+
 def find(repo_root: Path, logical_key: str) -> tuple[Path, LogicalPlanRecord] | None:
     """``(home common dir, record)`` of logical plan ``logical_key`` as seen
     from any worktree of an involved repository: its record in this
-    repository's common dir (the home), else the home named by an execution
-    of it recorded here. ``None`` when neither exists."""
+    repository's common dir (the home), else the home named by this
+    repository's pointer or by an execution of it recorded here -- trusted
+    only when that record binds this repository. ``None`` when none exists."""
 
     managed_run._check_run_key(logical_key)
     common = managed_run.git_common_dir(Path(repo_root))
     if record_path(common, logical_key).is_file():
         return common, load(common, logical_key)
+    homes: list[Path] = []
+    pointer = pointer_path(common, logical_key)
+    if pointer.is_file():
+        home = _pointer_home(pointer, logical_key)
+        if home is None:
+            raise LogicalPlanError("pointer_unreadable", f"{pointer} does not name a home for {logical_key}")
+        homes.append(home)
     try:
         executions = managed_run.list_records(Path(repo_root))
     except ManagedRunError:
-        return None
+        executions = ()
     for execution in executions:
         found = execution.logical_slice
         if found is not None and found["logical_key"] == logical_key:
-            home = Path(found["home_common_dir"])
-            return home, load(home, logical_key)
+            homes.append(Path(found["home_common_dir"]))
+    for home in homes:
+        record = load(home, logical_key)
+        if not any(Path(binding.git_common_dir).resolve() == common for binding in record.repositories):
+            raise LogicalPlanError(
+                "repository_unknown", f"logical plan {logical_key} at {home} does not bind this repository ({common})"
+            )
+        return home, record
     return None
 
 
@@ -1036,8 +1111,10 @@ __all__ = [
     "new_record",
     "next_slice",
     "plan_slice_execution",
+    "pointer_path",
     "previous_integration",
     "record_path",
+    "require_home_first",
     "record_slice_created",
     "resolve_bindings",
     "resolve_stages",
@@ -1046,4 +1123,5 @@ __all__ = [
     "snapshot_input",
     "snapshot_path",
     "snapshot_source",
+    "write_pointers",
 ]
