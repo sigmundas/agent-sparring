@@ -166,6 +166,7 @@ from agent_sparring.acceptance import (
     freeze_candidate,
 )
 from agent_sparring.activity import ActivityEmitter
+from agent_sparring.config import VisualReviewConfig
 from agent_sparring.plan_obligations import (
     PlanObligationError,
     carry as carry_plan_obligations,
@@ -1160,6 +1161,7 @@ def start_plan(
     allow_push_for_run: bool = False,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
+    visual_review: VisualReviewConfig | None = None,
     stop_after_stage: str | None = None,
     report: Reporter = lambda message: None,
     managed: bool = False,
@@ -1339,6 +1341,7 @@ def start_plan(
         make_adapters,
         max_send_back_cycles=max_send_back_cycles,
         self_check=self_check,
+        visual_review=visual_review,
         report=report,
         stop_after_stage=stop_after_stage,
     )
@@ -1634,6 +1637,7 @@ def resume_plan(
     accept_advanced_head: str | None = None,
     max_send_back_cycles: int = DEFAULT_MAX_SEND_BACK_CYCLES,
     self_check: bool = False,
+    visual_review: VisualReviewConfig | None = None,
     stop_after_stage: str | None = None,
     next_turn: str | None = None,
     fresh_roles: tuple[str, ...] = (),
@@ -1982,6 +1986,7 @@ def resume_plan(
         make_adapters,
         max_send_back_cycles=max_send_back_cycles,
         self_check=self_check,
+        visual_review=visual_review,
         report=report,
         sparrer_first=sparrer_first,
         stop_after_stage=stop_after_stage,
@@ -3593,6 +3598,7 @@ def _drive(
     max_send_back_cycles: int,
     self_check: bool,
     report: Reporter,
+    visual_review: VisualReviewConfig | None = None,
     sparrer_first: bool = False,
     stop_after_stage: str | None = None,
     next_turn_choice: str | None = None,
@@ -4137,6 +4143,7 @@ def _drive(
                             expected_branch=state.expected_branch,
                             max_send_back_cycles=max_send_back_cycles,
                             self_check=self_check,
+                            visual_review=visual_review,
                             start_with="sparring" if start_with == "next_turn" else start_with,
                             sparring_first_reason=(
                                 "next_turn" if start_with == "next_turn" else "evidence"

@@ -1,8 +1,8 @@
 """Visual evidence: the contract between screenshot capture and image review.
 
-This module only defines and checks evidence. Running a capture command and
-handing images to a reviewer are later stages; nothing here launches a
-browser, a renderer or a provider. It is deliberately standard library only:
+This module only defines and checks evidence. Running a capture command is
+:mod:`agent_sparring.visual_capture`; handing images to a reviewer is a later
+stage. Nothing here launches a browser, a renderer or a provider. It is deliberately standard library only:
 the contract names no capture technology (Playwright, a JavaScript runtime,
 React, Qt), so any repository that can write PNG files and a small JSON
 manifest can supply evidence.

@@ -235,6 +235,22 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
         ),
     ),
     ArtifactOwnership(
+        path="stages/<stage>/visual-evidence/",
+        owner=(
+            "engine (screenshots and manifest written by the project's [visual_review] "
+            "capture command, which the engine runs outside every provider session)"
+        ),
+        provider_writable=False,
+        lifetime=(
+            "deleted and recaptured before every sparring turn when visual review is "
+            "enabled; must be git-ignored"
+        ),
+        purpose=(
+            "the screenshots for the candidate under review and current.json, the "
+            "engine's binding of them to that exact candidate"
+        ),
+    ),
+    ArtifactOwnership(
         path="stages/<stage>/activity.jsonl",
         owner="engine",
         provider_writable=False,

@@ -47,6 +47,7 @@ from agent_sparring.config import (
     CONFIG_FILENAME,
     ProjectConfig,
     ProjectConfigError,
+    VisualReviewConfig,
     load_project_config,
     load_project_markdown,
 )
@@ -1086,6 +1087,15 @@ def _resolve_self_check(sparring_dir: Path) -> bool:
     return False
 
 
+def _resolve_visual_review(sparring_dir: Path) -> VisualReviewConfig | None:
+    """project.toml's ``[visual_review]``, or ``None`` when it is absent or
+    disabled. Config-only, like ``[stage] self_check``."""
+
+    if (sparring_dir / CONFIG_FILENAME).is_file():
+        return load_project_config(sparring_dir).visual_review
+    return None
+
+
 def _cmd_run_stage(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
     try:
@@ -1576,6 +1586,7 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             raise StageError(f"stage {args.stage_id!r} does not exist at {stage.directory}")
 
         self_check = _resolve_self_check(sparring_dir)
+        visual_review = _resolve_visual_review(sparring_dir)
         # An ordinary resume obeys the engine's record of whose turn it is
         # (derived once for state written before it existed), decided before
         # anything is pinned or any provider starts.
@@ -1606,6 +1617,7 @@ def _cmd_run_loop(args: argparse.Namespace) -> int:
             expected_branch=args.expected_branch,
             max_send_back_cycles=args.max_send_back_cycles,
             self_check=self_check,
+            visual_review=visual_review,
             start_with=start_with,
             sparring_first_reason="next_turn",
         )
@@ -2062,6 +2074,7 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool, source: PlanSou
             run_key=getattr(args, "run_key", None),
             max_send_back_cycles=args.max_send_back_cycles,
             self_check=self_check,
+            visual_review=_resolve_visual_review(sparring_dir),
             stop_after_stage=args.stop_after_stage,
             report=report,
         )

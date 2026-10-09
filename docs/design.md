@@ -700,10 +700,12 @@ for repository changes afterwards.
 Web GPT remains an escalation/manual sparring target rather than something the
 local driver assumes it can wake automatically.
 
-## Visual evidence (contract only)
+## Visual evidence
 
-Visual review is not wired into any run yet. What exists is the contract
-(`src/agent_sparring/visual_evidence.py`) and a proven image path through the
+Screenshots are captured for every review when a project enables
+`[visual_review]` (below), but no reviewer is shown them yet. What exists is
+the contract (`src/agent_sparring/visual_evidence.py`), capture
+(`src/agent_sparring/visual_capture.py`) and a proven image path through the
 Codex adapter:
 
 - **Image delivery.** `CodexCliAdapter.start`, `resume` and `start_structured`
@@ -731,6 +733,44 @@ Codex adapter:
 - **Independence.** Capture is run by the engine outside every provider
   session; the reviewer only receives files and keeps its read-only sandbox.
   The contract names no capture technology.
+
+### Capture
+
+```toml
+[visual_review]
+enabled = true                       # required; false keeps the table inert
+command = ["npm", "run", "screenshots"]  # argument vector, no shell
+timeout_seconds = 300                # optional, 1..3600
+```
+
+With `enabled = false` or no table, nothing is captured and every stage runs
+exactly as before. When enabled, the loop runs `command` from the repository
+root before every sparring turn -- after each implementation turn, each
+correction after `SEND_BACK`, and a resumed review alike -- against the
+candidate that turn is about to review, already pinned and verified. The
+command gets `SPARRING_EVIDENCE_DIR` (a fresh, empty directory),
+`SPARRING_EVIDENCE_MANIFEST` (where to write the version-1 manifest),
+`SPARRING_REPO_ROOT`, `SPARRING_CANDIDATE_SHA` and `SPARRING_STAGE_ID`.
+
+A capture counts only if the command exits 0 within the timeout (overrunning
+kills its process group), leaves the candidate identity exactly as it found
+it, and writes a manifest with at least one captured screenshot, every one a
+valid PNG -- a regular file, not a link -- inside the evidence directory, and
+every reference a valid, non-ignored PNG in the repository. Anything else
+stops the loop with the reviewer never started: a capture failure can stop a
+run, never become a verdict. The candidate is still pinned for review, so
+resuming after fixing the capture retries the same review.
+
+Evidence lives in `.sparring/stages/<stage>/visual-evidence/`, which must be
+git-ignored (refused otherwise), so screenshots are never candidate content.
+Before a capture runs, the previous capture and its record are deleted;
+afterwards `current.json` records the engine's binding: the full candidate
+identity (`TurnCandidate`, which identifies an uncommitted candidate by
+content digest as well as HEAD), sibling pins, each screenshot's viewport,
+path and SHA-256, and each reference's hash. The binding's `candidate_sha` is
+the candidate's HEAD. `load_current_evidence` re-derives the candidate and
+re-hashes every file, refusing evidence for any other candidate or any file
+changed since.
 
 ---
 

@@ -109,6 +109,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_sparring.config import VisualReviewConfig
 from agent_sparring.deferred_gate import DeferredObligation
 from agent_sparring.finalization import (
     FinalizationError,
@@ -140,6 +141,7 @@ from agent_sparring.stage import (
     Stage,
 )
 from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
+from agent_sparring.visual_capture import VisualCaptureError, run_capture
 
 # A small, deliberately conservative default: enough headroom for a normal
 # correction cycle or two without risking an unattended run burning through
@@ -251,6 +253,7 @@ def run_unattended_loop(
     start_with: str = "stage",
     pending_deferred: tuple[DeferredObligation, ...] = (),
     sparring_first_reason: str = "evidence",
+    visual_review: VisualReviewConfig | None = None,
 ) -> LoopResult:
     """Drive the stage<->sparring loop until a terminal routing action.
 
@@ -331,6 +334,16 @@ def run_unattended_loop(
     that is not the content that was reviewed. This module never invents
     recovery for any of these; it stops cleanly and lets the caller decide
     what to do next.
+
+    ``visual_review`` (the project's ``[visual_review]``; ``None`` when it
+    is disabled) runs the repository's capture command before *every*
+    sparring turn, against the candidate that turn is about to review (see
+    :mod:`agent_sparring.visual_capture`). Each review therefore has
+    evidence captured for exactly its candidate, a correction after
+    SEND_BACK is captured afresh, and earlier evidence is discarded before
+    the new capture runs. A capture that fails raises :class:`LoopError`
+    with the reviewer never started -- it can stop a run, never become a
+    verdict. With ``None`` nothing is captured and the loop is unchanged.
     """
 
     if max_send_back_cycles < 1:
@@ -537,6 +550,27 @@ def run_unattended_loop(
                 if cycle == 1 and stage_run is None:
                     raise CandidateRefused(str(exc)) from exc
                 raise LoopError(str(exc)) from exc
+
+        if visual_review is not None:
+            # After the candidate is pinned and verified, so the evidence is
+            # captured for -- and checked against -- exactly what the
+            # reviewer is about to rule on.
+            activity.emit("loop.visual_capture", cycle=cycle, summary="capturing screenshots")
+            try:
+                capture = run_capture(repo_root, stage, visual_review)
+            except VisualCaptureError as exc:
+                activity.emit("loop.stopped", cycle=cycle, summary="visual capture failed")
+                raise LoopError(
+                    f"visual capture for stage {stage.stage_id!r} failed, so the reviewer was "
+                    f"not started and no verdict was recorded: {exc}"
+                ) from exc
+            activity.emit(
+                "loop.visual_captured",
+                cycle=cycle,
+                sha=capture.candidate.head_sha,
+                summary=f"{sum(s.captured for s in capture.manifest.screenshots)} screenshot(s) "
+                f"captured as {capture.capture_id}",
+            )
 
         try:
             sparring_run = run_sparring_agent(

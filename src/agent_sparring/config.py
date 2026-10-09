@@ -55,6 +55,11 @@ class ProjectConfig:
     # honoured -- ``finish-run`` always keeps the remote branch and reports
     # ``remote_delete_unavailable`` (see ``managed_finish.REMOTE_DELETE_UNAVAILABLE``).
     finish_delete_remote_branch: bool = False
+    # ``[visual_review]``: the repository's own screenshot capture command
+    # (see :mod:`agent_sparring.visual_capture`). ``None`` when the table is
+    # absent or says ``enabled = false`` -- no capture runs and every stage
+    # executes exactly as it would without visual review.
+    visual_review: "VisualReviewConfig | None" = None
 
     def command(self, name: str) -> str | None:
         """Return a configured project command by name, if any."""
@@ -93,6 +98,71 @@ class MigrationsConfig:
     target_ref: str | None = None
     deferred_registry: str | None = None
     max_observation_age_minutes: int = 60
+
+
+@dataclass(frozen=True)
+class VisualReviewConfig:
+    """``[visual_review]``: how the engine captures screenshots for review.
+
+    ``command`` is an argument vector run as is, without a shell, from the
+    repository root. It is the repository's own trusted code: the engine
+    runs it outside every provider session and only validates what it
+    leaves behind (see :mod:`agent_sparring.visual_capture` for the output
+    contract). ``timeout_seconds`` bounds one capture; a capture that
+    overruns is killed and counts as failed.
+    """
+
+    command: tuple[str, ...]
+    timeout_seconds: int = 300
+
+
+DEFAULT_VISUAL_TIMEOUT_SECONDS = 300
+MAX_VISUAL_TIMEOUT_SECONDS = 3600
+
+# Closed for the same reason as ``_AGENT_ROLE_KEYS``: a misspelled
+# ``timeout`` must not silently leave the default in force.
+_VISUAL_REVIEW_KEYS: frozenset[str] = frozenset({"enabled", "command", "timeout_seconds"})
+
+
+def _parse_visual_review(table: Mapping[str, Any], *, source: str) -> VisualReviewConfig | None:
+    if "visual_review" not in table:
+        return None
+    raw = table["visual_review"]
+    if not isinstance(raw, Mapping):
+        raise ProjectConfigError(f"{source} field 'visual_review' must be a table")
+    where = f"{source} [visual_review]"
+    unknown = sorted(set(raw) - _VISUAL_REVIEW_KEYS)
+    if unknown:
+        raise ProjectConfigError(
+            f"{where} has unknown field(s) {', '.join(repr(key) for key in unknown)}; "
+            f"supported fields: {', '.join(sorted(_VISUAL_REVIEW_KEYS))}"
+        )
+    if "enabled" not in raw:
+        raise ProjectConfigError(f"{where} is missing required field 'enabled'")
+    enabled = _optional_bool(raw, "enabled", where=where)
+    command = raw.get("command")
+    if command is not None and (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(part, str) and part for part in command)
+        or not command[0].strip()
+    ):
+        raise ProjectConfigError(
+            f"{where} field 'command' must be a non-empty array of non-empty strings "
+            '(an argument vector, e.g. ["npm", "run", "screenshots"])'
+        )
+    timeout = _optional_int(
+        raw, "timeout_seconds", where=where, default=DEFAULT_VISUAL_TIMEOUT_SECONDS
+    )
+    if not 0 < timeout <= MAX_VISUAL_TIMEOUT_SECONDS:
+        raise ProjectConfigError(
+            f"{where} field 'timeout_seconds' must be in 1..{MAX_VISUAL_TIMEOUT_SECONDS}"
+        )
+    if not enabled:
+        return None
+    if command is None:
+        raise ProjectConfigError(f"{where} is enabled but has no 'command'")
+    return VisualReviewConfig(command=tuple(command), timeout_seconds=timeout)
 
 
 def _require_str(table: Mapping[str, Any], key: str, *, where: str) -> str:
@@ -323,6 +393,8 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
         )
     delete_remote = _optional_bool(finish_table, "delete_remote_branch", where=f"{source} [finish]")
 
+    visual_review = _parse_visual_review(table, source=source)
+
     return ProjectConfig(
         project=project_name,
         repo_root=repo_root,
@@ -334,6 +406,7 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
         obsolete_agent_settings=obsolete,
         migrations=migrations,
         finish_delete_remote_branch=bool(delete_remote),
+        visual_review=visual_review,
     )
 
 

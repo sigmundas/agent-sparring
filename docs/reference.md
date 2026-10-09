@@ -458,6 +458,7 @@ itself, which is an ordinary repository file.
 | `stages/<stage>/sparring.md` | engine | no | rewritten in full by every sparring exchange | the latest verdict, rendered from the structured routing result |
 | `stages/<stage>/state.json` | engine | no | rewritten on every lifecycle change | status, candidate identity, whose turn it is, provider session generations |
 | `stages/<stage>/dialogue.jsonl` | engine | no | append-only; one record per question and answer | provenance for the read-only conversation a person holds with the reviewer (`sparring ask`) |
+| `stages/<stage>/visual-evidence/` | engine (files written by the project's `[visual_review]` capture command, run by the engine outside every provider session) | no | deleted and recaptured before every sparring turn when visual review is enabled; must be git-ignored | the screenshots for the candidate under review and `current.json`, the engine's binding of them to that exact candidate |
 | `stages/<stage>/activity.jsonl` | engine | no | append-only, never read by orchestration | observational telemetry only |
 
 **No artifact is provider-writable, including `notes.md`.** Despite its
