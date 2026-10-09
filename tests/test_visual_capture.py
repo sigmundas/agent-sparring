@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -66,7 +67,9 @@ CAPTURE_SCRIPT = textwrap.dedent(
         shots = [shot(path=None, status="failed")]
     if mode == "ignored-reference":
         shots = [shot(reference="build/ref.png")]
-    if mode != "no-manifest":
+    if mode == "fifo":
+        os.mkfifo(manifest_path)
+    if mode not in ("no-manifest", "fifo"):
         manifest_path.write_text(json.dumps({"version": 1, "screenshots": shots}))
     """
 )
@@ -214,6 +217,24 @@ class RunCaptureTests(VisualCaptureTestCase):
         with self.assertRaisesRegex(VisualCaptureError, "is a link"):
             load_current_evidence(self.repo, self.stage)
 
+    def test_a_capture_directory_moved_out_and_linked_back_is_refused(self):
+        record = run_capture(self.repo, self.stage, self.config("ok"))
+        directory = record.directory(self.stage)
+        outside = self.tools / "moved-capture"
+        directory.rename(outside)
+        directory.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(VisualCaptureError, "not a directory the engine owns"):
+            load_current_evidence(self.repo, self.stage)
+
+    def test_an_evidence_root_moved_out_and_linked_back_is_refused(self):
+        run_capture(self.repo, self.stage, self.config("ok"))
+        root = evidence_root(self.stage)
+        outside = self.tools / "moved-root"
+        root.rename(outside)
+        root.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(VisualCaptureError, "is a link"):
+            load_current_evidence(self.repo, self.stage)
+
     def test_a_new_capture_discards_the_previous_one_first(self):
         first = run_capture(self.repo, self.stage, self.config("ok"))
         with self.assertRaises(VisualCaptureError):
@@ -226,7 +247,7 @@ class RunCaptureTests(VisualCaptureTestCase):
     def test_rejected_captures(self):
         cases = {
             "exit": "exited with status 3(.|\n)*renderer crashed",
-            "no-manifest": "cannot read evidence manifest",
+            "no-manifest": "missing or not a regular file",
             "missing": "not a regular file",
             "corrupt": "invalid evidence",
             "symlink": "is a link",
@@ -235,6 +256,7 @@ class RunCaptureTests(VisualCaptureTestCase):
             "all-failed": "no captured screenshot",
             "ignored-reference": "git-ignored, so it is not part of the candidate",
             "dirty": "changed the candidate",
+            "fifo": "not a regular file",
         }
         for mode, pattern in cases.items():
             with self.subTest(mode=mode):
@@ -289,6 +311,14 @@ class LoopCaptureTests(VisualCaptureTestCase):
         # Still owed a review of the same candidate; no verdict was recorded.
         self.assertEqual(state.next_turn, NEXT_TURN_SPARRING)
         self.assertEqual(state.next_turn_candidate, self.candidate())
+
+    def test_a_fifo_manifest_fails_promptly_without_starting_the_reviewer(self):
+        sparring = _SparringAdapter(["READY"])
+        started = time.monotonic()
+        with self.assertRaisesRegex(LoopError, "not a regular file"):
+            self.run_loop(sparring, self.config("fifo"))
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertEqual(sparring.calls, 0)
 
     def test_disabled_visual_review_captures_nothing(self):
         sparring = _SparringAdapter(["READY"])

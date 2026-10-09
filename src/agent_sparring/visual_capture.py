@@ -158,6 +158,29 @@ def evidence_root(stage: Stage) -> Path:
     return stage.directory / EVIDENCE_DIRNAME
 
 
+def _owned_capture_directory(stage: Stage, capture_id: str) -> Path:
+    """``visual-evidence/<capture_id>`` as a real directory the engine owns.
+
+    Neither the evidence root nor the capture directory may be a link, and
+    the capture directory must resolve to exactly that place under the
+    stage directory: a capture moved elsewhere and linked back would
+    otherwise be checked -- and hashed -- outside the directory it is
+    recorded in.
+    """
+
+    root = evidence_root(stage)
+    directory = root / capture_id
+    for path in (root, directory):
+        if path.is_symlink() or not path.is_dir():
+            raise VisualCaptureError(
+                f"{path} is not a directory the engine owns (missing, a file or a link)"
+            )
+    expected = stage.directory.resolve() / EVIDENCE_DIRNAME / capture_id
+    if directory.resolve() != expected:
+        raise VisualCaptureError(f"{directory} resolves outside the stage's evidence directory")
+    return directory
+
+
 def _is_capture_id(value: str) -> bool:
     return (
         value.startswith("capture-")
@@ -342,16 +365,17 @@ def run_capture(repo_root: Path, stage: Stage, config: VisualReviewConfig) -> Ca
             f"{candidate.describe()} and is now {after.describe()}. Capture must not write "
             "candidate content; write only inside SPARRING_EVIDENCE_DIR."
         )
-    if (
-        directory.is_symlink()
-        or not directory.is_dir()
-        or directory.resolve() != expected_directory
-        or root.is_symlink()
-    ):
+    try:
+        _owned_capture_directory(stage, capture_id)
+    except VisualCaptureError as exc:
+        raise VisualCaptureError(f"the capture command replaced the evidence directory: {exc}") from exc
+    if directory.resolve() != expected_directory:
         raise VisualCaptureError("the capture command replaced the evidence directory")
     try:
-        if manifest_path.is_symlink():
-            raise VisualEvidenceError(f"{manifest_path} is a symlink, not the manifest")
+        # A regular file, checked before it is opened: reading a FIFO (or a
+        # device) would block forever, outside the command's timeout.
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise VisualEvidenceError(f"{manifest_path} is missing or not a regular file")
         manifest = load_manifest(manifest_path)
         if not any(shot.captured for shot in manifest.screenshots):
             raise VisualEvidenceError("the manifest records no captured screenshot")
@@ -388,7 +412,10 @@ def load_current_evidence(repo_root: Path, stage: Stage) -> CaptureRecord:
     the repository holds now and every file is unchanged since capture."""
 
     repo_root = Path(repo_root)
-    path = evidence_root(stage) / RECORD_FILENAME
+    root = evidence_root(stage)
+    if root.is_symlink():
+        raise VisualCaptureError(f"{root} is a link, not the stage's own evidence directory")
+    path = root / RECORD_FILENAME
     if path.is_symlink() or not path.is_file():
         raise VisualCaptureError(f"stage {stage.stage_id!r} has no current visual evidence")
     try:
@@ -402,12 +429,13 @@ def load_current_evidence(repo_root: Path, stage: Stage) -> CaptureRecord:
             f"visual evidence was captured for {record.candidate.describe()}, not the current "
             f"candidate {current.describe()}; it is stale and must be captured again"
         )
+    directory = _owned_capture_directory(stage, record.capture_id)
     try:
         for relative, _ in record.binding.screenshots:
-            _refuse_links(record.directory(stage), relative)
+            _refuse_links(directory, relative)
         verify_binding(
             record.binding,
-            evidence_root=record.directory(stage),
+            evidence_root=directory,
             repo_root=repo_root,
             candidate_sha=current.head_sha,
             siblings=_siblings(current),
