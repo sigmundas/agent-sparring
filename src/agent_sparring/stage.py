@@ -315,6 +315,12 @@ class TurnCandidate:
     drift. Both derive from ``content_digest``'s inputs, so they take no part
     in equality, and both are ``None`` for markers recorded before they
     existed.
+
+    ``index_digest`` is the digest of what the real index staged (``"unmerged"``
+    while a path was unmerged), so a branch advance accepted beneath the
+    candidate can show the attempt's staged work unchanged too. It is not
+    the candidate (the working tree is), so it takes no part in equality
+    either, and is ``None`` for markers recorded before it existed.
     """
 
     head_sha: str
@@ -323,6 +329,7 @@ class TurnCandidate:
     repositories: tuple[SiblingPin, ...] = ()
     tracked_digest: str | None = field(default=None, compare=False)
     untracked: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
+    index_digest: str | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -336,6 +343,8 @@ class TurnCandidate:
             payload["tracked_digest"] = self.tracked_digest
         if self.untracked is not None:
             payload["untracked"] = [{"path": path, "blob": blob} for path, blob in self.untracked]
+        if self.index_digest is not None:
+            payload["index_digest"] = self.index_digest
         return payload
 
     @classmethod
@@ -373,6 +382,7 @@ class TurnCandidate:
             repositories=tuple(SiblingPin.from_dict(entry) for entry in raw),
             tracked_digest=_optional_str_field(payload, "tracked_digest"),
             untracked=untracked,
+            index_digest=_optional_str_field(payload, "index_digest"),
         )
 
     def describe(self) -> str:

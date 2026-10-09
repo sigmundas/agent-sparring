@@ -269,19 +269,44 @@ def _read_content(
         if include_worktree:
             _git(repo_root, "add", "-A", env=env)
         raw = _git(repo_root, "ls-files", "-s", "-z", env=env)
+    return CandidateContent(
+        entries=tuple(
+            (path, entry) for path, entry, _ in _parse_index(repo_root, stage, raw)
+        )
+    )
 
-    entries: list[tuple[str, str]] = []
+
+def _parse_index(repo_root: Path, stage: Stage, raw: str) -> list[tuple[str, str, str]]:
+    """``(path, "<mode> <blob>", merge stage)`` for each ``ls-files -s -z``
+    entry that is not stage bookkeeping, sorted."""
+
+    entries: list[tuple[str, str, str]] = []
     for token in raw.split("\0"):
         if not token:
             continue
         meta, separator, path = token.partition("\t")
         fields = meta.split()
-        if not separator or not path or len(fields) < 2:
+        if not separator or not path or len(fields) < 3:
             raise FinalizationError(f"unparseable git index entry {token!r} in {repo_root}")
         if _is_stage_artifact(repo_root, stage, path):
             continue
-        entries.append((path, f"{fields[0]} {fields[1]}"))
-    return CandidateContent(entries=tuple(sorted(entries)))
+        entries.append((path, f"{fields[0]} {fields[1]}", fields[2]))
+    return sorted(entries)
+
+
+def read_index_content(repo_root: Path, stage: Stage) -> CandidateContent | None:
+    """What the repository's real index stages, as candidate content entries;
+    ``None`` while it holds an unmerged path, which has no single entry.
+
+    The candidate itself is the working tree (:func:`read_worktree_content`);
+    this is the separate record of which of it was staged, so that what an
+    attempt staged can be shown unchanged, not only what it wrote."""
+
+    raw = _git(repo_root, "ls-files", "-s", "-z")
+    entries = _parse_index(repo_root, stage, raw)
+    if any(merge_stage != "0" for _, _, merge_stage in entries):
+        return None
+    return CandidateContent(entries=tuple((path, entry) for path, entry, _ in entries))
 
 
 def read_worktree_content(repo_root: Path, stage: Stage) -> CandidateContent:
