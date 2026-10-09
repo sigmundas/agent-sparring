@@ -46,6 +46,7 @@ from agent_sparring.finalization import (
 )
 from agent_sparring.git_context import (
     GitContextError,
+    current_branch,
     dirty_entries,
     resolve_commit,
 )
@@ -287,7 +288,12 @@ def verify_candidate(repo_root: Path, stage: Stage, state: StageState) -> None:
 
 
 def repin_after_authorized_advance(
-    repo_root: Path, stage: Stage, state: StageState, accepted_head: str
+    repo_root: Path,
+    stage: Stage,
+    state: StageState,
+    accepted_head: str,
+    *,
+    expected_branch: str | None = None,
 ) -> TurnCandidate:
     """Re-pin a pending review onto a HEAD a person named, when the branch
     advanced by commits made outside the stage while it waited on them.
@@ -302,7 +308,9 @@ def repin_after_authorized_advance(
     the pinned ones, and the current content -- and the current index --
     with exactly those commits taken back out reproduce the pinned digests.
     That proves the attempt's work, written and staged, is preserved exactly
-    and that the only difference is the named commits. Returns the newly
+    and that the only difference is the named commits. With
+    ``expected_branch``, HEAD must also be that branch checked out, so the
+    advance recorded is the run's branch advancing. Returns the newly
     pinned candidate; writes nothing.
     """
 
@@ -327,6 +335,16 @@ def repin_after_authorized_advance(
             f"{accepted_head!r} resolves to {accepted}, which it is not a prefix of (a ref "
             "with that name?); name the commit by its SHA"
         )
+    if expected_branch is not None:
+        try:
+            branch = current_branch(repo_root)
+        except GitContextError as exc:
+            raise NextTurnError(f"{exc}; only the run's branch {expected_branch!r} can advance") from exc
+        if branch != expected_branch:
+            raise NextTurnError(
+                f"{branch!r} is checked out, not the run's branch {expected_branch!r}; only "
+                "that branch advancing can be accepted"
+            )
     current = capture_candidate(repo_root, stage, state)
     if current.head_sha != accepted:
         raise NextTurnError(
@@ -374,6 +392,14 @@ def repin_after_authorized_advance(
         }
     except FinalizationError as exc:
         raise NextTurnError(f"could not read the candidate content: {exc}") from exc
+    # The pin recorded is ``current``; the proof below reads the repository
+    # again, so both reads must have seen the same content.
+    if current.content_digest != content.digest or current.index_digest != (
+        index.digest if index is not None else "unmerged"
+    ):
+        raise NextTurnError(
+            "the repository changed while the re-pin was being checked; rerun once it is still"
+        )
     advanced = before.diverged_from(after)
     overlap = sorted(uncommitted.intersection(touched | set(advanced)))
     if overlap:

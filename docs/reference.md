@@ -217,13 +217,18 @@ to continue explicitly (for example `sparring reset-stage`). The one re-pin is
 `--evidence ... --accept-advanced-head SHA`, answering a recorded NEEDS_YOU
 whose branch was deliberately fast-forwarded beneath the uncommitted attempt
 (a separately landed prerequisite): accepted only if `SHA` is a SHA prefix of
-the current HEAD, the pinned HEAD is its ancestor, no sibling moved, no commit
-in the range touches an uncommitted path, and taking the commits back out
+the current HEAD on the run's branch, the pinned HEAD is its ancestor, no
+sibling moved, the untracked candidate files are unchanged, no commit in the
+range touches an uncommitted path, and taking the commits back out
 reproduces the pinned content and the pinned staged content exactly (a review
 pinned before staged content was recorded is accepted only with nothing
 staged). It is checked in full before anything is written, cannot be combined
 with `--deferred-result`, and everything it writes before the first provider
-turn lands together or not at all.
+turn is put back if the resume fails in-process before that turn. (A killed
+process can leave the re-pin without its evidence note; the flag is then
+refused as still pinned, and the evidence is recorded without it.) If the
+reviewer turn itself fails after the re-pin, the evidence is already recorded
+and awaiting review: resume without `--evidence`.
 A resume without evidence over a recorded NEEDS_YOU / ESCALATE keeps that
 pause and runs nothing, whatever the marker says; `--fresh-*` or `--next-turn` alone are
 refused there, because neither answers a person. State with no marker keeps

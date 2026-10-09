@@ -1835,6 +1835,8 @@ def resume_plan(
             evidence=bool(evidence and evidence.strip()),
             next_turn=next_turn,
             deferred=bool(deferred_results),
+            expected_branch=state.expected_branch,
+            run_state=state,
         )
         rollback = (
             Path(state_path),
@@ -1924,7 +1926,11 @@ def resume_plan(
                     pinned_head = current_state.next_turn_candidate.head_sha
                     try:
                         repinned = repin_after_authorized_advance(
-                            repo_root, stage, current_state, accept_advanced_head
+                            repo_root,
+                            stage,
+                            current_state,
+                            accept_advanced_head,
+                            expected_branch=state.expected_branch,
                         )
                     except NextTurnError as repin_exc:
                         raise PlanError(
@@ -1952,7 +1958,9 @@ def resume_plan(
                     evidence = None
                 else:
                     if accept_advanced_head is not None:
-                        raise PlanError(_still_pinned_message(current.stage_id))
+                        raise PlanError(
+                            _still_pinned_message(current.stage_id, _evidence_awaiting_review(state, stage))
+                        )
             elif accept_advanced_head is not None:
                 raise PlanError(_no_pending_review_message(current.stage_id))
             if evidence is not None:
@@ -2058,11 +2066,21 @@ def _check_next_turn_choice(
         raise PlanError(str(exc)) from exc
 
 
-def _still_pinned_message(stage_id: str) -> str:
-    return (
+def _still_pinned_message(stage_id: str, evidence_awaiting_review: bool) -> str:
+    message = (
         f"--accept-advanced-head: stage {stage_id!r} still holds its pinned candidate; there "
-        "is no branch advance to accept (if an earlier --accept-advanced-head already re-pinned "
-        "it, record the evidence without the flag)"
+        "is no branch advance to accept"
+    )
+    if evidence_awaiting_review:
+        # An earlier re-pin recorded its evidence and the reviewer turn did
+        # not finish: recording it again would duplicate it.
+        return (
+            f"{message}. An earlier --accept-advanced-head already re-pinned it and its evidence "
+            "is recorded and awaiting review; resume without --evidence or the flag"
+        )
+    return (
+        f"{message} (if an earlier --accept-advanced-head already re-pinned it, record the "
+        "evidence without the flag)"
     )
 
 
@@ -2082,6 +2100,8 @@ def _check_advanced_head(
     evidence: bool,
     next_turn: str | None,
     deferred: bool,
+    expected_branch: str | None = None,
+    run_state: PlanRunState | None = None,
 ) -> Path:
     """Refuse (:class:`PlanError`) an ``--accept-advanced-head`` the resume
     could not honour, without creating or changing anything: the same proof
@@ -2132,9 +2152,13 @@ def _check_advanced_head(
     except NextTurnError:
         pass
     else:
-        raise PlanError(_still_pinned_message(planned.stage_id))
+        raise PlanError(_still_pinned_message(
+            planned.stage_id, run_state is not None and _evidence_awaiting_review(run_state, stage)
+        ))
     try:
-        repin_after_authorized_advance(repo_root, stage, stage_state, accepted_head)
+        repin_after_authorized_advance(
+            repo_root, stage, stage_state, accepted_head, expected_branch=expected_branch
+        )
     except NextTurnError as exc:
         raise PlanError(
             f"refusing to record evidence for stage {planned.stage_id!r}: "
@@ -2209,15 +2233,25 @@ def _rolled_back_on_failure(paths: Sequence[Path]) -> Iterator[_Rollback]:
     rollback = _Rollback(armed=bool(paths))
     try:
         yield rollback
-    except BaseException:
+    except BaseException as exc:
         if rollback.armed:
+            # Every path is attempted; a path that cannot be restored is
+            # noted on the original error, which is what propagates.
             for path, data in saved.items():
-                if data is None:
-                    path.unlink(missing_ok=True)
-                    continue
-                tmp = path.with_name(f".{path.name}.rollback")
-                tmp.write_bytes(data)
-                os.replace(tmp, path)
+                try:
+                    if data is None:
+                        path.unlink(missing_ok=True)
+                        continue
+                    tmp = path.with_name(f".{path.name}.rollback")
+                    with open(tmp, "wb") as handle:
+                        handle.write(data)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(tmp, path)
+                except OSError as restore_exc:
+                    exc.add_note(f"could not restore {path}: {restore_exc}")
+                    with contextlib.suppress(OSError):
+                        path.with_name(f".{path.name}.rollback").unlink(missing_ok=True)
         raise
 
 
@@ -2246,7 +2280,9 @@ def _grant_push_authorization(
     "don't ask me again for this run", which is a decision about the run
     rather than about one commit. Both are written to the run state
     immediately, so the permission is durable even if this call then fails
-    for an unrelated reason.
+    for an unrelated reason -- except under ``--accept-advanced-head``, whose
+    rollback takes back a grant together with everything else that resume
+    wrote before its first provider turn.
     """
 
     if not allow_push_candidate and not allow_push_for_run:

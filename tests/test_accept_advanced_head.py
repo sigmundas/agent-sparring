@@ -9,6 +9,7 @@ state.json and the plan run state byte-for-byte as they were.
 import contextlib
 import dataclasses
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -348,11 +349,11 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
         real_repin = plan_module.repin_after_authorized_advance
         proofs = []
 
-        def second_proof_refuses(*args):
+        def second_proof_refuses(*args, **kwargs):
             proofs.append(args)
             if len(proofs) == 2:
                 raise NextTurnError("the repository changed between the two proofs")
-            return real_repin(*args)
+            return real_repin(*args, **kwargs)
 
         failures = {
             "re-pin write": ("record_next_turn", OSError("disk full")),
@@ -559,6 +560,67 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
         self.assertEqual(self._stage(S1).read_state().next_turn_candidate.head_sha, advanced)
         self.assertIn("Accepted branch advance", self._stage(S1).read_notes())
         self.assertIsNotNone(self._plan_state().evidence_pending)
+
+    def test_after_a_failed_review_turn_the_hint_does_not_ask_for_the_evidence_again(self):
+        stage_adapter, _, _ = self._pause(verdicts=(NEEDS_YOU,))
+        advanced = self._land_other()
+
+        class _FailsMidTurn(_SparringAdapter):
+            def resume(self, session_id, prompt):
+                raise ProviderUnavailable("usage limit reached")
+
+        with self.assertRaises(PlanRunError):
+            self._resume(
+                stage_adapter, _FailsMidTurn([]), evidence="prerequisite landed",
+                accept_advanced_head=advanced,
+            )
+        message = self._refused(
+            (stage_adapter, _FailsMidTurn([])),
+            "its evidence is recorded and awaiting review; resume without --evidence",
+            evidence="prerequisite landed",
+            accept_advanced_head=advanced,
+        )
+        self.assertNotIn("record the evidence without the flag", message)
+        self.assertEqual(self._stage(S1).read_notes().count("Accepted branch advance"), 1)
+
+    def test_a_head_not_on_the_runs_branch_is_refused(self):
+        for label, args in (("detached", ("--detach",)), ("other branch", ("-b", "elsewhere"))):
+            with self.subTest(label):
+                self.tearDown_and_reset()
+                stage_adapter, sparring_adapter, _ = self._pause()
+                advanced = self._land_other()
+                _run_git(self.repo, "checkout", "-q", *args)
+                self.assertEqual(_head_sha(self.repo), advanced)
+                message = self._refused(
+                    (stage_adapter, sparring_adapter), "refusing",
+                    evidence="prerequisite landed", accept_advanced_head=advanced,
+                )
+                self.assertIn("the run's branch 'feature/x'", message)
+
+    def test_content_that_changes_between_the_two_reads_is_refused(self):
+        from agent_sparring import next_turn as next_turn_module
+
+        stage_adapter, sparring_adapter, _ = self._pause()
+        advanced = self._land_other()
+        real_capture = next_turn_module.capture_candidate
+
+        def edited_after_the_repins_capture(*args, **kwargs):
+            captured = real_capture(*args, **kwargs)
+            frame = sys._getframe(1)
+            while frame is not None and frame.f_code.co_name != "repin_after_authorized_advance":
+                frame = frame.f_back
+            if frame is not None:
+                self._write("tracked.txt", "edited mid-check\n")
+            return captured
+
+        with mock.patch.object(
+            next_turn_module, "capture_candidate", side_effect=edited_after_the_repins_capture
+        ):
+            self._refused(
+                (stage_adapter, sparring_adapter),
+                "changed while the re-pin was being checked",
+                evidence="prerequisite landed", accept_advanced_head=advanced,
+            )
 
     def test_a_fresh_reviewer_announcing_its_session_then_failing_is_recovered(self):
         # The engine installs its session-recording callback by assigning
