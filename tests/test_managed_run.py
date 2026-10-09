@@ -278,13 +278,16 @@ class ManagedRunTests(_ManagedRepoTestCase):
         code, out, err = self._main("runs", "--repo-root", str(self.repo), "--json")
         self.assertEqual(code, 0, err)
         payload = json.loads(out)
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["plans"], [])
         (run,) = payload["runs"]
         self.assertEqual(
             set(run),
             {"run_key", "plan_label", "managed", "worktree_path", "worktree_exists", "branch",
-             "target_branch", "base_sha", "created_at", "lifecycle", "run_status", "git", "finish"},
+             "target_branch", "base_sha", "created_at", "lifecycle", "run_status", "git", "finish",
+             "logical_plan"},
         )
+        self.assertIsNone(run["logical_plan"])
         self.assertTrue(run["managed"])
         self.assertTrue(run["worktree_exists"])
         self.assertEqual(run["run_status"], "paused")

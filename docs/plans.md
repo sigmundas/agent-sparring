@@ -344,7 +344,8 @@ sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
   it is the only link between a run and its worktree. The worktree is a
   sibling directory `<repo>-sparring-<run-key>` on branch
   `sparring/<plan-slug>-<suffix>`. Only Markdown plans and plain manifests
-  run managed, and only in a single repository.
+  run managed. A plan whose stages belong to other repositories runs as one
+  plan in several managed parts: [A plan across repositories](#a-plan-across-repositories).
 - `finish-run` re-makes every check, then in order: merges into the target
   (fast-forward; a merge commit only with `--allow-merge-commit`; never a
   rebase), with `[finish] remove_plan = true` commits the plan file's
@@ -444,6 +445,73 @@ refusal), and `record_malformed` / `record_unreadable` /
 `record_schema_unknown`. Finish execution steps report `stopped_at` as one
 of `merge`, `remove_plan`, `push_target`, `archive_state`, `remove_worktree`,
 `delete_branch`, `delete_remote_branch`. JSON shapes: [reference](reference.md#managed-run-json).
+
+### A plan across repositories
+
+A plan is one ordered sequence of stages and gates, even when some stages
+[belong to another repository](#which-repository-a-stage-belongs-to). The
+engine runs each run of consecutive stages one repository owns in that
+repository, as its own managed run, and keeps one plan: one stage sequence,
+one obligation ledger and one status. You start it once, finish each part
+as usual, and confirm every move into another repository.
+
+```sh
+# start from the repository the first stage belongs to; say where every other one is
+sparring run-plan docs/plans/foo.md --repo-root . --managed --repository sporely-landing=../sporely-landing
+#   … Stage 4 belongs to sporely-landing. Finish this part, then continue the plan.
+sparring finish-run --run-key <key>
+# from a checkout of any repository of the plan: where the plan continues, and a confirm token
+sparring resume-plan --run-key <key> [--target-branch main] [--json]
+sparring resume-plan --run-key <key> --confirm <token> [--allow-push-for-run]
+# later: resume the current part, answer its gates, finish it
+sparring resume-plan --run-key <key> [--deferred-result <instance>:<gate id>=pass]
+sparring runs [--json]
+```
+
+- `--repository NAME=PATH` (repeatable) is the only way a name is resolved.
+  `PATH` must be a git work tree whose `.sparring/project.toml`, committed at
+  the target branch's tip, says `project = "NAME"`; every other repository a
+  stage names must be given, every name given must own a stage, and two
+  names may not be one repository. The bindings are recorded with the plan
+  when it starts and never re-derived from the text.
+- The first stage must belong to the repository you start in
+  (`first_stage_not_home`). The run stops at the end of the stages that
+  repository owns.
+- A later part may be prepared only after the part before it is
+  **integrated**: finished with `finish-run`, so its target branch contains
+  its accepted candidate (`previous_not_integrated` until then).
+- Moving into another repository is always your explicit choice.
+  `resume-plan --run-key <key>` shows the destination repository, its
+  target branch and tip, the stages it will run and a confirm token, and
+  creates nothing. `--confirm <token>` re-checks everything and refuses if
+  anything changed (`confirm_mismatch`, with the new status and token);
+  otherwise it creates the part's branch and worktree in that repository —
+  from its target branch, never from the checkout's uncommitted changes,
+  which are left alone and listed — and runs it. Push permission
+  (`--allow-push-for-run`) is per part, for that part's repository only.
+- Once a part exists, `resume-plan --run-key <key>` resumes it, from any
+  checkout of any repository of the plan; an interrupted creation is
+  reconciled to the one part it was creating, never duplicated.
+- A check a reviewer [deferred to plan completion](#a-check-that-is-owed-but-not-now)
+  in one part is carried in the plan's ledger and asked at the end of the
+  last part, wherever it was raised. When the raising part has already been
+  finished (its `.sparring` archived), the answer is recorded in the ledger
+  and the answering part, and the archived stage is not recreated.
+- `runs --json` lists each plan this repository takes part in under
+  `plans`: its stages in order with their repository and state, its gates,
+  and `next` — what moves it forward (`finish`, `continue`, `resume` or
+  `gate`) and where. Its shape is in the
+  [reference](reference.md#managed-run-json).
+
+Every refusal names a stable code and leaves everything in place:
+`repository_unknown`, `repository_mismatch`, `repository_ambiguous`,
+`first_stage_not_home`, `cross_repository_requires_managed`,
+`previous_not_integrated`, `confirm_mismatch`, `execution_not_in_plan` (a
+run that merely has the next part's key is never adopted),
+`pointer_conflict`, `logical_record_exists`, `logical_digest_mismatch` and
+`logical_stages_mismatch`. Users see plans, stages, gates and repositories;
+run keys of individual parts appear only under "Technical details" and in
+`--json`. Design: [repository ownership](design.md#repository-ownership).
 
 ## Marking stages in a plan — or handing over an execution manifest
 
@@ -550,6 +618,67 @@ Nothing is inferred from prose: a plan with no such headings, a heading that
 starts with `## Stage` but does not fit, a numbering gap or duplicate, or an
 empty section is refused before any agent runs. A reviewed plan written
 another way either needs a small edit to mark its stages, or a manifest.
+
+#### Which repository a stage belongs to
+
+A stage belongs to the repository the plan is run from (its **home**: the
+`project` name in `.sparring/project.toml`) unless it says otherwise. A stage
+that belongs to another repository declares it on the first non-blank line
+after its heading:
+
+```markdown
+## Stage 4 — Publish the screenshots
+
+Repository: sporely-landing
+
+…
+```
+
+`**Repository:** sporely-landing` works too; the name is `[A-Za-z0-9._-]+`
+and is that repository's `project` name. Ownership is declared, never
+inferred: prose that mentions another repository moves nothing. A
+declaration anywhere else in the section, or a malformed one, is refused
+(`owner_declaration_invalid`). A `Repository:` line above the first stage is
+context only and owns nothing. The line is part of the stage's section, so
+the plan digest covers it; a plan without declarations has exactly the stage
+ids, digest and run keys it had before. `check-plan` warns when an
+undeclared plan names another repository, and `check-plan --json` reports
+each stage's `repository` and the `executions` the plan will run as.
+
+A plan with stages in another repository runs only `--managed`
+(`cross_repository_requires_managed`); see
+[A plan across repositories](#a-plan-across-repositories). A manifest
+declares the same with an optional per-stage `owner_repository`.
+
+#### Gates in a Markdown plan
+
+A human gate before a stage is a `Gate before:` block directly after the
+heading (or after its `Repository:` line), followed by its reason as a
+quoted block:
+
+```markdown
+## Stage 3 — Turn on visual review
+
+Repository: sporely-landing
+
+Gate before: staging-config — Visual review configured in staging
+> Set this in staging's project.toml first:
+>
+> [visual_review]
+> enabled = true
+
+…
+```
+
+`**Gate before:**` works too, the separator may be an en dash or a hyphen,
+and a stage may have several gates. It is exactly the version-2 manifest
+`gates_before` gate below: when the previous stage is accepted the run stops
+before this stage is created, shows the reason verbatim (so it can state an
+exact setting), and only `resume-plan --deferred-result <instance>:<gate
+id>=pass` releases it. Gate ids are unique across the plan; a gate anywhere
+else, without a quoted reason, or with a malformed id is refused
+(`gate_declaration_invalid`). The digest covers gates; a plan without them
+is unchanged.
 
 ## Pause and resume
 

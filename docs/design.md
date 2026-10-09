@@ -921,8 +921,10 @@ behavior and refusal codes are in [plans.md](plans.md#managed-runs); JSON
 shapes in [reference.md](reference.md#managed-run-json).
 
 **What remains.** Not built yet: managed runs through the intake route (an
-intake input is refused `--managed`); multi-repository runs (a manifest
-declaring sibling `repositories` is refused); an explicitly confirmed
+intake input is refused `--managed`); sibling candidate pins in a managed
+run (a manifest declaring sibling `repositories` is refused — a plan whose
+stages *belong* to other repositories is a different thing, see
+[Repository ownership](#repository-ownership)); an explicitly confirmed
 *abandon* that keeps the branch.
 Unmanaged runs — the current checkout, or a worktree a person made —
 behave as before and are never cleanup candidates.
@@ -1084,6 +1086,59 @@ person confirmed. It never runs git itself to merge or remove, never
 decides eligibility, and keeps branch and worktree details under
 diagnostics. Opening a managed worktree in a window is offered, never
 required.
+
+## Repository ownership
+
+A plan is one ordered sequence of stages and human gates, and a stage may
+belong to a different repository from the one before it. The engine runs
+each run of consecutive same-repository stages as its own managed execution
+in that repository, and keeps **one logical plan**: one stage sequence, one
+obligation ledger, one status. People see plans, stages, gates and
+repositories; executions, slices, manifests and run keys are technical
+details.
+
+- **Declared, never inferred.** A stage's owner is its `Repository:` line
+  (a manifest's `owner_repository`); an undeclared stage belongs to the
+  home, the repository the plan is started from. Prose naming another
+  repository only earns a `check-plan` warning. Ownership is distinct from
+  sibling candidate pins (`repositories`), which say what a reviewed
+  candidate spans, not where the work runs.
+- **Resolved once, recorded.** Names resolve only through explicit
+  `--repository NAME=PATH`, checked against the `project` committed at the
+  target tip. The logical record — `<home git-common-dir>/agent-sparring/plans/<key>.json`,
+  with an exact snapshot of the input and the plan's obligation ledger
+  beside it — stores every stage's resolved owner and every binding. It is
+  created exclusively and changed only by appending events (`created`,
+  `slice_created`, `rescoped`), like a worktree record. Nothing later
+  re-reads ownership from the text.
+- **Derived status.** Each execution's own record (in its own repository,
+  naming the logical plan in its `slice` key) and run state are the only
+  truth about its progress; the plan's status, and the view `runs --json`
+  shows, are derived from them on every read and never stored twice.
+  `logical_plan.view` is that one derivation for the CLI and the editor.
+- **Identity.** The logical key is the first execution's run key;
+  execution *k* is `<key>-s<k>`, so retries converge. Stage ids are
+  namespaced by the logical key in every repository and every execution
+  records the logical input digest, so an execution is scoped to its
+  stages (`PlanRunState.scope`) but is unmistakably part of one plan.
+- **Ordering and authorization.** The next repository's execution is
+  prepared only after the previous one is integrated (merged into its
+  target, which contains its candidate), and only on a person's explicit
+  confirmation of the destination repository, target branch and tip. A
+  token binds what was shown; anything that moved refuses.
+- **Who writes where.** The engine writes the logical record and ledger in
+  the home, and each execution record in its own repository. Agents work
+  only in their execution's worktree; nothing runs from an earlier
+  worktree, and a finished, archived one is never recreated — an answer to
+  an obligation it raised is recorded in the ledger and the answering run.
+- **Single-repository plans are unchanged.** No logical record, and
+  byte-identical stage ids, digests, run keys, run state and records.
+
+Recovery of a run created before its plan declared ownership (one execution
+holding stages that belong elsewhere) is the job of `rescope-run`, an
+audited move at an accepted boundary — recovery only, never the way to start
+a plan across repositories. It is designed (`docs/plans/repository-slices.md`,
+Stage 4) but not in this engine yet. Behavior: [plans.md](plans.md#a-plan-across-repositories).
 
 ## Slices as built
 

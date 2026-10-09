@@ -1,0 +1,314 @@
+{
+  "description": "logical_plan.view at each step of tests/test_logical_view.py: one plan, Stage 1 in 'repo', Stages 2-3 in 'web' with a gate before Stage 3. Gate instance ids are replaced by '<instance>'. The `plans` entries of `runs --json` have this shape.",
+  "runs_schema_version": 2,
+  "next_actions": [
+    "finish",
+    "continue",
+    "resume",
+    "gate"
+  ],
+  "steps": [
+    {
+      "step": "started",
+      "view": {
+        "logical_key": "plan-cross-0001",
+        "plan_label": "docs/plan.md",
+        "home": "repo",
+        "status": "in_progress",
+        "stages": [
+          {
+            "stage_id": "plan-cross-0001-stage-1-s1",
+            "label": "1",
+            "title": "S1",
+            "repository": "repo",
+            "state": "accepted",
+            "run_key": "plan-cross-0001"
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-2-s2",
+            "label": "2",
+            "title": "S2",
+            "repository": "web",
+            "state": "not_started",
+            "run_key": null
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-3-s3",
+            "label": "3",
+            "title": "S3",
+            "repository": "web",
+            "state": "not_started",
+            "run_key": null
+          }
+        ],
+        "gates": [
+          {
+            "id": "canary",
+            "title": "Staging canary",
+            "reason": "Set `canary = true` in staging first.",
+            "before_stage": "plan-cross-0001-stage-3-s3",
+            "repository": "web",
+            "state": "pending",
+            "instance_id": null
+          }
+        ],
+        "next": {
+          "repository": "repo",
+          "target_branch": "main",
+          "action": "finish"
+        }
+      }
+    },
+    {
+      "step": "home_part_finished",
+      "view": {
+        "logical_key": "plan-cross-0001",
+        "plan_label": "docs/plan.md",
+        "home": "repo",
+        "status": "in_progress",
+        "stages": [
+          {
+            "stage_id": "plan-cross-0001-stage-1-s1",
+            "label": "1",
+            "title": "S1",
+            "repository": "repo",
+            "state": "accepted",
+            "run_key": "plan-cross-0001"
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-2-s2",
+            "label": "2",
+            "title": "S2",
+            "repository": "web",
+            "state": "not_started",
+            "run_key": null
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-3-s3",
+            "label": "3",
+            "title": "S3",
+            "repository": "web",
+            "state": "not_started",
+            "run_key": null
+          }
+        ],
+        "gates": [
+          {
+            "id": "canary",
+            "title": "Staging canary",
+            "reason": "Set `canary = true` in staging first.",
+            "before_stage": "plan-cross-0001-stage-3-s3",
+            "repository": "web",
+            "state": "pending",
+            "instance_id": null
+          }
+        ],
+        "next": {
+          "repository": "web",
+          "target_branch": "main",
+          "action": "continue"
+        }
+      }
+    },
+    {
+      "step": "stopped_at_gate",
+      "view": {
+        "logical_key": "plan-cross-0001",
+        "plan_label": "docs/plan.md",
+        "home": "repo",
+        "status": "in_progress",
+        "stages": [
+          {
+            "stage_id": "plan-cross-0001-stage-1-s1",
+            "label": "1",
+            "title": "S1",
+            "repository": "repo",
+            "state": "accepted",
+            "run_key": "plan-cross-0001"
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-2-s2",
+            "label": "2",
+            "title": "S2",
+            "repository": "web",
+            "state": "accepted",
+            "run_key": "plan-cross-0001-s2"
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-3-s3",
+            "label": "3",
+            "title": "S3",
+            "repository": "web",
+            "state": "not_started",
+            "run_key": "plan-cross-0001-s2"
+          }
+        ],
+        "gates": [
+          {
+            "id": "canary",
+            "title": "Staging canary",
+            "reason": "Set `canary = true` in staging first.",
+            "before_stage": "plan-cross-0001-stage-3-s3",
+            "repository": "web",
+            "state": "open",
+            "instance_id": "<instance>"
+          }
+        ],
+        "next": {
+          "repository": "web",
+          "target_branch": "main",
+          "action": "gate"
+        }
+      }
+    },
+    {
+      "step": "plan_obligation_owed",
+      "view": {
+        "logical_key": "plan-cross-0001",
+        "plan_label": "docs/plan.md",
+        "home": "repo",
+        "status": "in_progress",
+        "stages": [
+          {
+            "stage_id": "plan-cross-0001-stage-1-s1",
+            "label": "1",
+            "title": "S1",
+            "repository": "repo",
+            "state": "accepted",
+            "run_key": "plan-cross-0001"
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-2-s2",
+            "label": "2",
+            "title": "S2",
+            "repository": "web",
+            "state": "accepted",
+            "run_key": "plan-cross-0001-s2"
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-3-s3",
+            "label": "3",
+            "title": "S3",
+            "repository": "web",
+            "state": "accepted",
+            "run_key": "plan-cross-0001-s2"
+          }
+        ],
+        "gates": [
+          {
+            "id": "canary",
+            "title": "Staging canary",
+            "reason": "Set `canary = true` in staging first.",
+            "before_stage": "plan-cross-0001-stage-3-s3",
+            "repository": "web",
+            "state": "passed",
+            "instance_id": "<instance>"
+          }
+        ],
+        "next": {
+          "repository": "web",
+          "target_branch": "main",
+          "action": "gate"
+        }
+      }
+    },
+    {
+      "step": "last_part_complete",
+      "view": {
+        "logical_key": "plan-cross-0001",
+        "plan_label": "docs/plan.md",
+        "home": "repo",
+        "status": "complete",
+        "stages": [
+          {
+            "stage_id": "plan-cross-0001-stage-1-s1",
+            "label": "1",
+            "title": "S1",
+            "repository": "repo",
+            "state": "accepted",
+            "run_key": "plan-cross-0001"
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-2-s2",
+            "label": "2",
+            "title": "S2",
+            "repository": "web",
+            "state": "accepted",
+            "run_key": "plan-cross-0001-s2"
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-3-s3",
+            "label": "3",
+            "title": "S3",
+            "repository": "web",
+            "state": "accepted",
+            "run_key": "plan-cross-0001-s2"
+          }
+        ],
+        "gates": [
+          {
+            "id": "canary",
+            "title": "Staging canary",
+            "reason": "Set `canary = true` in staging first.",
+            "before_stage": "plan-cross-0001-stage-3-s3",
+            "repository": "web",
+            "state": "passed",
+            "instance_id": "<instance>"
+          }
+        ],
+        "next": {
+          "repository": "web",
+          "target_branch": "main",
+          "action": "finish"
+        }
+      }
+    },
+    {
+      "step": "finished",
+      "view": {
+        "logical_key": "plan-cross-0001",
+        "plan_label": "docs/plan.md",
+        "home": "repo",
+        "status": "complete",
+        "stages": [
+          {
+            "stage_id": "plan-cross-0001-stage-1-s1",
+            "label": "1",
+            "title": "S1",
+            "repository": "repo",
+            "state": "accepted",
+            "run_key": "plan-cross-0001"
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-2-s2",
+            "label": "2",
+            "title": "S2",
+            "repository": "web",
+            "state": "accepted",
+            "run_key": "plan-cross-0001-s2"
+          },
+          {
+            "stage_id": "plan-cross-0001-stage-3-s3",
+            "label": "3",
+            "title": "S3",
+            "repository": "web",
+            "state": "accepted",
+            "run_key": "plan-cross-0001-s2"
+          }
+        ],
+        "gates": [
+          {
+            "id": "canary",
+            "title": "Staging canary",
+            "reason": "Set `canary = true` in staging first.",
+            "before_stage": "plan-cross-0001-stage-3-s3",
+            "repository": "web",
+            "state": "passed",
+            "instance_id": null
+          }
+        ],
+        "next": null
+      }
+    }
+  ]
+}

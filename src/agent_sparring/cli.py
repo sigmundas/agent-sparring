@@ -2693,6 +2693,20 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             f"{run['branch']} -> {run['target_branch']}  {where}"
         )
         print(f"  {run['finish']['summary']}")
+    for view in payload["plans"]:
+        if "error" in view:
+            print(f"plan {view['logical_key']}: cannot be read: {view['error']['detail']}")
+            continue
+        print(f"plan {view['plan_label']}")
+        for stage in view["stages"]:
+            print(f"  Stage {stage['label']} — {stage['title']} ({stage['repository']}): {stage['state']}")
+        for gate in view["gates"]:
+            print(f"  gate {gate['id']} — {gate['title']}: {gate['state']}")
+        nxt = view["next"]
+        if nxt is None:
+            print("  every stage is done and integrated")
+        else:
+            print(f"  next: {nxt['action']} in {nxt['repository']} ({nxt['target_branch'] or 'target branch unknown'})")
     return 0
 
 

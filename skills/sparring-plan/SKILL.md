@@ -123,17 +123,36 @@ before the next starts. Prose does not create a machine-enforced dependency
 graph. Use **Prerequisites / ordering rationale** when explanation helps;
 state the accepted result a stage needs, not a promise of runtime enforcement.
 
-A direct Markdown plan declares neither sibling candidates nor review-only
-mode nor plan-level external gates. For those needs, write an intake-oriented
+A direct Markdown plan may declare which repository each stage belongs to
+(`Repository:`) and human gates before a stage (`Gate before:`), below. It
+declares neither sibling candidates, nor review-only mode, nor gates before
+plan completion. For those needs, write an intake-oriented
 plan and hand it over for [plan intake](../../docs/intake.md) or an explicit
 [execution manifest](../../docs/plans.md#marking-stages-in-a-plan--or-handing-over-an-execution-manifest).
 `start-plan` chooses the direct route whenever the stage headings parse; prose
 about repositories, gates or review does not force intake. Use non-direct
 labels such as `1A` when the plan requires intake.
 
-For cross-repository work, name the primary repository for each run slice and
-how coupled candidates relate. A sibling declaration pins a reviewed candidate;
-it does not move implementation into that repository or coordinate merges.
+For work in more than one repository, decide which repository each stage's
+work belongs to and declare it: `Repository: <name>` as the first line after
+the stage heading, where `<name>` is that repository's `project` name in its
+`.sparring/project.toml`. An undeclared stage belongs to the repository the
+plan is run from, and a plan is run from the repository its first stage
+belongs to. Ownership is never
+inferred from prose: a plan that clearly does work in another repository but
+declares no stage there is a defect — flag it and declare the owners (or, if
+the work really is here, say so), and treat a `check-plan` warning about an
+undeclared repository the same way. Describe the plan as stages and gates in
+order; the engine decides how it executes them, so never write slices,
+parts, stage ranges, run keys or manifests into a plan, and do not plan
+merges or hand-offs between repositories — moving into the next repository
+is the engine's confirmed step. A `Repository:` line above the first stage
+is context only.
+
+A sibling declaration (manifest `repositories`) is different: it pins a
+reviewed candidate that spans repositories; it does not move implementation
+into that repository or coordinate merges. Name how coupled candidates
+relate when a stage needs one.
 A review-only stage requires manifest `mode: independent_review`; a title
 alone still runs implementation. Add a separate review stage only when it
 serves a meaningful acceptance purpose beyond each stage's normal review.
@@ -148,9 +167,10 @@ commit, not rebasing onto unrelated changes during a sensitive migration, or
 not force-pushing a reviewed branch.
 
 Keep implementation separate from production/manual actions. Real external
-prerequisites need supported mechanisms: intake prerequisites confirmed at
-run-slice approval, or manifest v2 `gates_before` / `completion_gates` emitted
-by compile intake or declared explicitly. Say what each gate blocks and what
+prerequisites need supported mechanisms: a Markdown `Gate before:` on the
+stage that needs it, intake prerequisites confirmed at run-slice approval, or
+manifest v2 `gates_before` / `completion_gates` emitted by compile intake or
+declared explicitly. Say what each gate blocks and what
 evidence satisfies it; document order or a prose dependency is insufficient.
 Human checks are only for verification agents cannot adequately perform,
 not merely checks a read-only reviewer cannot run. Consult
@@ -177,8 +197,20 @@ name). For a direct Markdown plan, use this lightweight shape:
 demonstrate the outcome and required invariants, with expected results.
 
 ## Stage 2 — <Title>
+
+Repository: <project name>        (only when it belongs to another repository)
+
+Gate before: <gate-id> — <Gate title>   (only for a real prerequisite)
+> What a person must have done, verbatim — e.g. the exact setting.
+
+**Outcome:** …
 ...
 ```
+
+`Repository:` comes first after the heading, then any `Gate before:` blocks,
+each with a `>`-quoted reason that is shown to the person verbatim; anything
+else misplaced is refused. Released only by an explicit `pass`, a gate is a
+true precondition for the stage, not a review step.
 
 These are essential concepts, not mandatory field labels. Add invariants,
 hard constraints, starting points, implementation freedom, prerequisites /
@@ -227,7 +259,9 @@ the intake quality vocabulary where useful:
   or for one fresh reviewer to confidently establish their contract; adjacent
   stages that would form a clearer single acceptance boundary.
 - Implementation mixed with production/manual action; cross-repository
-  ambiguity or a missing candidate strategy; unnecessary human gates.
+  ambiguity (a stage doing another repository's work with no `Repository:`
+  line, or execution mechanics such as slices written into the plan) or a
+  missing candidate strategy; unnecessary human gates.
 - Repeated or contradictory requirements (distinguish necessary shared
   invariants from redundant instructions), stale baseline facts, open questions
   presented as instructions or settled by a default, and ambiguous source or
@@ -247,8 +281,10 @@ sparring check-plan docs/plans/<slug>.md
 ```
 
 `check-plan` is deterministic structural validation: it lists the direct
-Markdown stages the engine will see, runs nothing and spends no model turn.
-For a direct plan, fix structural errors and re-check until it passes.
+Markdown stages the engine will see, with each stage's repository and gates,
+runs nothing and spends no model turn. For a direct plan, fix structural
+errors and re-check until it passes, and resolve every warning about an
+undeclared repository rather than ignoring it.
 
 For an intentionally intake-oriented plan, run the check and report that the
 non-direct headings require intake; do not relabel it just to make the check
@@ -259,7 +295,8 @@ Execution preparation belongs to `/agent-sparring:sparring-run`.
 
 ## 7. Hand over
 
-Report the path, the stage list, the required execution route and validation
+Report the path, the stage list (with each stage's repository and any gates,
+when the plan spans repositories), the required execution route and validation
 result, and any unresolved questions with their effect on approval. Do not
 present downstream work as ready for approval while consequential questions
 remain. Say plainly that the plan still needs the person's review, and that

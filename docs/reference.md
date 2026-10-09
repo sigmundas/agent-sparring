@@ -503,9 +503,65 @@ active plan updated with their progress, which is right everywhere except
 inside a managed run — so the restriction travels with the managed prompt
 rather than depending on the project's own wording.
 
+## Plans across repositories
+
+Behavior: [plans.md](plans.md#a-plan-across-repositories); design:
+[repository ownership](design.md#repository-ownership).
+
+**Declarations** (Markdown, first lines after a stage heading):
+`Repository: <name>` / `**Repository:** <name>`, then any number of
+`Gate before: <id> — <title>` blocks each followed by a `>`-quoted reason.
+Manifest: per-stage `owner_repository`, and v2 `gates_before`.
+
+**Flags.**
+
+| Command | Flag | Meaning |
+| --- | --- | --- |
+| `run-plan` / `start-plan` `--managed` | `--repository NAME=PATH` (repeatable) | where each repository a stage belongs to is; recorded with the plan |
+| `resume-plan --run-key <key>` | *(none)* | resume the current part, or show where the plan continues with a confirm token |
+| `resume-plan --run-key <key>` | `--confirm TOKEN` | create the next part in its repository exactly as shown, and run it |
+| `resume-plan --run-key <key>` | `--target-branch BRANCH` | the next part's target branch (default: the branch checked out in that repository); only before the part exists |
+| `resume-plan --run-key <key>` | `--allow-push-for-run` | push permission for the part being created, in its repository only; part of the token |
+| `resume-plan --run-key <key>` | `--json` | the continuation status below; creates nothing |
+| `resume-plan --run-key <key>` | `--deferred-result <instance>:<id>=pass` | release a gate, or answer the plan's obligation, in the current part |
+| `check-plan --json` | | each stage's `repository`, `gates_before`, `completion_gates`, the `executions` and `warnings` |
+
+**Codes.** Declarations: `owner_declaration_invalid`,
+`gate_declaration_invalid`. Start: `cross_repository_requires_managed`
+(a current-checkout run of a plan with a foreign stage),
+`repository_unknown` (a stage's repository not given, or a name given that
+no stage owns), `repository_mismatch` (not a git work tree, or its committed
+`project` is not the name), `repository_ambiguous` (two names, one
+repository), `first_stage_not_home`, `logical_record_exists`,
+`snapshot_exists`. Continuation: `previous_not_integrated`,
+`confirm_mismatch`, `execution_not_in_plan`, `pointer_conflict`,
+`pointer_unreadable`, `logical_record_missing`, `logical_digest_mismatch`,
+`logical_stages_mismatch`, `snapshot_missing`, `snapshot_mismatch`,
+`snapshot_unreadable`, `record_malformed`, `record_unreadable`,
+`record_schema_unknown`.
+
+**Recovery: `rescope-run`.** A run created before its plan declared
+ownership holds stages that belong to another repository. The designed
+recovery is `sparring rescope-run --run-key K --plan PLAN.md --repository
+NAME=PATH [--confirm TOKEN]`: at an accepted boundary only, it records the
+plan and moves the never-started stages to their repository without
+rewriting any history. It is for already-created, mis-scoped runs only — a
+new plan across repositories uses `run-plan`/`resume-plan` above. **Not in
+this engine yet** (`docs/plans/repository-slices.md`, Stage 4); until it
+is, such a run cannot be rescoped.
+
+**`resume-plan --run-key <key> --json`** — `{"schema_version": 1, "status":
+"ready | exists | complete | refused", "plan": {"label", "logical_key"},
+"slices": [{"index", "run_key", "repository", "stages", "lifecycle",
+"run_status", "integrated", "complete", "proof"}], "next": {"index",
+"run_key", "repository", "path", "git_common_dir", "project",
+"target_branch", "base_sha", "exists", "stages": [{"stage_id", "label",
+"title"}], "not_part_of_this_run"} | null, "allow_push_for_run",
+"confirm_token", "error", "code"}`. `confirm_token` only when `ready`.
+
 ## Managed-run JSON
 
-Every payload carries `schema_version` (records and `runs` currently `1`,
+Every payload carries `schema_version` (records currently `1`, `runs` `2`,
 the `finish` objects `1` — the execution report's `plan_removal` and
 `remote_branch` are additive fields in v1 — and `prune` with a selector `2`); a client refuses a
 version it does not know. Behavior: [plans.md](plans.md#managed-runs).
@@ -527,12 +583,42 @@ remote, candidate}`, `finished`; no `created` event means `creating`).
  "events": [{"at": "…", "event": "created", "detail": {}}]}
 ```
 
-**`runs --json`** — `{"schema_version", "runs": [run]}`, each run:
+**`runs --json`** (v2) — `{"schema_version": 2, "runs": [run], "plans": [plan]}`, each run:
 `run_key`, `plan_label`, `managed: true`, `worktree_path`,
 `worktree_exists`, `branch`, `target_branch`, `base_sha`, `created_at`,
 `lifecycle` (`creating | creation_failed | created | merged |
 worktree_removed | finished`), `run_status` (the run state's status, or
-`missing` / `unreadable`), and the `git` and `finish` objects below.
+`missing` / `unreadable`), `logical_plan` (the key of the plan across
+repositories this run is a part of, else `null`), and the `git` and
+`finish` objects below. v2 added `logical_plan` and `plans`; nothing else
+changed.
+
+`plans` holds every plan across repositories this repository takes part in
+(home or not), identical from each of them — `logical_plan.view`, which
+the editor shows too:
+
+```json
+{"logical_key": "…", "plan_label": "docs/plans/foo.md", "home": "agent-sparring",
+ "status": "in_progress | complete",
+ "stages": [{"stage_id": "…", "label": "1", "title": "…", "repository": "agent-sparring",
+             "state": "not_started | working | frozen | accepted | unknown",
+             "run_key": "<executing run> | null"}],
+ "gates": [{"id": "…", "title": "…", "reason": "…", "before_stage": "<stage id> | null",
+            "repository": "…", "state": "pending | open | failed | passed",
+            "instance_id": "<to answer> | null"}],
+ "next": {"repository": "…", "target_branch": "main", "action": "finish | continue | resume | gate"}}
+```
+
+`status` is `complete` once every stage is proven accepted; `next` is
+`null` only once every part is also integrated. `action`: `resume` the
+current part, answer its open `gate` (a plan gate, or the plan's own
+obligation at its end) with `--deferred-result`, `finish` a complete part,
+or `continue` into the next repository (`target_branch` is then the branch
+checked out there, which `--target-branch` may override). `before_stage:
+null` is a manifest completion gate. A plan that cannot be read is
+`{"logical_key", "error": {"code", "detail"}}`. Every step of an end-to-end
+plan is published as `tests/fixtures/logical_plan_view.json` for client
+parity tests.
 
 **`git`** — `head`, `branch_tip`, `clean`, `final_candidate`,
 `candidate_pushed`, `target_tip`, `target_contains_candidate`,

@@ -30,6 +30,8 @@ FINISH_SCHEMA_VERSION = 1
 #: The ``finish-run`` execution report. ``plan_removal`` and ``remote_branch``
 #: are additive fields within v1 (clients ignore unknown fields).
 FINISH_REPORT_SCHEMA_VERSION = 1
+#: ``runs --json``: v2 added each run's ``logical_plan`` and the ``plans`` array.
+RUNS_SCHEMA_VERSION = 2
 MERGE_MODES = ("already_merged", "fast_forward", "merge_commit")
 
 
@@ -594,13 +596,38 @@ def finish_status(
 
 
 def runs_report(repo_root: Path) -> dict[str, Any]:
-    """:func:`managed_run.runs_payload` with each run's ``git`` and ``finish``."""
+    """:func:`managed_run.runs_payload` with each run's ``git``, ``finish``
+    and ``logical_plan`` (the logical key of the plan across repositories it
+    is a part of, else ``None``), and ``plans``: the
+    :func:`logical_plan.view` of every such plan this repository takes part
+    in, or ``{logical_key, error: {code, detail}}`` where it cannot be read."""
+
+    from agent_sparring import logical_plan
 
     payload = managed_run.runs_payload(repo_root)
+    payload["schema_version"] = RUNS_SCHEMA_VERSION
+    common = managed_run.git_common_dir(Path(repo_root))
     for run in payload["runs"]:
         status = finish_status(repo_root, run["run_key"])
         run["git"] = status["git"]
         run["finish"] = status["finish"]
+        record = managed_run.read_record(repo_root, run["run_key"])
+        if record is not None and record.logical_slice is not None:
+            run["logical_plan"] = record.logical_slice["logical_key"]
+        else:
+            # The first part of a plan is the run its logical key names.
+            run["logical_plan"] = (
+                run["run_key"] if logical_plan.record_path(common, run["run_key"]).is_file() else None
+            )
+    plans: list[dict[str, Any]] = []
+    for key in logical_plan.plan_keys(repo_root):
+        try:
+            found = logical_plan.find(repo_root, key)
+            if found is not None:
+                plans.append(logical_plan.view(*found))
+        except ManagedRunError as exc:
+            plans.append({"logical_key": key, "error": {"code": exc.code, "detail": str(exc)}})
+    payload["plans"] = plans
     return payload
 
 

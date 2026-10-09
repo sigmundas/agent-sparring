@@ -1087,6 +1087,199 @@ def plan_slice_execution(
     return replace(prepared, record=replace(prepared.record, logical_slice=logical_slice))
 
 
+# -- the logical view --------------------------------------------------------
+
+#: ``next.action`` values of :func:`view`.
+NEXT_ACTIONS = ("finish", "continue", "resume", "gate")
+
+
+@dataclass(frozen=True)
+class _Execution:
+    """One slice's execution as :func:`view` reads it; ``None`` fields
+    where nothing exists or could be read."""
+
+    status: SliceStatus
+    record: ManagedRunRecord | None
+    state: Any
+
+
+def _read_execution(record: LogicalPlanRecord, entry: SliceStatus) -> _Execution:
+    from agent_sparring.plan import PlanError, PlanRunState
+
+    if entry.lifecycle in (None, "unreadable"):
+        return _Execution(entry, None, None)
+    binding = record.binding(entry.repository)
+    try:
+        execution = managed_run.read_record_in(Path(binding.git_common_dir), entry.id)
+    except ManagedRunError:
+        return _Execution(entry, None, None)
+    if execution is None or membership(record, entry.index, execution) is not None:
+        return _Execution(entry, None, None)
+    state = None
+    path = _state_path(execution)
+    if path is not None and path.is_file():
+        try:
+            state = PlanRunState.load(path)
+        except PlanError:
+            state = None
+    return _Execution(entry, execution, state)
+
+
+def _stage_state(found: _Execution, stage_id: str) -> str:
+    from agent_sparring.stage import Stage, StageError
+
+    if found.record is None:
+        # An execution exists but is unreadable, or is not this plan's part.
+        return "not_started" if found.status.lifecycle is None else "unknown"
+    try:
+        stage = Stage.resolve(found.record.sparring_dir, stage_id)
+        if stage.exists():
+            return stage.read_state().status.value
+    except (StageError, ManagedRunError):
+        return "unknown"
+    # Merged only after finish proved every stage in scope accepted; the
+    # stage directories may since have been archived with the worktree.
+    return "accepted" if found.status.integrated else "not_started"
+
+
+def _gate_state(found: _Execution, gate: Any, checkpoint: str, stage_started: bool) -> tuple[str, str | None]:
+    """``(state, gate instance)``: ``pending`` until the run reaches the
+    gate, ``open`` while it is owed (``failed`` once answered ``fail``),
+    ``passed`` once released."""
+
+    from agent_sparring.deferred_gate import ObligationStatus
+
+    owed = [
+        obligation
+        for obligation in (found.state.deferred_human_checks if found.state is not None else ())
+        if obligation.manifest_gate
+        and obligation.checkpoint == checkpoint
+        and any(check.id == gate.id for check in obligation.gate.checks)
+    ]
+    if owed:
+        latest = owed[-1]
+        state = {ObligationStatus.PASSED: "passed", ObligationStatus.FAILED: "failed"}.get(latest.status, "open")
+        return state, latest.instance_id
+    if stage_started or found.status.integrated:
+        return "passed", None
+    return "pending", None
+
+
+def _next(record: LogicalPlanRecord, executions: tuple[_Execution, ...]) -> dict[str, Any] | None:
+    """What moves the plan forward now, in order: a part not proven complete
+    is resumed (or its open gate answered), a complete part not yet
+    integrated is finished, and a part with no execution is continued into."""
+
+    from agent_sparring.deferred_gate import DeferredVerificationRequired
+
+    for found in executions:
+        entry = found.status
+        if found.record is not None and not entry.complete:
+            awaiting = getattr(found.state, "awaiting", None)
+            action = "gate" if isinstance(awaiting, DeferredVerificationRequired) else "resume"
+            return {"repository": entry.repository, "target_branch": found.record.target_branch, "action": action}
+        if found.record is not None and not entry.integrated:
+            return {"repository": entry.repository, "target_branch": found.record.target_branch, "action": "finish"}
+        if found.record is None and not entry.complete:
+            target: str | None = None
+            if entry.lifecycle is None:
+                try:
+                    target, _ = managed_run.resolve_target(Path(record.binding(entry.repository).path), None)
+                except ManagedRunError:
+                    target = None
+            action = "continue" if entry.lifecycle is None else "resume"
+            return {"repository": entry.repository, "target_branch": target, "action": action}
+    return None
+
+
+def view(home_common_dir: Path, record: LogicalPlanRecord) -> dict[str, Any]:
+    """The logical plan as people see it: its stages in order, each with its
+    owner repository, its state and the run key executing it; its gates;
+    and ``next`` -- ``{repository, target_branch, action}`` with ``action``
+    one of :data:`NEXT_ACTIONS`, or ``None`` once every part is integrated.
+
+    Derived on every call from the record, its snapshot and each part's own
+    execution record and run state (:func:`derived_status`); writes nothing.
+    ``sparring runs --json`` and the editor extension both show this."""
+
+    from agent_sparring.deferred_gate import CHECKPOINT_PLAN_COMPLETION, before_stage_checkpoint
+
+    status = derived_status(record)
+    executions = tuple(_read_execution(record, entry) for entry in status.slices)
+    by_stage = {stage_id: found for found in executions for stage_id in found.status.stages}
+    source = snapshot_source(home_common_dir, record)
+    planned = {stage.stage_id: stage for stage in source.stages()}
+
+    stages: list[dict[str, Any]] = []
+    gates: list[dict[str, Any]] = []
+    for stage in record.stages:
+        found = by_stage[stage.stage_id]
+        state = _stage_state(found, stage.stage_id)
+        stages.append(
+            {
+                "stage_id": stage.stage_id,
+                "label": stage.label,
+                "title": stage.title,
+                "repository": stage.owner,
+                "state": state,
+                "run_key": found.status.id if found.record is not None else None,
+            }
+        )
+        for gate in planned[stage.stage_id].gates_before:
+            gate_state, instance = _gate_state(
+                found, gate, before_stage_checkpoint(stage.stage_id), state not in ("not_started", "unknown")
+            )
+            gates.append(_gate_entry(gate, stage.stage_id, stage.owner, gate_state, instance))
+    last = executions[-1]
+    for gate in getattr(source, "completion_gates", ()):
+        gate_state, instance = _gate_state(last, gate, CHECKPOINT_PLAN_COMPLETION, False)
+        gates.append(_gate_entry(gate, None, last.status.repository, gate_state, instance))
+    nxt = _next(record, executions)
+    return {
+        "logical_key": record.logical_key,
+        "plan_label": record.plan_label,
+        "home": record.home,
+        "status": "complete" if status.complete else "in_progress",
+        "stages": stages,
+        "gates": gates,
+        "next": nxt,
+    }
+
+
+def _gate_entry(gate: Any, before: str | None, repository: str, state: str, instance: str | None) -> dict[str, Any]:
+    return {
+        "id": gate.id,
+        "title": gate.title,
+        "reason": gate.reason,
+        "before_stage": before,
+        "repository": repository,
+        "state": state,
+        "instance_id": instance,
+    }
+
+
+def plan_keys(repo_root: Path) -> tuple[str, ...]:
+    """Every logical plan this repository takes part in: records it is home
+    to, plans whose home its pointers name, and plans its executions name."""
+
+    common = managed_run.git_common_dir(Path(repo_root))
+    keys: set[str] = set()
+    directory = records_dir(common)
+    names = {path.name for path in directory.iterdir()} if directory.is_dir() else set()
+    for name in names:
+        key = name.removesuffix(".home.json") if name.endswith(".home.json") else name.removesuffix(".json")
+        # A record is <key>.json with its snapshot beside it; a pointer is
+        # <key>.home.json. Ledgers and snapshots are not plans of their own.
+        if not managed_run._RUN_KEY_RE.match(key) or name == key:
+            continue
+        if name.endswith(".home.json") or any(other.startswith(f"{key}.snapshot") for other in names):
+            keys.add(key)
+    for execution in managed_run.list_records(Path(repo_root)):
+        if execution.logical_slice is not None:
+            keys.add(execution.logical_slice["logical_key"])
+    return tuple(sorted(keys))
+
+
 def record_slice_created(home_common_dir: Path, logical_key: str, index: int, run_key: str) -> LogicalPlanRecord:
     """Append ``slice_created`` for ``index`` once: a retried or interrupted
     creation reconciles to one event."""
@@ -1104,6 +1297,7 @@ __all__ = [
     "LogicalSlice",
     "LogicalStage",
     "LogicalStatus",
+    "NEXT_ACTIONS",
     "RepositoryBinding",
     "ScopedPlanSource",
     "SliceStatus",
@@ -1121,6 +1315,7 @@ __all__ = [
     "membership",
     "new_record",
     "next_slice",
+    "plan_keys",
     "plan_slice_execution",
     "pointer_path",
     "previous_integration",
@@ -1134,5 +1329,6 @@ __all__ = [
     "snapshot_input",
     "snapshot_path",
     "snapshot_source",
+    "view",
     "write_pointers",
 ]
