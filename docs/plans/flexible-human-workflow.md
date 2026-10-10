@@ -1,432 +1,372 @@
 # Flexible human gates and audited workflow recovery (engine)
 
-**Status:** Draft for review (2026-10-10). Not approved; not started.
+**Status:** Approved direction with decisions (2026-10-10). Not started.
 **Repository:** `agent-sparring` only. The VS Code presentation is a separate
 plan in `agent-sparring-vscode` (`docs/plans/authoritative-status-ux.md`) that
 consumes the contracts defined here.
+**Prerequisites:**
+- `docs/plans/run-ownership-lock.md` (P0), both stages accepted and merged.
+- repository-slices merged to `main`. This plan changes `resume_plan`, which
+  that work reshapes.
 
 Principle: **strict about evidence and safety, flexible about workflow.** When
 a paused run meets an unexpected but explainable change, the engine explains
 what changed and why it matters, offers specific supported recovery actions,
 and performs the chosen one itself after the human authorizes exactly that
-action. The engine does not gain a generic "ignore checks" switch.
+action. There is no generic "ignore checks" switch. Human authorization never
+overrides a live runner. Every mutating action holds the run ownership lock.
 
 ## Why (audit summary, 2026-10-10)
 
 - **Recording and continuing are one command.** `--evidence` exists only on
   `resume-plan`. It records into `notes.md`, sets `evidence_pending`, then
   drives the reviewer in the same process. The reviewer's SEND_BACK starts
-  the stage agent at once. The first half (record, set `evidence_pending`)
-  already works on its own, because a plain `resume-plan` re-enters the
-  reviewer when `evidence_pending` matches (`plan.py` `_evidence_awaiting_review`).
-  There is just no command that stops after recording. *(Case 2)*
+  the stage agent at once. The record half already works on its own: a plain
+  `resume-plan` re-enters the reviewer when `evidence_pending` matches
+  (`plan.py` `_evidence_awaiting_review`). *(Case 2: a production measurement
+  window was approved for Sunday 02:00. Recording it on Saturday started the
+  stage agent, which then kept a provider turn alive for about 15 hours,
+  sleeping until the window.)*
 - **Evidence that changes the candidate has no supported path.** The paused
   pin (`next_turn_candidate`) must match exactly. The only re-pin is
-  `--accept-advanced-head`. It applies to commits *beneath* an unchanged attempt
-  that touch no attempt path. It needs a hand-made commit and a hand-typed SHA,
-  only works together with `--evidence`, and always launches. *(Cases 1, 3)*
-- **No run-level mutual exclusion.** `resume-plan`/`run-plan` hold no lock
-  across verify → record → launch. The per-worktree `flock` is held only
-  *during* individual stage and reviewer turns. A second `resume-plan`, or any
-  recovery command, can rewrite `notes.md`, stage `state.json` and the run
-  state while another runner sits between turns. It can also rewrite them
-  before that runner's own next turn fails on the lock. Under
-  `--accept-advanced-head`, a refusal before the first provider turn restores
-  byte snapshots taken at that process's start over whatever the other process
-  wrote since. `PlanRunState.save` and `Stage.write_state` are plain
-  `write_text`, not atomic. The `runner_live` check in `finish-run` probes the
-  per-turn lock, so between turns it reports "no runner" for an active run.
-  The planned `rescope-run` precondition relies on the same probe.
-- **No machine-readable runner state.** Nothing tells a client whether a
-  runner is executing a run. The VS Code extension infers liveness by parsing
-  `ps`. Workflow state and process liveness are separate facts, but only the
-  first has an engine-owned source.
+  `--accept-advanced-head`, which covers commits *beneath* an unchanged
+  attempt that touch no attempt path. It needs a hand-made commit and a
+  hand-typed SHA, only works together with `--evidence`, and always launches.
+  *(Cases 1, 3)*
 
-## Relationship to other plans
+## Approved decisions (2026-10-10)
 
-- `docs/plans/repository-slices.md` (implementation branch
-  `sparring/repository-slices-439b82fa-93f833e0`, unmerged, Stage 4 not yet
-  built) owns repository scope, `rescope-run` and cross-repository
-  continuation. This plan does **not** change scope or plan content. Stage 1's
-  run lock is what the planned `rescope-run` "no live runner" precondition
-  should use. That branch rewrites much of `resume_plan`, so this plan should
-  start from `main` *after* it merges.
-- `plan/post-completion-check-amendments` (unmerged plan) adds an append-only,
-  `flock`-guarded amendment log for **complete** runs. Stage 3 here adds a
-  decision log for **running/paused** runs. The two logs must not diverge into
-  incompatible formats. Whichever lands first defines the record envelope, and
-  the other extends it (see the decision at the end).
-- Execution windows / scheduling (Case 2's "not before Sunday 02:00") are
-  deliberately **not** in this plan. See *Deferred* below.
+1. **Order.**
+   1. repository-slices: review and merge its implemented Stages 1–3 and 5.
+   2. run-ownership-lock (P0).
+   3. repository-slices Stage 4 (`rescope-run`), held for its whole apply
+      step under the run ownership lock, and only then the ui-screenshots
+      recovery.
+   4. This plan.
 
-## Stage 1 — Run-level runner lock, atomic state writes and runner status
+   `rescope-run` must not be built, or used for recovery, before the run
+   ownership lock exists. See `run-ownership-lock.md` *Why*.
+2. **Audit record.** Use one append-only audit record format, shared with the
+   post-completion check amendments plan. The two plans keep distinct
+   operation kinds, each with its own validation rules. Neither plan's
+   implementation depends on the other's code beyond that format.
+3. **Evidence during candidate drift** may be recorded durably against the
+   correct gate instance. It stays *unverified / pending review* until the
+   candidate is reconciled and independently reviewed. Candidate integrity
+   checks are not weakened.
+4. **Execution windows** are deferred to a separate follow-up. The preferred
+   shape is a minimal `not-before` / `expires-at` constraint, not a general
+   scheduler. This plan delivers the independent *record* and *continue*
+   actions first.
+5. **No waiting turns.** The design must not require a provider turn to stay
+   alive merely to wait for an external time or condition.
 
-**Outcome:** At most one engine process can mutate a run's state, from the
-moment it reads that state until it exits, including the time between agent
-turns. Every write of run state and stage state is atomic. A client can ask
-the engine whether a runner currently holds a run, without parsing process
-lists.
+## Stage 1 — Deviation report: invariant, recoverable deviation, warning
 
-**Hard constraints**
-- `run-plan`, `resume-plan` and every command that mutates a run's
-  `.sparring/plans/<key>.json`, a stage's `state.json`, `notes.md` or
-  `sparring.md` hold one exclusive, run-scoped lock for that whole mutation.
-  For a runner, that is the process's whole life. Contention is a
-  non-blocking refusal with a stable code that names the holder; it is never a
-  wait and never a race. The existing per-worktree turn lock stays exactly as
-  it is.
-- The lock is kernel-released on process death, like `concurrency.py`'s
-  `flock`. Liveness is never decided from a pid file. A pid, start time, run
-  key and command recorded next to the lock are diagnostic only.
-- A liveness probe must never make a starting runner fail or delay it
-  materially. Probing a free lock must not acquire anything a runner could
-  then contend on, or the runner must tolerate such a probe.
-- The rollback around `--accept-advanced-head` may restore only what this
-  process itself wrote, while it still holds the lock. It must never restore a
-  snapshot over another process's writes.
-- `PlanRunState.save`, stage state writes and evidence appends become atomic
-  (temp file, fsync, rename). A crash leaves either the old or the new file,
-  never a torn one.
-- `finish-run`'s `runner_live` check uses the run lock, not the per-turn
-  worktree lock.
-- Windows: if the lock cannot be implemented, the probe answers `unknown`.
-  It never answers `absent`.
-
-**Client contract (additive):** `sparring runs --json` gains a per-run
-`runner` object: `{"state": "live" | "absent" | "unknown", "pid", "started_at",
-"command"}`. Only `state` is authoritative. A read-only `sparring run-status
---run-key K [--repo-root R] --json` returns the same object for any run,
-managed or not, together with the run's workflow position (plan status,
-current stage, stage status, `next_turn`, recorded outcome, `evidence_pending`,
-`awaiting`). That is everything a client needs to say whose turn it is.
-Document both in `docs/reference.md`. Additive fields keep `schema_version`
-unless the reviewer finds the change incompatible.
-
-**Starting points:** `concurrency.py`, `plan.py` (`resume_plan`, `_drive`,
-`_rolled_back_on_failure`, `PlanRunState.save`), `stage.py` (`write_state`,
-`append_note`), `recovery.py` (`reset_stage`, `reopen_for_failed_check`),
-`managed_finish.py` (`runner_live`), `cli.py` (`_cmd_runs`).
-`tests/test_accept_advanced_head.py` has the existing rollback tests.
-
-**Boundaries / non-goals:** no change to verdict routing, gates, candidate
-verification or acceptance. No new recovery behavior. No UI.
-
-**Acceptance evidence**
-- A test runs two concurrent `resume-plan` processes on one paused run: exactly
-  one proceeds and the other is refused before writing anything (byte-identical
-  `notes.md`, stage and run state).
-- A test runs a recovery command (`reset-stage`, `reopen-stage`, a resume with
-  `--accept-advanced-head`) while a runner sits *between* turns: it is
-  refused, and it no longer rewrites state behind the runner.
-- A test: the `--accept-advanced-head` rollback never restores over a write it
-  did not make.
-- An atomic-write test: a write interrupted at the replace step leaves
-  parseable state.
-- Tests: `runner.state` is `live` during and between turns, `absent` after
-  normal exit and after SIGKILL, and a probe does not break a runner starting
-  at the same moment.
-- `finish-run --dry-run` reports `runner_live: false` for a runner that is
-  between turns.
-- The full suite passes: `.venv/bin/python -m pytest -q`.
-
-**Handoff:** the name and location of the run lock, the refusal code, and the
-`runner` / `run-status` JSON shapes, recorded in `docs/reference.md` for
-Stages 2–5 and the VS Code plan.
-
-## Stage 2 — Deviation report: invariant, recoverable deviation, warning
+**Prerequisite:** run-ownership-lock is merged. It provides the run ownership
+lock and `sparring run-status --json` with separate `workflow` and `runner`
+objects.
 
 **Outcome:** For any recorded run, the engine can explain *why it cannot
-simply continue*. The explanation is in one machine-readable report that
-separates three classes:
+simply continue*, in one machine-readable report. The report separates three
+classes:
 
-- **invariant** — a hard safety property is violated or unprovable. No action
-  continues the run past it. The report says what would have to be true. The
-  property list: candidate content differs from its pin in a way no supported
-  action explains; wrong branch or a protected branch is checked out;
-  ownership or worktree-record mismatch; plan digest changed; a sibling pin
-  moved; an accepted stage's history would change; the gate instance does not
-  match.
-- **recoverable deviation** — unexpected, explainable, and covered by a
-  supported action. The report gives what changed (commits, paths, short
-  diff stat), why it blocks continuation, the risk, and the specific action(s)
-  that would recover. Each action carries a **confirmation token** bound to
-  the exact facts it was computed from.
-- **warning** — informational. It never blocks continuation.
+- **invariant**: a hard safety property is violated or unprovable. No action
+  continues the run past it, and the report says what would have to be true.
+  Examples:
+  - the candidate content differs from its pin in a way no supported action
+    explains;
+  - the wrong branch, or a protected branch, is checked out;
+  - ownership or the worktree record does not match;
+  - the plan digest changed;
+  - a sibling pin moved;
+  - an accepted stage's history would change;
+  - the gate instance does not match;
+  - another runner holds the run.
+- **recoverable deviation**: unexpected and explainable, and covered by a
+  supported action. The report gives:
+  - what changed (commits, paths, diff stat);
+  - why it blocks continuation;
+  - the risk;
+  - the specific recovery action(s), each with a **confirmation token** bound
+    to the exact facts it was computed from.
+- **warning**: informational only; it never blocks continuation.
 
 **Hard constraints**
-- Read-only. Producing the report writes nothing and takes no lock that could
-  block a runner. It may report `runner.state: live`, and then it offers no
-  mutating action.
-- The classifier reuses the engine's existing proofs (`verify_candidate`,
-  `repin_after_authorized_advance`, the plan-digest and ownership checks). It
-  never adds a looser parallel version of them. Anything it cannot prove
-  recoverable is an `invariant`.
-- A token binds at least: run key, stage id, gate instance, pinned candidate
-  identity, current HEAD and content digest, action kind and action
-  parameters. A token is recomputed and compared when the action executes. Any
+- **Read-only.** The report writes nothing. While `runner.state` is `live` or
+  `unknown`, it offers no mutating action.
+- **Reuse the existing proofs.** The classifier uses `verify_candidate`,
+  `repin_after_authorized_advance`, the plan-digest checks and the ownership
+  checks. It never adds a looser parallel version of any of them. Anything it
+  cannot prove recoverable is classed as invariant.
+- **Tokens.** A token binds at least: run key, stage id, gate instance, pinned
+  candidate identity, current HEAD and content digest, action kind and
+  parameters. The executing action recomputes the token and compares it. Any
   difference refuses with "the repository changed since you reviewed this".
-  Reuse the confirm-token approach `plan_start` already has where it fits.
-- Each offered action names an existing or planned engine command. Existing
-  recovery commands are classified, not reimplemented: `reset-stage`,
-  `reopen-stage`, fresh sessions, and `rescope-run` once repository-slices
-  provides it. Stages 4 and 5 register their actions here.
-- Stable reason codes, each with a human sentence, documented in
-  `docs/reference.md`.
+  Reuse the `plan_start` confirm-token approach where it fits.
+- **Actions map to commands.** Each offered action names an existing engine
+  command or one of this plan's commands. Existing recovery commands are
+  classified, not reimplemented: `reset-stage`, `reopen-stage`, fresh
+  sessions, and `rescope-run` when it exists on `main`.
+- **Codes.** Reason codes are stable and come with human sentences, documented
+  in `docs/reference.md`.
 
-**Interface:** `sparring run-status … --json` (from Stage 1) gains a
-`deviations` list. Each entry has `class`, `code`, `summary`, `detail`,
-`evidence` and `actions: [{kind, command, token, effect}]`. A human-readable
-form prints by default.
+**Interface:** `run-status --json` gains a `deviations` list. Each entry has
+`class`, `code`, `summary`, `detail`, `evidence` and
+`actions: [{kind, command, token, effect}]`. The default output is human
+readable.
 
-**Boundaries / non-goals:** no new mutating operation in this stage.
-`resume-plan`'s refusals keep their current behavior and wording, though they
-may add a pointer to `run-status`.
+**Boundaries / non-goals:** no new mutating operation. `resume-plan`'s
+refusals keep their behavior; they may add a pointer to `run-status`.
 
 **Acceptance evidence**
-- Fixture-driven tests for each class:
-  - a paused stage whose branch advanced beneath an unchanged attempt →
-    recoverable, offering today's `--accept-advanced-head` command with a
-    token;
-  - an attempt file edited while paused → recoverable, offered as a candidate
-    amendment, which Stage 5 executes (until then the action is listed as
-    unavailable);
-  - an advance that touches attempt paths → recoverable only as an amendment,
-    never as a prerequisite advance;
-  - rewritten history, a moved sibling pin, a protected branch, or an edited
-    plan stage section → invariant, with no action;
-  - a live runner → no mutating actions.
-- A token is refused after any repository change between report and use.
-- The report changes nothing (byte comparison of `.sparring` and the
-  `git status` output).
+- Fixture tests for each class:
+  - The branch advanced beneath an unchanged attempt → recoverable. It offers
+    `--accept-advanced-head` with a token.
+  - An attempt file was edited while paused → recoverable as a candidate
+    amendment, which Stage 4 executes and which is "unavailable" until then.
+  - An advance touching attempt paths → recoverable only as an amendment.
+  - Rewritten history, a moved sibling pin, a protected branch or an edited
+    plan stage section → invariant, with no action.
+  - A live runner → no mutating actions.
+- A token is refused after any repository change made between the report and
+  its use.
+- `.sparring` and `git status` are byte-identical after the report.
 
-**Handoff:** the deviation codes, the action registry, and the token contract
-in `docs/reference.md`.
+## Stage 2 — Record human-check outcomes without continuing the run
 
-## Stage 3 — Record human-check outcomes without continuing the run
-
-**Outcome:** A person can record one or several human-check answers, and
-further notes, into a paused run without starting any agent. Continuing the run
-is a separate action. `resume-plan --evidence` keeps working as "record, then
+**Outcome:** A person can record one or several human-check answers, plus
+notes, into a paused run without starting any agent. **Continuing** is a
+separate action. `resume-plan --evidence` keeps working as "record, then
 continue".
 
 **Hard constraints**
-- New command (name is the stage agent's choice, for example
-  `sparring record-evidence`). It writes the answers into the current stage's
-  `notes.md` `## Human evidence` in the engine's existing shape, so
-  `gate_answers.py` and the sparrer prompt read it unchanged. It sets
-  `evidence_pending` exactly as `resume-plan --evidence` does. It exits
-  without launching anything. A later plain `resume-plan` continues
-  reviewer-first through the existing `_evidence_awaiting_review` path.
-- Answers name their gate **instance** and check ids. An answer to an instance
-  that is not the stage's current open gate is refused. Recording never
-  answers a deferred or plan-declared gate. Those keep `--deferred-result`.
-- **Idempotent and atomic.** Each submission carries an id, supplied by the
-  caller or derived from the content. Repeating the same submission records
-  nothing new and succeeds. A different submission for the same instance is
-  appended, never overwrites, and history stays. An interrupted write leaves
-  either the whole entry or none of it. The whole operation runs under
-  Stage 1's run lock and is refused while a runner holds the run.
-- Recording is allowed when the working tree no longer matches the pin. The
-  answer is the person's observation, and the drift is a separate fact. The
-  entry records the pinned candidate identity it was given against. Starting
-  the reviewer still requires the candidate to verify (unchanged rule), and
-  the refusal points at `run-status`. This is what lets Case 1 record its
-  evidence first and then resolve the drift (Stages 4 and 5).
-- A per-run, append-only **decision log** records each submission's id, gate
-  instance, check outcomes, pinned candidate, time and actor (`person`). The
-  log is registered in `artifact_ownership.py` with the engine as sole writer.
-  If the post-completion check-amendment log
-  (`.sparring/plans/amendments/<run>.jsonl`) exists on `main` when this stage
-  starts, extend that format and its locking rather than adding a second one.
-  Otherwise, define a versioned record envelope that it can adopt. Either way,
-  the stage report says which. `notes.md` remains the canonical text agents
-  read. The log is the audit and idempotency record.
-- `resume-plan --evidence …` behaves exactly as before, as a composition of
-  record + continue, under one lock hold. Its existing tests pass unchanged.
+- **Record-only command.** A new command, named by the stage agent (for
+  example `sparring record-evidence`):
+  - writes the answers into the current stage's `notes.md`
+    `## Human evidence`, in the engine's existing shape, so `gate_answers.py`
+    and the sparrer prompt read them unchanged;
+  - sets `evidence_pending`;
+  - exits without launching anything.
 
-**Boundaries / non-goals:** no candidate changes and no re-pinning (Stages 4
-and 5). No scheduling. No change to how the reviewer judges evidence.
+  A later plain `resume-plan` continues reviewer-first through the existing
+  `_evidence_awaiting_review` path.
+- **Gate instance.** Answers name their gate **instance** and check ids. An
+  answer to any instance other than the stage's current open gate is refused.
+  Deferred and plan-declared gates keep `--deferred-result`.
+- **Idempotent and atomic, under the run ownership lock.**
+  - Each submission carries an id, supplied by the caller or derived from its
+    content. Repeating it records nothing new and succeeds.
+  - A different submission for the same instance is appended. Nothing is
+    overwritten, and history is kept.
+  - An interrupted write leaves either the whole entry or none of it.
+  - The command is refused while another process holds the run.
+- **Drift: recorded, never verified.**
+  - Recording is allowed when the working tree no longer matches the pin.
+  - The entry records the pinned candidate identity it was given against, and
+    its status is *recorded, pending review*.
+  - `run-status` reports it as unverified until a reviewer turn on a candidate
+    that verifies has consumed it.
+  - Starting the reviewer still requires the candidate to verify (an
+    unchanged rule).
+  - Recording never moves, re-pins or validates the candidate.
+- **Audit record.**
+  - Each submission appends one entry to the run's append-only audit log:
+    operation kind `evidence_recorded`, submission id, gate instance, check
+    outcomes, pinned candidate, time and actor (`person`).
+  - The log is registered in `artifact_ownership.py` with the engine as its
+    sole writer.
+  - The record format is shared with the post-completion check-amendment
+    plan:
+    - If that format exists on `main`, adopt it.
+    - Otherwise, define it as a small versioned envelope (schema version,
+      sequence, operation kind, actor, time, subject, payload) that the other
+      plan can adopt without code changes. Its operation kinds and validation
+      stay that plan's own.
+  - `notes.md` remains the canonical text agents read; the audit log is the
+    audit and idempotency record.
+- **Compatibility.** `resume-plan --evidence …` behaves exactly as before:
+  record, then continue, under one lock hold. Its existing tests pass
+  unchanged.
+
+**Boundaries / non-goals:** no candidate changes or re-pinning (Stages 3–4).
+No time windows. No change to how the reviewer judges evidence.
 
 **Acceptance evidence**
-- Record → no provider started (fake providers assert zero turns) →
-  `run-status` shows evidence recorded and awaiting review → `resume-plan`
-  starts the reviewer first, against the same pin.
-- Replaying the identical submission is a no-op. A second, different answer
-  for the same instance appears as history. Answering a superseded instance is
-  refused.
-- Recording while a runner holds the run is refused with nothing written.
-- Killing the process mid-write leaves notes and the decision log consistent
-  (either both have the entry or neither does). Recovery through retry is
-  covered.
-- Recording against a drifted candidate succeeds and is labelled with the
-  pin. The following `resume-plan` refuses to start the reviewer until the
-  drift is resolved.
-- Existing evidence tests pass unchanged: `tests/test_plan.py` evidence and
-  `--accept-advanced-head` cases, `tests/test_accept_advanced_head.py`.
+- Record → fake providers show no provider started → `run-status` reports the
+  evidence as recorded and pending review → `resume-plan` starts the reviewer
+  first on the same pin.
+- Repeating the identical submission is a no-op. A different second answer
+  for the same instance is kept as history. A superseded instance is refused.
+- Recording while another process holds the run is refused, and nothing is
+  written.
+- A kill injected at each write step leaves the notes and the audit log
+  consistent, and a retry converges.
+- Recording against a drifted candidate succeeds and is reported as
+  unverified. The next `resume-plan` refuses to start the reviewer until the
+  drift is reconciled, and the evidence stays pending throughout.
+- Existing evidence tests pass unchanged (`tests/test_plan.py`,
+  `tests/test_accept_advanced_head.py`).
 
-**Handoff:** the command, its JSON result, the decision-log schema and the
-idempotency semantics, in `docs/plans.md` *Answering a human gate* and
-`docs/reference.md`.
+## Stage 3 — Authorized prerequisite advance as a standalone action
 
-## Stage 4 — Authorized prerequisite advance as a standalone action
-
-**Outcome:** When a paused stage's branch advanced beneath an unchanged
-attempt (Case 3), the person authorizes "accept these commits as a
-prerequisite" from Stage 2's report. The engine re-pins without requiring
-evidence and without launching. The person never has to find or type a SHA.
+**Outcome:** A paused stage's branch can advance beneath an unchanged attempt
+(Case 3). The person then authorizes "accept these commits as a prerequisite"
+from the deviation report (Stage 1). The engine re-pins without requiring
+evidence and without launching anything. The person never finds or types a
+SHA.
 
 **Hard constraints**
-- The proof is exactly `repin_after_authorized_advance` as it stands:
+- **The proof is unchanged.** It is exactly `repin_after_authorized_advance`:
   - the accepted head is the current HEAD on the run's branch;
   - the pinned head is a strict ancestor of it;
-  - sibling pins are unchanged;
+  - the sibling pins are unchanged;
   - no path in the range overlaps uncommitted attempt content;
   - untracked files are byte-identical;
-  - content and index, minus the range, reproduce the pinned digests.
+  - content and index, with the range removed, reproduce the pinned digests.
 
-  Nothing in that proof is relaxed.
-- Authorization is Stage 2's token. The action executes only if the
-  recomputed token matches, and only under the run lock.
-- Allowed while the stage waits on a recorded NEEDS_YOU. The answer may be
-  recorded before or after (Stage 3). The gate instance is unchanged, because
-  the asking did not change. Today's restriction to NEEDS_YOU stays. Any
-  extension to other paused states (ESCALATE, a failed review turn) must be
-  argued in the stage report and is otherwise out of scope.
-- Audit:
-  - the decision log gets `{action: prerequisite_advance, previous_pin,
-    new_pin, commits, paths, token digest, actor, time}`;
-  - `notes.md` gets the existing human-readable note;
-  - an activity event is emitted.
+  Nothing is relaxed.
+- **Authorization.** It is Stage 1's token, executed only if the recomputed
+  token matches, and only under the run ownership lock.
+- **Allowed states.** The action is allowed while the stage waits on a
+  recorded NEEDS_YOU. The answer may be recorded before or after (Stage 2).
+  The gate instance is unchanged. Extending the action to other paused states
+  is out of scope.
+- **Audit.** Each advance:
+  - appends an audit entry: operation kind `prerequisite_advance`, previous
+    pin, new pin, commits, paths, token digest, actor and time;
+  - writes the existing human-readable note to `notes.md`;
+  - emits an activity event.
+- **Compatibility.** `--accept-advanced-head <sha>` keeps its semantics and
+  tests. It runs on the same path and appends the same audit entry.
 
-  The previous pin stays recoverable from the log, so it does not survive only
-  as prose.
-- `--accept-advanced-head <sha>` keeps working with its current semantics
-  and tests. It is implemented on the same path and logs the same record.
-
-**Boundaries / non-goals:** no changes to the attempt itself (Stage 5).
-Never a rebase, reset or any history rewrite. No automatic re-pin without a
-token.
+**Boundaries / non-goals:** no changes to the attempt itself (Stage 4). No
+rebase, reset or history rewrite. No re-pin without a token.
 
 **Acceptance evidence**
-- The scenarios already in `tests/test_accept_advanced_head.py` all pass
-  through the new action as well: each refusal still refuses, and accepted
-  cases re-pin identically.
-- A replayed or stale token is refused. Nothing launches. The decision log
-  holds the old and new pins.
-- A stage with recorded evidence, then the advance action, then `resume-plan`:
-  the reviewer judges the new pin first.
+- Every scenario in `tests/test_accept_advanced_head.py` behaves identically
+  through the new action: refusals refuse, accepted cases re-pin identically.
+- A replayed or stale token is refused. Nothing launches. The audit log holds
+  the old and new pins.
+- Recorded evidence → advance → `resume-plan`: the reviewer judges the new
+  pin first.
 
-## Stage 5 — Authorized evidence amendment of the candidate
+## Stage 4 — Authorized evidence amendment of the candidate
 
 **Outcome:** While a stage waits on a human, a person can approve a bounded
-change to the candidate itself, for example measurements written into
-`docs/perf/baseline-2026-10.md` (Case 1). The engine previews it, commits
-exactly the approved change on the run's branch, re-pins, and requires the
-reviewer to judge the amended candidate. No manual Git is needed.
+change to the candidate itself, for example measurements written into a
+tracked document (Case 1). The engine previews it, records exactly the
+approved change, re-pins, and requires the reviewer to judge the amended
+candidate. No manual Git is needed.
 
 **Hard constraints**
-- The person approves a **named path set**. The preview (Stage 2 action) lists
-  the exact changed paths and diff (stat plus full text for text files, with a
-  size cap) and binds them into the token. Execution refuses if any path
-  outside the approved set differs from the pin (tracked, staged or
-  untracked), or if the approved paths' content differs from the preview.
-  Unrelated changes are refused, never silently left out.
-- Amendments touch only files tracked in the candidate repository. They never
-  touch `.sparring/` stage or run artifacts, the input plan, or another
-  repository. An approved path inside the plan's executable content is refused
-  (the plan-digest invariant).
-- If the pinned candidate is a commit, the engine makes **one** commit with
-  exactly the approved paths, on the run's expected branch, with a trailer
-  naming the run, stage, gate instance and decision id. It never amends,
-  rebases or force-pushes. If the pinned candidate is a deliberately
-  uncommitted worktree candidate, the amendment re-pins the working tree
-  without committing, and the existing finalization comparison applies later.
-- After an amendment the reviewer **must** review the amended candidate
-  before any acceptance: `next_turn` is the reviewer, and `evidence_pending`
-  is set so it gets the evidence turn. The previous review's gate stays
-  recorded. No acceptance carries over from the previous pin.
-- Branch/protected-branch guard, run lock, token match and ownership checks
-  apply exactly as for agent turns. Push follows the run's existing push
-  policy. Never push implicitly.
-- Audit: the decision log records the previous pin, the new pin and commit,
-  the approved paths, a diff digest, the gate instance and the actor. The note
-  in `notes.md` states that the candidate was amended by a person and lists
-  the paths.
+- **Path set.**
+  - The person approves a **named path set**.
+  - The preview, offered as an action in the Stage 1 report, lists the exact
+    changed paths and diff (stat, plus full text for text files under a size
+    cap) and binds them into the token.
+  - Execution refuses if any path outside the set differs from the pin
+    (tracked, staged or untracked), or if the approved paths' content differs
+    from the preview.
+  - Unrelated changes are refused, never silently left out.
+- **Allowed files.** Only files tracked in the candidate repository. Never
+  `.sparring/` artifacts, the input plan, plan-executable content (the
+  plan-digest invariant) or another repository.
+- **Commit rules.**
+  - A committed pin gets **one** engine commit containing exactly the approved
+    paths, on the run's expected branch. A trailer names the run, stage, gate
+    instance and audit sequence.
+  - Never amend, rebase or force-push.
+  - A deliberately uncommitted worktree pin is re-pinned without a commit. The
+    existing finalization comparison applies later.
+- **Mandatory re-review.**
+  - After an amendment the reviewer **must** review the amended candidate
+    before any acceptance: `next_turn` becomes the reviewer, and
+    `evidence_pending` is set.
+  - Evidence recorded earlier stays pending review.
+  - Nothing accepted carries over from the previous pin.
+- **Guards.**
+  - Branch, protected-branch, ownership, token and run-lock checks apply
+    exactly as for agent turns.
+  - Push follows the run's existing push policy. Never push implicitly.
+- **Audit.** An entry of operation kind `evidence_amendment` records the
+  previous pin, the new pin and commit, the approved paths, a diff digest, the
+  gate instance and the actor. The `notes.md` note says that a person amended
+  the candidate and lists the paths.
 
-**Boundaries / non-goals:** not a way to change plan scope, accepted stages
-or another repository. Not available while a runner holds the run, or for an
-accepted stage (that is `reopen-stage`'s or a follow-up stage's job).
+**Boundaries / non-goals:** not a way to change plan scope, accepted stages or
+other repositories. Unavailable while any other process holds the run, and for
+an accepted stage.
 
 **Acceptance evidence**
-- Case 1 replay as a test: paused NEEDS_YOU on a committed candidate → a person
-  edits one approved file → `run-status` offers an amendment for exactly that
-  path → executing it creates one commit with exactly that path → `resume-plan`
-  starts the reviewer on the new pin.
-- Refusals:
+- **Case 1 replay.**
+  1. The stage is paused on NEEDS_YOU with a committed candidate.
+  2. Evidence is recorded (pending).
+  3. One approved file is edited.
+  4. `run-status` offers an amendment for exactly that path.
+  5. Executing it makes one commit containing exactly that path.
+  6. `resume-plan` starts the reviewer on the new pin.
+- **Refusals:**
   - an extra changed file;
-  - the approved file changed after preview;
+  - an approved file changed after the preview;
   - the plan file;
   - `.sparring/`;
-  - wrong branch;
-  - live runner;
-  - accepted stage;
-  - stale token.
-- The uncommitted-candidate variant re-pins without a commit, and finalization
-  later compares against the amended tree.
-- No path exists from an amendment to acceptance without a reviewer turn on
-  the new pin (asserted through fake providers).
+  - the wrong branch;
+  - a live runner;
+  - an accepted stage;
+  - a stale token.
+- The uncommitted-candidate variant re-pins without a commit.
+- Fake providers prove there is no path from an amendment to acceptance
+  without a reviewer turn on the new pin.
 
-## Stage 6 — Adversarial integration, documentation and planning skill
+## Stage 5 — Adversarial integration, documentation, prompts and skills
 
 **Outcome:** The recovery operations are proven together under concurrency
-and failure, documented as one model, and reflected in the planning skill.
+and failure. They are documented as one model, and agents are told not to
+wait inside a turn.
 
 **Scope**
-- End-to-end tests with fake providers:
-  - Case 1: record → amend → continue → READY;
-  - Case 2: record now → no agent → continue later;
-  - Case 3: prerequisite lands while paused → authorize advance → continue;
-  - interleavings of each with a second `resume-plan`, a recovery command and
-    a SIGKILL at every write step, showing the run lock and atomic writes
-    leave consistent, auditable state.
-- `docs/gates.md` / `docs/plans.md` / `docs/reference.md`: one section,
-  *When a paused run cannot simply continue*, covering the three classes, the
-  report, tokens, and each action and its proof. `docs/design.md`: record the
-  invariant/deviation/warning contract and that the engine performs recovery.
-- `skills/sparring-plan` and `skills/sparring-run`, only where behavior
-  changed:
-  - a human gate that is a scheduling or permission decision is not a Pass
-    check that releases immediate work;
-  - evidence that will be committed into the repository should be named in
-    the stage so an amendment is expected;
-  - the run skill uses `run-status` and the recovery actions instead of
-    teaching Git plumbing.
+- **End-to-end tests** with fake providers:
+  - Case 1: record → amend → continue → READY.
+  - Case 2: record now → no agent → continue later → reviewer first.
+  - Case 3: a prerequisite lands while paused → authorize the advance →
+    continue.
+  - Each case interleaved with a second `resume-plan`, a recovery command,
+    and SIGKILL at every write step. The run lock and atomic writes must leave
+    the state consistent and auditable.
+- **Docs.**
+  - `docs/gates.md`, `docs/plans.md`, `docs/reference.md`: one section, *When
+    a paused run cannot simply continue*, covering the three classes, the
+    report, tokens, and each action with its proof.
+  - `docs/design.md`: the invariant/deviation/warning contract.
+- **No waiting turns.**
+  - Stage-agent and reviewer prompts state that work which cannot start until
+    an external time or condition must not be waited for inside a turn (no
+    sleep or poll loops).
+  - The stage agent reports the wait and stops. The reviewer expresses it as
+    a NEEDS_YOU `EXTERNAL_CONDITION` gate, not as a SEND_BACK that releases
+    the work immediately.
+  - The person records the condition with Stage 2 and continues when it holds.
+- **Skills** (`sparring-plan`, `sparring-run`), only where behavior changed:
+  - A scheduling or permission decision is an external-condition gate, not a
+    Pass that releases immediate work.
+  - Evidence that will be committed into the repository is named in the stage,
+    so an amendment is expected.
+  - The run skill uses `run-status` and the recovery actions instead of Git
+    plumbing.
 
 **Acceptance evidence:** the full suite passes. Docs examples match real
-`run-status` output from a test fixture. `git diff --check` is clean.
+`run-status` output from a fixture. Prompt tests assert the no-waiting
+instruction. `git diff --check` is clean.
 
-## Deferred (not in this plan)
+## Deferred (separate follow-up)
 
-- **Execution windows / scheduling.** The engine can enforce a window only at
-  turn boundaries: refuse to start a turn outside it, and pause at the next
-  boundary after it closes. It cannot police commands inside a running turn.
-  Production-safety for measurements also belongs in project tooling, for
-  example scripts that refuse outside an authorized window. Turn-boundary
-  enforcement fits naturally after Stage 3 (record now, continue later) and is
-  a candidate for a small follow-up plan. Automatic start at the window's
-  opening is scheduling and is out of scope.
-- **Changing plan scope or contracts mid-run.** By engine invariant, changed
-  executable content needs a newly reviewed plan or run identity. Scope moves
-  are owned by repository-slices `rescope-run`. This plan only lists those
-  actions in the deviation report once they exist.
-
-## Decisions needed before approval
-
-1. Land order: repository-slices first (recommended, because it reshapes
-   `resume_plan`), then this plan from `main`.
-2. One shared run decision log for this plan and post-completion amendments
-   (recommended), or two separate files with a shared envelope.
-3. Whether recording evidence against a drifted candidate (Stage 3) is
-   acceptable. Recommended: yes, because the reviewer still cannot start until
-   the candidate verifies.
-4. Whether execution windows become a follow-up plan now or wait.
+- **Execution window**: a minimal `not-before` / `expires-at` constraint on
+  continuing a run. The engine refuses to start a turn outside it and pauses
+  at the next turn boundary after it expires. It cannot police commands
+  inside a running turn. Production safety also belongs in project tooling:
+  for example, the sporely-landing measurement script's own window guard. Not
+  a general scheduler, and no automatic start.
+- **Changing plan scope or contracts mid-run**: changed executable content
+  needs a newly reviewed plan or run identity. Scope moves are repository-
+  slices `rescope-run`. This plan only lists them as actions once they exist.
