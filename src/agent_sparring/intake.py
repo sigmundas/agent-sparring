@@ -311,7 +311,11 @@ _AUTHORIZATION_WORDING_RE = re.compile(r"\b(go-ahead|authori[sz]\w*|permission)\
 #: requests, SQL, a migration on a disposable target, tests, browser
 #: automation) and none of what makes a check genuinely human. Matching gates
 #: get a recommendation finding proposing agent verification; the gate itself
-#: is never changed, so the heuristic is conservative in both directions.
+#: is never changed. The heuristic deliberately leans toward not flagging: any
+#: human-only word suppresses the finding, because a missed flag only loses
+#: advice while a wrong one asks a person to give up a genuine check.
+#: "operator" is deliberately not a human-only word: plans describe
+#: scriptable checks as an operator's procedure (the ingestion G1).
 _SCRIPTABLE_CHECK_RE = re.compile(
     r"\b(api|http\w*|endpoints?|requests?|curl|sql|queries|query|migrations?|"
     r"disposable|staging|local target|playwright|browser automation|scripts?|"
@@ -321,7 +325,7 @@ _SCRIPTABLE_CHECK_RE = re.compile(
 _HUMAN_ONLY_CHECK_RE = re.compile(
     r"\b(devices?|hardware|physical\w*|android|ios|iphone|ipad|phones?|tablets?|"
     r"cameras?|gps|offline|on-site|field|visual\w*|look(s|ing)?|feel|tast\w*|"
-    r"aesthetic\w*|design|usability|judg(e)?ment|subjective|real (users?|accounts?|customers?)|"
+    r"aesthetic\w*|design\w*|usability|accessibility|screen readers?|real (sessions?|hardware)|human|manually|sign(s|ed)?[- ]off|judg(e)?ment|subjective|real (users?|accounts?|customers?)|"
     r"e-?mails?|payments?|publish\w*|app stores?|production|prod|live|deploy\w*|"
     r"go-ahead|authori[sz]\w*|permission|decid\w*|decision|continu\w*|scope)\b",
     re.IGNORECASE,
@@ -1098,8 +1102,9 @@ def check_interpretation(
             add(
                 "automatable_human_gate",
                 f"manual gate {gate.id!r} ({gate.title}) describes scriptable verification "
-                "(API/SQL/migration/test/browser automation) and no human-only judgment, "
-                "device, real-world, external or production action. Consider reclassifying "
+                "(API/SQL/migration/test/browser automation): its described steps appear "
+                "scriptable and mention no device, real-world, external or production action. "
+                "Consider reclassifying "
                 "it as agent verification: the stage runs it and reports the results as test "
                 "evidence, the independent review checks them, and the person supplies only "
                 "inputs the agent lacks (credentials, a disposable target, a URL). The gate "

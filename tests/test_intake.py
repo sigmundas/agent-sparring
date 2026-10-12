@@ -1000,6 +1000,39 @@ class AutomatableHumanGateTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(self.check(sentence, kind=kind, title=name)[1], [])
 
+    def test_a_scriptable_gate_with_a_device_step_is_not_flagged(self):
+        sentence = "Run the API checks against staging, then repeat them on a physical Android device."
+        self.assertEqual(self.check(sentence)[1], [])
+
+    def test_human_words_match_on_word_boundaries_only(self):
+        # capital/attest/deliver contain "api", "test", "live" inside words.
+        sentence = "Attest that the capital SQL queries deliver the expected rows on the staging API."
+        self.assertEqual(len(self.check(sentence)[1]), 1)
+
+    def test_human_only_wording_suppresses_the_finding(self):
+        for sentence in (
+            "A human checks the API responses with a screen reader.",
+            "The owner signs off on the designed SQL report.",
+            "Verify the API manually in a real session.",
+        ):
+            with self.subTest(sentence):
+                self.assertEqual(self.check(sentence)[1], [])
+
+    def test_non_manual_kinds_are_never_flagged(self):
+        for kind in ("production", "external", "deferred", "authorization"):
+            with self.subTest(kind):
+                self.assertEqual(self.check(_G1_TEXT, kind=kind)[1], [])
+
+    def test_the_review_and_sparring_prompts_keep_scriptable_checks_with_agents(self):
+        from agent_sparring import review_prompt, sparring_prompt
+
+        for module in (review_prompt, sparring_prompt):
+            with self.subTest(module.__name__):
+                text = " ".join(open(module.__file__, encoding="utf-8").read().split())
+                self.assertIn("browser script an agent can run is not a human check", text)
+                # The note follows the whole category table.
+                self.assertLess(text.index("SCOPE EXPANSION"), text.index("browser script an agent can run"))
+
     def test_the_intake_prompt_defines_manual_as_human_only(self):
         from agent_sparring import intake_prompt
 
