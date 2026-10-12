@@ -307,6 +307,29 @@ _GATE_KIND_EVIDENCE: dict[str, re.Pattern[str]] = {
 #: interpreter's reading.
 _GATE_KIND_FAMILY: dict[str, str] = {"authorization": "manual"}
 _AUTHORIZATION_WORDING_RE = re.compile(r"\b(go-ahead|authori[sz]\w*|permission)\b", re.IGNORECASE)
+#: A manual gate whose own text describes only scriptable verification (API
+#: requests, SQL, a migration on a disposable target, tests, browser
+#: automation) and none of what makes a check genuinely human. Matching gates
+#: get a recommendation finding proposing agent verification; the gate itself
+#: is never changed. The heuristic deliberately leans toward not flagging: any
+#: human-only word suppresses the finding, because a missed flag only loses
+#: advice while a wrong one asks a person to give up a genuine check.
+#: "operator" is deliberately not a human-only word: plans describe
+#: scriptable checks as an operator's procedure (the ingestion G1).
+_SCRIPTABLE_CHECK_RE = re.compile(
+    r"\b(api|http\w*|endpoints?|requests?|curl|sql|queries|query|migrations?|"
+    r"disposable|staging|local target|playwright|browser automation|scripts?|"
+    r"automated|unit tests?|integration tests?|test suites?|assertions?)\b",
+    re.IGNORECASE,
+)
+_HUMAN_ONLY_CHECK_RE = re.compile(
+    r"\b(devices?|hardware|physical\w*|android|ios|iphone|ipad|phones?|tablets?|"
+    r"cameras?|gps|offline|on-site|field|visual\w*|look(s|ing)?|feel|tast\w*|"
+    r"aesthetic\w*|design\w*|usability|accessibility|screen readers?|real (sessions?|hardware)|human|manually|sign(s|ed)?[- ]off|judg(e)?ment|subjective|real (users?|accounts?|customers?)|"
+    r"e-?mails?|payments?|publish\w*|app stores?|production|prod|live|deploy\w*|"
+    r"go-ahead|authori[sz]\w*|permission|decid\w*|decision|continu\w*|scope)\b",
+    re.IGNORECASE,
+)
 
 
 class IntakeError(RuntimeError):
@@ -1065,6 +1088,30 @@ def check_interpretation(
                 f"context block {block.id!r} is attached to no stage, so its text reaches no "
                 "brief; attach it to the stages it constrains, or exclude it with a reason",
                 ranges=block.ranges,
+            )
+
+    # A plan may declare a scriptable check as a manual gate. Flag it with a
+    # proposal, never change it: the gate stays as declared unless the person
+    # amends the plan.
+    for gate in interpretation.gates:
+        if gate.kind != "manual":
+            continue
+        good = [r for r in gate.ranges if 1 <= r.start <= r.end <= total]
+        text = " ".join([gate.title, *(source.lines[n - 1] for n in sorted(_lines(good, total)))])
+        if _SCRIPTABLE_CHECK_RE.search(text) and not _HUMAN_ONLY_CHECK_RE.search(text):
+            add(
+                "automatable_human_gate",
+                f"manual gate {gate.id!r} ({gate.title}) describes scriptable verification "
+                "(API/SQL/migration/test/browser automation): its described steps appear "
+                "scriptable and mention no device, real-world, external or production action. "
+                "Consider reclassifying "
+                "it as agent verification: the stage runs it and reports the results as test "
+                "evidence, the independent review checks them, and the person supplies only "
+                "inputs the agent lacks (credentials, a disposable target, a URL). The gate "
+                "is kept as declared unless you amend the plan.",
+                stages=[s for s in (gate.after_stage, *gate.blocks_stages) if s],
+                ranges=good,
+                severity=SEVERITY_RECOMMENDATION,
             )
 
     # Gates may only sit at run-slice boundaries. The runtime cannot wait for

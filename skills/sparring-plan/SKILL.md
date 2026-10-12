@@ -153,7 +153,15 @@ run-slice approval, or manifest v2 `gates_before` / `completion_gates` emitted
 by compile intake or declared explicitly. Say what each gate blocks and what
 evidence satisfies it; document order or a prose dependency is insufficient.
 Human checks are only for verification agents cannot adequately perform,
-not merely checks a read-only reviewer cannot run. Consult
+not merely checks a read-only reviewer cannot run: human judgment or taste,
+physical/device or real-world access, real external accounts or
+consequential external actions, production authorization, scope or
+continuation decisions. Tests, HTTP/API requests, SQL assertions, migrations
+against a disposable target, browser automation and other scriptable
+procedures are stage work: the stage agent runs them, reports the results as
+test evidence, and the independent review checks them. Where the agent lacks
+one specific input (credentials, a disposable database, a URL), name that
+input as the human prerequisite instead of handing over the whole check. Consult
 [human gates](../../docs/gates.md) for immediate checks and
 [deferred verification](../../docs/plans.md#a-check-that-is-owed-but-not-now)
 for checks still owed. Do not invent gates for automatable checks or move

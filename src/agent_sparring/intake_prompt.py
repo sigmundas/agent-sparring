@@ -108,8 +108,19 @@ plan below.
   gate later work. `after_stage`: the stage it follows (or null).
   `kind`: `authorization` when the gate is only a person's decision to let
   the blocked stages start (a go-ahead, permission to continue); `manual`
-  when something must be done or verified (a test, device check, operator
-  procedure); `production`, `external` or `deferred` otherwise. Keep a
+  when a person must do or verify something agents cannot: human judgment
+  or taste, physical/device or real-world access, real external accounts or
+  consequential external actions, or a capability genuinely unavailable to
+  agents; `production`, `external` or `deferred` otherwise. Ordinary tests,
+  HTTP/API requests, SQL assertions, migrations against a disposable target,
+  browser automation and other scriptable procedures are agent verification:
+  stage work whose results the stage reports as test evidence and the
+  independent review checks, not human gates. If the agent would lack one
+  specific input (credentials, a disposable database, a URL), that input is
+  what the stage asks the person for, not the whole check. When the plan
+  itself declares such a scriptable check as a manual gate, keep the gate
+  exactly as declared and raise a recommendation finding that names it and
+  proposes reclassifying it as agent verification; only the person changes it. Keep a
   verification and the go-ahead that follows it as separate gates; the
   runtime asks for the verification first and the decision once it passes.
   The engine already enforces its own operations, so they are never gates:

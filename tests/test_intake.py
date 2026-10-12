@@ -22,6 +22,7 @@ import conftest_path  # noqa: F401
 from agent_sparring.cli import main
 from agent_sparring.intake import (
     BRIEF_FORMAT_VERSION,
+    CompileContext,
     INTERPRETATION_SCHEMA,
     IntakeError,
     SourcePlan,
@@ -943,6 +944,104 @@ class CliTests(_Repo):
         )
         self.assertEqual(code, 1)
         self.assertIn("could not prepare plan", err)
+
+
+# The ingestion-provenance plan's G1 wording, and genuine human gates that
+# must never be flagged as automatable.
+_G1_TEXT = (
+    "Kind: manual. After Stage 1A; blocks Stage 1B. The operator applies the accepted, "
+    "committed migration in the disposable local/staging target and verifies the actual "
+    "API: owner reads and atomic same-enum coordinate updates, non-owner/anonymous denial, "
+    "and public observation/image responses omitting the private fields. SQL tests and "
+    "effective ACL inspection alone do not satisfy this manual gate."
+)
+_HUMAN_GATES = {
+    "production deploy authorization": ("production", "Authorize the production deploy of the release."),
+    "physical Android device check": ("manual", "On a physical Android device, take a photo with the test build."),
+    "owner visual sign-off": ("manual", "The owner reviews the new layout and signs off on its visual design."),
+    "real external action": ("manual", "Send the announcement email to the real users and confirm delivery."),
+    "continuation go-ahead": ("authorization", "The user explicitly gives the go-ahead to continue with Stage 1B."),
+}
+
+
+class AutomatableHumanGateTests(unittest.TestCase):
+    def check(self, sentence, kind="manual", title="API and access checks", mode="faithful"):
+        text = PLAN.replace(
+            "Activate the release in production after Stage 1A, with explicit go-ahead.", sentence
+        )
+        payload = copy.deepcopy(good_interpretation())
+        gate = payload["gates"][0]
+        gate.update(kind=kind, title=title, ranges=[lines("## Release", sentence[:20], text=text)])
+        interpretation = parse_interpretation(json.dumps(payload))
+        context = CompileContext(named=frozenset({"app", "web"}), inspected=frozenset({"app", "web"}))
+        findings = check_interpretation(
+            interpretation,
+            SourcePlan(label="docs/plan.md", text=text),
+            mode=mode,
+            compile_context=context if mode == "compile" else None,
+        )
+        return interpretation, [f for f in findings if f.code == "automatable_human_gate"]
+
+    def test_the_ingestion_api_gate_is_flagged_and_kept(self):
+        for mode in ("faithful", "compile"):
+            interpretation, flagged = self.check(_G1_TEXT, mode=mode)
+            (finding,) = flagged
+            self.assertFalse(finding.blocking)
+            self.assertEqual(finding.origin, "engine")
+            self.assertIn("'release'", finding.message)
+            self.assertIn("agent verification", finding.message)
+            self.assertIn("kept as declared", finding.message)
+            # The gate itself is untouched.
+            (gate,) = interpretation.gates
+            self.assertEqual((gate.kind, gate.after_stage, gate.blocks_stages), ("manual", "1A", ("1B",)))
+
+    def test_genuine_human_gates_are_not_flagged(self):
+        for name, (kind, sentence) in _HUMAN_GATES.items():
+            with self.subTest(name):
+                self.assertEqual(self.check(sentence, kind=kind, title=name)[1], [])
+
+    def test_a_scriptable_gate_with_a_device_step_is_not_flagged(self):
+        sentence = "Run the API checks against staging, then repeat them on a physical Android device."
+        self.assertEqual(self.check(sentence)[1], [])
+
+    def test_human_words_match_on_word_boundaries_only(self):
+        # capital/attest/deliver contain "api", "test", "live" inside words.
+        sentence = "Attest that the capital SQL queries deliver the expected rows on the staging API."
+        self.assertEqual(len(self.check(sentence)[1]), 1)
+
+    def test_human_only_wording_suppresses_the_finding(self):
+        for sentence in (
+            "A human checks the API responses with a screen reader.",
+            "The owner signs off on the designed SQL report.",
+            "Verify the API manually in a real session.",
+        ):
+            with self.subTest(sentence):
+                self.assertEqual(self.check(sentence)[1], [])
+
+    def test_non_manual_kinds_are_never_flagged(self):
+        for kind in ("production", "external", "deferred", "authorization"):
+            with self.subTest(kind):
+                self.assertEqual(self.check(_G1_TEXT, kind=kind)[1], [])
+
+    def test_the_review_and_sparring_prompts_keep_scriptable_checks_with_agents(self):
+        from agent_sparring import review_prompt, sparring_prompt
+
+        for module in (review_prompt, sparring_prompt):
+            with self.subTest(module.__name__):
+                text = " ".join(open(module.__file__, encoding="utf-8").read().split())
+                self.assertIn("browser script an agent can run is not a human check", text)
+                # The note follows the whole category table.
+                self.assertLess(text.index("SCOPE EXPANSION"), text.index("browser script an agent can run"))
+
+    def test_the_intake_prompt_defines_manual_as_human_only(self):
+        from agent_sparring import intake_prompt
+
+        flat = " ".join(intake_prompt._INTERPRETATION.split())
+        self.assertNotIn("(a test, device check, operator procedure)", flat)
+        self.assertIn("Ordinary tests, HTTP/API requests, SQL assertions", flat)
+        self.assertIn("migrations against a disposable target", flat)
+        self.assertIn("are agent verification", flat)
+        self.assertIn("keep the gate exactly as declared", flat)
 
 
 if __name__ == "__main__":
