@@ -109,6 +109,10 @@ What each action means *here*:
       PRODUCT/PREFERENCE     choose between valid behaviors
       UI/VISUAL CHECK        look at layout, contrast, appearance
       DEVICE/MANUAL CHECK    run it on real hardware, offline, a real session
+
+  A test, API request, SQL check or browser script an agent can run is not a
+  human check: ask for the stage to run it, or for only the specific input
+  it lacks (credentials, a disposable target, a URL).
       EXTERNAL CONDITION     wait on a store/deploy/third-party state
       SCOPE EXPANSION        approve work beyond this stage's scope
 
