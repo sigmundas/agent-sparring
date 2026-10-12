@@ -106,6 +106,21 @@ plan below.
   mentions that is not itself executable stage work -- deployments, release
   activation, production data runs, owner go-aheads, security sign-offs that
   gate later work. `after_stage`: the stage it follows (or null).
+  `kind`: `authorization` when the gate is only a person's decision to let
+  the blocked stages start (a go-ahead, permission to continue); `manual`
+  when something must be done or verified (a test, device check, operator
+  procedure); `production`, `external` or `deferred` otherwise. Keep a
+  verification and the go-ahead that follows it as separate gates; the
+  runtime asks for the verification first and the decision once it passes.
+  The engine already enforces its own operations, so they are never gates:
+  approving and starting the prepared run slice (which authorizes exactly the
+  stages it contains), its verification policy, and candidate push
+  authorization (the engine asks before pushing unless the person allowed
+  pushes when starting). Plan text that only restates such an approval is
+  context, not a gate. Authorization the plan requires beyond the run being
+  started -- continuing into a later stage, production changes, publication
+  -- stays a gate. Where the plan's scope is unclear, raise a finding
+  instead of inventing an approval gate.
   `blocks_stages`: labels of executable stages that must not start until the
   gate is satisfied (empty if nothing executable depends on it). Gates sit
   only at run boundaries: `after_stage` must be the LAST stage of its run,

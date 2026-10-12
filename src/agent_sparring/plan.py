@@ -179,6 +179,7 @@ from agent_sparring.plan_obligations import (
 )
 from agent_sparring.deferred_gate import (
     CHECKPOINT_PLAN_COMPLETION,
+    CheckOutcome,
     DEFERRED_VERIFICATION_REQUIRED,
     CheckResult,
     DeferredAnswer,
@@ -3515,8 +3516,42 @@ def _claim_from_plan(
         )
 
 
+#: A plan-declared gate that is a person's decision to continue, not a
+#: verification (see :data:`agent_sparring.intake.GATE_KINDS`).
+GATE_KIND_AUTHORIZATION = "authorization"
+
+
 def _manifest_gate_category(gate: ManifestGate) -> str:
+    if gate.kind == GATE_KIND_AUTHORIZATION:
+        return "AUTHORIZATION"
     return "EXTERNAL_CONDITION" if gate.kind == "external" else "OTHER"
+
+
+def _manifest_gate_check(gate: ManifestGate, blocked: str | None) -> HumanCheck:
+    if gate.kind == GATE_KIND_AUTHORIZATION:
+        target = f"continuing into {blocked}" if blocked else "completing this run"
+        return HumanCheck(
+            id=gate.id,
+            instruction=(
+                f"Decide whether to authorize {target}: {gate.title}. Why the plan asks: "
+                f"{gate.reason}"
+            ),
+            pass_criteria=(
+                f"Continue authorizes {target} only, not any later stage, production change "
+                "or publication. Not now keeps the run stopped here."
+            ),
+        )
+    return HumanCheck(
+        id=gate.id,
+        instruction=(
+            f"Confirm the plan-declared {gate.kind} gate {gate.title!r} is "
+            f"satisfied. Why it exists: {gate.reason}"
+        ),
+        pass_criteria=(
+            "The gate is actually satisfied. Reaching this point in the run "
+            "does not satisfy it."
+        ),
+    )
 
 
 def _owe_manifest_gates(
@@ -3528,6 +3563,8 @@ def _owe_manifest_gates(
     *,
     checkpoint: str,
     report: Reporter,
+    blocked: str | None = None,
+    authorized_by_start: bool = False,
 ) -> tuple[DeferredObligation, ...]:
     """Mint one engine-owned obligation per plan-declared ``gates`` entry
     owed by ``checkpoint``, and return the ones still unresolved.
@@ -3537,14 +3574,25 @@ def _owe_manifest_gates(
     it -- instead of asking anew. ``stage_id`` is the accepted stage the gate
     follows (or, before the run's first stage, the gated stage itself, whose
     answer then lives only in the run ledger); the answer is written to its
-    ``notes.md`` when that exists. Every gate kind is
-    owed the same way: nothing about a gate is ever taken as satisfied.
+    ``notes.md`` when that exists. ``blocked`` names the stage the gates
+    precede (None for completion gates).
+
+    Reaching a gate never satisfies it. Authorization gates (a person's
+    go-ahead) are asked as one decision, and only once every other gate at
+    the same checkpoint has passed, so the decision is made on the evidence
+    it depends on. The one exception is ``authorized_by_start``: before the
+    run's first stage, the approved start of this run slice -- whose
+    manifest listed these gates -- is that same decision for those stages,
+    so it is recorded rather than asked again, provided no verification at
+    this checkpoint had yet to pass when it was given. Any approved start of
+    the slice counts (start-plan --confirm, or approve-plan then run-plan):
+    each is an explicit approval of a manifest that lists the gate. Every
+    other gate kind
+    is owed as a verification.
     """
 
-    owed: list[DeferredObligation] = []
-    minted = False
-    for gate in gates:
-        existing = next(
+    def existing_for(gate: ManifestGate) -> DeferredObligation | None:
+        return next(
             (
                 entry
                 for entry in state.deferred_human_checks
@@ -3554,38 +3602,53 @@ def _owe_manifest_gates(
             ),
             None,
         )
+
+    verifications = tuple(gate for gate in gates if gate.kind != GATE_KIND_AUTHORIZATION)
+    decisions = tuple(gate for gate in gates if gate.kind == GATE_KIND_AUTHORIZATION)
+    # The start covers the decisions only when nothing at this checkpoint was
+    # still to be verified first; such a start predates the evidence.
+    start_covers = authorized_by_start and not verifications
+    owed: list[DeferredObligation] = []
+    minted = False
+    for gate in (*verifications, *decisions):
+        existing = existing_for(gate)
         if existing is None:
+            if gate.kind == GATE_KIND_AUTHORIZATION and owed:
+                # Asked once the verification it follows has passed.
+                continue
             existing = DeferredObligation(
                 stage_id=stage_id,
                 gate=HumanGate(
                     category=_manifest_gate_category(gate),
                     title=gate.title,
-                    checks=(
-                        HumanCheck(
-                            id=gate.id,
-                            instruction=(
-                                f"Confirm the plan-declared {gate.kind} gate {gate.title!r} is "
-                                f"satisfied. Why it exists: {gate.reason}"
-                            ),
-                            pass_criteria=(
-                                "The gate is actually satisfied. Reaching this point in the run "
-                                "does not satisfy it."
-                            ),
-                        ),
-                    ),
+                    checks=(_manifest_gate_check(gate, blocked),),
                 ).asked_again(new_gate_instance_id()),
                 rationale=gate.reason,
                 checkpoint=checkpoint,
                 manifest_gate=True,
             )
+            if gate.kind == GATE_KIND_AUTHORIZATION and start_covers:
+                existing = existing.with_result(
+                    CheckResult(
+                        check_id=gate.id,
+                        outcome=CheckOutcome.PASS,
+                        note="authorized by the approved start of this run slice",
+                    )
+                )
             state.record_deferred(existing)
             minted = True
             if activity is not None:
                 activity.emit("plan.gate_owed", summary=f"{gate.title} ({gate.kind}) at {checkpoint}")
-            report(
-                f"plan-declared {gate.kind} gate {gate.title!r} ({gate.id}) is owed at {checkpoint}: "
-                f"gate instance {existing.instance_id}"
-            )
+            if existing.resolved:
+                report(
+                    f"plan-declared authorization gate {gate.title!r} ({gate.id}) is satisfied by "
+                    f"the approved start of this run slice: gate instance {existing.instance_id}"
+                )
+            else:
+                report(
+                    f"plan-declared {gate.kind} gate {gate.title!r} ({gate.id}) is owed at "
+                    f"{checkpoint}: gate instance {existing.instance_id}"
+                )
         if not existing.resolved:
             owed.append(existing)
     if minted:
@@ -3975,6 +4038,8 @@ def _drive(
                 plan_stage.gates_before,
                 checkpoint=before_stage_checkpoint(plan_stage.stage_id),
                 report=report,
+                blocked=plan_stage.label,
+                authorized_by_start=True,
             )
             if gated:
                 return _stop_for_deferred(
@@ -4589,6 +4654,7 @@ def _drive(
                 upcoming.gates_before,
                 checkpoint=before_stage_checkpoint(upcoming.stage_id),
                 report=report,
+                blocked=upcoming.label,
             )
             if gated:
                 return _stop_for_deferred(

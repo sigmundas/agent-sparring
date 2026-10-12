@@ -492,5 +492,195 @@ class IntakeGateRenderingTests(unittest.TestCase):
         self.assertIn("The run stops before stage 2 for: `canary`", (result.directory / "report.md").read_text(encoding="utf-8"))
 
 
+# The ingestion-provenance plan's own wording, reduced: G1 is evidence, G1C
+# is the Stage 2 go-ahead that must follow it, and the Stage 1 start gate
+# only restates approving the run.
+START = {
+    "id": "managed-run-approval",
+    "title": "Start managed execution with the explicit verification and push policy",
+    "kind": "authorization",
+    "reason": "approving the run must include the commit-before-manual-gate policy",
+}
+G1 = {"id": "G1", "title": "API and access checks", "kind": "manual",
+      "reason": "the operator verifies the accepted migration on a disposable target"}
+G1C = {"id": "G1C", "title": "Permission to continue with image ingestion", "kind": "authorization",
+       "reason": "requires a distinct Stage 2 go-ahead after G1 passes"}
+PROD = {"id": "prod", "title": "Authorize the production migration", "kind": "production",
+        "reason": "a fresh, specific production authorization"}
+
+
+class AuthorizationGateRunTests(_ManifestRepoTestCase):
+    """One informed authorization per consequential decision: the approved
+    start of a run slice is the go-ahead for its stages, a go-ahead that
+    depends on verification is asked once after it passes, and decisions are
+    never presented as tests."""
+
+    def setUp(self):
+        super().setUp()
+        self.stage_adapter = _StageAdapter(self.repo, commit=True)
+
+    def _first_stage_gated(self, gates, completion=(CLOSEOUT,)):
+        payload = gated_payload(before=(), completion=completion)
+        payload["stages"][0]["gates_before"] = [dict(g) for g in gates]
+        self.write_manifest(payload)
+
+    def _turns(self):
+        return len(self.stage_adapter.start_calls) + len(self.stage_adapter.resume_calls)
+
+    def _owed(self, gate_id):
+        return next(
+            entry for entry in self._plan_state().deferred_human_checks
+            if any(check.id == gate_id for check in entry.gate.checks)
+        )
+
+    def test_the_approved_start_satisfies_a_go_ahead_for_its_own_first_stage(self):
+        self._first_stage_gated([START])
+        reports: list[str] = []
+        result = self._start(self.stage_adapter, _SparringAdapter([READY, READY]), report=reports.append)
+        # No pause before Stage 1: the run ran to its closeout gate.
+        self.assertEqual([sid for sid, _ in result.accepted], [S3C, S3D])
+        self.assertEqual(result.awaiting.reason, DeferredVerificationRequired.PLAN_COMPLETION)
+        start = self._owed("managed-run-approval")
+        self.assertTrue(start.resolved)
+        self.assertEqual(start.gate.category, "AUTHORIZATION")
+        self.assertIn("approved start", start.results[0].note)
+        self.assertIn("satisfied by the approved start", "\n".join(reports))
+        # It authorized starting, not pushing: push stays the engine's own gate.
+        self.assertIsNone(self._plan_state().push_authorization)
+
+    def test_g1c_is_not_asked_while_g1_has_not_passed(self):
+        # The slice that starts at Stage 2: its start predates G1's evidence.
+        self._first_stage_gated([G1, G1C])
+        result = self._start(self.stage_adapter, _SparringAdapter([]))
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        (g1,) = self._plan_state().deferred_human_checks
+        self.assertEqual([c.id for c in g1.gate.checks], ["G1"])
+        self.assertEqual(g1.gate.category, "OTHER")
+        self.assertEqual(result.awaiting.instance_ids, (g1.instance_id,))
+        for outcome in ("blocked", "fail=anonymous read allowed"):
+            again = self._resume(
+                self.stage_adapter, _SparringAdapter([]),
+                deferred_results=(DeferredAnswer.parse(f"G1={outcome}"),),
+            )
+            self.assertIs(again.status, PlanRunStatus.PAUSED, outcome)
+            # Never offered, never satisfied by the earlier start.
+            self.assertEqual(len(self._plan_state().deferred_human_checks), 1)
+        self.assertFalse(self._stage(S3C).directory.exists())
+        self.assertEqual(self._turns(), 0)
+
+    def test_g1c_is_one_scoped_decision_after_g1_passes(self):
+        self._first_stage_gated([G1, G1C])
+        self._start(self.stage_adapter, _SparringAdapter([]))
+        result = self._resume(
+            self.stage_adapter, _SparringAdapter([]),
+            deferred_results=(DeferredAnswer.parse("G1=pass=matrix green"),),
+        )
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        g1c = self._owed("G1C")
+        self.assertEqual(result.awaiting.instance_ids, (g1c.instance_id,))
+        self.assertEqual(g1c.gate.category, "AUTHORIZATION")
+        self.assertEqual(g1c.results, ())
+        (check,) = g1c.gate.checks
+        self.assertIn("Decide whether to authorize continuing into Stage 3C", check.instruction)
+        self.assertIn("not any later stage, production change or publication", check.pass_criteria)
+        self.assertFalse(self._stage(S3C).directory.exists())
+        # Not now keeps the run stopped, and nothing else is asked.
+        again = self._resume(
+            self.stage_adapter, _SparringAdapter([]),
+            deferred_results=(DeferredAnswer.parse("G1C=blocked"),),
+        )
+        self.assertIs(again.status, PlanRunStatus.PAUSED)
+        self.assertEqual(again.awaiting.instance_ids, (g1c.instance_id,))
+        # Continue: one answer, and the run proceeds.
+        result = self._resume(
+            self.stage_adapter, _SparringAdapter([READY, READY]),
+            deferred_results=(DeferredAnswer.parse("G1C=pass"),),
+        )
+        self.assertEqual([sid for sid, _ in result.accepted], [S3C, S3D])
+        self.assertEqual(len(self._plan_state().deferred_human_checks), 3)
+
+    def test_once_the_decision_is_asked_its_passed_verification_is_settled(self):
+        # The pause names only G1C, so G1 cannot be re-answered beside it.
+        self._first_stage_gated([G1, G1C])
+        self._start(self.stage_adapter, _SparringAdapter([]))
+        self._resume(self.stage_adapter, _SparringAdapter([]), deferred_results=(DeferredAnswer.parse("G1=pass"),))
+        with self.assertRaisesRegex(PlanError, "not one of the deferred checks"):
+            self._resume(
+                self.stage_adapter, _SparringAdapter([]),
+                deferred_results=(DeferredAnswer.parse("G1=fail=regressed"),),
+            )
+        self.assertFalse(self._stage(S3C).directory.exists())
+
+    def test_a_go_ahead_for_a_later_stage_is_asked_not_assumed(self):
+        self.write_manifest(gated_payload(before=(G1C,)))
+        result = self._start(self.stage_adapter, _SparringAdapter([READY]))
+        self.assertEqual([sid for sid, _ in result.accepted], [S3C])
+        g1c = self._owed("G1C")
+        self.assertFalse(g1c.resolved)
+        self.assertEqual(g1c.gate.category, "AUTHORIZATION")
+        self.assertFalse(self._stage(S3D).directory.exists())
+
+    def test_verification_and_production_gates_are_never_satisfied_by_the_start(self):
+        for gate, category in ((G1, "OTHER"), (PROD, "OTHER")):
+            with self.subTest(gate=gate["id"]):
+                self.setUp()
+                self._first_stage_gated([gate])
+                result = self._start(self.stage_adapter, _SparringAdapter([]))
+                self.assertIs(result.status, PlanRunStatus.PAUSED)
+                owed = self._owed(gate["id"])
+                self.assertFalse(owed.resolved)
+                self.assertEqual(owed.gate.category, category)
+                self.assertIn("is satisfied", owed.gate.checks[0].instruction)
+                self.assertFalse(self._stage(S3C).directory.exists())
+
+    def test_a_completion_go_ahead_is_asked(self):
+        self.write_manifest(gated_payload(before=(), completion=(G1C,)))
+        result = self._start(self.stage_adapter, _SparringAdapter([READY, READY]))
+        self.assertEqual(result.awaiting.reason, DeferredVerificationRequired.PLAN_COMPLETION)
+        self.assertFalse(self._owed("G1C").resolved)
+        self.assertIn("completing this run", self._owed("G1C").gate.checks[0].instruction)
+
+
+class AuthorizationGateIntakeTests(unittest.TestCase):
+    def test_authorization_is_a_gate_kind_the_manifest_carries(self):
+        payload = _gated_interpretation()
+        payload["gates"][0]["kind"] = "authorization"
+        interpretation = parse_interpretation(json.dumps(payload), mode="compile")
+        before, _ = slice_manifest_gates(interpretation, "app")
+        self.assertEqual([g.kind for g in before["2"]], ["authorization"])
+
+    def test_reviewers_cannot_emit_the_engine_authorization_category(self):
+        from agent_sparring.human_gate import REVIEWER_GATE_CATEGORIES
+        from agent_sparring.providers import codex_cli
+
+        self.assertNotIn("AUTHORIZATION", REVIEWER_GATE_CATEGORIES)
+        self.assertNotIn("AUTHORIZATION", json.dumps(codex_cli._HUMAN_GATE_SCHEMA))
+
+    def test_an_authorization_needs_authorization_wording(self):
+        from agent_sparring.intake import _AUTHORIZATION_WORDING_RE
+
+        self.assertTrue(_AUTHORIZATION_WORDING_RE.search("The user explicitly gives the Stage 2 go-ahead."))
+        self.assertFalse(_AUTHORIZATION_WORDING_RE.search("Manual approval after the device test."))
+
+    def test_moving_a_gate_keeps_its_family(self):
+        from agent_sparring.intake import _GATE_KIND_EVIDENCE, _GATE_KIND_FAMILY
+
+        def family(text):
+            return {_GATE_KIND_FAMILY.get(k, k) for k, ev in _GATE_KIND_EVIDENCE.items() if ev.search(text)}
+
+        self.assertEqual(family("The user explicitly gives the Stage 2 go-ahead."), {"manual"})
+        self.assertEqual(family("Manual approval of the owner canary."), {"manual"})
+        self.assertEqual(family("Deploy the release to production."), {"production"})
+
+    def test_the_interpreter_is_told_which_approvals_the_engine_already_enforces(self):
+        from agent_sparring.intake_prompt import _INTERPRETATION
+
+        text = " ".join(_INTERPRETATION.split())
+        self.assertIn("approving and starting the prepared run slice", text)
+        self.assertIn("candidate push authorization", text)
+        self.assertIn("raise a finding instead of inventing an approval gate", text)
+        self.assertIn("continuing into a later stage, production changes, publication", text)
+
+
 if __name__ == "__main__":
     unittest.main()
