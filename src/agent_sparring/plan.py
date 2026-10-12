@@ -3584,7 +3584,10 @@ def _owe_manifest_gates(
     run's first stage, the approved start of this run slice -- whose
     manifest listed these gates -- is that same decision for those stages,
     so it is recorded rather than asked again, provided no verification at
-    this checkpoint had yet to pass when it was given. Every other gate kind
+    this checkpoint had yet to pass when it was given. Any approved start of
+    the slice counts (start-plan --confirm, or approve-plan then run-plan):
+    each is an explicit approval of a manifest that lists the gate. Every
+    other gate kind
     is owed as a verification.
     """
 

@@ -306,6 +306,7 @@ _GATE_KIND_EVIDENCE: dict[str, re.Pattern[str]] = {
 #: turn it into another family, but within this one the kind is the
 #: interpreter's reading.
 _GATE_KIND_FAMILY: dict[str, str] = {"authorization": "manual"}
+_AUTHORIZATION_WORDING_RE = re.compile(r"\b(go-ahead|authori[sz]\w*|permission)\b", re.IGNORECASE)
 
 
 class IntakeError(RuntimeError):
@@ -1489,6 +1490,12 @@ def _transform_problem(
                 for kind, evidence in _GATE_KIND_EVIDENCE.items()
                 if evidence.search(text)
             }
+            # An authorization is never inferred from verification wording.
+            if gate.kind == "authorization" and not _AUTHORIZATION_WORDING_RE.search(text):
+                return (
+                    f"gate {gate.id!r}'s source text does not state an authorization "
+                    "(go-ahead, permission or authorization)"
+                )
             if kinds != {_GATE_KIND_FAMILY.get(gate.kind, gate.kind)}:
                 found = ", ".join(sorted(kinds)) or "none"
                 return (

@@ -76,6 +76,9 @@ HUMAN_GATE_CATEGORIES = (
     "OTHER",
     "AUTHORIZATION",
 )
+# What a reviewer may ask for. AUTHORIZATION is the engine's own category for a
+# plan-declared go-ahead (see plan._owe_manifest_gates), never a reviewer's.
+REVIEWER_GATE_CATEGORIES = tuple(c for c in HUMAN_GATE_CATEGORIES if c != "AUTHORIZATION")
 
 _MAX_ID_LENGTH = 128
 
@@ -273,6 +276,7 @@ def parse_human_gate(text: str) -> HumanGate:
 
 __all__ = [
     "HUMAN_GATE_CATEGORIES",
+    "REVIEWER_GATE_CATEGORIES",
     "HUMAN_GATE_MARKER",
     "HumanCheck",
     "HumanGate",

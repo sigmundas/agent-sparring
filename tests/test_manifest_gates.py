@@ -599,6 +599,18 @@ class AuthorizationGateRunTests(_ManifestRepoTestCase):
         self.assertEqual([sid for sid, _ in result.accepted], [S3C, S3D])
         self.assertEqual(len(self._plan_state().deferred_human_checks), 3)
 
+    def test_once_the_decision_is_asked_its_passed_verification_is_settled(self):
+        # The pause names only G1C, so G1 cannot be re-answered beside it.
+        self._first_stage_gated([G1, G1C])
+        self._start(self.stage_adapter, _SparringAdapter([]))
+        self._resume(self.stage_adapter, _SparringAdapter([]), deferred_results=(DeferredAnswer.parse("G1=pass"),))
+        with self.assertRaisesRegex(PlanError, "not one of the deferred checks"):
+            self._resume(
+                self.stage_adapter, _SparringAdapter([]),
+                deferred_results=(DeferredAnswer.parse("G1=fail=regressed"),),
+            )
+        self.assertFalse(self._stage(S3C).directory.exists())
+
     def test_a_go_ahead_for_a_later_stage_is_asked_not_assumed(self):
         self.write_manifest(gated_payload(before=(G1C,)))
         result = self._start(self.stage_adapter, _SparringAdapter([READY]))
@@ -636,6 +648,19 @@ class AuthorizationGateIntakeTests(unittest.TestCase):
         interpretation = parse_interpretation(json.dumps(payload), mode="compile")
         before, _ = slice_manifest_gates(interpretation, "app")
         self.assertEqual([g.kind for g in before["2"]], ["authorization"])
+
+    def test_reviewers_cannot_emit_the_engine_authorization_category(self):
+        from agent_sparring.human_gate import REVIEWER_GATE_CATEGORIES
+        from agent_sparring.providers import codex_cli
+
+        self.assertNotIn("AUTHORIZATION", REVIEWER_GATE_CATEGORIES)
+        self.assertNotIn("AUTHORIZATION", json.dumps(codex_cli._HUMAN_GATE_SCHEMA))
+
+    def test_an_authorization_needs_authorization_wording(self):
+        from agent_sparring.intake import _AUTHORIZATION_WORDING_RE
+
+        self.assertTrue(_AUTHORIZATION_WORDING_RE.search("The user explicitly gives the Stage 2 go-ahead."))
+        self.assertFalse(_AUTHORIZATION_WORDING_RE.search("Manual approval after the device test."))
 
     def test_moving_a_gate_keeps_its_family(self):
         from agent_sparring.intake import _GATE_KIND_EVIDENCE, _GATE_KIND_FAMILY

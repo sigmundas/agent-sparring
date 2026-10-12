@@ -98,7 +98,7 @@ from typing import Any, Callable, Mapping
 
 from agent_sparring.activity import ActivityEmitter, emit, repo_relative_path
 from agent_sparring.deferred_gate import CHECKPOINTS
-from agent_sparring.human_gate import HUMAN_GATE_CATEGORIES
+from agent_sparring.human_gate import REVIEWER_GATE_CATEGORIES
 from agent_sparring.providers import (
     ProviderError,
     Runner,
@@ -240,7 +240,7 @@ _HUMAN_GATE_SCHEMA: dict[str, Any] = {
     "properties": {
         "category": {
             "type": "string",
-            "enum": list(HUMAN_GATE_CATEGORIES),
+            "enum": list(REVIEWER_GATE_CATEGORIES),
         },
         "title": {"type": "string"},
         "checks": {
@@ -270,7 +270,7 @@ _HUMAN_GATE_SCHEMA: dict[str, Any] = {
 _DEFERRED_GATE_SCHEMA: dict[str, Any] = {
     "type": ["object", "null"],
     "properties": {
-        "category": {"type": "string", "enum": list(HUMAN_GATE_CATEGORIES)},
+        "category": {"type": "string", "enum": list(REVIEWER_GATE_CATEGORIES)},
         "title": {"type": "string"},
         "checks": _HUMAN_GATE_SCHEMA["properties"]["checks"],
         "rationale": {"type": "string"},
