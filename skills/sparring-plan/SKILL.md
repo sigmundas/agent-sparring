@@ -159,6 +159,15 @@ not merely checks a read-only reviewer cannot run. Consult
 for checks still owed. Do not invent gates for automatable checks or move
 unresolved product scope into execution.
 
+Do not restate engine operations as plan requirements: approving and starting
+a prepared run slice authorizes exactly its stages, verification policy and
+candidate pushes are engine settings chosen at start, and the engine asks
+before pushing. Write the outcomes and safety boundaries instead. Declare a
+separate go-ahead only for authorization beyond the started run (continuing
+into a later slice, production changes, publication), and keep it distinct
+from any verification it depends on: name the verification gate and its
+evidence, then the decision that follows it.
+
 ## 4. Write a lightweight, self-contained plan
 
 Write `docs/plans/<slug>.md` (don't overwrite an existing file; pick a new

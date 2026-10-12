@@ -510,6 +510,19 @@ the run ledger. Only
 `--evidence` is refused at a `before_stage` stop. The v2 digest covers every
 gate field and its position; version-1 digests are unchanged.
 
+A gate of kind `authorization` is a person's decision to continue into the
+stages it blocks, not a verification. Its obligation has category
+`AUTHORIZATION` and asks for a decision scoped to the blocked stage (or to
+completing the run); `pass` means Continue, `blocked` means Not now. It is
+minted only once every other gate at the same checkpoint has passed, so the
+decision follows the evidence it depends on. Before a run's first stage, an
+authorization gate with no other gate at that checkpoint is recorded as
+passed by the approved start of the slice whose manifest listed it, because
+that start is the same decision; with a verification gate at the
+checkpoint, the start predates the evidence and the decision is asked after
+it passes. Other kinds are never satisfied this way, and the start grants no
+push authorization.
+
 `repositories` is for a stage whose reviewed candidate spans more than one
 repository; see [Cross-repository candidates](reference.md#cross-repository-candidates). `mode` is for a stage
 that is a review and nothing else; see [Review-only stages](reference.md#review-only-stages).

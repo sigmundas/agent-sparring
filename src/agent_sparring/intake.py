@@ -242,7 +242,10 @@ TRANSFORMS: tuple[str, ...] = (
     "conditional_sibling",
 )
 
-GATE_KINDS: tuple[str, ...] = ("production", "manual", "external", "deferred")
+#: ``authorization`` is a person's decision to let the run continue into the
+#: stages a gate blocks (a go-ahead); every other kind is something that must
+#: be done or verified. The runtime asks for the two differently.
+GATE_KINDS: tuple[str, ...] = ("production", "manual", "authorization", "external", "deferred")
 STAGE_MODES: tuple[str, ...] = tuple(mode.value for mode in StageMode)
 
 _HORIZONTAL_RULE_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
@@ -296,7 +299,13 @@ _GATE_KIND_EVIDENCE: dict[str, re.Pattern[str]] = {
     "manual": re.compile(r"\b(manual\w*|canar(y|ies)|owner|go-ahead|sign-?off|approv\w*)\b", re.IGNORECASE),
     "external": re.compile(r"\b(external|third[- ]party|vendor|upstream)\b", re.IGNORECASE),
     "deferred": re.compile(r"\b(defer\w*|later|follow-?up)\b", re.IGNORECASE),
+    "authorization": re.compile(r"\b(go-ahead|authori[sz]\w*|permission|approv\w*)\b", re.IGNORECASE),
 }
+#: A manual gate and an authorization gate are both a person's action, and the
+#: same words ("approval", "go-ahead") evidence either; moving a gate may not
+#: turn it into another family, but within this one the kind is the
+#: interpreter's reading.
+_GATE_KIND_FAMILY: dict[str, str] = {"authorization": "manual"}
 
 
 class IntakeError(RuntimeError):
@@ -1475,8 +1484,12 @@ def _transform_problem(
             if not set(finding.stages) & ({gate.after_stage} | set(gate.blocks_stages)):
                 return f"gate {gate.id!r} neither follows nor blocks the named stages"
             text = " ".join(source.lines[n - 1] for n in sorted(_lines(gate.ranges, total)))
-            kinds = {kind for kind, evidence in _GATE_KIND_EVIDENCE.items() if evidence.search(text)}
-            if kinds != {gate.kind}:
+            kinds = {
+                _GATE_KIND_FAMILY.get(kind, kind)
+                for kind, evidence in _GATE_KIND_EVIDENCE.items()
+                if evidence.search(text)
+            }
+            if kinds != {_GATE_KIND_FAMILY.get(gate.kind, gate.kind)}:
                 found = ", ".join(sorted(kinds)) or "none"
                 return (
                     f"gate {gate.id!r}'s source text does not establish its kind {gate.kind!r} "
