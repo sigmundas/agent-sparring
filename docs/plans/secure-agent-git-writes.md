@@ -338,8 +338,12 @@ launch.
 - **Codex.**
   - User MCP servers are not loaded.
   - Credential environment variables are not passed.
-  - Readable private-key files remain a listed residual exposure, acceptable
-    because the sandbox has no network and no writes.
+  - Codex's read-only sandbox can read files such as `~/.ssh` private keys,
+    and no network or write restriction substitutes for that. If the engine
+    can supply a read restriction that Codex honours, it uses it. Otherwise
+    the same presence-only launch probe applies to the reviewer, and a
+    retrievable write-capable credential sets that run's guarantee to
+    "detected, not prevented".
 - **Network.**
   - Agent shells default to denying all outbound access. Exceptions are
     declared in `.sparring/project.toml`, for example package registries.
@@ -351,10 +355,10 @@ launch.
   - It refuses any entry that matches a configured Git remote by host and
     port, or a Git-hosting web, API or SSH host.
   - It also refuses proxy- or tunnel-like entries (HTTP/SOCKS proxies,
-    generic tunnel hosts), because they could carry traffic to a Git host
-    while keychain credentials remain readable. If a project needs one,
-    it is unsupported. Engine-enabled WebFetch is listed beside the
-    keychain residual.
+    generic tunnel hosts), because they would add routes to a Git host.
+    This only narrows network routes; it is not credential protection. If a
+    project needs such an entry, that entry is unsupported. Project-enabled
+    WebFetch is listed as a residual risk.
   - A network failure caused by the allowlist names the `project.toml` key.
   - Agents do not fetch from Git hosts; the engine refreshes the refs a turn
     needs.
@@ -372,10 +376,11 @@ launch.
     `start-plan` confirmation line, in `check-config` and in `sparring runs
     --json`. It is not a separate prompt.
   - Nothing describes a "detected" run as protected. The capability table
-    marks "write-capable Git credentials unreachable from agent shells" as
-    **unsupported for Claude on macOS while such a credential is in the
-    login keychain**. For the Codex read-only reviewer it is marked
-    supported for the keychain and residual for readable key files.
+    marks the single control "write-capable Git credentials unreachable from agent shells"
+    per provider and role, measured by the launch probe. On macOS it is
+    unsupported for Claude while such a credential is in the login keychain.
+    For the Codex reviewer it is unsupported while one is in a readable file,
+    unless an engine-supplied read restriction is proven.
   - This stage is not weakened to fit: its acceptance never counts network
     denial as credential isolation.
 - **Re-established every turn.** The boundary is rebuilt for every turn,
@@ -386,9 +391,9 @@ launch.
   - It is documented in `docs/setup.md` and reported by `sparring
     check-config` for the configured roles.
   - A launch is refused if any required control is unsupported.
-  - Keychain hiding for Claude is a *residual* control, not a required one.
-    It is shown in the table and in the `start-plan` confirmation line, and
-    it never blocks a launch.
+  - "write-capable Git credentials unreachable from agent shells" is the one control reported
+    rather than required. A run without it is launched but is recorded,
+    shown and documented as "detected, not prevented", never as protected.
   - Anything not proven by this stage's evidence counts as unsupported.
 
 **Starting points:** `providers/claude_cli.py`, `providers/codex_cli.py`,
@@ -457,8 +462,14 @@ code.claude.com/docs/en/sandboxing, /settings, /permissions (`sandbox.*`,
   transcript, log, report or terminal output.
   - Probes report presence or absence only. Credential command output is
     discarded inside the probe.
-  - Live sessions direct retrieval attempts only at the disposable test
-    credential, never at a real host's credential.
+  - Real-provider live sessions run only under an OS account whose
+    keychain, Git and `gh` configuration and readable files hold no real
+    Git-host credentials. The test checks this with the presence-only probe
+    before starting the session, and refuses to start otherwise. In an
+    account that holds real credentials, only the scripted presence-only
+    probes and the generated-rules check run, with no model turn. A real
+    token is therefore unreachable to the model by construction, not by
+    instruction.
   - Every transcript and log a test produces is scanned for credential
     patterns (GitHub token prefixes, private-key headers, the disposable test
     secret). The scan prints counts only and never the matched text.
