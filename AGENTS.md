@@ -57,6 +57,9 @@ before adding a parallel fixture or helper.
 ## Git policy
 
 Agents may create branches, commit, push, merge, and delete branches as needed to complete the task.
+Inside a managed stage (an Agent Sparring run) this is narrower: agents commit, and the
+engine pushes the candidate after a person authorizes it. Interactive use outside
+managed runs is unchanged.
 
 Use normal Git workflows and keep history understandable.
 
@@ -68,7 +71,8 @@ Do not:
 - deploy, publish a release, or modify production systems unless the task explicitly includes that.
 
 For staged/agent-sparring work:
-- commit and push completed stage work;
+- commit completed stage work; inside a managed stage do not push it -- the
+  engine pushes after authorization (outside managed runs, push as usual);
 - merge when the stage or plan calls for it;
 - leave a clear handoff describing what changed, what was tested, and any unresolved issues.
 

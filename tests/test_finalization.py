@@ -175,11 +175,10 @@ class _StageAdapter:
             path.write_text(body, encoding="utf-8")
 
     def _mode_commit(self) -> None:
-        """Commit and push exactly what is in the worktree."""
+        """Commit exactly what is in the worktree (the engine pushes)."""
 
         _run_git(self.repo, "add", "-A")
         _run_git(self.repo, "commit", "-q", "-m", "stage work")
-        _run_git(self.repo, "push", "-q", "origin", "HEAD")
 
     def _mode_commit_and_alter(self) -> None:
         """"Improve" one reviewed file on the way past, then commit."""
@@ -196,7 +195,6 @@ class _StageAdapter:
 
         _run_git(self.repo, "add", "ui/measurement_content_view.py")
         _run_git(self.repo, "commit", "-q", "-m", "part of the stage work")
-        _run_git(self.repo, "push", "-q", "origin", "HEAD")
 
     def _mode_noop(self) -> None:
         """A turn that reports success and changes nothing."""
@@ -276,6 +274,9 @@ class _RepoCase(unittest.TestCase):
         return lambda _stage: (stage_adapter, sparring_adapter)
 
     def _start(self, stage_adapter, sparring_adapter, **kwargs):
+        # The engine pushes each verified candidate, under the run-level
+        # grant a person gives at start.
+        kwargs.setdefault("allow_push_for_run", True)
         return start_plan(
             self.plan_path,
             self.sparring_dir,
@@ -643,7 +644,6 @@ class StuckRunRecoveryTests(_RepoCase):
         stage = self._leave_stuck()
         _run_git(self.repo, "add", "-A")
         _run_git(self.repo, "commit", "-q", "-m", "committed by hand meanwhile")
-        _run_git(self.repo, "push", "-q", "origin", "HEAD")
 
         stage_adapter = _StageAdapter(self.repo, ["noop", "noop"])
         result = self._resume(stage_adapter, _SparringAdapter([READY, NEEDS_YOU]))

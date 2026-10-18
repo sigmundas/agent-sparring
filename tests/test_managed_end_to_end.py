@@ -11,8 +11,9 @@ from test_plan import READY, _run_git, _SparringAdapter
 
 
 class _ManagedStageAdapter:
-    """Commits and pushes one file per turn in the run's managed worktree --
-    found through the engine's record, as the engine itself does."""
+    """Commits one file per turn in the run's managed worktree -- found
+    through the engine's record, as the engine itself does. It never pushes:
+    the engine pushes, after authorization."""
 
     def __init__(self, repo: Path):
         self.repo = repo
@@ -25,7 +26,6 @@ class _ManagedStageAdapter:
         (worktree / f"impl-{self._calls}.txt").write_text("implementation\n", encoding="utf-8")
         _run_git(worktree, "add", f"impl-{self._calls}.txt")
         _run_git(worktree, "commit", "-q", "-m", f"turn {self._calls}")
-        _run_git(worktree, "push", "-q", "origin", record.branch)
         return StageAgentResult(session_id=session_id, text="claims", is_error=False)
 
     def start(self, prompt: str) -> StageAgentResult:
@@ -44,7 +44,8 @@ class ManagedRunEndToEndTests(_ManagedRepoTestCase):
         adapters = (_ManagedStageAdapter(self.repo), _SparringAdapter([READY] * 4))
 
         code, _, err = self._main(
-            "run-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed", adapters=adapters
+            "run-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed",
+            "--allow-push-for-run", adapters=adapters,
         )
         self.assertEqual(code, 0, err)
         (record,) = self._records()

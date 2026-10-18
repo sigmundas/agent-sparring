@@ -79,6 +79,7 @@ from agent_sparring.plan import (
     PlanRunStatus,
     PAUSE_SESSION_UNRESUMABLE,
     ProviderPause,
+    acknowledge_remote_movement,
     load_plan_source,
     plan_label,
     plan_state_not_ignored_message,
@@ -93,6 +94,7 @@ from agent_sparring.deferred_gate import (
 )
 from agent_sparring.plan_model import PlanSource
 from agent_sparring.push_gate import PUSH_AUTHORIZATION_REQUIRED
+from agent_sparring.remote_pin import UNAUTHORIZED_REMOTE_MOVEMENT, UnauthorizedRemoteMovement
 from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
     PROVIDER_ID as CLAUDE_PROVIDER_ID,
@@ -1847,6 +1849,10 @@ def _report_plan_result(
         _report_deferred_verification_required(result, args, stage)
         return
 
+    if isinstance(result.awaiting, UnauthorizedRemoteMovement):
+        _report_unauthorized_remote_movement(result, args, stage)
+        return
+
     if result.awaiting is not None:
         _report_push_authorization_required(result, args, stage)
         return
@@ -1976,6 +1982,72 @@ def _report_deferred_verification_required(
     print(f"stage directory of the current stage: {stage.directory}")
 
 
+def _report_unauthorized_remote_movement(
+    result: PlanRunResult, args: argparse.Namespace, stage: Stage
+) -> None:
+    """A run stopped because its pinned remote ref is somewhere the engine's
+    own records do not explain.
+
+    Reported as the detection it is -- not a review outcome, not a request
+    for push permission, and not something any push authorization answers.
+    """
+
+    movement = result.awaiting
+    assert isinstance(movement, UnauthorizedRemoteMovement)  # the caller checked
+    print(f"plan paused: {result.plan}")
+    print(f"stage: {result.stage_id} ({stage.directory})")
+    print(f"needs: {UNAUTHORIZED_REMOTE_MOVEMENT}")
+    for stage_id, sha in result.accepted:
+        print(f"  accepted {stage_id} at {sha}")
+    print(f"remote: {movement.remote} ({movement.url or 'no URL'})")
+    print(f"ref: {movement.ref}")
+    print(f"expected tip: {movement.expected_tip or 'absent'}")
+    print(f"observed tip: {movement.observed_tip or 'absent'}")
+    if movement.candidate_sha:
+        print(f"candidate: {movement.candidate_sha}")
+    if movement.detail:
+        print(f"why: {movement.detail}")
+    print()
+    print(
+        "The run's pinned remote ref moved, and none of the engine's push receipts or "
+        "acknowledgements explains it. Nothing was pushed, frozen or accepted. This is "
+        "detection, not prevention: look at what is on the remote first. The engine does "
+        "not reset, force-push or delete anything there."
+    )
+    print()
+    print("Once you have looked, acknowledge exactly what you saw:")
+    print(
+        f"  sparring acknowledge-remote-movement --run-key {result.run} "
+        f"--observed {movement.observed_label}"
+    )
+    print()
+    print(
+        "The acknowledgement is recorded with who and when. It is not a review, an "
+        "acceptance or a push authorization; resume the run afterwards as usual."
+    )
+
+
+def _cmd_acknowledge_remote_movement(args: argparse.Namespace) -> int:
+    sparring_dir = Path(args.sparring_dir)
+    try:
+        repo_root = _resolve_repo_root(args, sparring_dir)
+        try:
+            record = managed_run.read_record(repo_root, args.run_key)
+        except ManagedRunError as exc:
+            if exc.code != "not_a_repository":
+                raise
+            record = None
+        if record is not None:
+            sparring_dir = record.sparring_dir
+        acknowledge_remote_movement(
+            sparring_dir, run_key=args.run_key, observed=args.observed, report=print
+        )
+    except (PlanError, ManagedRunError, ProjectConfigError, GitContextError) as exc:
+        print(f"could not acknowledge remote movement: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _report_push_authorization_required(
     result: PlanRunResult, args: argparse.Namespace, stage: Stage
 ) -> None:
@@ -2013,11 +2085,12 @@ def _report_push_authorization_required(
     print(f"  {resume} --allow-push-candidate {awaiting.candidate_sha} --allow-push-for-run")
     print()
     print(
-        "Either way the push is an ordinary non-force push of "
-        f"{awaiting.branch} to {awaiting.remote}/{awaiting.remote_branch}, the engine "
-        "re-checks that the commit is really there, and the acceptance gate then runs "
-        "unchanged. Push it yourself instead if you prefer; resuming without either "
-        "option then accepts it as usual."
+        "Either way the push is an ordinary non-force push of exactly this commit to "
+        f"{awaiting.remote}/{awaiting.remote_branch} at the URL the run pinned when it "
+        "started; the engine re-checks that the ref is exactly that commit, records a push "
+        "receipt, and the acceptance gate then runs unchanged. A push made outside the "
+        "engine is not explained by its records and stops the run as unauthorized remote "
+        "movement."
     )
 
 
@@ -4316,6 +4389,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="the branch the plan run was started for; required and verified",
     )
     reopen_parser.set_defaults(func=_cmd_reopen_stage)
+
+    acknowledge = subparsers.add_parser(
+        "acknowledge-remote-movement",
+        help=(
+            "acknowledge the unauthorized remote movement a plan run is paused on, naming "
+            "the run and the observed tip; recorded with who and when, and never a review, "
+            "an acceptance or a push authorization"
+        ),
+    )
+    acknowledge.add_argument("--run-key", required=True, help="the paused run")
+    acknowledge.add_argument(
+        "--observed",
+        required=True,
+        help="the observed tip the run reported, exactly (or 'absent' for a deleted ref)",
+    )
+    acknowledge.add_argument("--repo-root", default=None, help=repo_root_help)
+    acknowledge.set_defaults(func=_cmd_acknowledge_remote_movement)
 
     freeze = subparsers.add_parser(
         "freeze-candidate",

@@ -14,6 +14,8 @@ check itself.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import hashlib
 import os
 import shutil
@@ -21,7 +23,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from agent_sparring import managed_run
+from agent_sparring import engine_git, managed_run
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.managed_run import ManagedRunError, ManagedRunRecord
 
@@ -453,7 +455,9 @@ def finish_status(
     )
     if record.remote:
         if candidate and present:
-            pushed, detail = _remote_contains(worktree, record.remote, record.branch, candidate)
+            pushed, detail = _remote_contains(
+                worktree, _destination(repo_root, record) or record.remote, record.branch, candidate
+            )
         else:
             pushed, detail = False, "no candidate in a present worktree to check against the remote"
         git["candidate_pushed"] = pushed
@@ -772,9 +776,7 @@ def _candidate_config(repo_root: Path, record: ManagedRunRecord, candidate: str)
     from agent_sparring.config import CONFIG_FILENAME, ProjectConfigError, parse_project_config
 
     spec = f"{candidate}:{(Path(record.project_dir) / CONFIG_FILENAME).as_posix()}"
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), "show", spec], capture_output=True, check=False
-    )
+    result = managed_run._git_bytes(repo_root, "show", spec)
     if result.returncode != 0:
         return None, f"{spec} cannot be read"
     try:
@@ -979,8 +981,13 @@ def finish_run(
                 if notes["remote_branch"]["code"] in ("remote_branch_deleted", "remote_branch_absent"):
                     notes["kept"] = []
                 return report(None, "the run is already finished"), None
-            return _finish_locked(repo_root, locked, planned, completed, notes, merge_only=merge_only,
-                                  allow_merge_commit=allow_merge_commit, push_target=push_target)
+            # Every Git invocation of the finish -- merge, target push,
+            # remote branch deletion -- is held to the run's trusted
+            # configuration snapshot: changed credential, transport or remote
+            # configuration is a typed refusal, never followed.
+            with _run_guard(repo_root, locked):
+                return _finish_locked(repo_root, locked, planned, completed, notes, merge_only=merge_only,
+                                      allow_merge_commit=allow_merge_commit, push_target=push_target)
     except WorktreeLockError as exc:
         return report("checks", f"runner_live: {exc}"), None
     except _StepFailed as exc:
@@ -990,6 +997,72 @@ def finish_run(
         # stops at the step in progress; later steps stay untouched.
         stopped = next((step for step in planned if step not in completed), None)
         return report(stopped, f"{type(exc).__name__}: {exc}"), None
+
+
+def _run_guard(repo_root: Path, record: ManagedRunRecord):
+    """The trusted-configuration guard of ``record``'s run, from the pin in
+    its engine-written plan-run state (in the worktree, or in the archive
+    once the worktree is gone). A run with no pin finishes under the
+    hardened Git path alone."""
+
+    from agent_sparring.remote_pin import RemotePinError, load_run_remote_state
+
+    roots: list[Path] = []
+    try:
+        roots.append(record.sparring_dir)
+    except ManagedRunError:
+        pass
+    roots.append(archive_dir(repo_root, record.run_key))
+    for root in roots:
+        try:
+            remote = load_run_remote_state(root, record.run_key)
+        except RemotePinError:
+            # An unreadable copy names no pin; the finish's own steps report
+            # it (archive_state), and the hardened Git path still applies.
+            continue
+        if remote is not None and remote.pin is not None:
+            return _pinned_finish(repo_root, record, remote.pin)
+    return contextlib.nullcontext()
+
+
+#: The pin of the run being finished, while its finish runs.
+_FINISH_PIN: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "agent_sparring_finish_pin", default=None
+)
+
+
+@contextlib.contextmanager
+def _pinned_finish(repo_root: Path, record: ManagedRunRecord, pin: Any):
+    with engine_git.trusted_config(
+        [Path(repo_root), Path(record.worktree_path)], pin.trusted_config
+    ):
+        token = _FINISH_PIN.set(pin)
+        try:
+            yield pin
+        finally:
+            _FINISH_PIN.reset(token)
+
+
+def _destination(repo_root: Path, record: ManagedRunRecord) -> str | None:
+    """Where a remote operation of this finish goes: the run's pinned
+    destination URL when the record's remote is the pinned one, never a
+    name the repository's configuration could redirect. A pinned run whose
+    record names another remote resolves that remote's URL once, from the
+    configuration the finish is already held to (unchanged since the run
+    started). ``None`` when the run has no pin (recorded before pins
+    existed): the record's remote is then used by name, as it always was."""
+
+    pin = _FINISH_PIN.get()
+    if pin is None or not record.remote:
+        return None
+    if record.remote == pin.remote:
+        return pin.destination
+    from agent_sparring.git_context import GitContextError, resolved_push_url
+
+    try:
+        return resolved_push_url(Path(repo_root), record.remote)
+    except GitContextError as exc:
+        raise ManagedRunError(getattr(exc, "code", "git_failed"), str(exc)) from exc
 
 
 def _recorded_plan_removal(record: ManagedRunRecord) -> dict[str, Any]:
@@ -1227,14 +1300,20 @@ def _delete_remote_branch(repo_root: Path, record: ManagedRunRecord, candidate: 
     refused = _foreign_branch(record)
     if refused:
         return "remote_delete_rejected", f"{refused}; nothing was read or pushed and {where} is kept"
-    push_urls = managed_run._git(repo_root, "remote", "get-url", "--push", "--all", record.remote)
-    urls = [u for u in push_urls.stdout.splitlines() if u.strip()] if push_urls.returncode == 0 else []
-    if len(urls) > 1:
-        return "remote_multiple_push_urls", (
-            f"{record.remote} has {len(urls)} push URLs ({', '.join(urls)}); a per-URL lease delete is not "
-            f"supported, so nothing was read or pushed and {where} is kept"
-        )
-    url = urls[0] if urls else record.remote
+    pinned = _destination(repo_root, record)
+    if pinned is not None:
+        # The run's pinned destination: one URL, fixed when the run started,
+        # and read and written in an isolated repository (engine_git).
+        url = pinned
+    else:
+        push_urls = managed_run._git(repo_root, "remote", "get-url", "--push", "--all", record.remote)
+        urls = [u for u in push_urls.stdout.splitlines() if u.strip()] if push_urls.returncode == 0 else []
+        if len(urls) > 1:
+            return "remote_multiple_push_urls", (
+                f"{record.remote} has {len(urls)} push URLs ({', '.join(urls)}); a per-URL lease delete is not "
+                f"supported, so nothing was read or pushed and {where} is kept"
+            )
+        url = urls[0] if urls else record.remote
     ok, branch_sha, error = _remote_sha(repo_root, url, record.branch)
     if not ok:
         return "remote_unreachable", f"{where} cannot be reached at {url} ({error}); the branch is kept"
@@ -1254,7 +1333,8 @@ def _delete_remote_branch(repo_root: Path, record: ManagedRunRecord, candidate: 
             f"the merged candidate {candidate}; push the target (--push-target) and re-run. {where} is kept"
         )
     result = managed_run._git(
-        repo_root, "push", "--porcelain", f"{REMOTE_DELETE_LEASE}={ref}:{candidate}", record.remote, "--delete", ref,
+        repo_root, "push", "--porcelain", f"{REMOTE_DELETE_LEASE}={ref}:{candidate}",
+        pinned if pinned is not None else record.remote, "--delete", ref,
     )
     lines = result.stdout.splitlines()
     sections = [line for line in lines if line.startswith("To ")]
@@ -1327,10 +1407,12 @@ def _plan_snapshot(repo_root: Path, record: ManagedRunRecord) -> tuple[bytes, st
 
 def _git_bytes(cwd: Path, *args: str, env: dict[str, str] | None = None,
                stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        ["git", "-C", str(cwd), *args], capture_output=True, check=False, input=stdin,
-        env={**os.environ, **env} if env else None,
-    )
+    # The one engine Git path; ``env`` is applied over its sanitized
+    # environment, so a deliberate GIT_INDEX_FILE here still takes effect.
+    try:
+        return engine_git.run(cwd, *args, text=False, input=stdin, env=env)
+    except engine_git.GitConfigRefusal as exc:
+        raise ManagedRunError(exc.code, str(exc)) from exc
 
 
 def _git_identity(repo_root: Path) -> str | None:
@@ -1508,7 +1590,8 @@ def _push_target(repo_root: Path, record: ManagedRunRecord, candidate: str) -> M
 
     if not record.remote:
         raise _StepFailed("push_target", "the record has no remote to push the target to")
-    ok, remote_tip, error = _remote_sha(repo_root, record.remote, record.target_branch)
+    destination = _destination(repo_root, record) or record.remote
+    ok, remote_tip, error = _remote_sha(repo_root, destination, record.target_branch)
     if not ok:
         raise _StepFailed("push_target", error)
     removal = _events(record, "plan_removed")
@@ -1518,9 +1601,14 @@ def _push_target(repo_root: Path, record: ManagedRunRecord, candidate: str) -> M
         or _rev(repo_root, remote_tip) is None
         or not all(_is_ancestor(repo_root, sha, remote_tip) for sha in must_contain)
     ):
+        # The exact commit the target holds now, resolved once: a branch
+        # that moved between this read and the push cannot widen it.
+        source = _rev(repo_root, f"refs/heads/{record.target_branch}")
+        if source is None:
+            raise _StepFailed("push_target", f"{record.target_branch} does not resolve to a commit")
         result = managed_run._git(
-            repo_root, "-c", "push.followTags=false", "push", record.remote,
-            f"refs/heads/{record.target_branch}:refs/heads/{record.target_branch}",
+            repo_root, "-c", "push.followTags=false", "push", destination,
+            f"{source}:refs/heads/{record.target_branch}",
         )
         if result.returncode != 0:
             raise _StepFailed("push_target", f"the push was rejected: {result.stderr.strip()}")

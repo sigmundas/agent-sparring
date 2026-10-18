@@ -185,7 +185,6 @@ class PreventionResumeTests(_PlanRepoTestCase):
             "commit": lambda: (
                 _run_git(self.repo, "add", ".DS_Store"),
                 _run_git(self.repo, "commit", "-q", "-m", "keep it"),
-                _run_git(self.repo, "push", "-q", "origin", "feature/x"),
             ),
         }
         for name, remedy in remedies.items():
@@ -259,7 +258,6 @@ class ReviewOwedRoutingTests(_PlanRepoTestCase):
         (self.repo / "later.txt").write_text("later\n")
         _run_git(self.repo, "add", "later.txt")
         _run_git(self.repo, "commit", "-q", "-m", "moved on")
-        _run_git(self.repo, "push", "-q", "origin", "feature/x")
         (self.repo / "stray.txt").write_text("not mine\n")
 
         code, err = self.cli(
@@ -408,7 +406,6 @@ class ManualResolutionProvenanceTests(_PlanRepoTestCase):
         (self.repo / "later.txt").write_text("later\n")
         _run_git(self.repo, "add", "later.txt")
         _run_git(self.repo, "commit", "-q", "-m", "moved on")
-        _run_git(self.repo, "push", "-q", "origin", "feature/x")
 
         self._resume(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1, next_turn="stage")
 

@@ -185,6 +185,9 @@ class _ReviewRepoTestCase(unittest.TestCase):
         return PlanRunState.load(self.state_path)
 
     def start(self, stage_adapter, sparring_adapter, **kwargs):
+        # The engine pushes each verified candidate; these runs hold the
+        # run-level grant a person gives at start unless a test says not.
+        kwargs.setdefault("allow_push_for_run", True)
         return start_plan(
             self.source(),
             self.sparring_dir,
@@ -336,7 +339,6 @@ class IndependentReviewRunTests(_ReviewRepoTestCase):
         (self.repo / "later.txt").write_text("after the review began\n", encoding="utf-8")
         _run_git(self.repo, "add", "later.txt")
         _run_git(self.repo, "commit", "-q", "-m", "moved on")
-        _run_git(self.repo, "push", "-q", "origin", "feature/x")
 
         with self.assertRaises(PlanRunError) as ctx:
             self.resume(stage_adapter, _SparringAdapter([READY]), evidence="the check passed")

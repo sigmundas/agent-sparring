@@ -522,7 +522,6 @@ class EvidenceCandidateTests(_PlanRepoTestCase):
         (self.repo / "fix.txt").write_text("asked for by the gate\n")
         _run_git(self.repo, "add", "fix.txt")
         _run_git(self.repo, "commit", "-q", "-m", "manual fix")
-        _run_git(self.repo, "push", "-q", "origin", "feature/x")
         state_before = (stage.directory / "state.json").read_bytes()
         notes_before = (stage.directory / "notes.md").read_text()
         sparring = _SparringAdapter([READY])
@@ -999,7 +998,6 @@ class ReviewOnlyProviderPauseRecordTests(_ReviewRepoTestCase):
         (self.repo / "later.txt").write_text("after the review began\n", encoding="utf-8")
         _run_git(self.repo, "add", "later.txt")
         _run_git(self.repo, "commit", "-q", "-m", "moved on")
-        _run_git(self.repo, "push", "-q", "origin", "feature/x")
         reviewer = _SparringAdapter([READY])
 
         with self.assertRaises(PlanRunError) as ctx:

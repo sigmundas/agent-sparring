@@ -80,9 +80,11 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
         self.assertEqual(pinned, _head_sha(self.repo))
         return stage_adapter, sparring_adapter, pinned
 
-    def _land(self, message: str, *paths: str, push: bool = True) -> str:
+    def _land(self, message: str, *paths: str, push: bool = False) -> str:
         # Commits only ``paths`` beneath the attempt; the index keeps the
-        # attempt's staged work for every other path.
+        # attempt's staged work for every other path. Not pushed by default:
+        # mid-run, the engine pushes, and a push made by hand is movement
+        # its records do not explain.
         _run_git(self.repo, "commit", "-q", "-m", message, "--", *paths)
         if push:
             _run_git(self.repo, "push", "-q", "origin", "feature/x")

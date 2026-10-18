@@ -545,7 +545,17 @@ class AuthorizationGateRunTests(_ManifestRepoTestCase):
         self.assertEqual(start.gate.category, "AUTHORIZATION")
         self.assertIn("approved start", start.results[0].note)
         self.assertIn("satisfied by the approved start", "\n".join(reports))
-        # It authorized starting, not pushing: push stays the engine's own gate.
+
+    def test_the_approved_start_authorizes_starting_not_pushing(self):
+        # Without a push grant, a satisfied go-ahead still leaves the push to
+        # the engine's own gate: the first verified candidate stops for it.
+        self._first_stage_gated([START])
+        result = self._start(
+            self.stage_adapter, _SparringAdapter([READY, READY]), allow_push_for_run=False
+        )
+        self.assertTrue(self._owed("managed-run-approval").resolved)
+        self.assertEqual(result.awaiting.kind, "push_authorization_required")
+        self.assertEqual(result.accepted, ())
         self.assertIsNone(self._plan_state().push_authorization)
 
     def test_g1c_is_not_asked_while_g1_has_not_passed(self):

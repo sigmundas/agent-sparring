@@ -163,6 +163,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from agent_sparring.acceptance import (
     AcceptanceError,
+    UnauthorizedRemoteMovementError,
     accept_candidate,
     accept_reviewed_candidate,
     freeze_candidate,
@@ -231,6 +232,20 @@ from agent_sparring.push_gate import (
     authorization_for_candidate,
     authorization_for_run,
     ensure_candidate_pushed,
+)
+from agent_sparring import engine_git
+from agent_sparring.remote_pin import (
+    ABSENT,
+    UNAUTHORIZED_REMOTE_MOVEMENT,
+    RemoteMovementDetected,
+    RemotePin,
+    RemoteRecord,
+    UnauthorizedRemoteMovement,
+    acknowledgement,
+    check_movement,
+    pin_remote,
+    records_from,
+    who,
 )
 from agent_sparring.providers import (
     ProviderSessionUnresumable,
@@ -537,11 +552,14 @@ class PlanRunState:
     push_authorization: PushAuthorization | None = None
     #: Why this run is stopped, when the reason is a typed one the runner
     #: itself recorded rather than a reviewer's verdict:
-    #: :class:`~agent_sparring.push_gate.PushRequired`, or
-    #: :class:`~agent_sparring.deferred_gate.DeferredVerificationRequired`.
+    #: :class:`~agent_sparring.push_gate.PushRequired`,
+    #: :class:`~agent_sparring.deferred_gate.DeferredVerificationRequired`, or
+    #: :class:`~agent_sparring.remote_pin.UnauthorizedRemoteMovement`.
     #: Cleared whenever the run enters a stage for execution, so it can never
-    #: describe an older pause than the one the run is actually in.
-    awaiting: PushRequired | DeferredVerificationRequired | None = None
+    #: describe an older pause than the one the run is actually in -- except
+    #: unauthorized remote movement, which a run never leaves by entering a
+    #: stage: only an explicit acknowledgement clears it.
+    awaiting: PushRequired | DeferredVerificationRequired | UnauthorizedRemoteMovement | None = None
     #: The obligation ledger: human verification a reviewer deferred rather
     #: than stopped for (see :mod:`agent_sparring.deferred_gate`).
     #:
@@ -586,6 +604,16 @@ class PlanRunState:
     #: :mod:`agent_sparring.managed_run`). Omitted while ``False``, and
     #: absent from older states, which read as unmanaged.
     managed: bool = False
+    #: The remote target this run pushes to and verifies against, pinned
+    #: when it started (see :mod:`agent_sparring.remote_pin`). ``None`` only
+    #: for a run recorded before pins existed, until its first resume pins
+    #: it (as a weaker, legacy pin). Omitted while ``None``.
+    remote_pin: RemotePin | None = None
+    #: Every explained movement of the pinned ref, in order: the engine's
+    #: push receipts and a person's acknowledgements of movement the engine
+    #: did not make. The pinned ref is expected at the last one's tip.
+    #: Omitted while empty.
+    remote_records: tuple[RemoteRecord, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -594,6 +622,14 @@ class PlanRunState:
             self.push_authorization.to_dict() if self.push_authorization is not None else None
         )
         payload["awaiting"] = self.awaiting.to_dict() if self.awaiting is not None else None
+        if self.remote_pin is not None:
+            payload["remote_pin"] = self.remote_pin.to_dict()
+        else:
+            payload.pop("remote_pin", None)
+        if self.remote_records:
+            payload["remote_records"] = [record.to_dict() for record in self.remote_records]
+        else:
+            payload.pop("remote_records", None)
         payload["deferred_human_checks"] = [
             obligation.to_dict() for obligation in self.deferred_human_checks
         ]
@@ -722,8 +758,14 @@ class PlanRunState:
                     else None
                 ),
                 managed=_managed_flag(payload.get("managed", False)),
+                remote_pin=(
+                    RemotePin.from_dict(payload["remote_pin"])
+                    if payload.get("remote_pin")
+                    else None
+                ),
+                remote_records=records_from(payload.get("remote_records")),
             )
-        except (PushError, DeferredGateError) as exc:
+        except (PushError, DeferredGateError, GitContextError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -751,7 +793,7 @@ def _managed_flag(value: Any) -> bool:
 
 def _awaiting_from_dict(
     payload: Any,
-) -> "PushRequired | DeferredVerificationRequired | None":
+) -> "PushRequired | DeferredVerificationRequired | UnauthorizedRemoteMovement | None":
     """The typed pause a recorded run is stopped on.
 
     Dispatched on ``kind`` and on nothing else, so adding a reason is adding
@@ -766,6 +808,8 @@ def _awaiting_from_dict(
     kind = payload.get("kind") if isinstance(payload, Mapping) else None
     if kind == DEFERRED_VERIFICATION_REQUIRED:
         return DeferredVerificationRequired.from_dict(payload)
+    if kind == UNAUTHORIZED_REMOTE_MOVEMENT:
+        return UnauthorizedRemoteMovement.from_dict(payload)
     return PushRequired.from_dict(payload)
 
 
@@ -1160,7 +1204,10 @@ class PlanRunResult:
     #: kind of fact -- the engine stopped on a typed reason of its own, not
     #: on a verdict -- so a consumer switches on ``kind`` rather than on
     #: which field is populated.
-    awaiting: PushRequired | DeferredVerificationRequired | None = None
+    #:
+    #: And :class:`~agent_sparring.remote_pin.UnauthorizedRemoteMovement`:
+    #: the pinned remote ref is somewhere the engine's records do not explain.
+    awaiting: PushRequired | DeferredVerificationRequired | UnauthorizedRemoteMovement | None = None
     #: The obligations a :class:`DeferredVerificationRequired` pause is
     #: about, in full, so a caller can render them without re-reading the
     #: run state. Empty otherwise.
@@ -1414,10 +1461,20 @@ def start_plan(
         run=key,
         managed=managed,
     )
+    # The one place the target is read from configuration: every push,
+    # reachability and movement check of this run uses these values, and a
+    # later change to them is refused rather than followed.
+    try:
+        state.remote_pin = pin_remote(Path(repo_root), expected_branch)
+    except GitContextError as exc:
+        raise PlanError(
+            f"refusing a fresh run of {label}: cannot pin the remote it pushes to ({exc})"
+        ) from exc
+    report(f"remote target pinned for this run: {state.remote_pin.describe}")
     if allow_push_for_run:
         try:
             state.push_authorization = authorization_for_run(
-                Path(repo_root), branch=expected_branch
+                Path(repo_root), branch=expected_branch, pin=state.remote_pin
             )
         except PushError as exc:
             raise PlanError(str(exc)) from exc
@@ -1921,6 +1978,7 @@ def resume_plan(
             next_turn,
             evidence=bool(evidence and evidence.strip()),
         )
+    _pin_legacy_run(state, state_path, Path(repo_root), report=report)
     rollback: tuple[Path, ...] = ()
     if accept_advanced_head is not None:
         # Likewise validated in full before anything is written: a refused
@@ -2387,13 +2445,19 @@ def _grant_push_authorization(
     if not allow_push_candidate and not allow_push_for_run:
         return
 
-    awaiting = state.awaiting
+    awaiting = state.awaiting if isinstance(state.awaiting, PushRequired) else None
     if allow_push_candidate:
         wanted = allow_push_candidate.strip().lower()
         if awaiting is None:
             raise PlanError(
                 f"plan run for {state.plan} is not waiting for permission to push a "
                 "candidate, so there is nothing to authorize for one"
+                + (
+                    "; it is stopped on unauthorized remote movement, which a push "
+                    "authorization does not clear (see acknowledge-remote-movement)"
+                    if isinstance(state.awaiting, UnauthorizedRemoteMovement)
+                    else ""
+                )
             )
         if awaiting.candidate_sha.lower() != wanted:
             raise PlanError(
@@ -2411,9 +2475,12 @@ def _grant_push_authorization(
                 stage_id=awaiting.stage_id,
                 candidate_sha=awaiting.candidate_sha,
                 branch=state.expected_branch,
+                pin=state.remote_pin,
             )
         else:
-            granted = authorization_for_run(repo_root, branch=state.expected_branch)
+            granted = authorization_for_run(
+                repo_root, branch=state.expected_branch, pin=state.remote_pin
+            )
     except PushError as exc:
         raise PlanError(str(exc)) from exc
 
@@ -2430,23 +2497,32 @@ def _ensure_candidate_pushed(
     stage: Stage,
     *,
     report: Reporter,
-) -> PushRequired | None:
+) -> PushRequired | UnauthorizedRemoteMovement | None:
     """Put the verified candidate where the acceptance gate requires it, or
-    say that a person has to allow that first.
+    say that a person has to allow that first, or stop on remote movement
+    the engine's records do not explain.
 
-    Returns the typed request when the run must stop for permission -- the
-    run is already paused and the request recorded by the time it returns.
-    Returns ``None`` when nothing was needed or the push succeeded and
-    reachability was re-proven; a failure of either raises
+    Returns the typed reason when the run must stop -- the run is already
+    paused and the reason recorded by the time it returns. Returns ``None``
+    when nothing was needed or the push succeeded, the pinned ref was re-read
+    and the receipt recorded; a failure of either raises
     :class:`PlanRunError` with the run paused and the stage unaccepted.
     """
 
+    try:
+        stage_base = stage.read_state().base_sha
+    except StageError:
+        stage_base = None
     try:
         outcome = ensure_candidate_pushed(
             repo_root,
             stage_id=stage.stage_id,
             expected_branch=state.expected_branch,
             authorization=state.push_authorization,
+            pin=state.remote_pin,
+            records=state.remote_records,
+            run=_RunOwner.of(state).key,
+            stage_base=stage_base,
         )
     except PushError as exc:
         raise _fail(
@@ -2461,6 +2537,10 @@ def _ensure_candidate_pushed(
             ),
         ) from exc
 
+    if outcome.movement is not None:
+        _stop_for_movement(state, state_path, activity, outcome.movement, report=report)
+        return outcome.movement
+
     if outcome.required is not None:
         state.awaiting = outcome.required
         _pause(state, state_path)
@@ -2472,6 +2552,11 @@ def _ensure_candidate_pushed(
         return outcome.required
 
     state.awaiting = None
+    if outcome.receipt is not None:
+        # Recorded the moment the push is proven, before anything else can
+        # fail: the receipt is what explains the pinned ref's new tip.
+        state.remote_records = state.remote_records + (outcome.receipt,)
+        state.save(state_path)
     if outcome.pushed:
         activity.emit("plan.candidate.pushed", sha=outcome.target.candidate_sha)
         report(
@@ -2480,6 +2565,157 @@ def _ensure_candidate_pushed(
             f"{outcome.target.remote_branch} as authorized ({outcome.detail})"
         )
     return None
+
+
+def _pin_legacy_run(
+    state: PlanRunState, state_path: Path, repo_root: Path, *, report: Reporter
+) -> None:
+    """Pin a run recorded before pins existed, from the configuration as it
+    is now, and say so plainly: this is weaker than a run-start pin."""
+
+    if state.remote_pin is not None:
+        return
+    try:
+        pin = pin_remote(repo_root, state.expected_branch, legacy=True)
+    except GitContextError as exc:
+        raise PlanError(
+            f"plan run {_RunOwner.of(state).key} was recorded before runs pinned their remote "
+            f"target, and it cannot be pinned now ({exc}); nothing was run"
+        ) from exc
+    state.remote_pin = pin
+    state.save(state_path)
+    report(
+        f"notice: plan run {_RunOwner.of(state).key} was recorded before runs pinned their "
+        f"remote target, so it is pinned now, from the current configuration: {pin.describe}. "
+        "This is weaker than a run-start pin: the tip observed now is taken as the starting "
+        "point, so movement before this moment cannot be told apart from legitimate work -- "
+        "except that a stage candidate already on the remote with no engine push receipt is "
+        "still treated as unexplained. Check these values; a later change to them is refused."
+    )
+
+
+def _stop_for_movement(
+    state: PlanRunState,
+    state_path: Path,
+    activity: ActivityEmitter | None,
+    movement: UnauthorizedRemoteMovement,
+    *,
+    report: Reporter,
+) -> None:
+    """Record the typed pause for remote movement nobody explained."""
+
+    state.awaiting = movement
+    _pause(state, state_path)
+    if activity is not None:
+        activity.emit("plan.paused", summary="unauthorized remote movement")
+    report(
+        f"stage {movement.stage_id}: {UNAUTHORIZED_REMOTE_MOVEMENT}: {movement.describe}. "
+        "The plan is paused; nothing was pushed, frozen or accepted. This is detection, not "
+        "prevention: look at what is on the remote, and once you have, acknowledge it with "
+        f"`sparring acknowledge-remote-movement --run-key {_RunOwner.of(state).key} "
+        f"--observed {movement.observed_label}`. An acknowledgement is not a review, an "
+        "acceptance or a push authorization."
+    )
+
+
+def _movement_now(
+    state: PlanRunState,
+    repo_root: Path,
+    stage: Stage,
+    *,
+    candidate_sha: str | None = None,
+) -> UnauthorizedRemoteMovement | None:
+    """Unexplained movement of the pinned ref right now, if any. Raises
+    :class:`GitContextError` when the check itself cannot be made."""
+
+    if state.remote_pin is None:
+        return None
+    stage_base = None
+    if candidate_sha is not None:
+        try:
+            stage_base = stage.read_state().base_sha
+        except StageError:
+            stage_base = None
+    _observed, movement = check_movement(
+        repo_root,
+        state.remote_pin,
+        state.remote_records,
+        stage_id=stage.stage_id,
+        candidate_sha=candidate_sha,
+        stage_base=stage_base,
+    )
+    return movement
+
+
+def _after_turn_check(state: PlanRunState, repo_root: Path, stage: Stage) -> Callable[[], None]:
+    """The check run after every agent turn: raises
+    :class:`RemoteMovementDetected` for unexplained movement, and
+    :class:`LoopError` when the pinned ref cannot be checked at all."""
+
+    def check() -> None:
+        try:
+            movement = _movement_now(state, repo_root, stage)
+        except GitContextError as exc:
+            raise LoopError(
+                f"the pinned remote target of stage {stage.stage_id!r} could not be checked after "
+                f"an agent turn: {exc}"
+            ) from exc
+        if movement is not None:
+            raise RemoteMovementDetected(movement)
+
+    return check
+
+
+def acknowledge_remote_movement(
+    sparring_dir: Path,
+    *,
+    run_key: str,
+    observed: str,
+    by: str | None = None,
+    report: Reporter = lambda message: None,
+) -> RemoteRecord:
+    """A person's explicit acknowledgement of the remote movement a run is
+    paused on, naming the run and the observed tip (``absent`` for a ref
+    that is gone).
+
+    Refused unless the run is paused on exactly that movement. Recorded in
+    the run's own state with who and when; the pause is cleared and the run
+    stays paused, to be resumed separately. It is not a review, an
+    acceptance or a push authorization, and it records none of those.
+    """
+
+    state_path = run_state_path(sparring_dir, run_key)
+    if not state_path.is_file():
+        raise PlanError(f"no plan run {run_key!r} is recorded at {state_path}")
+    state = PlanRunState.load(state_path)
+    movement = state.awaiting
+    if not isinstance(movement, UnauthorizedRemoteMovement):
+        raise PlanError(
+            f"plan run {run_key} is not paused on {UNAUTHORIZED_REMOTE_MOVEMENT}; there is "
+            "nothing to acknowledge"
+        )
+    wanted = observed.strip().lower()
+    if wanted == ABSENT:
+        matches = movement.observed_tip is None
+    else:
+        matches = movement.observed_tip is not None and movement.observed_tip.lower() == wanted
+    if not matches:
+        raise PlanError(
+            f"plan run {run_key} is paused on {movement.remote} {movement.ref} at "
+            f"{movement.observed_label}, not {observed}; refusing to acknowledge a tip the run "
+            "did not observe"
+        )
+    record = acknowledgement(run=run_key, movement=movement, by=by or who())
+    state.remote_records = state.remote_records + (record,)
+    state.awaiting = None
+    state.status = PlanRunStatus.PAUSED
+    state.save(state_path)
+    report(
+        f"acknowledged by {record.by} at {record.recorded_at}: {movement.remote} {movement.ref} "
+        f"at {movement.observed_label} (the records explained {movement.expected_tip or ABSENT}). "
+        "Nothing was reviewed, accepted, pushed or authorized; resume the run to continue."
+    )
+    return record
 
 
 def _resuming_authorized_push(
@@ -3970,6 +4206,59 @@ def _drive(
     sparring_dir: Path,
     repo_root: Path,
     make_adapters: AdapterFactory,
+    **kwargs: Any,
+) -> PlanRunResult:
+    """:func:`_drive_pinned`, held to the run's trusted Git configuration.
+
+    A run paused on unauthorized remote movement stays paused: nothing --
+    not a push authorization, not evidence, not a resume -- moves it on
+    except an explicit acknowledgement (:func:`acknowledge_remote_movement`).
+    """
+
+    movement = state.awaiting
+    if isinstance(movement, UnauthorizedRemoteMovement):
+        _pause(state, state_path)
+        report: Reporter = kwargs.get("report") or (lambda message: None)
+        report(
+            f"plan {state.plan}: still paused on {UNAUTHORIZED_REMOTE_MOVEMENT}: "
+            f"{movement.describe}. Nothing was run, pushed, frozen or accepted. Acknowledge it "
+            f"with `sparring acknowledge-remote-movement --run-key {_RunOwner.of(state).key} "
+            f"--observed {movement.observed_label}` once you have looked."
+        )
+        return PlanRunResult(
+            status=PlanRunStatus.PAUSED,
+            plan=state.plan,
+            run=_RunOwner.of(state).key,
+            stage_id=movement.stage_id,
+            awaiting=movement,
+        )
+    pin = state.remote_pin
+    guard = (
+        engine_git.trusted_config([Path(repo_root)], pin.trusted_config)
+        if pin is not None
+        else contextlib.nullcontext()
+    )
+    with guard:
+        return _drive_pinned(
+            source,
+            stages,
+            state,
+            state_path,
+            sparring_dir,
+            repo_root,
+            make_adapters,
+            **kwargs,
+        )
+
+
+def _drive_pinned(
+    source: PlanSource,
+    stages: tuple[PlannedStage, ...],
+    state: PlanRunState,
+    state_path: Path,
+    sparring_dir: Path,
+    repo_root: Path,
+    make_adapters: AdapterFactory,
     *,
     max_send_back_cycles: int,
     self_check: bool,
@@ -4222,6 +4511,27 @@ def _drive(
                 )
                 sparrer_first = False  # only the stage this resume entered
                 _retire_pending_evidence(state, state_path)
+                # After the reviewer's turn, as after every agent turn.
+                try:
+                    _after_turn_check(state, repo_root, stage)()
+                except RemoteMovementDetected as detected:
+                    _stop_for_movement(state, state_path, activity, detected.movement, report=report)
+                    return PlanRunResult(
+                        status=PlanRunStatus.PAUSED,
+                        plan=state.plan,
+                        run=_RunOwner.of(state).key,
+                        stage_id=stage.stage_id,
+                        awaiting=detected.movement,
+                        accepted=tuple(accepted),
+                    )
+                except LoopError as exc:
+                    raise _fail(
+                        state,
+                        state_path,
+                        activity,
+                        why="remote check failed",
+                        message=f"plan {state.plan} stopped at stage {stage.stage_id!r}: {exc}",
+                    ) from exc
                 if review.outcome is not RoutingAction.READY:
                     _pause(state, state_path)
                     activity.emit("plan.paused", action=review.outcome.value)
@@ -4268,6 +4578,16 @@ def _drive(
                 try:
                     result = accept_reviewed_candidate(
                         stage, repo_root, expected_branch=state.expected_branch
+                    )
+                except UnauthorizedRemoteMovementError as exc:
+                    _stop_for_movement(state, state_path, activity, exc.movement, report=report)
+                    return PlanRunResult(
+                        status=PlanRunStatus.PAUSED,
+                        plan=state.plan,
+                        run=_RunOwner.of(state).key,
+                        stage_id=stage.stage_id,
+                        awaiting=exc.movement,
+                        accepted=tuple(accepted),
                     )
                 except AcceptanceError as exc:
                     raise _fail(
@@ -4469,8 +4789,8 @@ def _drive(
                             ),
                             "finalization": (
                                 "the sparrer already said READY and the reviewed candidate is "
-                                "not committed; committing and pushing exactly that work, then "
-                                "reviewing the commit"
+                                "not committed; committing exactly that work, then reviewing "
+                                "the commit (the engine pushes after authorization)"
                             ),
                             "stage": "running the implementation <-> sparring loop",
                         }[start_with]
@@ -4525,6 +4845,20 @@ def _drive(
                                 "next_turn" if start_with == "next_turn" else "evidence"
                             ),
                             pending_deferred=state.unresolved_deferred,
+                            after_turn=_after_turn_check(state, repo_root, stage),
+                        )
+                    except RemoteMovementDetected as detected:
+                        state.left_provider_pause = None
+                        _stop_for_movement(
+                            state, state_path, activity, detected.movement, report=report
+                        )
+                        return PlanRunResult(
+                            status=PlanRunStatus.PAUSED,
+                            plan=state.plan,
+                            run=_RunOwner.of(state).key,
+                            stage_id=stage.stage_id,
+                            awaiting=detected.movement,
+                            accepted=tuple(accepted),
                         )
                     except LoopError as exc:
                         raise _fail_or_pause_for_provider(
@@ -4595,6 +4929,16 @@ def _drive(
                         stage, sparring_dir, repo_root, expected_branch=state.expected_branch
                     )
                     result = accept_candidate(stage, repo_root, expected_branch=state.expected_branch)
+                except UnauthorizedRemoteMovementError as exc:
+                    _stop_for_movement(state, state_path, activity, exc.movement, report=report)
+                    return PlanRunResult(
+                        status=PlanRunStatus.PAUSED,
+                        plan=state.plan,
+                        run=_RunOwner.of(state).key,
+                        stage_id=stage.stage_id,
+                        awaiting=exc.movement,
+                        accepted=tuple(accepted),
+                    )
                 except AcceptanceError as exc:
                     raise _fail(
                         state,
@@ -4753,6 +5097,7 @@ __all__ = [
     "PlanStage",
     "PlannedStage",
     "RecordedRun",
+    "acknowledge_remote_movement",
     "describe_source",
     "find_runs",
     "legacy_run_key",

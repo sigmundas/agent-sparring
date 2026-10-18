@@ -36,6 +36,7 @@ from agent_sparring.plan import (
     PlanRunError,
     PlanRunState,
     PlanRunStatus,
+    acknowledge_remote_movement,
     resume_plan,
 )
 from agent_sparring.push_gate import (
@@ -122,20 +123,30 @@ class PushCommandShapeTests(unittest.TestCase):
     function that builds it."""
 
     TARGET = PushTarget(
-        candidate_sha="a" * 40, branch="feature/x", remote="origin", remote_branch="feature/x"
+        candidate_sha="a" * 40,
+        branch="feature/x",
+        remote="origin",
+        remote_branch="feature/x",
+        url="/srv/pinned.git",
     )
 
-    def test_pushes_one_fully_qualified_refspec_to_the_named_remote(self):
+    def test_pushes_exactly_the_authorized_commit_to_the_pinned_url(self):
         self.assertEqual(
             push_command(self.TARGET),
             [
                 "-c",
                 "push.followTags=false",
                 "push",
-                "origin",
-                "refs/heads/feature/x:refs/heads/feature/x",
+                "/srv/pinned.git",
+                f"{'a' * 40}:refs/heads/feature/x",
             ],
         )
+
+    def test_without_a_pin_it_names_the_remote(self):
+        command = push_command(
+            PushTarget(candidate_sha="a" * 40, branch="feature/x", remote="origin", remote_branch="feature/x")
+        )
+        self.assertEqual(command[-2], "origin")
 
     def test_carries_no_force_no_tags_and_no_deletion(self):
         command = push_command(self.TARGET)
@@ -154,11 +165,12 @@ class PushCommandShapeTests(unittest.TestCase):
             "--no-verify",
         ):
             self.assertNotIn(forbidden, command)
-        # A refspec with a non-empty source cannot delete a ref, and both
-        # sides are fully qualified so no push configuration can widen it.
+        # A refspec with a non-empty source cannot delete a ref; the source is
+        # the exact commit (not a branch that could move) and the destination
+        # is fully qualified, so no push configuration can widen it.
         refspec = command[-1]
         source, _, destination = refspec.partition(":")
-        self.assertTrue(source.startswith("refs/heads/"))
+        self.assertEqual(source, "a" * 40)
         self.assertTrue(destination.startswith("refs/heads/"))
         self.assertEqual(refspec.count(":"), 1)
 
@@ -169,10 +181,11 @@ class PushCommandShapeTests(unittest.TestCase):
                 branch="feature/local",
                 remote="upstream",
                 remote_branch="feature/remote",
+                url="/srv/upstream.git",
             )
         )
-        self.assertEqual(command[-2], "upstream")
-        self.assertEqual(command[-1], "refs/heads/feature/local:refs/heads/feature/remote")
+        self.assertEqual(command[-2], "/srv/upstream.git")
+        self.assertEqual(command[-1], f"{'b' * 40}:refs/heads/feature/remote")
 
 
 class AuthorizationBindingTests(unittest.TestCase):
@@ -301,10 +314,22 @@ class _RemoteAwareTestCase(_PlanRepoTestCase):
     against the real starting point rather than against the branch not
     existing (the fixture pushes it in setUp, as a real project has)."""
 
+    # These tests are about the permission itself, so runs start without one.
+    GRANT_PUSH_FOR_RUN = False
+
     def setUp(self):
         super().setUp()
         self.remote_before = _remote_sha(self.remote, "feature/x")
         self.assertIsNotNone(self.remote_before)
+
+    def _reject_pushes(self):
+        """Make the bare remote refuse every push (its own pre-receive hook,
+        on the remote's side), while it can still be read."""
+
+        hook = self.remote / "hooks" / "pre-receive"
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text("#!/bin/sh\necho rejected by the remote >&2\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
 
     def assertNothingPushed(self):
         self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
@@ -324,7 +349,9 @@ class PushGateTests(_RemoteAwareTestCase):
         _run_git(self.repo, "commit", "-q", "-m", name)
         return _head_sha(self.repo)
 
-    def test_an_already_pushed_candidate_is_left_alone(self):
+    def test_an_already_pushed_candidate_is_unexplained_movement_not_success(self):
+        # Reachability alone is never success: nothing in the engine's records
+        # says who put this commit there (the Sporely Stage 4b shape).
         sha = self._commit("one.txt")
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
         outcome = ensure_candidate_pushed(
@@ -332,7 +359,10 @@ class PushGateTests(_RemoteAwareTestCase):
         )
         self.assertIsNone(outcome.required)
         self.assertFalse(outcome.pushed)
-        self.assertEqual(outcome.target.candidate_sha, sha)
+        self.assertIsNotNone(outcome.movement)
+        self.assertEqual(outcome.movement.kind, "unauthorized_remote_movement")
+        self.assertEqual(outcome.movement.candidate_sha, sha)
+        self.assertTrue(outcome.blocked)
 
     def test_without_authorization_nothing_is_pushed_and_the_request_is_typed(self):
         sha = self._commit("one.txt")
@@ -366,6 +396,14 @@ class PushGateTests(_RemoteAwareTestCase):
         self.assertTrue(outcome.pushed)
         self.assertIsNone(outcome.required)
         self.assertPushed(sha)
+        receipt = outcome.receipt
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt.kind, "push_receipt")
+        self.assertEqual(receipt.stage_id, "stage-1")
+        self.assertEqual(receipt.remote, "origin")
+        self.assertEqual(receipt.ref, "refs/heads/feature/x")
+        self.assertEqual(receipt.previous_tip, self.remote_before)
+        self.assertEqual(receipt.tip, sha)
 
     def test_authorization_for_a_different_commit_does_not_authorize_this_one(self):
         first = self._commit("one.txt")
@@ -426,9 +464,8 @@ class PushGateTests(_RemoteAwareTestCase):
     def test_a_failing_push_is_reported_and_the_candidate_stays_unpushed(self):
         self._commit("one.txt")
         authorization = authorization_for_run(self.repo, branch="feature/x")
-        # A remote that cannot be written to: the ordinary, realistic failure.
-        (self.remote / "HEAD").chmod(0o444)
-        _run_git(self.repo, "remote", "set-url", "origin", str(self.remote / "gone.git"))
+        # A remote that refuses the write: the ordinary, realistic failure.
+        self._reject_pushes()
 
         with self.assertRaises(PushError) as ctx:
             ensure_candidate_pushed(
@@ -444,12 +481,9 @@ class PushGateTests(_RemoteAwareTestCase):
         sha = self._commit("one.txt")
         authorization = authorization_for_run(self.repo, branch="feature/x")
 
-        # git reported success and the candidate is still not reachable: the
-        # one shape in which a "successful" push must not be believed.
-        with mock.patch(
-            "agent_sparring.push_gate.verify_pushed",
-            side_effect=[(False, "not there yet"), (False, "still not there")],
-        ):
+        # git reported success and the pinned ref is still not the candidate:
+        # the one shape in which a "successful" push must not be believed.
+        with mock.patch("agent_sparring.push_gate.observe", return_value=self.remote_before):
             with self.assertRaises(PushError) as ctx:
                 ensure_candidate_pushed(
                     self.repo,
@@ -573,7 +607,7 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         # something. There is no candidate awaiting permission, so there is
         # nothing this flag could be about.
         self._start(
-            _Implementer(self.repo, push=True), _SparringAdapter([NEEDS_YOU]), stop_after_stage=S1
+            _Implementer(self.repo), _SparringAdapter([NEEDS_YOU]), stop_after_stage=S1
         )
         self.assertIsNone(self._plan_state().awaiting)
 
@@ -686,7 +720,7 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
     def test_a_push_failure_stops_the_run_and_accepts_nothing(self):
-        _run_git(self.repo, "remote", "set-url", "origin", str(self.remote.parent / "gone.git"))
+        self._reject_pushes()
 
         with self.assertRaises(PlanRunError) as ctx:
             self._start(self._unpushed(), _SparringAdapter([READY]), allow_push_for_run=True)
@@ -697,10 +731,7 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
 
     def test_a_push_whose_result_cannot_be_verified_accepts_nothing(self):
-        with mock.patch(
-            "agent_sparring.push_gate.verify_pushed",
-            side_effect=[(False, "not there"), (False, "still not there")],
-        ):
+        with mock.patch("agent_sparring.push_gate.observe", return_value=self.remote_before):
             with self.assertRaises(PlanRunError):
                 self._start(
                     self._unpushed(), _SparringAdapter([READY]), allow_push_for_run=True
@@ -709,9 +740,9 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
         self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
 
-    def test_pushing_it_yourself_and_resuming_accepts_it_without_any_permission(self):
-        # The third answer to the request, and the one that needs nothing from
-        # the engine: the person pushes the branch and resumes normally.
+    def test_pushing_it_yourself_is_unexplained_movement_until_acknowledged(self):
+        # A push made outside the engine is not one of its answers any more:
+        # nothing in the run's records explains it, so the run stops on it.
         self._start(self._unpushed(), _SparringAdapter([READY]), stop_after_stage=S1)
         sha = _head_sha(self.repo)
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
@@ -719,26 +750,37 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         stage_adapter = self._unpushed()
         result = self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
 
-        # No agent ran and nothing was pushed by the engine: the recorded
-        # READY was already over this exact commit, and it is now reachable.
         self.assertEqual(stage_adapter.turns, 0)
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.awaiting.kind, "unauthorized_remote_movement")
+        self.assertEqual(result.awaiting.observed_tip, sha)
+        self.assertEqual(result.awaiting.expected_tip, self.remote_before)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+
+        # A person who has looked acknowledges exactly what they saw; the
+        # run then accepts the reviewed commit without pushing anything.
+        acknowledge_remote_movement(self.sparring_dir, run_key=self.run_key, observed=sha, by="tester")
+        result = self._resume(self._unpushed(), _SparringAdapter([]), stop_after_stage=S1)
+
         self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
         self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1])
         self.assertIsNone(self._plan_state().push_authorization)
-        self.assertIsNone(self._plan_state().awaiting)
         self.assertPushed(sha)
 
-    def test_an_authorization_is_permission_and_not_an_instruction(self):
-        # The stage pushes its own candidate, as a well-behaved agent may.
-        # Nothing else is pushed on top of that.
+    def test_an_agent_pushing_its_own_candidate_stops_the_run_even_under_a_run_grant(self):
+        # A run-level grant is permission for the *engine* to push. An agent
+        # that pushes on its own produced movement no record explains.
         stage_adapter = _Implementer(self.repo, push=True)
 
         result = self._start(
             stage_adapter, _SparringAdapter([READY, READY]), allow_push_for_run=True
         )
 
-        self.assertIs(result.status, PlanRunStatus.COMPLETE)
-        self.assertPushed(_head_sha(self.repo))
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.awaiting.kind, "unauthorized_remote_movement")
+        self.assertEqual(result.accepted, ())
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        self.assertFalse(self._stage(S2).exists())
 
     def test_a_run_recorded_before_push_authorization_existed_loads_as_no_authorization(self):
         self._start(self._unpushed(), _SparringAdapter([READY]), stop_after_stage=S1)

@@ -14,6 +14,9 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_sparring import engine_git
+from agent_sparring.engine_git import GitConfigRefusal, GitContextError
+
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -29,10 +32,6 @@ def is_full_sha(value: object) -> bool:
     """
 
     return isinstance(value, str) and _FULL_SHA_RE.match(value) is not None
-
-
-class GitContextError(RuntimeError):
-    """Raised when git context cannot be gathered for a repo/revision."""
 
 
 @dataclass(frozen=True)
@@ -64,12 +63,10 @@ class GitContext:
 
 
 def _run(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo_root), *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    # The one engine Git path (see agent_sparring.engine_git): no hooks,
+    # fsmonitor, drivers or included configuration, and -- inside a managed
+    # run -- no configuration that changed since the run started.
+    return engine_git.run(repo_root, *args)
 
 
 def _git(repo_root: Path, *args: str) -> str:
@@ -296,11 +293,16 @@ def verify_pushed(repo_root: Path, candidate_sha: str, branch: str) -> tuple[boo
 
     remote, remote_branch = tracking_remote(repo_root, branch)
     ref = f"refs/heads/{remote_branch}"
-    result = _run(repo_root, "ls-remote", "--exit-code", remote, ref)
+    # Read by URL: inside a managed run a remote operation runs in an
+    # isolated repository where remote names do not exist (see
+    # agent_sparring.engine_git.run_remote).
+    got = _run(repo_root, "remote", "get-url", remote)
+    configured = got.stdout.strip() if got.returncode == 0 else ""
+    url = absolute_url(repo_root, configured) if configured else remote
+    result = _run(repo_root, "ls-remote", "--exit-code", url, ref)
     if result.returncode != 0:
         return False, (
-            f"{remote} has no {ref}; push the branch before presenting a candidate "
-            f"({result.stderr.strip() or 'ls-remote failed'})"
+            f"{remote} has no {ref} yet ({result.stderr.strip() or 'ls-remote failed'})"
         )
     first_line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
     remote_sha = first_line.split()[0] if first_line else ""
@@ -315,10 +317,93 @@ def verify_pushed(repo_root: Path, candidate_sha: str, branch: str) -> tuple[boo
         )
     if _run(repo_root, "merge-base", "--is-ancestor", candidate_sha, remote_sha).returncode == 0:
         return True, f"{candidate_sha} is reachable from {remote}/{remote_branch} ({remote_sha})"
-    return False, (
-        f"{candidate_sha} is not reachable from {remote}/{remote_branch} ({remote_sha}); "
-        f"push the branch before presenting a candidate"
-    )
+    return False, f"{candidate_sha} is not reachable from {remote}/{remote_branch} ({remote_sha})"
+
+
+def remote_tip(
+    repo_root: Path, url: str, ref: str, *, trusted: tuple[tuple[str, str], ...]
+) -> str | None:
+    """The commit ``ref`` points at in the repository at ``url``, or ``None``
+    when that ref does not exist there.
+
+    ``url`` is passed to Git as a URL, never as a remote name, and the read
+    runs in an isolated repository configured only from ``trusted`` (see
+    :func:`agent_sparring.engine_git.run_remote`), so no repository
+    configuration can redirect it. Only a line naming exactly ``ref``
+    counts (``ls-remote`` patterns also match longer refs ending in the
+    same components). An unreachable remote raises :class:`GitContextError`
+    -- "cannot tell" is never read as "absent".
+    """
+
+    if url.startswith("-") or ref.startswith("-"):
+        raise GitContextError(f"refusing to read {ref!r} at {url!r}: git would read it as an option")
+    result = engine_git.run_remote(repo_root, trusted, "ls-remote", url, ref)
+    if result.returncode != 0:
+        raise GitContextError(
+            f"cannot read {ref} at {url}: {result.stderr.strip() or 'git ls-remote failed'}"
+        )
+    for line in result.stdout.splitlines():
+        sha, _, name = line.partition("\t")
+        if name.strip() == ref:
+            sha = sha.strip()
+            if not _FULL_SHA_RE.match(sha):
+                raise GitContextError(f"{url} {ref} did not report a usable commit id ({sha!r})")
+            return sha
+    return None
+
+
+def is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
+    """Is ``ancestor`` ``descendant`` or one of its ancestors? ``False`` when
+    either commit is not present locally -- reachability that cannot be
+    proven here is not assumed."""
+
+    if ancestor == descendant:
+        return True
+    return _run(repo_root, "merge-base", "--is-ancestor", ancestor, descendant).returncode == 0
+
+
+_SCP_LIKE_RE = re.compile(r"^[^/]+:")
+
+
+def absolute_url(repo_root: Path, url: str) -> str:
+    """``url`` as Git would resolve it when run in ``repo_root``, made
+    independent of the working directory: a relative local path (such as
+    ``../remote.git``) becomes absolute; URLs and ``host:path`` forms are
+    returned unchanged."""
+
+    if "://" in url or url.startswith("/") or _SCP_LIKE_RE.match(url):
+        return url
+    return str((Path(repo_root) / url).resolve())
+
+
+def resolved_push_url(repo_root: Path, remote: str) -> str | None:
+    """Where ``git push <remote>`` would actually write: ``remote.<r>.pushurl``
+    or ``.url`` after Git's own ``insteadOf``/``pushInsteadOf`` rewriting,
+    made absolute (see :func:`absolute_url`). ``None`` when the remote has
+    no URL."""
+
+    result = _run(repo_root, "remote", "get-url", "--push", remote)
+    url = result.stdout.strip()
+    if result.returncode != 0 or not url:
+        return None
+    return absolute_url(repo_root, url)
+
+
+def config_values(repo_root: Path, key: str) -> tuple[str, ...]:
+    """Every value of ``key`` (``git config --get-all``), in order."""
+
+    result = _run(repo_root, "config", "--get-all", key)
+    if result.returncode != 0:
+        return ()
+    return tuple(line for line in result.stdout.splitlines() if line)
+
+
+def config_value(repo_root: Path, key: str) -> str | None:
+    """``git config --get key`` (the last value), or ``None`` when unset."""
+
+    result = _run(repo_root, "config", "--get", key)
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
 
 
 def diff_patch(repo_root: Path, base_sha: str, candidate_sha: str) -> str:

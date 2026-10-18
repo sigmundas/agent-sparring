@@ -334,7 +334,6 @@ class LegacyDerivationTests(_Stuck):
         (self.repo / "later.txt").write_text("later\n")
         _run_git(self.repo, "add", "later.txt")
         _run_git(self.repo, "commit", "-q", "-m", "moved on")
-        _run_git(self.repo, "push", "-q", "origin", "feature/x")
 
         sparring = _SparringAdapter([READY])
         self._resume(stage_adapter, sparring, stop_after_stage=S1, next_turn="stage")
@@ -1142,7 +1141,6 @@ class FreshWithNextTurnTests(_Stuck):
         (self.repo / "later.txt").write_text("later\n")
         _run_git(self.repo, "add", "later.txt")
         _run_git(self.repo, "commit", "-q", "-m", "moved on")
-        _run_git(self.repo, "push", "-q", "origin", "feature/x")
 
         self._resume(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1,
                      next_turn="stage", fresh_roles=("stage",), fresh_reason="context full")

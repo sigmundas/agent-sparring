@@ -85,7 +85,14 @@ class _WebOnMain(_Sealed):
         return load_plan_source(approval.manifest_path, self.web, manifest=True)
 
     def start_web(self, approval, adapters, branch):
-        return start_plan(self.web_source(approval), self.web_sparring, self.web, adapters, expected_branch=branch)
+        # The engine pushes each verified candidate, under the run-level
+        # grant a person gives at start -- never for a protected branch, which
+        # a slice must be moved off before it runs (and a run holding a grant
+        # for one cannot be moved).
+        return start_plan(
+            self.web_source(approval), self.web_sparring, self.web, adapters, expected_branch=branch,
+            allow_push_for_run=branch != "main",
+        )
 
     def failed_on_main(self):
         """Stage 1B sealed on main, and a run refused before any provider turn."""
@@ -111,6 +118,7 @@ class _WebOnMain(_Sealed):
         return resume_plan(
             self.web_source(web), self.web_sparring, self.web,
             lambda s: (stage, _SparringAdapter([READY] * 4)), expected_branch=branch,
+            allow_push_for_run=True,
         )
 
 

@@ -50,8 +50,9 @@ def _head(repo: Path) -> str:
 
 
 class _Committer:
-    """A stage agent that commits and pushes one file per turn on ``branch``,
-    optionally doing something else first (the ``during`` hook)."""
+    """A stage agent that commits one file per turn on ``branch``, optionally
+    doing something else first (the ``during`` hook). It never pushes: the
+    engine pushes, after authorization."""
 
     def __init__(self, repo: Path, branch: str, *, during=None, fail_at=None):
         self.repo, self.branch, self.during, self.fail_at = repo, branch, during, fail_at
@@ -67,7 +68,6 @@ class _Committer:
         path.write_text("work\n", encoding="utf-8")
         _git(self.repo, "add", path.name)
         _git(self.repo, "commit", "-q", "-m", f"turn {self.calls}")
-        _git(self.repo, "push", "-q", "origin", self.branch)
         return StageAgentResult(session_id=session_id, text="claims", is_error=False)
 
     def start(self, prompt):
@@ -112,6 +112,9 @@ class _Sealed(_Repo):
 
     def start(self, approval, adapters, *, repo=None, branch=APP_BRANCH, **kwargs):
         repo = repo or self.repo
+        # The engine pushes each verified candidate, under the run-level
+        # grant a person gives at start.
+        kwargs.setdefault("allow_push_for_run", True)
         return start_plan(
             self.source(approval, repo), repo / ".sparring", repo, adapters, expected_branch=branch, **kwargs
         )

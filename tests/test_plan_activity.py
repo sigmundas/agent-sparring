@@ -94,7 +94,7 @@ class _PlanActivityCase(_PlanRepoTestCase):
         """Everything the plan runner decides from, with commit ids
         normalized so two repositories can be compared byte for byte."""
 
-        snapshot = {"plan": self.state_path.read_text(encoding="utf-8")}
+        snapshot = {"plan": _without_remote_pin(self.state_path.read_text(encoding="utf-8"))}
         for stage_id in (S1, S2):
             stage = self._stage(stage_id)
             if stage.exists():
@@ -102,6 +102,15 @@ class _PlanActivityCase(_PlanRepoTestCase):
             else:
                 snapshot[stage_id] = "<absent>"
         return {key: _TS_RE.sub(r'"\1_at": "<ts>"', _SHA_RE.sub("<sha>", value)) for key, value in snapshot.items()}
+
+
+def _without_remote_pin(text: str) -> str:
+    """Plan-run state without its remote pin, whose URL is the repository's
+    own (temporary) path and whose pin time is wall-clock bookkeeping."""
+
+    payload = json.loads(text)
+    payload.pop("remote_pin", None)
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
 # -- per-stage provider binding, end to end ---------------------------------
@@ -408,21 +417,28 @@ class PlanEventChronologyTests(_PlanActivityCase):
         result = self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY, READY]))
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
 
+        # The engine pushes each committed candidate (the run holds a
+        # run-level grant) before the acceptance gate runs.
         s1_events, s2_events = _plan_events(self._s1()), _plan_events(self._s2())
         self.assertEqual(
             [(e["event"], e.get("summary")) for e in s1_events],
-            [("plan.stage.entered", "Stage 1 — Foundation (1/2)"), ("plan.stage.accepted", None)],
+            [
+                ("plan.stage.entered", "Stage 1 — Foundation (1/2)"),
+                ("plan.candidate.pushed", None),
+                ("plan.stage.accepted", None),
+            ],
         )
         self.assertEqual(
             [(e["event"], e.get("summary")) for e in s2_events],
             [
                 ("plan.stage.entered", "Stage 2 — Incremental rendering (2/2)"),
+                ("plan.candidate.pushed", None),
                 ("plan.stage.accepted", None),
                 ("plan.completed", "2 stage(s) accepted"),
             ],
         )
-        self.assertEqual(s1_events[1]["sha"], self._s1().read_state().candidate_sha)
-        self.assertEqual(s2_events[1]["sha"], self._s2().read_state().candidate_sha)
+        self.assertEqual(s1_events[2]["sha"], self._s1().read_state().candidate_sha)
+        self.assertEqual(s2_events[2]["sha"], self._s2().read_state().candidate_sha)
         self.assertNotEqual(s1_events[1]["sha"], s2_events[1]["sha"])
         for event in s1_events + s2_events:
             self.assertEqual((event["v"], event["actor"]), (1, "plan"))
@@ -524,7 +540,11 @@ class PlanEventChronologyTests(_PlanActivityCase):
         self.assertIn("acceptance gate refused", str(ctx.exception))
         self.assertEqual(
             [(e["event"], e.get("summary")) for e in _plan_events(self._s1())],
-            [("plan.stage.entered", "Stage 1 — Foundation (1/2)"), ("plan.failed", "acceptance gate refused")],
+            [
+                ("plan.stage.entered", "Stage 1 — Foundation (1/2)"),
+                ("plan.candidate.pushed", None),
+                ("plan.failed", "acceptance gate refused"),
+            ],
         )
         # The refusal's own detail (remote names, paths) stays out of the log.
         self.assertNotIn(str(self.remote), self._s1().activity_path().read_text(encoding="utf-8"))
@@ -534,7 +554,9 @@ class PlanEventChronologyTests(_PlanActivityCase):
         # A committed but unpushed candidate: the sparrer says READY and the
         # run stops to ask, which is a pause and not a failure.
         result = self._start(
-            _StageAdapter(self.repo, commit=True, push=False), _SparringAdapter([READY])
+            _StageAdapter(self.repo, commit=True, push=False),
+            _SparringAdapter([READY]),
+            allow_push_for_run=False,
         )
 
         self.assertIs(result.status, PlanRunStatus.PAUSED)
@@ -558,7 +580,6 @@ class PlanEventChronologyTests(_PlanActivityCase):
                 plan.write_text(plan.read_text(encoding="utf-8").replace("Lay the groundwork", "Dig"),
                                 encoding="utf-8")
                 _run_git(self.repo, "commit", "-q", "-am", "edit plan")
-                _run_git(self.repo, "push", "-q", "origin", "feature/x")
                 return super()._turn(session_id)
 
         with self.assertRaises(PlanRunError):
@@ -599,7 +620,7 @@ class _Env:
         self.state_path = run_state_path(self.sparring_dir, self.run_key)
 
     def snapshot(self) -> dict[str, str]:
-        snapshot = {"plan": self.state_path.read_text(encoding="utf-8")}
+        snapshot = {"plan": _without_remote_pin(self.state_path.read_text(encoding="utf-8"))}
         for stage_id in (S1, S2):
             stage = Stage.resolve(self.sparring_dir, stage_id)
             snapshot[stage_id] = (

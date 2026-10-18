@@ -82,9 +82,12 @@ and, like every other refusal here, leaves ``state.json`` untouched.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
+from agent_sparring import engine_git
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import (
     DirtyEntry,
@@ -96,6 +99,15 @@ from agent_sparring.git_context import (
     verify_pushed,
 )
 from agent_sparring.prompt_capture import PROMPTS_DIRNAME, is_prompt_artifact
+from agent_sparring.remote_pin import (
+    UNAUTHORIZED_REMOTE_MOVEMENT,
+    RemotePinError,
+    RunRemoteState,
+    UnauthorizedRemoteMovement,
+    check_movement,
+    load_run_remote_state,
+    verify_pinned,
+)
 from agent_sparring.stage import (
     ACTIVITY_FILENAME,
     BRIEF_FILENAME,
@@ -190,11 +202,98 @@ class AcceptanceResult:
     repositories: tuple[CandidateRepository, ...] = field(default_factory=tuple)
 
 
+class UnauthorizedRemoteMovementError(AcceptanceError):
+    """The run this stage belongs to has unexplained movement on its pinned
+    remote ref (see :mod:`agent_sparring.remote_pin`): nothing is frozen or
+    accepted until a person acknowledges it."""
+
+    def __init__(self, movement: UnauthorizedRemoteMovement) -> None:
+        super().__init__(
+            f"refusing: {UNAUTHORIZED_REMOTE_MOVEMENT}: {movement.describe}. Nothing was frozen "
+            "or accepted; acknowledge the movement (sparring acknowledge-remote-movement) once "
+            "you have looked"
+        )
+        self.movement = movement
+
+
 def _read_state(stage: Stage) -> StageState:
     try:
         return stage.read_state()
     except StageError as exc:
         raise AcceptanceError(f"cannot read stage state: {exc}") from exc
+
+
+def _run_remote(stage: Stage) -> RunRemoteState | None:
+    """The remote records of the managed run that owns ``stage``, read from
+    that run's engine-written state -- never from any stage artifact.
+    ``None`` for an unowned (hand-driven) stage or a run with no state."""
+
+    run = _read_state(stage).run
+    if not run:
+        return None
+    sparring_dir = Path(stage.directory).parent.parent
+    try:
+        return load_run_remote_state(sparring_dir, run)
+    except RemotePinError as exc:
+        raise AcceptanceError(f"cannot read the remote records of run {run}: {exc}") from exc
+
+
+@contextlib.contextmanager
+def _run_guard(stage: Stage, repo_root: Path) -> Iterator[RunRemoteState | None]:
+    """Hold this operation's Git invocations to the owning run's trusted
+    configuration snapshot, when the run has one."""
+
+    remote = _run_remote(stage)
+    if remote is not None and remote.pin is not None:
+        with engine_git.trusted_config([Path(repo_root)], remote.pin.trusted_config):
+            yield remote
+    else:
+        yield remote
+
+
+def _require_explained(
+    remote: RunRemoteState | None,
+    stage: Stage,
+    repo_root: Path,
+    candidate_sha: str,
+    stage_base: str | None,
+) -> None:
+    """Refuse while the owning run is paused on, or would now detect,
+    remote movement its records do not explain."""
+
+    if remote is None:
+        return
+    if remote.movement is not None:
+        raise UnauthorizedRemoteMovementError(remote.movement)
+    if remote.pin is None:
+        return
+    try:
+        _observed, movement = check_movement(
+            repo_root,
+            remote.pin,
+            remote.records,
+            stage_id=stage.stage_id,
+            candidate_sha=candidate_sha,
+            stage_base=stage_base,
+        )
+    except GitContextError as exc:
+        raise AcceptanceError(f"cannot check the run's pinned remote ref: {exc}") from exc
+    if movement is not None:
+        raise UnauthorizedRemoteMovementError(movement)
+
+
+def _pushed(
+    remote: RunRemoteState | None, repo_root: Path, sha: str, branch: str
+) -> tuple[bool, str]:
+    """Reachability against the run's pinned target when it has one; the
+    branch's configured remote only for a stage no pinned run owns."""
+
+    try:
+        if remote is not None and remote.pin is not None:
+            return verify_pinned(repo_root, remote.pin, sha)
+        return verify_pushed(repo_root, sha, branch)
+    except GitContextError as exc:
+        raise AcceptanceError(str(exc)) from exc
 
 
 def _require_branch(repo_root: Path, expected_branch: str, *, operation: str) -> str:
@@ -576,8 +675,10 @@ def freeze_candidate(
     del sparring_dir
 
     try:
-        with worktree_lock(repo_root):
-            frozen = _freeze_candidate_locked(stage, repo_root, expected_branch=expected_branch)
+        with worktree_lock(repo_root), _run_guard(stage, repo_root) as remote:
+            frozen = _freeze_candidate_locked(
+                stage, repo_root, expected_branch=expected_branch, remote=remote
+            )
     except WorktreeLockError as exc:
         error = AcceptanceError(
             f"cannot freeze a candidate for stage {stage.stage_id!r}: {exc}"
@@ -614,6 +715,7 @@ def _freeze_candidate_locked(
     repo_root: Path,
     *,
     expected_branch: str,
+    remote: RunRemoteState | None = None,
 ) -> FreezeResult:
     state = _read_state(stage)
 
@@ -641,7 +743,10 @@ def _freeze_candidate_locked(
             f"does not represent ({listed}). Commit or discard them first."
         )
 
-    pushed, push_detail = verify_pushed(repo_root, candidate_sha, branch)
+    # Reachability is evidence only once the run's own records explain the
+    # pinned ref: a candidate an agent pushed itself is refused here too.
+    _require_explained(remote, stage, repo_root, candidate_sha, state.base_sha)
+    pushed, push_detail = _pushed(remote, repo_root, candidate_sha, branch)
     if not pushed:
         raise AcceptanceError(
             f"refusing to freeze {candidate_sha} as the candidate for stage "
@@ -719,9 +824,9 @@ def accept_candidate(
     """
 
     try:
-        with worktree_lock(repo_root):
+        with worktree_lock(repo_root), _run_guard(stage, repo_root) as remote:
             accepted = _accept_candidate_locked(
-                stage, repo_root, expected_branch=expected_branch
+                stage, repo_root, expected_branch=expected_branch, remote=remote
             )
     except WorktreeLockError as exc:
         error = AcceptanceError(
@@ -741,6 +846,7 @@ def _accept_candidate_locked(
     repo_root: Path,
     *,
     expected_branch: str,
+    remote: RunRemoteState | None = None,
 ) -> AcceptanceResult:
     state = _read_state(stage)
 
@@ -793,6 +899,20 @@ def _accept_candidate_locked(
             f"({listed}), even though HEAD still matches the frozen "
             "candidate. Commit or discard them first."
         )
+
+    # The owning run's pinned ref must still be what its records explain,
+    # as it had to be at the freeze -- and, independently of any
+    # acknowledgement, must still contain the frozen candidate: an
+    # acknowledged deletion or rewind explains the remote, it does not put
+    # the candidate back on it.
+    _require_explained(remote, stage, repo_root, frozen_sha, state.base_sha)
+    if remote is not None and remote.pin is not None:
+        pushed, push_detail = _pushed(remote, repo_root, frozen_sha, branch)
+        if not pushed:
+            raise AcceptanceError(
+                f"refusing to accept {frozen_sha} for stage {stage.stage_id!r}: it is no "
+                f"longer available on the run's pinned remote ref ({push_detail})"
+            )
 
     # The same two questions, asked of every pinned sibling candidate: is it
     # still exactly the commit that was reviewed, and does its worktree still
@@ -863,9 +983,9 @@ def accept_reviewed_candidate(
     """
 
     try:
-        with worktree_lock(repo_root):
+        with worktree_lock(repo_root), _run_guard(stage, repo_root) as remote:
             accepted = _accept_reviewed_candidate_locked(
-                stage, repo_root, expected_branch=expected_branch
+                stage, repo_root, expected_branch=expected_branch, remote=remote
             )
     except WorktreeLockError as exc:
         error = AcceptanceError(
@@ -885,6 +1005,7 @@ def _accept_reviewed_candidate_locked(
     repo_root: Path,
     *,
     expected_branch: str,
+    remote: RunRemoteState | None = None,
 ) -> AcceptanceResult:
     state = _read_state(stage)
 
@@ -938,7 +1059,8 @@ def _accept_reviewed_candidate_locked(
             "though HEAD still matches. Commit or discard them first."
         )
 
-    pushed, push_detail = verify_pushed(repo_root, reviewed_sha, branch)
+    _require_explained(remote, stage, repo_root, reviewed_sha, state.base_sha)
+    pushed, push_detail = _pushed(remote, repo_root, reviewed_sha, branch)
     if not pushed:
         raise AcceptanceError(
             f"refusing to complete the independent review of {reviewed_sha} for stage "
@@ -964,6 +1086,7 @@ __all__ = [
     "AcceptanceResult",
     "FreezeResult",
     "StaleCandidateError",
+    "UnauthorizedRemoteMovementError",
     "accept_candidate",
     "accept_reviewed_candidate",
     "freeze_candidate",

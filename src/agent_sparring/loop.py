@@ -37,9 +37,10 @@ So READY is terminal only once the reviewed candidate is a commit. When it
 is not, this loop routes one more ordinary cycle, with both halves narrowed
 to exactly what is missing:
 
-- the stage-agent turn is asked to commit and push that exact tree and
-  nothing else (``finalize_only``; see :func:`~agent_sparring.stage_prompt.
-  build_stage_prompt`);
+- the stage-agent turn is asked to commit that exact tree and nothing
+  else (``finalize_only``; see :func:`~agent_sparring.stage_prompt.
+  build_stage_prompt`) -- never to push it: the engine pushes, after
+  authorization, once the commit is reviewed;
 - :mod:`agent_sparring.finalization` then compares the committed content
   against the tree the sparrer reviewed, path by path. Anything still
   uncommitted, or any committed content that is not the reviewed content,
@@ -108,6 +109,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from agent_sparring.deferred_gate import DeferredObligation
 from agent_sparring.finalization import (
@@ -251,8 +253,15 @@ def run_unattended_loop(
     start_with: str = "stage",
     pending_deferred: tuple[DeferredObligation, ...] = (),
     sparring_first_reason: str = "evidence",
+    after_turn: Callable[[], None] | None = None,
 ) -> LoopResult:
     """Drive the stage<->sparring loop until a terminal routing action.
+
+    ``after_turn``, when given, is called after every agent turn (stage and
+    sparring alike) that returned, before anything else looks at its
+    result. The managed plan runner uses it to check its pinned remote ref
+    for movement its records do not explain; whatever it raises propagates
+    unchanged and stops the loop.
 
     ``pending_deferred`` is the managed run's ledger of human verification
     already owed, passed straight through to every sparring turn of this
@@ -416,6 +425,8 @@ def run_unattended_loop(
             except StageAgentRunError as exc:
                 activity.emit("loop.stopped", cycle=cycle, summary="stage-agent turn failed")
                 raise LoopError(f"stage-agent turn failed: {exc}") from exc
+            if after_turn is not None:
+                after_turn()
 
         if stage_run is not None and stage_run.result.is_error:
             # The provider's own machine-readable output reported this turn
@@ -487,7 +498,7 @@ def run_unattended_loop(
                 f"identical across all {len(outcome.committed.entries)} path(s) that make "
                 "up this candidate; the only files that changed are this stage's own "
                 "workflow artifacts, which are outside candidate identity. That turn was "
-                "asked to commit and push, and nothing else. Any human evidence recorded "
+                "asked to commit, and nothing else. Any human evidence recorded "
                 "for this stage therefore still describes exactly this content."
             )
             pending = None
@@ -553,6 +564,8 @@ def run_unattended_loop(
             activity.emit("loop.stopped", cycle=cycle, summary="sparring-agent turn failed")
             raise LoopError(f"sparring-agent turn failed: {exc}") from exc
         finalization_note = None
+        if after_turn is not None:
+            after_turn()
 
         cycle_records.append(
             LoopCycleRecord(

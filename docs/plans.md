@@ -250,10 +250,9 @@ candidate for nothing.
 ### Pushing a verified candidate
 
 Acceptance only ever freezes a commit that is already reachable from the
-branch's intended remote ref. That rule is not new and is not relaxed. What
-*is* new is what happens when a reviewed candidate has not been pushed —
-usually because the project's own agent instructions forbid an agent from
-pushing without being told:
+run's pinned remote ref. In a managed run the engine is the one that pushes,
+after a person authorizes it; agents commit and are told not to push. When a
+reviewed candidate is not on the remote yet:
 
 ```text
     -> the sparrer reviews the commit … READY
@@ -276,7 +275,7 @@ permission question rather than a manual test:
 }
 ```
 
-Two ways to answer it, and a third that needs nothing from the engine:
+Two ways to answer it:
 
 ```sh
 # allow exactly this commit, then continue
@@ -284,30 +283,106 @@ sparring resume-plan … --allow-push-candidate f2e455c…
 
 # allow it and stop being asked again for this run
 sparring resume-plan … --allow-push-candidate f2e455c… --allow-push-for-run
-
-# or push it yourself and resume normally
-git push origin feature/add-reference-dialog
-sparring resume-plan …
 ```
 
 `--allow-push-for-run` can also be given to `run-plan`, which records the
 permission as part of creating the run.
 
+The target is pinned when the run starts: the remote name, its URL (and
+push URL, if one is configured), the remote ref and that ref's tip (or its
+absence). Every push, reachability and movement check of the run uses the
+pinned values; changing `branch.<b>.remote`/`.merge` or `remote.<r>.url`
+afterwards is a typed refusal, never followed. A run recorded before pins
+existed is pinned on its first resume from the configuration as it is then,
+with a notice that this is weaker than a run-start pin.
+
 An authorized push is exactly one thing:
 
 ```sh
-git -c push.followTags=false push <remote> refs/heads/<branch>:refs/heads/<remote branch>
+git -c push.followTags=false push <pinned URL> <candidate sha>:refs/heads/<remote branch>
 ```
 
-Ordinary, non-force, one fully qualified refspec, so no `push.default` or
-`remote.*.push` configuration can widen it. No `--force`, no
+Ordinary, non-force, the exact authorized commit to one fully qualified ref
+at the pinned URL, so no `push.default`, `remote.*.push` or `remote.*`
+configuration can widen or redirect it. Each one is recorded as a push
+receipt in the run's state (run, stage, remote, ref, previous tip, pushed
+commit). No `--force`, no
 `--force-with-lease`, no tags, no ref deletion, no branch switching, no
 other branch, and no sibling repository — a declared sibling is a different
 repository, and authorizing this run's candidate says nothing about it. The
-engine then re-proves that the commit really is reachable from that remote
-ref, and only then runs the unchanged acceptance gate. A push that fails,
-or one that reports success without landing, stops the run with nothing
-accepted.
+engine then re-reads the pinned ref, which must be exactly that commit, and
+only then runs the acceptance gate. A push that fails, or one that reports
+success without landing, stops the run with nothing accepted.
+
+#### Remote movement the engine did not make
+
+After every agent turn, before every engine push and before freeze or
+accept, the engine compares the pinned ref's tip with what its own records
+explain: the start tip, then each push receipt and each acknowledgement. A
+tip nothing explains -- including a candidate an agent pushed itself before
+review -- stops the run:
+
+```json
+"awaiting": {
+  "kind": "unauthorized_remote_movement",
+  "stage_id": "…-stage-4-…",
+  "remote": "origin",
+  "ref": "refs/heads/feature/add-reference-dialog",
+  "expected_tip": "1a2b3c…",
+  "observed_tip": "f2e455c…"
+}
+```
+
+Nothing is pushed, frozen or accepted while it stands, and a push
+authorization does not clear it. The engine never resets, force-pushes or
+deletes anything on the remote. Once you have looked, acknowledge exactly
+what you saw:
+
+```sh
+sparring acknowledge-remote-movement --run-key <run> --observed f2e455c…
+sparring resume-plan …
+```
+
+The acknowledgement is recorded in the run's state with who and when. It is
+not a review, an acceptance or a push authorization.
+
+This is detection, not prevention: it watches only the pinned ref, and it
+is a blocking backstop rather than a substitute for agents being unable to
+push. Nothing in a plan, brief, notes, handoff or agent output is ever read
+as a push authorization or an acknowledgement.
+
+#### Engine Git
+
+Every Git command the engine runs goes through one path
+(`agent_sparring.engine_git`): repository hooks, `core.fsmonitor`, textconv
+and external diff and filter drivers never run, a merge refuses while any
+merge driver is configured, and any `include`/`includeIf` configuration is
+refused by name. Inside a run, a change to the repository's own credential,
+SSH, URL-rewrite, remote, protocol, HTTP, signing, hook, fsmonitor or driver
+configuration since the run started is a typed refusal naming the key, and
+reordering values counts as a change; configuration that was already there
+at the start keeps working. Local commands that could reach a driver
+(`status`, `diff`, `add`, `merge`, `commit`, `reset` ...) read a private copy
+of exactly the configuration that was just checked (`GIT_COMMON_DIR` points
+at a throwaway directory holding that copy, with the real objects, refs and
+reflogs linked in), so configuration written between the check and the
+command is not what runs. The repository a command uses is found from the
+file system (the `.git` directory or file); its work tree is the
+`core.worktree` in that validated copy when one is set, otherwise the
+directory holding `.git` -- never a value read again afterwards. A directory
+the file system does not place in a repository gets a failed command, not a
+run against unvalidated configuration. Only commands that touch nothing executable --
+`rev-parse`, `config`, ref updates, `worktree` bookkeeping -- read the live
+file. Remote operations (push, `ls-remote`, the finish's target push and
+branch deletion) go to the pinned destination -- the push URL as Git
+resolved it at run start, after `pushInsteadOf`/`insteadOf`, made absolute
+-- and run in a throwaway repository that borrows the objects and is
+configured only from the run-start snapshot's credential and transport
+settings plus a copy of your user-level and system configuration, both with
+every `url.*` rewrite removed, so the destination is never rewritten a
+second time and the engine writes and reads the same repository. A remote with several URLs or push URLs is not pinned. Editing
+`.gitattributes` alone is not a change: a driver runs only if configuration
+defines it.
 
 Permission is bound to what it was granted for: this run, this worktree,
 this branch, that one remote branch, and — for `--allow-push-candidate` —

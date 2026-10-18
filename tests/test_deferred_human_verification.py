@@ -689,7 +689,6 @@ class _FinalizingStageAdapter:
         else:
             _git(self.repo, "add", "-A", "implementation.txt")
             _git(self.repo, "commit", "-q", "-m", "finalize the reviewed tree")
-            _git(self.repo, "push", "-q", "origin", "feature/x")
         return StageAgentResult(session_id=session_id, text="claims", is_error=False)
 
     def start(self, prompt: str):
@@ -820,7 +819,9 @@ class ObligationCannotBeLostTests(_DeferredRunCase):
         # and the resume that answers it runs no agent at all -- so there is
         # no fresh verdict to fold in, only the recorded one.
         stage_adapter = _StageAdapter(self.repo, commit=True, push=False)
-        first = self._start(stage_adapter, _SparringAdapter([READY_WITH_DEFERRAL]))
+        first = self._start(
+            stage_adapter, _SparringAdapter([READY_WITH_DEFERRAL]), allow_push_for_run=False
+        )
         self.assertIsNotNone(first.awaiting)
         self.assertEqual(self._plan_state().deferred_human_checks, ())
 

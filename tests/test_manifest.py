@@ -218,6 +218,9 @@ class _ManifestRepoTestCase(unittest.TestCase):
         return load_manifest_source(self.manifest_path)
 
     def _start(self, stage_adapter, sparring_adapter, **kwargs):
+        # The engine pushes each verified candidate, under the run-level
+        # grant a person gives at start.
+        kwargs.setdefault("allow_push_for_run", True)
         return start_plan(
             self.source(), self.sparring_dir, self.repo, _fixed(stage_adapter, sparring_adapter),
             expected_branch="feature/x", run_key=kwargs.pop("run_key", self.run_key), **kwargs,
@@ -661,7 +664,8 @@ class ManifestCliTests(_ManifestRepoTestCase):
 
         code, out, err = self._main(
             "run-plan", "--manifest", str(self.manifest_path), "--adopt",
-            "--repo-root", str(self.repo), "--expected-branch", "feature/x", adapters=adapters,
+            "--repo-root", str(self.repo), "--expected-branch", "feature/x",
+            "--allow-push-for-run", adapters=adapters,
         )
         self.assertEqual(code, 0, err)
         self.assertIn("adopting Stage 3C — Cloud schema", err)

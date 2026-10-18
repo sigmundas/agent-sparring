@@ -672,9 +672,11 @@ class RemoteBranchDeletionTests(_FinishTestCase):
         with patch:
             code, report, err = self._finish(record, "--push-target")
         self.assertEqual(code, 0, err)
+        # To the run's pinned destination URL, never to a remote name the
+        # repository's configuration could redirect.
         self.assertEqual(calls, [(
             "push", "--porcelain", f"--force-with-lease=refs/heads/{record.branch}:{head}",
-            "origin", "--delete", f"refs/heads/{record.branch}",
+            str(self.remote), "--delete", f"refs/heads/{record.branch}",
         )])
         self.assertEqual(report["completed_steps"][-2:], ["delete_remote_branch", "finished"])
         self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
@@ -755,22 +757,27 @@ class RemoteBranchDeletionTests(_FinishTestCase):
         self.assertEqual((code, report["remote_branch"]["code"]), (1, "remote_lease_mismatch"))
         self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), raced)
 
-    def test_unreachable_remote_stops_then_rerun_completes(self):
+    def test_a_remote_url_changed_mid_finish_is_refused_by_name_then_rerun_completes(self):
+        # Retargeting the remote after the run started is never followed:
+        # the engine's next Git invocation refuses, naming the key, and
+        # nothing is pushed or deleted at the new URL.
         record, _ = self._complete()
         head = self._set_policy(record, True)
         url = _git(self.repo, "remote", "get-url", "origin")
-        gone = str(self.remote) + ".gone"
+        gone = Path(str(self.remote) + ".gone")
+        subprocess.run(["git", "init", "-q", "--bare", str(gone)], check=True, capture_output=True)
 
-        def unreachable():
-            subprocess.run(["git", "-C", str(self.repo), "remote", "set-url", "origin", gone], check=True)
+        def retarget():
+            subprocess.run(["git", "-C", str(self.repo), "remote", "set-url", "origin", str(gone)], check=True)
 
-        patch, _ = self._on_delete(unreachable)
+        patch, _ = self._on_delete(retarget)
         with patch:
             code, report, _ = self._finish(record, "--push-target")
         self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
-        self.assertEqual(report["remote_branch"]["code"], "remote_unreachable")
-        self.assertEqual([k["code"] for k in report["kept"]], ["remote_unreachable"])
+        self.assertIn("repository_config_changed", report["reason"])
+        self.assertIn("remote.origin.url", report["reason"])
         self.assertNotIn("finished", self._events(record))
+        self.assertEqual(_git(gone, "for-each-ref"), "")  # nothing reached the new target
         _run_git(self.repo, "remote", "set-url", "origin", url)
         code, report, err = self._finish(record)
         self.assertEqual(code, 0, err)
@@ -797,46 +804,39 @@ class RemoteBranchDeletionTests(_FinishTestCase):
         self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
         self._assert_cleaned(record, head)
 
-    def test_push_url_differs_from_fetch_url(self):
+    def test_a_push_url_added_after_the_run_started_is_refused_by_name(self):
+        # A planted remote.origin.pushurl would send the target push and the
+        # branch deletion somewhere else. It is not followed: the finish
+        # refuses before any Git invocation, naming the key, and the planted
+        # destination receives nothing.
         record, _ = self._complete()
         head = self._set_policy(record, True)
         mirror = self.remote.parent / "push.git"
-        subprocess.run(["git", "clone", "-q", "--bare", str(self.remote), str(mirror)], check=True, capture_output=True)
-        raced = _git(self.repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "moved on the push remote")
-        _run_git(self.repo, "push", "-q", str(mirror), f"{raced}:refs/heads/{record.branch}")
+        subprocess.run(["git", "init", "-q", "--bare", str(mirror)], check=True, capture_output=True)
         _run_git(self.repo, "remote", "set-url", "--push", "origin", str(mirror))
         code, report, _ = self._finish(record, "--push-target")
-        # The fetch URL still shows the candidate; the push URL has moved on.
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
-        self.assertEqual(report["remote_branch"]["code"], "remote_lease_mismatch")
-        self.assertEqual(_git(mirror, "rev-parse", f"refs/heads/{record.branch}"), raced)
+        self.assertEqual(code, 1)
+        self.assertIsNotNone(report["stopped_at"])
+        self.assertIn("repository_config_changed", report["reason"])
+        self.assertIn("remote.origin.pushurl", report["reason"])
+        self.assertEqual(_git(mirror, "for-each-ref"), "")
         self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
-        self.assertNotIn("remote_branch_deleted", self._events(record))
-        # The push URL now agrees with the candidate: the delete goes there.
-        _run_git(self.repo, "push", "-q", "--force", str(mirror), f"{head}:refs/heads/{record.branch}")
-        code, report, err = self._finish(record)
-        self.assertEqual(code, 0, err)
-        self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
-        self.assertNotIn(record.branch, _git(self.repo, "ls-remote", str(mirror)))
-        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
+        self.assertNotIn("merged", self._events(record))
 
-    def test_multiple_push_urls_stop_without_reading_or_pushing(self):
+    def test_multiple_push_urls_added_after_the_run_started_are_refused_by_name(self):
         record, _ = self._complete()
         head = self._set_policy(record, True)
         second = self.remote.parent / "second.git"
         subprocess.run(["git", "clone", "-q", "--bare", str(self.remote), str(second)], check=True, capture_output=True)
         _run_git(self.repo, "push", "-q", "origin", "main")  # the target already contains the candidate
-        _run_git(second, "fetch", "-q", str(self.remote), "+refs/heads/*:refs/heads/*")
         _run_git(self.repo, "remote", "set-url", "--add", "--push", "origin", str(self.remote))
         _run_git(self.repo, "remote", "set-url", "--add", "--push", "origin", str(second))
         patch, calls = self._on_delete(lambda: None)
         with patch:
             code, report, _ = self._finish(record)
         self.assertEqual(calls, [])
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
-        self.assertEqual(report["remote_branch"]["code"], "remote_multiple_push_urls")
-        self.assertIn("per-URL lease", report["remote_branch"]["detail"])
-        self.assertEqual([k["code"] for k in report["kept"]], ["remote_multiple_push_urls"])
+        self.assertEqual(code, 1)
+        self.assertIn("remote.origin.pushurl", report["reason"])
         self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
         self.assertEqual(_git(second, "rev-parse", f"refs/heads/{record.branch}"), head)
         events = self._events(record)
@@ -938,11 +938,13 @@ class RemoteBranchDeletionTests(_FinishTestCase):
         self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), remote_main)
 
     def test_a_push_url_with_a_space_is_one_url(self):
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
+        # Configured before the run starts, so it is part of the trusted
+        # snapshot the finish is held to.
         spaced = Path(str(self.remote) + " with space")
         spaced.symlink_to(self.remote)
         _run_git(self.repo, "remote", "set-url", "--push", "origin", str(spaced))
+        record, _ = self._complete()
+        head = self._set_policy(record, True)
         code, report, err = self._finish(record, "--push-target")
         self.assertEqual(code, 0, err)
         self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
@@ -1125,7 +1127,7 @@ class PlanRemovalTests(_FinishTestCase):
         pushes = []
 
         def recording(cwd, *args):
-            if "push" in args and any(a.startswith("refs/heads/main") for a in args):
+            if "push" in args and any(a.endswith(":refs/heads/main") for a in args):
                 pushes.append(args)
             return real_git(cwd, *args)
 

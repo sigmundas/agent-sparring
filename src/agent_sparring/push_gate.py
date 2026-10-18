@@ -1,8 +1,18 @@
 """Authorizing, performing and verifying the one push managed acceptance needs.
 
 The acceptance gate only ever freezes a commit that is *already* reachable
-from the intended remote branch (:func:`~agent_sparring.git_context.
-verify_pushed`). That check is not relaxed here and is not bypassed here.
+from the run's pinned remote ref (see :mod:`agent_sparring.remote_pin`).
+That check is not relaxed here and is not bypassed here.
+
+Reachability alone is not success. Before the pin existed, a candidate that
+was already reachable was taken as pushed, whoever had pushed it -- which is
+how a stage agent's own push of an unreviewed commit went through as
+though the engine had made it (Sporely Stage 4b). Now the pinned ref's tip
+must be what the engine's own records explain (its push receipts and a
+person's acknowledgements); anything else is an
+:class:`~agent_sparring.remote_pin.UnauthorizedRemoteMovement`, and nothing
+is pushed, frozen or accepted until a person has looked. A candidate that
+is reachable *and* explained needs no push.
 
 What this module adds is the missing step in front of it. A reviewer says
 READY, the reviewed work is committed, and the commit was never pushed --
@@ -37,7 +47,7 @@ within the identity it was granted for. Both bind to:
 - this plan run (the state file that holds them *is* the run);
 - this repository/worktree, by resolved path;
 - the exact expected branch the run was started for;
-- the exact remote and remote branch the acceptance gate would check.
+- the exact remote, remote URL and remote branch the run pinned.
 
 ``CANDIDATE`` additionally binds to the stage id and the candidate SHA, so a
 candidate that moved is a candidate nobody authorized.
@@ -52,11 +62,14 @@ What an authorized push is allowed to be
 Exactly one command shape, built by :func:`push_command` and by nothing
 else::
 
-    git -c push.followTags=false push <remote> refs/heads/<branch>:refs/heads/<remote branch>
+    git -c push.followTags=false push <pinned URL> <candidate sha>:refs/heads/<remote branch>
 
-Both sides of the refspec are fully qualified, so no ``push.default``,
-``remote.<name>.push`` or tracking configuration can widen what is sent. The
-source is non-empty, so the refspec cannot delete a ref. There is no
+The destination is the URL the run pinned, never a remote name, so no
+``remote.<name>.*`` configuration can redirect it; the source is the exact
+authorized commit, not a branch that could move between the check and the
+push; the destination ref is fully qualified, so no ``push.default``,
+``remote.<name>.push`` or tracking configuration can widen what is sent.
+The source is non-empty, so the refspec cannot delete a ref. There is no
 ``--force``, no ``--force-with-lease``, no ``--tags``, no ``--delete``, no
 ``--all``, no ``--mirror`` and no ``--prune``; ``push.followTags`` is turned
 off for the invocation so a tag cannot ride along. Nothing here checks out,
@@ -64,28 +77,40 @@ switches, creates or merges a branch, and nothing here touches a sibling
 repository: a declared sibling is a different repository, and authorizing
 this run's candidate says nothing about it.
 
-After the push, reachability is proven again by the same
-:func:`~agent_sparring.git_context.verify_pushed` the gate uses, against the
-same remote ref. A push that reported success but left the candidate
-unreachable is a failure, and the candidate is not accepted.
+After the push the pinned ref is read again at the pinned URL and must be
+exactly the pushed commit. A push that reported success but left anything
+else there is a failure, and the candidate is not accepted. A successful
+push yields a :class:`~agent_sparring.remote_pin.RemoteRecord` receipt for
+the caller to record. The push itself runs through
+:mod:`agent_sparring.engine_git`: no hooks, and no configuration changed
+since the run started.
 """
 
 from __future__ import annotations
 
-import re
-import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
+from agent_sparring import engine_git
 from agent_sparring.git_context import (
     GitContextError,
     current_branch,
+    is_ancestor,
     is_full_sha,
     resolve_commit,
     tracking_remote,
-    verify_pushed,
+)
+from agent_sparring.remote_pin import (
+    SAFE_REF_RE,
+    RemotePin,
+    RemoteRecord,
+    UnauthorizedRemoteMovement,
+    check_movement,
+    observe,
+    pin_remote,
+    push_receipt,
 )
 
 #: The typed reason a managed run can be stopped on. One value today; it is
@@ -98,7 +123,7 @@ PUSH_AUTHORIZATION_REQUIRED = "push_authorization_required"
 # option rather than as the thing it names. Every value here comes from git
 # itself (config, symbolic-ref), so this is a guard against a repository
 # configured to attack its own tooling, not against ordinary input.
-_SAFE_REF_RE = re.compile(r"^[^-][^\s:^~?*\[\\]*$")
+_SAFE_REF_RE = SAFE_REF_RE
 
 
 class PushError(RuntimeError):
@@ -144,6 +169,10 @@ class PushAuthorization:
     #: CANDIDATE only: the stage and commit the permission is about.
     stage_id: str | None = None
     candidate_sha: str | None = None
+    #: The pinned push destination (URL) the permission was granted for.
+    #: ``None`` only in authorizations recorded before pins existed, which
+    #: then bind by remote name and remote branch as they always did.
+    url: str | None = None
 
     def __post_init__(self) -> None:
         if self.scope is PushScope.CANDIDATE and not (self.stage_id and self.candidate_sha):
@@ -163,6 +192,8 @@ class PushAuthorization:
         if self.scope is PushScope.CANDIDATE:
             payload["stage_id"] = self.stage_id
             payload["candidate_sha"] = self.candidate_sha
+        if self.url is not None:
+            payload["url"] = self.url
         return payload
 
     @classmethod
@@ -178,6 +209,7 @@ class PushAuthorization:
             remote_branch=_text(payload, "remote_branch"),
             stage_id=_optional_text(payload, "stage_id"),
             candidate_sha=_optional_text(payload, "candidate_sha"),
+            url=_optional_text(payload, "url"),
         )
 
     @property
@@ -207,6 +239,8 @@ class PushAuthorization:
             return False
         if target.remote != self.remote or target.remote_branch != self.remote_branch:
             return False
+        if self.url is not None and target.url != self.url:
+            return False
         if self.scope is PushScope.RUN:
             return True
         return stage_id == self.stage_id and target.candidate_sha == self.candidate_sha
@@ -220,6 +254,9 @@ class PushTarget:
     branch: str
     remote: str
     remote_branch: str
+    #: The pinned push destination. ``None`` only for a target built without
+    #: a pin; :func:`push_command` then names the remote, as it used to.
+    url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -295,21 +332,28 @@ class PushRequired:
 class PushOutcome:
     """The result of asking whether the candidate can reach the remote.
 
-    Exactly one of the three states is true:
+    Exactly one of the four states is true:
 
+    - ``movement`` set: the pinned ref is somewhere the records do not
+      explain; nothing was pushed, and nothing may be until a person
+      acknowledges it;
     - ``required`` set: a person has to allow it; nothing was pushed;
-    - ``pushed`` true: this call pushed it and re-proved reachability;
-    - neither: it was already reachable and nothing was done.
+    - ``pushed`` true: this call pushed it, re-read the pinned ref, and
+      ``receipt`` is the record to keep;
+    - none: it was already on the pinned ref *as the records explain* and
+      nothing was done.
     """
 
     target: PushTarget
     required: PushRequired | None = None
     pushed: bool = False
     detail: str | None = None
+    movement: UnauthorizedRemoteMovement | None = None
+    receipt: RemoteRecord | None = None
 
     @property
     def blocked(self) -> bool:
-        return self.required is not None
+        return self.required is not None or self.movement is not None
 
 
 def intended_remote(repo_root: Path, branch: str) -> tuple[str, str]:
@@ -352,9 +396,21 @@ def push_command(target: PushTarget) -> list[str]:
         "-c",
         "push.followTags=false",
         "push",
-        target.remote,
-        f"refs/heads/{target.branch}:refs/heads/{target.remote_branch}",
+        target.url or target.remote,
+        f"{target.candidate_sha}:refs/heads/{target.remote_branch}",
     ]
+
+
+def pinned_target(pin: RemotePin, candidate_sha: str) -> PushTarget:
+    """Where ``candidate_sha`` goes for a run pinned to ``pin``."""
+
+    return PushTarget(
+        candidate_sha=candidate_sha,
+        branch=pin.branch,
+        remote=pin.remote,
+        remote_branch=pin.remote_branch,
+        url=pin.push_destination,
+    )
 
 
 def ensure_candidate_pushed(
@@ -363,26 +419,40 @@ def ensure_candidate_pushed(
     stage_id: str,
     expected_branch: str,
     authorization: PushAuthorization | None,
+    pin: RemotePin | None = None,
+    records: Sequence[RemoteRecord] = (),
+    run: str = "",
+    stage_base: str | None = None,
 ) -> PushOutcome:
-    """Make the current candidate reachable from its intended remote branch,
-    or say who has to allow that.
+    """Put the current candidate on the run's pinned remote ref, or say who
+    has to allow that, or stop on remote movement nobody explained.
 
     Order matters and is the point:
 
     1. the worktree must be on ``expected_branch`` and ``HEAD`` must resolve
        (a push is about one exact commit of one exact branch);
-    2. if the candidate is *already* reachable, nothing is pushed -- an
-       authorization is permission, not an instruction;
-    3. otherwise the intended remote ref is resolved and ``authorization`` is
-       checked against the exact commit, branch, remote and remote branch. No
-       permission means :class:`PushRequired`, and **nothing is pushed**;
-    4. only then is :func:`push_command` run, and reachability re-proven
-       afterwards. Either failure raises :class:`PushError`, leaving the
-       candidate unaccepted.
+    2. the pinned target must still be what the configuration says (a
+       retarget is a typed refusal, never followed);
+    3. the pinned ref's tip must be what ``records`` explain, and a candidate
+       already reachable from it must be covered by them -- otherwise the
+       outcome carries an :class:`UnauthorizedRemoteMovement` and **nothing
+       is pushed**. Reachability alone is never success;
+    4. a candidate reachable from an explained tip needs no push;
+    5. otherwise ``authorization`` is checked against the exact commit,
+       branch, remote, URL and remote branch. No permission means
+       :class:`PushRequired`, and **nothing is pushed**;
+    6. only then is :func:`push_command` run, and the pinned ref re-read: it
+       must be exactly the candidate. Either failure raises
+       :class:`PushError`, leaving the candidate unaccepted. Success carries
+       a push receipt for the caller to record.
+
+    ``pin`` is ``None`` only for a caller that holds no run (a direct call);
+    the target is then pinned for this call from the current configuration,
+    as weakly as a legacy run is, so an already reachable candidate is still
+    unexplained.
 
     Nothing about the acceptance gate is relaxed by any of this: the gate
-    runs afterwards and makes its own checks, including this same
-    reachability check, for itself.
+    runs afterwards and makes its own checks for itself.
     """
 
     try:
@@ -396,15 +466,39 @@ def ensure_candidate_pushed(
         )
     try:
         candidate_sha = resolve_commit(repo_root, "HEAD", label="candidate")
+        if pin is None:
+            pin = pin_remote(repo_root, branch, legacy=True)
+        if pin.branch != branch:
+            raise PushError(
+                f"refusing to push: this run is pinned for branch {pin.branch!r}, not {branch!r}"
+            )
+        target = pinned_target(pin, candidate_sha)
+        observed, movement = check_movement(
+            repo_root,
+            pin,
+            records,
+            stage_id=stage_id,
+            candidate_sha=candidate_sha,
+            stage_base=stage_base,
+        )
     except GitContextError as exc:
-        raise PushError(str(exc)) from exc
+        raise PushError(f"refusing to push: {exc}") from exc
 
-    target = intended_target(repo_root, candidate_sha, branch)
+    if movement is not None:
+        return PushOutcome(target=target, movement=movement, detail=movement.describe)
 
-    pushed, detail = verify_pushed(repo_root, candidate_sha, branch)
-    if pushed:
-        return PushOutcome(target=target, detail=detail)
+    where = f"{pin.remote}/{pin.remote_branch}"
+    if observed is not None and is_ancestor(repo_root, candidate_sha, observed):
+        return PushOutcome(
+            target=target,
+            detail=f"{candidate_sha} is already on {where} ({observed}), as the engine's records explain",
+        )
 
+    detail = (
+        f"{where} is at {observed}, which does not contain {candidate_sha}"
+        if observed is not None
+        else f"{where} does not exist yet"
+    )
     if authorization is None or not authorization.covers(
         repo_root=repo_root, branch=branch, target=target, stage_id=stage_id
     ):
@@ -412,38 +506,68 @@ def ensure_candidate_pushed(
             target=target, required=PushRequired.for_target(stage_id, target, detail)
         )
 
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), *push_command(target)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    destination = target.url or target.remote
+    try:
+        # In an isolated repository configured only from the run's trusted
+        # snapshot: no repository configuration -- not even one written
+        # after the checks above -- reaches the push.
+        result = engine_git.run_remote(repo_root, pin.trusted_config, *push_command(target))
+    except GitContextError as exc:
+        raise PushError(f"refusing to push {candidate_sha} to {destination}: {exc}") from exc
     if result.returncode != 0:
         raise PushError(
-            f"pushing {candidate_sha} to {target.remote}/{target.remote_branch} failed: "
+            f"pushing {candidate_sha} to {where} ({destination}) failed: "
             f"{(result.stderr or result.stdout).strip() or f'git push exited {result.returncode}'}"
         )
 
-    pushed, detail = verify_pushed(repo_root, candidate_sha, branch)
-    if not pushed:
+    try:
+        landed = observe(repo_root, pin)
+    except GitContextError as exc:
         raise PushError(
-            f"{target.remote}/{target.remote_branch} was pushed, but {candidate_sha} is still "
-            f"not reachable from it ({detail}); the candidate was not accepted"
+            f"{where} was pushed, but it could not be read back ({exc}); the candidate was not "
+            "accepted"
+        ) from exc
+    if landed != candidate_sha:
+        raise PushError(
+            f"{where} was pushed, but it is still not exactly {candidate_sha} (it is "
+            f"{landed or 'absent'}); the candidate was not accepted"
         )
-    return PushOutcome(target=target, pushed=True, detail=detail)
+    return PushOutcome(
+        target=target,
+        pushed=True,
+        detail=f"{where} is exactly {candidate_sha}",
+        receipt=push_receipt(
+            run=run, stage_id=stage_id, pin=pin, previous_tip=observed, pushed_sha=candidate_sha
+        ),
+    )
+
+
+def _binding(repo_root: Path, branch: str, pin: RemotePin | None) -> tuple[str, str, str | None]:
+    if pin is None:
+        remote, remote_branch = intended_remote(repo_root, branch)
+        return remote, remote_branch, None
+    if pin.branch != branch:
+        raise PushError(f"this run is pinned for branch {pin.branch!r}, not {branch!r}")
+    return pin.remote, pin.remote_branch, pin.push_destination
 
 
 def authorization_for_candidate(
-    repo_root: Path, *, stage_id: str, candidate_sha: str, branch: str
+    repo_root: Path,
+    *,
+    stage_id: str,
+    candidate_sha: str,
+    branch: str,
+    pin: RemotePin | None = None,
 ) -> PushAuthorization:
-    """A one-candidate authorization for exactly ``candidate_sha``."""
+    """A one-candidate authorization for exactly ``candidate_sha``, bound to
+    the run's pinned destination when there is one."""
 
     if not is_full_sha(candidate_sha):
         raise PushError(
             f"a one-candidate push authorization needs the exact 40-character commit id, "
             f"got {candidate_sha!r}"
         )
-    remote, remote_branch = intended_remote(repo_root, branch)
+    remote, remote_branch, url = _binding(repo_root, branch, pin)
     return PushAuthorization(
         scope=PushScope.CANDIDATE,
         repo_root=str(Path(repo_root).resolve()),
@@ -452,20 +576,24 @@ def authorization_for_candidate(
         remote_branch=remote_branch,
         stage_id=stage_id,
         candidate_sha=candidate_sha,
+        url=url,
     )
 
 
-def authorization_for_run(repo_root: Path, *, branch: str) -> PushAuthorization:
+def authorization_for_run(
+    repo_root: Path, *, branch: str, pin: RemotePin | None = None
+) -> PushAuthorization:
     """A run-scoped authorization: this run's future verified candidates, on
-    this branch, to this remote branch, in this worktree."""
+    this branch, to this pinned destination, in this worktree."""
 
-    remote, remote_branch = intended_remote(repo_root, branch)
+    remote, remote_branch, url = _binding(repo_root, branch, pin)
     return PushAuthorization(
         scope=PushScope.RUN,
         repo_root=str(Path(repo_root).resolve()),
         branch=branch,
         remote=remote,
         remote_branch=remote_branch,
+        url=url,
     )
 
 
@@ -498,5 +626,6 @@ __all__ = [
     "ensure_candidate_pushed",
     "intended_remote",
     "intended_target",
+    "pinned_target",
     "push_command",
 ]

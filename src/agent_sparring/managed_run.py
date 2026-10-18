@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from agent_sparring import engine_git
+
 SCHEMA_VERSION = 1
 RECORDS_SUBDIR = Path("agent-sparring") / "worktrees"
 INPUT_KINDS = ("markdown", "manifest")
@@ -93,7 +95,21 @@ def _now() -> str:
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=False)
+    # The one engine Git path (see agent_sparring.engine_git). A refusal by
+    # configuration keeps its stable code and the key it names.
+    try:
+        return engine_git.run(cwd, *args)
+    except engine_git.GitConfigRefusal as exc:
+        raise ManagedRunError(exc.code, str(exc)) from exc
+
+
+def _git_bytes(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """:func:`_git` with byte-exact output (blob contents)."""
+
+    try:
+        return engine_git.run(cwd, *args, text=False)
+    except engine_git.GitConfigRefusal as exc:
+        raise ManagedRunError(exc.code, str(exc)) from exc
 
 
 def _git_out(cwd: Path, *args: str, code: str = "git_failed") -> str:
@@ -462,9 +478,7 @@ def committed_project(repo_root: Path, sparring_dir: Path, target: str, base_sha
             "needs it at the same relative location",
         ) from exc
     config_rel = (project_rel / "project.toml").as_posix()
-    shown = subprocess.run(
-        ["git", "-C", str(top), "show", f"{base_sha}:{config_rel}"], capture_output=True, check=False
-    )
+    shown = _git_bytes(top, "show", f"{base_sha}:{config_rel}")
     if shown.returncode != 0:
         raise ManagedRunError(
             "project_not_committed",
@@ -508,11 +522,7 @@ def map_input(invoking_top: Path, base_sha: str, input_path: Path) -> tuple[Path
         relative = resolved.relative_to(invoking_top)
     except ValueError:
         return resolved, resolved
-    shown = subprocess.run(
-        ["git", "-C", str(invoking_top), "show", f"{base_sha}:{relative.as_posix()}"],
-        capture_output=True,
-        check=False,
-    )
+    shown = _git_bytes(invoking_top, "show", f"{base_sha}:{relative.as_posix()}")
     if shown.returncode == 0 and resolved.is_file() and shown.stdout == resolved.read_bytes():
         return relative, resolved  # relative: joined to the worktree once it is known
     return resolved, resolved
@@ -637,9 +647,16 @@ def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRun
         f"refs/heads/{record.branch}", record.base_sha, "",
     )
     if result.returncode == 0:
+        # Created without a checkout, then populated by a command that reads
+        # only validated configuration (engine_git runs `reset` isolated,
+        # `worktree` against the live repository it must register with), so
+        # no filter defined in between can run on the checkout.
         result = _git(
-            Path(repo_root), "worktree", "add", "--lock", "--reason", mark, record.worktree_path, record.branch
+            Path(repo_root), "worktree", "add", "--no-checkout", "--lock", "--reason", mark,
+            record.worktree_path, record.branch,
         )
+        if result.returncode == 0:
+            result = _git(Path(record.worktree_path), "reset", "--hard", "-q")
         # A failed add leaves the engine's branch in place: it may already be
         # checked out elsewhere, and deleting a ref never asks. The record is
         # marked creation_failed below; cleanup is not this function's.

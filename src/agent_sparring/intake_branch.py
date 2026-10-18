@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from agent_sparring import engine_git
 from agent_sparring.branch_guard import is_protected_branch
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import GitContextError, current_branch, repository_identity
@@ -398,7 +399,10 @@ def move_slice_approval(
                         f"run slice {run_id!r} was already moved from {approval.approved_branch!r} to "
                         f"{approval.expected_branch!r}; a slice is moved once"
                     )
-                return BranchMove(move_path, approval.approved_branch, branch, False, _update_run(sparring_dir, approval, branch))
+                return BranchMove(
+                    move_path, approval.approved_branch, branch, False,
+                    _update_run(sparring_dir, approval, branch, repo_root=repo_root),
+                )
             refusals = _move_refusals(approval, run, intake_dir, repo_root, sparring_dir, target=branch, digest=source.digest())
             if refusals:
                 raise IntakeError(
@@ -429,30 +433,55 @@ def move_slice_approval(
             if not write_exclusive(move_path, json.dumps(record, indent=2) + "\n"):
                 raise IntakeError(f"{move_path} was written by another process; look at it and try again")
             moved = read_approval(approval.path)
-            return BranchMove(move_path, approval.approved_branch, branch, True, _update_run(sparring_dir, moved, branch))
+            return BranchMove(
+                move_path, approval.approved_branch, branch, True,
+                _update_run(sparring_dir, moved, branch, repo_root=repo_root),
+            )
     except WorktreeLockError as exc:
         raise IntakeError(f"{repo_root} is busy: {exc}") from exc
     except GitContextError as exc:
         raise IntakeError(f"cannot inspect {repo_root}: {exc}") from exc
 
 
-def _update_run(sparring_dir: Path, approval: IntakeApproval, branch: str) -> Path | None:
-    """Point the slice's paused run at the moved branch (idempotently)."""
+def _update_run(
+    sparring_dir: Path, approval: IntakeApproval, branch: str, *, repo_root: Path | None = None
+) -> Path | None:
+    """Point the slice's paused run at the moved branch (idempotently).
+
+    The run never ran a turn (the move refuses otherwise), so its remote pin
+    -- made for the old branch -- is replaced by a fresh one for the new
+    branch. A run that already has push receipts or acknowledgements has a
+    history on its old target and is not re-pinned.
+    """
+
+    from agent_sparring.remote_pin import pin_remote
 
     path = run_state_path(sparring_dir, approval.run_key)
     if not path.is_file():
         return None
     state = PlanRunState.load(path)
+    changed = False
     if state.expected_branch != branch:
         state.expected_branch = branch
+        changed = True
+    if repo_root is not None and (state.remote_pin is None or state.remote_pin.branch != branch):
+        if state.remote_records:
+            raise IntakeError(
+                f"run {approval.run_key} has remote records on its old target and cannot be "
+                "re-pinned to the moved branch"
+            )
+        state.remote_pin = pin_remote(Path(repo_root), branch)
+        changed = True
+    if changed:
         state.save(path)
     return path
 
 
 def _valid_branch_name(repo_root: Path, name: str) -> bool:
-    result = subprocess.run(
-        ["git", "check-ref-format", "--branch", name], cwd=repo_root, capture_output=True, text=True
-    )
+    try:
+        result = engine_git.run(repo_root, "check-ref-format", "--branch", name)
+    except engine_git.GitContextError as exc:
+        raise IntakeError(str(exc)) from exc
     return result.returncode == 0 and result.stdout.strip() == name
 
 
@@ -483,7 +512,10 @@ def create_slice_branch(
     name = branch.strip()
     if not name or is_protected_branch(name) or not _valid_branch_name(repo_root, name):
         raise IntakeError(f"{branch!r} is not a branch name a stage agent may run on")
-    result = subprocess.run(["git", "switch", "-c", name], cwd=repo_root, capture_output=True, text=True)
+    try:
+        result = engine_git.run(repo_root, "switch", "-c", name)
+    except engine_git.GitContextError as exc:
+        raise IntakeError(str(exc)) from exc
     if result.returncode != 0:
         raise IntakeError(f"git switch -c {name} failed: {(result.stderr or result.stdout).strip()}")
     if status.approved_branch is None:
