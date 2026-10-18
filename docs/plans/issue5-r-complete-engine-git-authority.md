@@ -6,18 +6,20 @@ the bootstrap run accepted at `d1d48d0`. The audit is in
 operations still follow live repository configuration, and that the finish path
 fails open when the run state is absent.
 
-**Base.** `d1d48d0`, the Stage 1 endpoint. Do not include any Stage 2 commit.
+**Base.** The branch `plan/issue5-recovery`: `d1d48d0`, the Stage 1 endpoint,
+plus documentation-only commits. Do not include or port any Stage 2 commit.
 
 **Run with the frozen runner.** Run this plan with the frozen bootstrap runner
 (`/Users/Shared/sparring-bootstrap/runner`) under the credential-free account.
 This plan changes the engine that would otherwise supervise it.
+The procedure and its gate are in `docs/audits/issue5-recovery-kit/`.
 
 **Prerequisite (human).**
 - Run `d1d48d0`'s full suite (`.venv/bin/python -m pytest -q`) in a
   credential-free environment, and record the counts in the run notes. A failure
   there is fixed in Stage R1 before anything else.
-- Decision D2 (acknowledgement semantics) is recorded in this file before
-  Stage R2 starts. The recommended default is written into Stage R2.
+- Decision D2 (acknowledgement semantics) was approved on 2026-10-18 and is
+  written into Stage 2.
 
 **Threat model.** The threat model is unchanged from the original plan. Plan R
 improves the engine's own authority. Without agent confinement (Plan A),
@@ -34,7 +36,8 @@ nothing here protects against an active agent, and no output may say so.
   legacy run, unless an engine record outside `.sparring/` says the run
   predates pins.
 - **I-R3.** Reachability, push authorization, acknowledgement, acceptance and
-  release are distinct records. No one of them implies another.
+  release are distinct records. No one of them implies another. Authorization
+  and acceptance code never reads acknowledgement records.
 - **I-R4.** An engine push receipt records only movement the engine itself
   caused, as observed in that push's own old→new result.
 
@@ -141,16 +144,23 @@ not use mocks of `engine_git`.
   asserts that an acknowledged candidate is then accepted with no push
   authorization.
 
-**Decision D2.** The recommended default, used unless this section is amended
-before the run:
-- An acknowledgement records that a person observed a remote tip. It clears
-  the movement pause only.
+**Decision D2 (approved 2026-10-18).**
+- An acknowledgement records an observed remote movement only.
+  - It clears the movement pause.
+  - It sets the observed tip as the baseline for detecting *further* movement.
+  - It never authorizes a push, and never accepts or explains a candidate.
 - A candidate is "explained" only by an engine receipt, the pinned start tip or
   the stage base.
-- After an acknowledgement, the run pauses on the normal push-authorization
-  pause for that SHA. The authorization is recorded as
-  `authorized_without_push`, because the SHA is already on the remote.
-- A run-level push grant does **not** satisfy it. It needs a per-SHA decision.
+- When the candidate is already on the remote with no receipt for it, the run
+  pauses with the typed pause `pushed_candidate_unauthorized`.
+  - The pause clears only through a separate, explicit per-commit CLI action
+    that names the run and the exact SHA. The spelling of the action is free.
+  - That action is recorded on its own, with who and when, as
+    `authorized_without_push`.
+  - A run-level push grant does **not** satisfy it.
+- Acceptance still requires the normal independent review verdict for that
+  exact SHA. Neither the acknowledgement nor the per-commit authorization is a
+  review or an acceptance.
 
 **Outcome.**
 - **Pinned flag outside `.sparring/`.**
@@ -166,8 +176,9 @@ before the run:
 - **Ownership.** Freeze/accept of a stage resolve ownership from engine run
   state. Freeze/accept of an unpinned legacy run either pins it first, with the
   existing visible notice, or refuses. They never fall back to reachability.
-- **D2 is implemented as written above.** `test_push_authorization.py` is
-  updated to assert the new behavior. Do not delete the test.
+- **D2 is implemented as written above.** The test
+  `test_pushing_it_yourself_is_unexplained_movement_until_acknowledged` is
+  rewritten to assert the new behavior, not deleted.
 - **Push race.** An engine push compares the push's porcelain old→new with
   the observed tip. If they differ, or the push is a no-op, it records
   `unauthorized_remote_movement` instead of a receipt.
@@ -200,14 +211,21 @@ not make").
   candidate is already on the remote either pins it and pauses on
   `unauthorized_remote_movement`, or refuses. It never accepts.
 - **D2 sequence.** Pause, then acknowledge. Then:
-  - the run pauses for the per-SHA push authorization;
+  - the run pauses with `pushed_candidate_unauthorized`;
   - a run-level grant does not clear the pause;
-  - a per-SHA authorization records `authorized_without_push`, followed by
-    acceptance;
+  - the explicit per-commit action records `authorized_without_push` as its own
+    record;
+  - the stage is accepted only after a READY review of that SHA. With a
+    SEND_BACK, the stage is not accepted;
   - an acknowledgement of a tip ahead of the candidate does not explain a
     later, different candidate.
+- **The acknowledgement record is never consulted.**
+  - Deleting the acknowledgement record after the per-commit authorization
+    changes neither authorization nor acceptance.
+  - A forged acknowledgement for an unrelated SHA authorizes nothing.
 - **Race.** The test pushes between `check_movement` and the engine push, by
-  inserting the agent push through a test hook in the real push path. It covers
+  inserting the agent push through a seam that only tests can reach. No
+  configuration, environment variable or CLI flag can enable it. It covers
   both a fast-forward to the same SHA and an ancestor push. Expected: the result
   is movement, not a receipt.
 - **Failed turn.** A turn that raises after an out-of-band push, followed by

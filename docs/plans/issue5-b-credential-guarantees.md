@@ -9,6 +9,12 @@ This plan replaces the credential half of the failed Stage 2 of
 `docs/plans/secure-agent-git-writes.md`. The audit is
 `docs/audits/issue5-recovery-2026-10-18.md`, findings F4 and F5 and §2c.
 
+**Approved decisions (2026-10-18).** See D1, D4, R-1 and R-2 in the audit.
+- A verification record never authorizes execution. Probe outcomes and table
+  rows decide only what is *claimed*.
+- The single exception is `probe_failed`. It refuses the invocation because
+  the engine cannot measure, not because evidence is missing.
+
 **Depends on:**
 - Plan R, merged.
 - Plan A Stage 1, for `LaunchSpec`, the run policy and the capability table.
@@ -36,9 +42,18 @@ recorded design decision.
     unknown helper. It never counts as `absent`.
   - `probe_failed` means the probe could not launch at all. It refuses the
     invocation.
-- **I-B2. "Prevented" needs evidence.** The guarantee is `prevented` only when
-  every class is `absent`, or `present` and covered by a `supported`
-  table row for this exact launch.
+- **I-B2. "Prevented" needs evidence and isolation (D1).** The guarantee is
+  `prevented` only when both of these hold:
+  - the run's execution mode is `isolated`, with a `verified` boundary for
+    every execution path;
+  - every class is `absent`, or is `present` and covered by a `verified`
+    table row for this exact launch and every execution path that could reach
+    it.
+
+  A `same_user` run (the compatibility mode) is capped at
+  `detected_not_prevented`. That holds even when every class is `absent`,
+  because engine state and authorization are not behind an OS boundary
+  (D4).
   - Any `present` class that is not covered gives `detected_not_prevented`.
   - Any `indeterminate` class gives `unverified`, unless another class
     already gives `detected_not_prevented`.
@@ -153,8 +168,14 @@ also downgrade "detected" to "prevented".
   - per-class outcomes (no values);
   - credited classes, with the table row ids;
   - the resulting guarantee.
+- **Mode cap.**
+  - The guarantee computation takes the run's execution mode.
+  - `same_user` caps the result at `detected_not_prevented`.
+  - Until Plan D lands, no run reaches `prevented`. The surfaces then say
+    "compatibility mode: detection only".
 - **Crediting.**
-  - Crediting uses only reviewed table rows (Plan A Stage 1).
+  - Crediting uses only reviewed table rows (Plan A Stage 1), and only for
+    the execution paths the row names.
   - Claude rows for keychain classes on macOS are `unsupported` by
     construction. The table module asserts this in a test, citing the platform
     limitation.
@@ -187,8 +208,14 @@ renamed.
 - **Probe failure.** An unlaunchable probe at turn 3 refuses that turn, and no
   provider process starts.
 - **Crediting.**
-  - A `present` SSH-key class with a test table row `supported` for
-    `credential_files_unreadable` yields `prevented`.
+  - In a test-constructed `isolated` mode, a `present` SSH-key class with
+    `verified` rows for `credential_files_unreadable` on **every** path
+    yields `prevented`. It is computed by the pure function; nothing at
+    runtime can select `isolated` before Plan D.
+  - The same with only the `shell` row `verified` yields
+    `detected_not_prevented`.
+  - `same_user` with every class `absent` and every row `verified` yields
+    `detected_not_prevented`.
   - The same with the row removed yields `detected_not_prevented`.
   - Nothing else in the environment can make it `prevented`.
 - **Wording.** A test greps the output of every surface for "protected" and
@@ -210,8 +237,9 @@ renamed.
   - the crediting rule;
   - the Claude/macOS keychain limitation;
   - Codex `~/.ssh` status;
-  - why "prevented" for Claude on macOS requires a credential-free OS account
-    (decision D1).
+  - why "prevented" requires the `isolated` mode: a demonstrated boundary
+    separating agents from credentials, write authority and engine state
+    (D1, D4). Same-user runs are a detection-only compatibility mode.
 
 **Acceptance evidence:**
 - **Planted canary.** A canary planted in a fake provider transcript fails the

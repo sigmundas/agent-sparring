@@ -212,38 +212,90 @@ Order:
 Until step 5, `main` launches agents exactly as it does today. Only the
 integration branch enforces the gate. See D3.
 
-### Decisions required before implementation (human-only)
+### Decisions (approved 2026-10-18)
 
-- **D1 — What issue #5 accepts.**
-  - For Claude on macOS under the same OS user, "prevented" is impossible while
-    the login keychain holds a write-capable Git credential.
-  - The choice: either the separate credential-free account (the bootstrap
-    model) becomes the supported way to reach "prevented", or same-user runs are
-    accepted as "detected, not prevented".
-  - The plans support both, and always record the truth. D1 decides what the
-    VS Code Run Plan defaults to and what issue #5's closure claims.
-- **D2 — Acknowledgement semantics (S1-5).**
-  - Recommended: an acknowledgement is an observation only.
-  - Accepting an acknowledged candidate that no receipt covers additionally
-    requires a push authorization naming that exact SHA. It is recorded as
-    "authorized, no push performed".
-- **D3 — `main` before evidence exists.**
-  - Recommended: the enforcement gate lands only together with the C4 evidence,
-    so `main` is never "refuse all launches".
-  - The alternative: a recorded per-run human opt-in, `unconfined`, shown
-    everywhere as `unverified`.
-- **D4 — Self-hosting.**
-  - When agent-sparring develops itself, the engine code is inside the agent's
-    worktree.
-  - Recommended: a boundary-enforcing run refuses unless the runner is installed
-    outside every agent-writable root. That is the frozen-runner model the
-    bootstrap kit already uses.
-- **D5 — Where C4 runs.**
-  - Recommended: the `sparring-agent` account, through the existing bootstrap
-    kit, outside any agent sandbox.
-  - The human reviews the evidence bundle before committing table rows.
+- **D1 — Claiming prevention.**
+  - Prevention of unauthorized Git writes may be claimed only with a
+    *demonstrated* security boundary. It must separate agents from trusted Git
+    credentials, from write authority and from engine state.
+  - A separate macOS user, or an equivalent isolated environment, is
+    acceptable.
+  - Same-user operation stays supported as a **compatibility mode**. It never
+    claims prevention where only detection is demonstrated.
+- **D2 — Acknowledgement.**
+  - An acknowledgement records an observed remote movement only. It never
+    authorizes a push and never accepts a candidate.
+  - Any later per-commit authorization, and any acceptance, are explicit and
+    independently recorded.
+- **D3 — `main`.**
+  - Incomplete boundary enforcement stays off `main`. It is integrated only
+    after the complete implementation passes the required independent live
+    verification.
+  - Ordinary existing workflows must not become unusable through fail-closed
+    controls enabled too early.
+- **D4 — Trusted state outside the agent's write authority.**
+  - The trusted runner, the policy and the authorization state must be outside
+    the agent's *effective* write authority.
+  - Placing them outside the worktree is not enough when the agent runs under
+    the same account and could still modify them.
+- **D5 — Live testing.**
+  - It runs under `sparring-agent`, with disposable remotes and synthetic
+    credentials only.
+  - Both positive and negative evidence are preserved.
+
+Design requirements (approved 2026-10-18):
+
+- **R-1. Execution paths are verified separately.**
+  - Never assume all Claude and Codex execution paths share the same sandbox
+    protection.
+  - Shell tools, file tools, MCP processes, web tools, subagents and
+    launch-time configuration are distinct paths. Each claim is per path and
+    verified on the exact provider version and launch mode.
+- **R-2. Enforcement is separate from evidence.**
+  - Runtime enforcement is separate from verification evidence.
+  - A verification record never authorizes execution on its own, and never
+    allows a weaker boundary. Evidence only decides which guarantees may be
+    *claimed*.
+
+What these change in the drafts (applied in the commit after the drafts):
+
+- **Plan A, enforcement versus evidence (R-2, D3).**
+  - Enforcement is unconditional. The builder always applies the full boundary
+    and refuses only when that boundary cannot be applied.
+  - The capability table decides claims, not launches. The draft's "empty
+    table refuses every launch" gate is removed.
+- **Plan A, run modes and tables (D1, D4, R-1).**
+  - A run records its execution mode: `same_user` (compatibility) or
+    `isolated` (a separate trusted account).
+  - Table rows are keyed per execution path.
+- **Plan B (D1).** `prevented` requires the `isolated` mode with a verified
+  boundary. `same_user` is capped at `detected_not_prevented`.
+- **Plan R (D2).** An acknowledgement is never consulted by authorization or
+  acceptance code. Authorizing a commit already on the remote is its own
+  explicit CLI action.
+- **Plan C (D5, R-1).** Scenarios are per execution path. The positive and
+  negative evidence and the disable runs are all preserved.
+- **New, not yet drafted: Plan D, cross-account isolated execution (D1, D4).**
+  - In Plan D, the trusted engine, its policy, authorization state and Git
+    credentials live under one account. Agents run under another account that
+    cannot write them.
+  - Without Plan D, no run can claim prevention. Plans R, A, B and C remain
+    correct and useful without it.
+  - **This is a blocker for closing issue #5 as "prevented", not for Plan R.**
 
 ### Other blockers
+
+- **The bootstrap gate has F5's flaw.** `/Users/Shared/sparring-bootstrap/2-gate.sh`
+  checks credentials with `git credential fill | grep password`, so a failing
+  helper reads as "no credential". The recovery kit uses a stricter
+  presence-only gate (see `docs/audits/issue5-recovery-kit/README.md`).
+- **The frozen runner predates Stage 1.** It is `c61eaf8`, whose source equals
+  `ea8e70d`. It still treats a candidate reachable on the remote as pushed, and
+  its stage agents run with no provider boundary.
+  - That is acceptable only because its remote is a local disposable bare
+    repository, the account holds no Git credentials, and every result is
+    independently reviewed.
+  - A Plan R result is untrusted until that review.
 
 - **Run Stage 1's full test suite in a credential-free environment.** It must
   run before R starts, and the counts must be recorded. No independent count

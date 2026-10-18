@@ -14,10 +14,37 @@ nothing is cherry-picked unreviewed. The audit is
 - Plan R, accepted and merged to `main`. Base each run on that `main`.
 - Decisions D1, D3 and D4, recorded in the audit.
 
-**Integration branch.** Plans A, B and C stages 2 to 3 all land on the
-integration branch `issue5/boundary`. That branch merges to `main` only after
-the human live verification in Plan C (D3). Until then, `main` launches agents
-as it does today.
+**Integration branch.**
+- Plans A, B and C stages 2 to 3 all land on the integration branch
+  `issue5/boundary`.
+- That branch merges to `main` only after the complete implementation passes
+  Plan C's human live verification (D3). Until then, `main` launches agents as
+  it does today.
+- Nothing in this plan adds a fail-closed control to `main` early.
+
+**Approved decisions (2026-10-18), recorded in the audit:**
+- **D1.** Prevention is claimed only with a demonstrated boundary separating
+  agents from credentials, write authority and engine state. Same-user runs
+  are a compatibility mode.
+- **D3.** Keep this off `main` until live verification passes.
+- **D4.** Trusted runner, policy and state must be outside the agent's
+  *effective* write authority. Outside the worktree is not enough under the
+  same account.
+- **R-1.** Each execution path is verified separately.
+- **R-2.** Enforcement is separate from evidence.
+
+**Execution modes.**
+- A run records one of two modes:
+  - `same_user`, the compatibility mode: agents run under the engine's own OS
+    account;
+  - `isolated`: agents run under a separate account that cannot write the
+    trusted runner, policy, authorization state or credentials.
+- This plan builds the same boundary in both modes. `isolated` itself, meaning
+  the cross-account launch and its ownership checks, is **Plan D (not yet
+  drafted)**.
+- Until Plan D exists, every run is `same_user`. Under D4, its engine-state
+  protection is a provider control, not an OS boundary, and is reported as
+  such.
 
 **Runner.** Run this plan with a frozen runner installed outside the agent's
 worktree. This is decision D4. This plan changes the launch code that would
@@ -40,10 +67,22 @@ table.
 - **I-A2. Built every time.** The builder runs for every invocation, resume
   included. Its inputs come only from the immutable run-start policy in
   engine-protected state, never from the worktree or `HEAD`.
-- **I-A3. No self-certification.** Launch admissibility depends only on
-  reviewed, committed data: the capability table, keyed by exact provider
-  version and platform. No file the engine writes at runtime can make a
-  control "supported".
+- **I-A3. Enforcement never depends on evidence (R-2).**
+  - The builder always applies the full boundary for the provider and role.
+    It refuses only when it cannot apply that boundary: a required flag or
+    settings key is rejected, the sandbox is unavailable
+    (`failIfUnavailable`), or the policy is invalid.
+  - The capability table and all verification evidence decide **only which
+    guarantees may be claimed**. They never decide whether to launch, and they
+    never select a narrower or different configuration.
+  - The table is reviewed, committed data. No file the engine writes at
+    runtime is read by the builder or by the claim logic.
+- **I-A3a. Claims per execution path (R-1).**
+  - Every claim is keyed by provider × role × exact version × platform ×
+    execution mode × **execution path** × control.
+  - The execution paths are `shell`, `file_tools`, `mcp`, `web_tools`,
+    `subagents` and `launch_config`.
+  - A claim for one path never implies another.
 - **I-A4. Engine state is outside every writable root.** Engine state and the
   boundary's own settings sit outside every agent-writable root, and are also
   explicitly denied to the shell and the file tools.
@@ -93,26 +132,31 @@ table.
   `provider_changed_since_start`.
 - **Permission mode.** It is an enum, not free text: Claude stage `acceptEdits`;
   `bypassPermissions` and `auto` are refused.
-- **The capability table is reviewed data.**
-  - It is a committed module, `capability_table.py`, with rows keyed by
-    provider × role × exact version × platform × control.
-  - Each row is `supported`, `unsupported` or `residual`, with an
+- **The capability table is reviewed data, used for claims only.**
+  - It is a committed module, `capability_table.py`, keyed as in I-A3a.
+  - Each row is `verified`, `unsupported` or `residual`, with an
     `evidence: "<bundle digest>"` field.
-  - It ships with **no supported rows**.
+  - It ships with **no verified rows**, so every claim starts as
+    `unverified`.
+  - The claim function takes the table as an argument. The builder does not
+    import it, which a test asserts.
   - `record_verified_controls`, `load_verified_controls` and the
     `VERIFIED_VERSIONS` minimum gate are deleted.
-- **The gate.**
-  - A launch is refused when any required control lacks a `supported` row for
-    the exact version.
-  - On this branch every launch is refused until Plan C's human step adds
-    rows.
-  - Tests pass a table to the pure builder as an argument. There is no
-    environment variable, file or global for injecting one.
-- **Runner location.**
-  - A boundary-enforcing launch refuses with `runner_inside_agent_root` when
-    the running engine's package files sit inside any agent-writable root.
-  - Agent-writable roots are the agent working directory, the managed
-    worktree, `$TMPDIR` and every sandbox write root.
+- **Unknown provider version.**
+  - The full boundary is still applied.
+  - Every claim is `unverified`.
+  - A required flag or settings key that the installed CLI rejects refuses
+    with `provider_flag_unavailable`. It is never dropped.
+- **The run records its mode and claims.**
+  - It records its execution mode, which is always `same_user` until Plan D.
+  - It records the per-path claim set for each `LaunchSpec`.
+- **Runner location (necessary, not sufficient, under D4).**
+  - A launch refuses with `runner_inside_agent_root` when the running engine's
+    package files, the run policy or the authorization state sit inside any
+    agent-writable root. Agent-writable roots are the agent working directory,
+    the managed worktree, `$TMPDIR` and every sandbox write root.
+  - In `same_user` mode, the run's claims state that these are "protected by
+    provider sandbox rules, not an OS boundary".
 
 **Starting points:**
 - `cli.py`: adapter construction, `_claude_boundary_builder`,
@@ -143,11 +187,22 @@ table.
 - **Provider change.** The provider binary is replaced after start (a test
   binary at the same path with a different hash) → `provider_changed_since_start`.
 - **Permission mode.** `--permission-mode bypassPermissions` → typed refusal.
-- **Empty table.** It refuses every launch. A table with one control missing
-  refuses and names that control. No file placed in the user-config directory,
-  `.sparring/` or `$TMPDIR` changes the outcome.
-- **Runner location.** Running from an editable install inside the worktree
-  gives `runner_inside_agent_root`.
+- **Enforcement independent of evidence.**
+  - The empty table, a table with every row `verified`, and a table with
+    arbitrary rows all produce a byte-identical `LaunchSpec` for the same
+    inputs. Only the recorded claims differ.
+  - No file placed in the user-config directory, `.sparring/` or `$TMPDIR`
+    changes either the `LaunchSpec` or the claims.
+- **Unknown version.** It gives the full boundary and all-`unverified`
+  claims.
+- **Rejected flag.** A fake CLI that rejects a required flag gives
+  `provider_flag_unavailable` before any provider process starts.
+- **Per-path claims.** A `verified` row for `shell` does not make the same
+  control `verified` for `file_tools` or `mcp`.
+- **Runner location.** Each of the following gives
+  `runner_inside_agent_root`:
+  - running from an editable install inside the worktree;
+  - a policy file under `$TMPDIR`.
 - **Test runs.** Focused tests and `.venv/bin/python -m pytest -q` pass.
 
 ## Stage 2 — Claude boundary content: sources, engine state and environment
@@ -185,6 +240,16 @@ skills and `CLAUDE.md` still load.
   `~/.config/git/credentials`, `~/.netrc`, `~/.docker/config.json`, cloud CLI
   credential dirs, and any `credential.helper=store --file` path found in the
   snapshot.
+- **Execution paths (R-1).** The settings handle each Claude path explicitly,
+  and `docs/setup.md` states which mechanism governs each one:
+  - `shell`: the OS sandbox;
+  - `file_tools` (Read, Edit, Write, NotebookEdit, Glob, Grep): permission
+    rules only;
+  - `mcp`: no servers loaded;
+  - `web_tools` (WebFetch, WebSearch): disallowed unless the project enables
+    them;
+  - `subagents`: whether they inherit the boundary;
+  - `launch_config`: setting sources.
 - **Settings sources.**
   - The builder uses one documented mechanism for loading no user, project or
     local settings, plugins, hooks, MCP, agent definitions, skills or memory
@@ -252,8 +317,9 @@ layout. Claude docs: `/sandboxing`, `/settings`, `/permissions`, `claude --help`
   `codex_user_mcp_configured` remains as an additional fail-closed check.
 - **SSH read restriction.** If a `-P` permission profile can deny reading
   `~/.ssh` and the other credential paths, the builder uses it. Its effect is
-  `unverified` until Plan C. Otherwise the table row for "credential files
-  unreadable" is `unsupported` for Codex, and Plan B records the consequence.
+  `unverified` until Plan C. Otherwise the Codex claim for "credential files
+  unreadable" on the `shell` path is `unsupported`, and Plan B records the
+  consequence.
 - **Environment.** The same allowlist as Claude.
 
 **Starting points:** `providers/codex_cli.py` (`_build_args`, resume),
