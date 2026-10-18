@@ -1002,26 +1002,40 @@ def finish_run(
 def _run_guard(repo_root: Path, record: ManagedRunRecord):
     """The trusted-configuration guard of ``record``'s run, from the pin in
     its engine-written plan-run state (in the worktree, or in the archive
-    once the worktree is gone). A run with no pin finishes under the
-    hardened Git path alone."""
+    once the worktree is gone).
+
+    Fails closed: a copy that exists but cannot be read is never taken to
+    mean "no pin". If another copy is readable and pinned, that one is
+    used; otherwise the finish stops (:class:`_StepFailed`) before any Git
+    invocation. Only a run with no recorded state anywhere -- one that
+    predates pins -- finishes under the hardened Git path alone.
+    """
 
     from agent_sparring.remote_pin import RemotePinError, load_run_remote_state
 
-    roots: list[Path] = []
+    roots: list[tuple[Path, str]] = []
     try:
-        roots.append(record.sparring_dir)
+        roots.append((record.sparring_dir, "checks"))
     except ManagedRunError:
         pass
-    roots.append(archive_dir(repo_root, record.run_key))
-    for root in roots:
+    roots.append((archive_dir(repo_root, record.run_key), "archive_state"))
+    unreadable: list[tuple[str, str]] = []
+    for root, step in roots:
         try:
             remote = load_run_remote_state(root, record.run_key)
-        except RemotePinError:
-            # An unreadable copy names no pin; the finish's own steps report
-            # it (archive_state), and the hardened Git path still applies.
+        except RemotePinError as exc:
+            unreadable.append((step, str(exc)))
             continue
         if remote is not None and remote.pin is not None:
             return _pinned_finish(repo_root, record, remote.pin)
+    if unreadable:
+        step, detail = unreadable[0]
+        raise _StepFailed(
+            step,
+            f"run_state_unreadable: the run's recorded push authority cannot be read ({detail}); "
+            "refusing to finish without it -- nothing was merged, pushed or deleted by this finish",
+        )
+    # Readable but unpinned, or absent: a run recorded before pins.
     return contextlib.nullcontext()
 
 

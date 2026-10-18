@@ -1730,7 +1730,59 @@ class FinishHardeningTests(_FinishTestCase):
         archived.write_text("{broken", encoding="utf-8")
         code, report, _ = self._finish(record)
         self.assertEqual((code, report["stopped_at"]), (1, "archive_state"))
-        self.assertEqual(report["completed_steps"], ["merge"])
+        # Unreadable recorded authority stops the finish before any step runs.
+        self.assertIn("run_state_unreadable", report["reason"])
+        self.assertNotIn("finished", report["completed_steps"])
+        self.assertNotIn("finished", self._events(record))
+
+    def test_unreadable_recorded_authority_refuses_before_any_remote_operation(self):
+        # The worktree is gone, the archived run state is damaged, and the
+        # repository's remote and credential configuration changed since the
+        # run started. --push-target must not fall back to that live
+        # configuration: the finish refuses before any remote operation, and
+        # no planted helper runs.
+        record, _ = self._complete()
+        real_append = managed_run.append_event
+
+        def fail_branch_deleted(repo_root, run_key, event, detail=None):
+            if event == "branch_deleted":
+                raise OSError("simulated crash")
+            return real_append(repo_root, run_key, event, detail)
+
+        with mock.patch.object(managed_run, "append_event", side_effect=fail_branch_deleted):
+            self._finish(record)
+        self.assertFalse(Path(record.worktree_path).exists())
+        archived = managed_finish.archive_dir(self.repo, record.run_key) / "plans" / f"{record.run_key}.json"
+        archived.write_text("{broken", encoding="utf-8")
+
+        marker = self.repo.parent / "MARKER"
+        helper = self.repo.parent / "helper.sh"
+        helper.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
+        helper.chmod(0o755)
+        evil = self.repo.parent / "evil.git"
+        _run_git(self.repo.parent, "init", "-q", "--bare", str(evil))
+        _run_git(self.repo, "config", "credential.helper", f"!{helper}")
+        _run_git(self.repo, "remote", "set-url", "origin", str(evil))
+        main_before = _git(self.remote, "rev-parse", "refs/heads/main")
+
+        real_git = managed_run._git
+        remote_calls = []
+
+        def recording(cwd, *args):
+            if any(a in ("push", "ls-remote", "fetch") for a in args):
+                remote_calls.append(args)
+            return real_git(cwd, *args)
+
+        with mock.patch.object(managed_run, "_git", side_effect=recording):
+            code, report, _ = self._finish(record, "--push-target")
+
+        self.assertEqual((code, report["stopped_at"]), (1, "archive_state"))
+        self.assertIn("run_state_unreadable", report["reason"])
+        self.assertEqual(remote_calls, [])
+        self.assertFalse(marker.exists())
+        self.assertEqual(_git(evil, "for-each-ref"), "")
+        self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), main_before)
+        self.assertNotIn("target_pushed", self._events(record))
 
     def test_prune_retains_the_archive_of_an_interrupted_finish(self):
         record, _ = self._complete()
