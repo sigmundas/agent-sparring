@@ -511,7 +511,9 @@ def ensure_candidate_pushed(
         # In an isolated repository configured only from the run's trusted
         # snapshot: no repository configuration -- not even one written
         # after the checks above -- reaches the push.
-        result = engine_git.run_remote(repo_root, pin.trusted_config, *push_command(target))
+        result = engine_git.run_remote(
+            repo_root, pin.trusted_config, *push_command(target), pinned=pin.destination
+        )
     except GitContextError as exc:
         raise PushError(f"refusing to push {candidate_sha} to {destination}: {exc}") from exc
     if result.returncode != 0:

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_sparring.git_context import ChangedFile, GitContext, gather_git_context, diff_patch
+from agent_sparring.remote_pin import load_run_remote_state
 from agent_sparring.stage import HUMAN_EVIDENCE_HEADING, Stage
 
 
@@ -207,14 +208,24 @@ def generate_handoff(
     ``base_sha``/``candidate_sha`` override the stage's recorded
     ``state.json`` values when given (useful before those are recorded,
     e.g. from the CLI); otherwise the recorded values are used.
+
+    The pushed check of a stage a pinned run owns reads that run's pinned
+    destination with its trusted snapshot; any other stage's is the
+    unpinned read of :func:`~agent_sparring.git_context.verify_pushed`.
+    Neither follows the repository's live transport configuration.
     """
 
     state = stage.read_state()
+    pin = None
+    if check_pushed and state.run:
+        remote = load_run_remote_state(Path(stage.directory).parent.parent, state.run)
+        pin = remote.pin if remote is not None else None
     git = gather_git_context(
         repo_root,
         base_sha=base_sha or state.base_sha,
         candidate_sha=candidate_sha or state.candidate_sha,
         check_pushed=check_pushed,
+        pin=pin,
     )
     handoff_input = HandoffInput(
         stage_goal=stage_goal, claims=claims, git=git, test_evidence=test_evidence

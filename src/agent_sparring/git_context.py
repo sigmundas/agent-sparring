@@ -13,6 +13,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from agent_sparring import engine_git
 from agent_sparring.engine_git import GitConfigRefusal, GitContextError
@@ -289,17 +290,33 @@ def verify_pushed(repo_root: Path, candidate_sha: str, branch: str) -> tuple[boo
     logic (not the code) used by the Sporely V1 workflow scripts: the remote
     ref is looked up by its full name and reachability is proven locally via
     ``merge-base --is-ancestor``, rather than trusting any recorded flag.
+
+    This is the read for a repository no run pinned. It never follows the
+    repository's live transport configuration: under a run guard that
+    governs ``repo_root`` it uses that guard's snapshot; otherwise it
+    refuses (:class:`~agent_sparring.engine_git.GitConfigRefusal`,
+    ``repository_transport_config``) while the repository sets any
+    transport or credential key of its own, and reads with the user's
+    global and system configuration only. A pinned repository is read with
+    :func:`agent_sparring.remote_pin.verify_pinned` instead.
     """
 
+    guard = engine_git.guard_for(Path(repo_root))
+    if guard is None:
+        engine_git.refuse_repository_transport(Path(repo_root))
+    trusted = guard.entries if guard is not None else ()
     remote, remote_branch = tracking_remote(repo_root, branch)
     ref = f"refs/heads/{remote_branch}"
-    # Read by URL: inside a managed run a remote operation runs in an
-    # isolated repository where remote names do not exist (see
-    # agent_sparring.engine_git.run_remote).
+    # Read by URL, in an isolated repository where remote names do not
+    # exist (see agent_sparring.engine_git.run_remote).
     got = _run(repo_root, "remote", "get-url", remote)
     configured = got.stdout.strip() if got.returncode == 0 else ""
-    url = absolute_url(repo_root, configured) if configured else remote
-    result = _run(repo_root, "ls-remote", "--exit-code", url, ref)
+    if not configured:
+        return False, f"{remote} has no configured URL, so {ref} cannot be read"
+    url = absolute_url(repo_root, configured)
+    if url.startswith("-"):
+        raise GitContextError(f"refusing to read {ref!r} at {url!r}: git would read it as an option")
+    result = engine_git.run_remote(repo_root, trusted, "ls-remote", "--exit-code", url, ref)
     if result.returncode != 0:
         return False, (
             f"{remote} has no {ref} yet ({result.stderr.strip() or 'ls-remote failed'})"
@@ -426,12 +443,18 @@ def gather_git_context(
     base_sha: str | None = None,
     candidate_sha: str | None = None,
     check_pushed: bool = True,
+    pin: Any = None,
 ) -> GitContext:
     """Gather branch/commit/diff/status/push context for one repo.
 
     ``candidate_sha`` defaults to the current ``HEAD``. ``base_sha``, if
     given, is used to compute the changed-file list; if omitted, the
     changed-file list is empty (nothing recorded to diff against yet).
+
+    ``pin`` is the owning run's :class:`~agent_sparring.remote_pin.RemotePin`,
+    when it has one: the pushed check then reads the pinned destination
+    with the run's snapshot, and nothing else (see :func:`verify_pushed`
+    for a repository no run pinned).
     """
 
     branch = current_branch(repo_root)
@@ -445,7 +468,14 @@ def gather_git_context(
 
     pushed: bool | None = None
     push_detail: str | None = None
-    if check_pushed:
+    if check_pushed and pin is not None:
+        from agent_sparring.remote_pin import verify_pinned
+
+        with engine_git.trusted_config(
+            [Path(repo_root)], pin.trusted_config, destinations=(pin.destination,)
+        ):
+            pushed, push_detail = verify_pinned(repo_root, pin, resolved_candidate)
+    elif check_pushed:
         pushed, push_detail = verify_pushed(repo_root, resolved_candidate, branch)
 
     return GitContext(

@@ -208,6 +208,11 @@ class ManagedFinishTests(_FinishTestCase):
         self.assertTrue(status["finish"]["eligible"]["merge"])
 
     def test_candidate_pushed_is_bound_to_the_recorded_remote_and_branch(self):
+        # The second remote exists before the run starts: status reads remotes
+        # through the run's snapshot, and a remote added later is a change.
+        other = self.repo.parent / "other.git"
+        _run_git(self.repo.parent, "init", "-q", "--bare", str(other))
+        _run_git(self.repo, "remote", "add", "upstream", str(other))
         record, head = self._complete(push=False)
         worktree = Path(record.worktree_path)
         # Upstream config pointing at another ref that has the candidate does not count.
@@ -218,9 +223,6 @@ class ManagedFinishTests(_FinishTestCase):
         self.assertEqual(failed, {"candidate_not_pushed"})
         # A recorded non-origin remote is checked, not origin.
         _run_git(worktree, "push", "-q", "origin", record.branch)
-        other = self.repo.parent / "other.git"
-        _run_git(self.repo.parent, "init", "-q", "--bare", str(other))
-        _run_git(self.repo, "remote", "add", "upstream", str(other))
         path = managed_run.record_path(self.repo, record.run_key)
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["remote"] = "upstream"
@@ -1224,7 +1226,15 @@ class PlanRemovalTests(_FinishTestCase):
         env = {k: v for k, v in os.environ.items()
                if k not in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
                             "EMAIL")}
-        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        # The engine ignores GIT_CONFIG_GLOBAL (see engine_git._environment):
+        # the user's own configuration is found from HOME, so that is what
+        # is emptied here.
+        empty_home = self.repo.parent / "empty-home"
+        (empty_home / ".config").mkdir(parents=True)
+        env.update({
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "HOME": str(empty_home), "XDG_CONFIG_HOME": str(empty_home / ".config"),
+        })
         with mock.patch.dict(os.environ, env, clear=True):
             code, report, err = self._finish(record)
         self.assertEqual(code, 0, err)

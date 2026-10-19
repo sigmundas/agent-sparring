@@ -85,7 +85,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 from agent_sparring import engine_git
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
@@ -103,8 +103,10 @@ from agent_sparring.remote_pin import (
     UNAUTHORIZED_REMOTE_MOVEMENT,
     RemotePinError,
     RunRemoteState,
+    SiblingRemotePin,
     UnauthorizedRemoteMovement,
     check_movement,
+    find_sibling_pin,
     load_run_remote_state,
     verify_pinned,
 )
@@ -245,7 +247,9 @@ def _run_guard(stage: Stage, repo_root: Path) -> Iterator[RunRemoteState | None]
 
     remote = _run_remote(stage)
     if remote is not None and remote.pin is not None:
-        with engine_git.trusted_config([Path(repo_root)], remote.pin.trusted_config):
+        with engine_git.trusted_config(
+            [Path(repo_root)], remote.pin.trusted_config, destinations=(remote.pin.destination,)
+        ):
             yield remote
     else:
         yield remote
@@ -449,8 +453,25 @@ def _describe(repository: CandidateRepository) -> str:
     return f"{repository.name!r} ({repository.path})"
 
 
+def _sibling_pushed(
+    root: Path, head: str, branch: str, siblings: Sequence[SiblingRemotePin]
+) -> tuple[bool, str]:
+    """Reachability of a sibling's ``head``, read with the sibling's own
+    run-start pin and snapshot when the run pinned it, and otherwise
+    without any of the sibling's repository transport configuration (see
+    :func:`~agent_sparring.git_context.verify_pushed`)."""
+
+    pin = find_sibling_pin(siblings, root, branch)
+    if pin is None:
+        return verify_pushed(root, head, branch)
+    with engine_git.trusted_config([root], pin.trusted_config, destinations=(pin.destination,)):
+        return verify_pinned(root, pin, head)
+
+
 def _freeze_siblings(
-    repo_root: Path, repositories: tuple[CandidateRepository, ...]
+    repo_root: Path,
+    repositories: tuple[CandidateRepository, ...],
+    siblings: Sequence[SiblingRemotePin] = (),
 ) -> tuple[CandidateRepository, ...]:
     """Resolve and pin every declared sibling candidate, or refuse.
 
@@ -458,7 +479,8 @@ def _freeze_siblings(
     gets, in the same order: it must be on the declared branch, resolve
     HEAD, hold no dirty changes at all (a sibling holds none of *this*
     stage's workflow artifacts, so nothing is exempt there), and have that
-    commit reachable from its branch's configured remote. A sibling that
+    commit reachable from its branch's remote -- read through the
+    sibling's own run-start pin (``siblings``) when there is one. A sibling that
     declares a ``candidate_sha`` must be exactly at it -- that is the
     reviewed commit asserted by whoever declared it, and silently pinning a
     different one would defeat the point.
@@ -507,7 +529,10 @@ def _freeze_siblings(
                 f"{_describe(repository)}: its working tree holds changes that commit "
                 f"does not represent ({listed}). Commit or discard them first."
             )
-        pushed, push_detail = verify_pushed(root, head, branch)
+        try:
+            pushed, push_detail = _sibling_pushed(root, head, branch, siblings)
+        except GitContextError as exc:
+            raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
         if not pushed:
             raise AcceptanceError(
                 f"refusing to freeze {head} as the candidate of sibling repository "
@@ -599,17 +624,24 @@ def unrepresented_dirty(repo_root: Path, stage: Stage) -> tuple[str, ...]:
 
 
 def pin_sibling_candidates(
-    repo_root: Path, repositories: tuple[CandidateRepository, ...]
+    repo_root: Path,
+    repositories: tuple[CandidateRepository, ...],
+    *,
+    stage: Stage | None = None,
 ) -> tuple[CandidateRepository, ...]:
     """Resolve and pin every declared sibling candidate, or refuse.
 
     The public name for the freeze's own sibling handling, so an
     independent-review stage pins the sibling candidates it is reviewing
     under exactly the checks a freeze applies (see :func:`_freeze_siblings`)
-    instead of a second, looser version of them.
+    instead of a second, looser version of them. ``stage``, when given,
+    supplies its owning run's sibling pins.
     """
 
-    return _freeze_siblings(repo_root, repositories)
+    remote = _run_remote(stage) if stage is not None else None
+    return _freeze_siblings(
+        repo_root, repositories, remote.siblings if remote is not None else ()
+    )
 
 
 def verify_sibling_candidates(
@@ -757,7 +789,9 @@ def _freeze_candidate_locked(
     # A cross-repository stage is frozen as a *set*: pinning only the primary
     # commit would let a reviewed sibling move between review and acceptance.
     # Refuses before anything is written, like every check above.
-    repositories = _freeze_siblings(repo_root, state.repositories)
+    repositories = _freeze_siblings(
+        repo_root, state.repositories, remote.siblings if remote is not None else ()
+    )
 
     state.candidate_sha = candidate_sha
     state.status = StageStatus.FROZEN

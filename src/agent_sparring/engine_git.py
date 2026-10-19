@@ -18,14 +18,20 @@ calls Git so that none of that can happen:
   overridden to no command and not required;
 - **merge drivers** never run: a merge-like command refuses while any
   configuration defines one (an override cannot make one inert);
-- **included configuration** is never loaded: any ``include.*`` or
-  ``includeIf.*`` key, in any scope, is a refusal *before* the command runs;
+- **repository-included configuration** is never loaded: an ``include.*``
+  or ``includeIf.*`` key in local or worktree scope is a refusal *before*
+  the command runs. Includes in the user's own global and system
+  configuration are resolved by Git, against the repository the command
+  runs in (so ``includeIf "gitdir:..."`` in ``~/.gitconfig`` keeps
+  working), and a remote operation reads their expanded entries;
 - background ``gc``/maintenance, which would start further Git processes,
   is off.
 
-Git's own location and configuration-injection environment variables
-(``GIT_DIR``, ``GIT_CONFIG_PARAMETERS``, ``GIT_EXTERNAL_DIFF`` ...) are
-removed, so the engine always operates on the repository it names.
+Git's own location, program and configuration-injection environment
+variables (``GIT_DIR``, ``GIT_SSH_COMMAND``, ``GIT_CONFIG_PARAMETERS``,
+``GIT_EXTERNAL_DIFF`` ...; the exact list is :func:`_environment`'s) are
+removed, so the engine always operates on the repository it names, with
+the configuration files Git finds for it.
 
 Changed configuration is a refusal, not something to follow
 ----------------------------------------------------------------
@@ -48,7 +54,13 @@ repository's configuration at all. :func:`run_remote` runs them in a
 throwaway bare repository that borrows the objects and is configured from
 the trusted snapshot's transport keys only (see :func:`isolated_git_dir`),
 so configuration written between a check and the invocation cannot reach
-them either. Local operations do read the repository's configuration;
+them either. :func:`run` refuses a remote operation outright
+(``unguarded_remote_operation``) unless a run guard governs its directory:
+a caller with no guard passes an explicit snapshot and destination to
+:func:`run_remote`, or -- having none -- uses
+:func:`refuse_repository_transport` and an empty snapshot. A push to a
+local-path destination must be to the pinned one: a local repository runs
+its own receive hooks. Local operations do read the repository's configuration;
 what they could execute is neutralized as above, and a change is refused
 before each one. A concurrent writer racing a single local invocation is
 outside what this module can stop; confining the agents is.
@@ -59,6 +71,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -117,9 +130,20 @@ _STRIPPED_ENV = frozenset(
         "GIT_CONFIG",
         "GIT_CONFIG_PARAMETERS",
         "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
         "GIT_EXTERNAL_DIFF",
         "GIT_DIFF_OPTS",
         "GIT_ATTR_SOURCE",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_PROXY_COMMAND",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "GIT_EDITOR",
     }
 )
 
@@ -127,6 +151,27 @@ _REPO_SCOPES = frozenset({"local", "worktree"})
 
 
 def _environment(extra: Mapping[str, str] | None) -> dict[str, str]:
+    """The process environment for an engine Git invocation: the inherited
+    one without exactly these variables, then ``extra`` (the engine's own
+    settings) on top.
+
+    - location: ``GIT_DIR``, ``GIT_WORK_TREE``, ``GIT_INDEX_FILE``,
+      ``GIT_OBJECT_DIRECTORY``, ``GIT_ALTERNATE_OBJECT_DIRECTORIES``,
+      ``GIT_COMMON_DIR``, ``GIT_NAMESPACE``, ``GIT_ATTR_SOURCE``;
+    - configuration: ``GIT_CONFIG``, ``GIT_CONFIG_PARAMETERS``,
+      ``GIT_CONFIG_COUNT``, every ``GIT_CONFIG_KEY_*`` and
+      ``GIT_CONFIG_VALUE_*``, ``GIT_CONFIG_GLOBAL``, ``GIT_CONFIG_SYSTEM``,
+      ``GIT_CONFIG_NOSYSTEM``;
+    - programs: ``GIT_EXTERNAL_DIFF``, ``GIT_DIFF_OPTS``, ``GIT_SSH``,
+      ``GIT_SSH_COMMAND``, ``GIT_ASKPASS``, ``SSH_ASKPASS``,
+      ``GIT_PROXY_COMMAND``, ``GIT_EXEC_PATH``, ``GIT_TEMPLATE_DIR``,
+      ``GIT_EDITOR``.
+
+    Nothing else is removed: ``HOME`` and ``XDG_CONFIG_HOME`` still locate
+    the user's own configuration, which is what keeps existing
+    authentication working.
+    """
+
     env = {
         name: value
         for name, value in os.environ.items()
@@ -264,11 +309,15 @@ class TrustedConfig:
 
     ``roots`` are the resolved directories the snapshot governs: an
     invocation whose working directory is inside one of them is compared;
-    any other (a declared sibling repository, say) is not.
+    any other (a declared sibling repository, say) is not -- unless a guard
+    of its own governs it. ``destinations`` are the pinned URLs a remote
+    operation routed through this guard may push to when they are local
+    paths (see :func:`run_remote`).
     """
 
     roots: tuple[str, ...]
     entries: tuple[tuple[str, str], ...]
+    destinations: tuple[str, ...] = ()
 
     def governs(self, cwd: Path) -> bool:
         try:
@@ -282,22 +331,30 @@ class TrustedConfig:
         return False
 
 
-_TRUSTED: contextvars.ContextVar[TrustedConfig | None] = contextvars.ContextVar(
-    "agent_sparring_trusted_git_config", default=None
+#: The active guards, innermost last: a sibling repository's guard nests
+#: inside its run's guard without lifting the primary's.
+_TRUSTED: contextvars.ContextVar[tuple[TrustedConfig, ...]] = contextvars.ContextVar(
+    "agent_sparring_trusted_git_config", default=()
 )
 
 
 @contextlib.contextmanager
 def trusted_config(
-    roots: Sequence[Path], entries: Sequence[tuple[str, str]]
+    roots: Sequence[Path],
+    entries: Sequence[tuple[str, str]],
+    *,
+    destinations: Sequence[str | None] = (),
 ) -> Iterator[TrustedConfig]:
-    """Hold every engine Git invocation inside ``roots`` to ``entries``."""
+    """Hold every engine Git invocation inside ``roots`` to ``entries``,
+    and let a remote operation there push only to ``destinations`` when
+    one is a local path."""
 
     guard = TrustedConfig(
         roots=tuple(str(Path(root).resolve()) for root in roots),
         entries=tuple((str(k), str(v)) for k, v in entries),
+        destinations=tuple(str(d) for d in destinations if d),
     )
-    token = _TRUSTED.set(guard)
+    token = _TRUSTED.set((*_TRUSTED.get(), guard))
     try:
         yield guard
     finally:
@@ -305,18 +362,80 @@ def trusted_config(
 
 
 def active_guard() -> TrustedConfig | None:
-    return _TRUSTED.get()
+    """The innermost active guard, whatever it governs."""
+
+    guards = _TRUSTED.get()
+    return guards[-1] if guards else None
+
+
+def guard_for(cwd: Path) -> TrustedConfig | None:
+    """The innermost active guard that governs ``cwd``, or ``None``."""
+
+    for guard in reversed(_TRUSTED.get()):
+        if guard.governs(Path(cwd)):
+            return guard
+    return None
 
 
 def _refuse_includes(entries: Sequence[ConfigEntry]) -> None:
+    """Refuse an include in local or worktree scope.
+
+    The repository's own files are what an agent can write; the user's
+    global and system configuration are the user's, and their includes
+    (``includeIf "gitdir:..."`` in ``~/.gitconfig`` is common) are resolved
+    by Git into the entries listed with that scope.
+    """
+
     for entry in entries:
-        if is_include(entry.key):
+        if entry.scope in _REPO_SCOPES and is_include(entry.key):
             raise GitConfigRefusal(
                 "included_config",
                 entry.key,
                 f"refusing to run git: {entry.scope} configuration sets {entry.key}, and the "
-                "engine never loads included configuration. Remove the include (or inline what "
-                "it provides) and retry",
+                "engine never loads configuration a repository includes. Remove the include (or "
+                "inline what it provides) and retry",
+            )
+
+
+def is_repository_transport(key: str) -> bool:
+    """Repository configuration that would decide where, or with what, a
+    remote operation goes: credential and transport keys, URL rewrites, and
+    a remote's push URL and remote-side programs."""
+
+    section, variable = _section(key), _variable(key)
+    if is_transport(key):
+        return True
+    if section == "url" and variable in ("insteadof", "pushinsteadof"):
+        return True
+    return section == "remote" and variable in (
+        "pushurl", "uploadpack", "receivepack", "proxy", "proxyauthmethod", "vcs",
+    )
+
+
+def refuse_repository_transport(cwd: Path) -> None:
+    """For a remote read that has no trusted snapshot: refuse, naming the
+    key, while ``cwd``'s repository (local or worktree scope) sets any
+    transport or credential configuration of its own.
+
+    With no snapshot there is nothing to tell configuration the user set
+    from configuration an agent planted, so none is used: the read then
+    runs through :func:`run_remote` with an empty snapshot, on the user's
+    own global and system configuration only.
+    """
+
+    entries = config_entries(Path(cwd))
+    if entries is None:
+        raise GitContextError(f"cannot read the git configuration of {cwd}")
+    _refuse_includes(entries)
+    for entry in entries:
+        if entry.scope in _REPO_SCOPES and is_repository_transport(entry.key):
+            raise GitConfigRefusal(
+                "repository_transport_config",
+                entry.key,
+                f"refusing to contact a remote from {cwd}: its {entry.scope} configuration sets "
+                f"{entry.key}, and with no run-start snapshot of this repository the engine "
+                "cannot tell that from configuration an agent planted. Move it to your global "
+                "configuration, or run this inside a managed run that pinned it",
             )
 
 
@@ -411,8 +530,8 @@ def _checked(cwd: Path, args: Sequence[str]) -> tuple[tuple[ConfigEntry, ...] | 
     pairs = list(BASE_OVERRIDES)
     if entries is not None:
         _refuse_includes(entries)
-        guard = _TRUSTED.get()
-        if guard is not None and guard.governs(Path(cwd)):
+        guard = guard_for(Path(cwd))
+        if guard is not None:
             compare_snapshot(entries, guard.entries)
         pairs += _driver_overrides(entries)
     index, name = subcommand(args)
@@ -441,6 +560,8 @@ def command(cwd: Path, args: Sequence[str]) -> list[str]:
 #: --git-common-dir`` locates the engine's own records, ``worktree``
 #: records worktrees relative to it, ``config`` reads the live values the
 #: retargeting checks compare, and ref deletion may rewrite packed-refs.
+#: A ``worktree add`` that checks files out is the exception (see
+#: :func:`_live`): a checkout can run a filter driver.
 _LIVE_COMMANDS = frozenset(
     {
         "rev-parse", "symbolic-ref", "config", "cat-file", "merge-base", "for-each-ref",
@@ -448,6 +569,40 @@ _LIVE_COMMANDS = frozenset(
         "init", "version",
     }
 )
+
+
+def _remote_contacts(rest: Sequence[str]) -> bool:
+    """Does ``git remote <rest>`` contact a remote?"""
+
+    sub = rest[0] if rest else None
+    if sub in ("update", "prune"):
+        return True
+    if sub == "show":
+        return "-n" not in rest
+    if sub == "set-head":
+        return "-a" in rest or "--auto" in rest
+    if sub == "add":
+        return "-f" in rest or "--fetch" in rest
+    return False
+
+
+def _live(name: str | None, args: Sequence[str], index: int) -> bool:
+    """Does ``git <args>`` run against the live configuration?
+
+    Only a command of :data:`_LIVE_COMMANDS` that checks nothing out does.
+    ``worktree add`` without ``--no-checkout`` populates a work tree, so it
+    runs under :func:`isolated_config` like ``switch``, ``checkout`` and
+    every other command that is not live: a filter written between the
+    check and the checkout is not in the configuration it reads.
+    """
+
+    if name not in _LIVE_COMMANDS:
+        return False
+    if name == "worktree":
+        rest = list(args[index + 1 :])
+        if rest[:1] == ["add"] and "--no-checkout" not in rest:
+            return False
+    return True
 
 
 def run(
@@ -468,21 +623,47 @@ def run(
     :func:`isolated_config`), never against the live file: configuration
     written after the check -- a new filter or merge driver, an include --
     is not what the command reads.
+
+    A remote operation (:data:`REMOTE_COMMANDS`) runs only through
+    :func:`run_remote`, with the snapshot and pinned destinations of the
+    guard that governs ``cwd``. With no such guard it is refused
+    (``unguarded_remote_operation``, naming the subcommand) before anything
+    runs: there is no snapshot to hold it to, and the live configuration is
+    never followed.
     """
 
     entries, tail = _checked(Path(cwd), args)
-    _, name = subcommand(args)
-    guard = _TRUSTED.get()
-    if name in REMOTE_COMMANDS and guard is not None and guard.governs(Path(cwd)):
-        # Inside a run, a remote operation never reads the repository's own
-        # (mutable) configuration at all: see run_remote.
-        return run_remote(cwd, guard.entries, *args, text=text, input=input)
+    index, name = subcommand(args)
+    if name == "remote" and _remote_contacts(args[index + 1 :]):
+        # These address a remote by name, which only the live configuration
+        # resolves; the engine never needs them.
+        raise GitConfigRefusal(
+            "unguarded_remote_operation",
+            f"remote {args[index + 1]}",
+            f"refusing to run git remote {args[index + 1]} in {cwd}: it contacts a remote named "
+            "in the live configuration",
+        )
+    if name in REMOTE_COMMANDS:
+        guard = guard_for(Path(cwd))
+        if guard is None:
+            raise GitConfigRefusal(
+                "unguarded_remote_operation",
+                name,
+                f"refusing to run git {name} in {cwd}: no run guard governs it, and the engine "
+                "never contacts a remote with the repository's live configuration. A remote "
+                "operation needs a run's trusted snapshot and pinned destination",
+            )
+        # A remote operation never reads the repository's own (mutable)
+        # configuration at all: see run_remote.
+        return run_remote(
+            cwd, guard.entries, *args, text=text, input=input, pinned=guard.destinations
+        )
     argv = ["git", "-C", str(cwd), *tail]
-    if name is None or name in _LIVE_COMMANDS or name in REMOTE_COMMANDS or entries is None:
+    if name is None or _live(name, args, index) or entries is None:
         return subprocess.run(
             argv, capture_output=True, text=text, check=False, input=input, env=_environment(env)
         )
-    with isolated_config(Path(cwd), entries) as isolation:
+    with isolated_config(Path(cwd), entries, worktrees=name == "worktree") as isolation:
         if isolation is None:
             message = (
                 f"fatal: {cwd} is not inside a git repository the engine can locate from the file "
@@ -593,7 +774,7 @@ def _locate(cwd: Path) -> tuple[Path, Path, Path | None] | None:
 
 @contextlib.contextmanager
 def isolated_config(
-    cwd: Path, entries: Sequence[ConfigEntry]
+    cwd: Path, entries: Sequence[ConfigEntry], *, worktrees: bool = False
 ) -> Iterator[dict[str, str] | None]:
     """The environment that makes one local command read ``entries`` -- the
     configuration just validated -- instead of the repository's live file.
@@ -612,6 +793,10 @@ def isolated_config(
     ``core.worktree`` written after validation is not in ``entries`` and so
     cannot choose the directory. A repository the file system does not
     locate is refused rather than run against its live configuration.
+
+    ``worktrees``: the command registers a worktree, so the real
+    ``worktrees`` directory is created first if need be (a symlink to it,
+    not a scratch directory, is what the command must write through).
     """
 
     import shutil
@@ -633,8 +818,12 @@ def isolated_config(
         top = (chosen if chosen.is_absolute() else git_dir / chosen).resolve()
     scratch = Path(tempfile.mkdtemp(prefix="agent-sparring-config-"))
     try:
-        # Reflogs must land in the real logs directory, never in scratch.
+        # Reflogs must land in the real logs directory, and a worktree a
+        # checkout-performing ``worktree add`` registers in the real
+        # worktrees directory -- never in scratch.
         (common / "logs").mkdir(exist_ok=True)
+        if worktrees:
+            (common / "worktrees").mkdir(exist_ok=True)
         for child in common.iterdir():
             if child.name in ("config", "config.worktree"):
                 continue
@@ -726,59 +915,106 @@ def isolated_git_dir(
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+_SCP_LIKE_RE = re.compile(r"^[^/]+:")
+
+
+def is_local_url(url: str) -> bool:
+    """Is ``url`` a repository on this machine (a path or ``file://``)?
+    ``host:path`` and every ``scheme://`` other than ``file`` are not."""
+
+    if url.startswith("file://"):
+        return True
+    return "://" not in url and not _SCP_LIKE_RE.match(url)
+
+
+def _destination(args: Sequence[str]) -> str | None:
+    """The repository argument of a remote command: its first argument
+    after the subcommand that is not an option."""
+
+    index, name = subcommand(args)
+    if name is None:
+        return None
+    for arg in args[index + 1 :]:
+        if arg == "--":
+            continue
+        if not arg.startswith("-"):
+            return arg
+    return None
+
+
+def _same_local(a: str, b: str) -> bool:
+    def path(url: str) -> str:
+        raw = url[len("file://") :] if url.startswith("file://") else url
+        try:
+            return str(Path(raw).resolve())
+        except OSError:
+            return raw
+
+    return path(a) == path(b)
+
+
 def run_remote(
     repo_root: Path,
     trusted: Sequence[tuple[str, str]],
     *args: str,
     text: bool = True,
     input: str | bytes | None = None,
+    pinned: str | Sequence[str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a remote operation (``push``, ``ls-remote`` ...) for
     ``repo_root`` against :func:`isolated_git_dir`.
 
     Remote names do not exist there: callers pass the pinned URL. The same
-    neutralizing overrides as :func:`run` apply, and included configuration
-    is refused here too.
+    neutralizing overrides as :func:`run` apply, and no repository-scope
+    entry -- set or included -- is read into the operation.
+
+    A push to a local-path destination is refused
+    (``unpinned_local_remote``) unless that destination is ``pinned`` (one
+    URL, or several): Git runs a local repository's receive hooks and reads
+    its configuration in a process the engine's overrides do not reach, so
+    only the repository a run pinned may be written that way. Reads
+    (``ls-remote``, ``fetch``) of a local path run that repository's
+    ``upload-pack``, which runs no hooks.
 
     User-level and system configuration still supply authentication and
     transport settings -- that is what keeps existing setups working -- but
     through a copy: the command reads ``GIT_CONFIG_GLOBAL`` pointing at the
-    exact entries just listed, minus every ``url.*`` rewrite, and no system
-    file. The destination was resolved, rewrites and all, when the run was
-    pinned; rewriting it again here (``A->B`` at pin time, then ``B->C`` on
-    the push) could write one repository and read another.
+    exact global and system entries Git resolves for ``repo_root`` (their
+    includes expanded, so ``includeIf "gitdir:..."`` matches the real
+    repository), minus every ``url.*`` rewrite and include key, and no
+    system file. The destination was resolved, rewrites and all, when the
+    run was pinned; rewriting it again here (``A->B`` at pin time, then
+    ``B->C`` on the push) could write one repository and read another.
     """
 
+    _, name = subcommand(args)
+    destination = _destination(args)
+    if name == "push" and destination is not None and is_local_url(destination):
+        allowed = [pinned] if isinstance(pinned, str) else list(pinned or ())
+        if not any(_same_local(destination, url) for url in allowed if url):
+            raise GitConfigRefusal(
+                "unpinned_local_remote",
+                destination,
+                f"refusing to push to {destination}: it is a repository on this machine, whose own "
+                "hooks and configuration would run, and it is not the destination this run "
+                "pinned",
+            )
+    # Listed where the repository is, so the user's conditional includes
+    # resolve for it; only the global and system entries are copied, so
+    # nothing the repository sets -- or includes -- reaches the operation.
+    listed = config_entries(Path(repo_root))
+    if listed is None:
+        raise GitContextError(
+            f"cannot list the configuration a remote operation from {repo_root} would use"
+        )
     with isolated_git_dir(Path(repo_root), trusted) as git_dir:
         prefix = ["--git-dir", str(git_dir)]
-        try:
-            listed = subprocess.run(
-                ["git", *prefix, *_overrides(BASE_OVERRIDES), "config", "--list", "--null",
-                 "--show-scope"],
-                capture_output=True,
-                check=False,
-                env=_environment(None),
-                cwd=git_dir,
-            )
-        except OSError as exc:
-            raise GitContextError(f"cannot run git: {exc}") from exc
-        if listed.returncode != 0:
-            raise GitContextError(
-                listed.stderr.decode("utf-8", errors="replace").strip()
-                or "cannot list the configuration a remote operation would use"
-            )
-        tokens = listed.stdout.decode("utf-8", errors="surrogateescape").split("\0")
-        entries = []
-        for i in range(0, len(tokens) - 1, 2):
-            key, sep, value = tokens[i + 1].partition("\n")
-            entries.append(ConfigEntry(scope=tokens[i], key=key, value=value if sep else None))
-        _refuse_includes(entries)
         user_config = git_dir.parent / "user.gitconfig"
         user_config.write_text(
             render_config(
-                entries,
+                listed,
                 scopes=frozenset({"system", "global"}),
-                drop_sections=frozenset({"url"}),
+                drop_sections=frozenset({"url", "include", "includeif"}),
             ),
             encoding="utf-8",
         )
@@ -806,10 +1042,14 @@ __all__ = [
     "compare_snapshot",
     "config_entries",
     "REMOTE_COMMANDS",
+    "guard_for",
     "is_include",
+    "is_local_url",
+    "is_repository_transport",
     "is_transport",
     "is_watched",
     "isolated_git_dir",
+    "refuse_repository_transport",
     "repository_snapshot",
     "run",
     "run_remote",

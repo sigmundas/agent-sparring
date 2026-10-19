@@ -577,6 +577,60 @@ def records_from(payload: Any) -> tuple[RemoteRecord, ...]:
 
 
 @dataclass(frozen=True)
+class SiblingRemotePin:
+    """A declared sibling repository's remote target and trusted snapshot,
+    pinned when the run started -- the same :class:`RemotePin` shape as
+    the primary's, for the repository at ``path`` (resolved)."""
+
+    path: str
+    pin: RemotePin
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"path": self.path, "pin": self.pin.to_dict()}
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "SiblingRemotePin":
+        if not isinstance(payload, Mapping):
+            raise RemotePinError(f"a sibling pin must be an object, got {payload!r}")
+        return cls(path=_text(payload, "path"), pin=RemotePin.from_dict(payload.get("pin")))
+
+
+def sibling_pins_from(payload: Any) -> tuple[SiblingRemotePin, ...]:
+    if payload is None:
+        return ()
+    if not isinstance(payload, list):
+        raise RemotePinError("sibling_pins must be an array")
+    return tuple(SiblingRemotePin.from_dict(entry) for entry in payload)
+
+
+def _resolved(path: Path | str) -> str:
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return str(path)
+
+
+def find_sibling_pin(
+    pins: Sequence[SiblingRemotePin], root: Path, branch: str
+) -> RemotePin | None:
+    """The run-start pin of the sibling repository at ``root`` for
+    ``branch``, or ``None`` when the run pinned none."""
+
+    wanted = _resolved(root)
+    for entry in pins:
+        if _resolved(entry.path) == wanted and entry.pin.branch == branch:
+            return entry.pin
+    return None
+
+
+def pin_sibling(root: Path, branch: str) -> SiblingRemotePin:
+    """Pin a declared sibling repository as configured right now, exactly
+    as :func:`pin_remote` pins the primary."""
+
+    return SiblingRemotePin(path=_resolved(root), pin=pin_remote(Path(root), branch))
+
+
+@dataclass(frozen=True)
 class RunRemoteState:
     """The remote records of one plan run, as its engine state holds them."""
 
@@ -584,6 +638,8 @@ class RunRemoteState:
     pin: RemotePin | None
     records: tuple[RemoteRecord, ...]
     movement: UnauthorizedRemoteMovement | None
+    #: The declared sibling repositories pinned at run start.
+    siblings: tuple[SiblingRemotePin, ...] = ()
 
 
 def load_run_remote_state(sparring_dir: Path, run_key: str) -> RunRemoteState | None:
@@ -612,6 +668,7 @@ def load_run_remote_state(sparring_dir: Path, run_key: str) -> RunRemoteState | 
         pin=RemotePin.from_dict(pin_payload) if pin_payload else None,
         records=records_from(payload.get("remote_records")),
         movement=movement,
+        siblings=sibling_pins_from(payload.get("sibling_pins")),
     )
 
 
@@ -626,16 +683,20 @@ __all__ = [
     "RemotePinError",
     "RemoteRecord",
     "RunRemoteState",
+    "SiblingRemotePin",
     "UnauthorizedRemoteMovement",
     "acknowledgement",
     "check_movement",
     "expected_tip",
+    "find_sibling_pin",
     "load_run_remote_state",
     "observe",
     "pin_remote",
+    "pin_sibling",
     "push_receipt",
     "records_from",
     "require_pinned_target",
+    "sibling_pins_from",
     "verify_pinned",
     "who",
 ]

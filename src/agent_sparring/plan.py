@@ -167,6 +167,7 @@ from agent_sparring.acceptance import (
     accept_candidate,
     accept_reviewed_candidate,
     freeze_candidate,
+    sibling_root,
 )
 from agent_sparring.activity import ActivityEmitter
 from agent_sparring.plan_obligations import (
@@ -240,11 +241,14 @@ from agent_sparring.remote_pin import (
     RemoteMovementDetected,
     RemotePin,
     RemoteRecord,
+    SiblingRemotePin,
     UnauthorizedRemoteMovement,
     acknowledgement,
     check_movement,
     pin_remote,
+    pin_sibling,
     records_from,
+    sibling_pins_from,
     who,
 )
 from agent_sparring.providers import (
@@ -614,6 +618,10 @@ class PlanRunState:
     #: did not make. The pinned ref is expected at the last one's tip.
     #: Omitted while empty.
     remote_records: tuple[RemoteRecord, ...] = field(default_factory=tuple)
+    #: Every declared sibling repository's remote target and trusted
+    #: snapshot, pinned when the run started (see
+    #: :class:`~agent_sparring.remote_pin.SiblingRemotePin`). Omitted while empty.
+    sibling_pins: tuple[SiblingRemotePin, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -630,6 +638,10 @@ class PlanRunState:
             payload["remote_records"] = [record.to_dict() for record in self.remote_records]
         else:
             payload.pop("remote_records", None)
+        if self.sibling_pins:
+            payload["sibling_pins"] = [entry.to_dict() for entry in self.sibling_pins]
+        else:
+            payload.pop("sibling_pins", None)
         payload["deferred_human_checks"] = [
             obligation.to_dict() for obligation in self.deferred_human_checks
         ]
@@ -764,6 +776,7 @@ class PlanRunState:
                     else None
                 ),
                 remote_records=records_from(payload.get("remote_records")),
+                sibling_pins=sibling_pins_from(payload.get("sibling_pins")),
             )
         except (PushError, DeferredGateError, GitContextError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -1471,6 +1484,7 @@ def start_plan(
             f"refusing a fresh run of {label}: cannot pin the remote it pushes to ({exc})"
         ) from exc
     report(f"remote target pinned for this run: {state.remote_pin.describe}")
+    state.sibling_pins = _pin_siblings(Path(repo_root), stages, report=report)
     if allow_push_for_run:
         try:
             state.push_authorization = authorization_for_run(
@@ -2565,6 +2579,56 @@ def _ensure_candidate_pushed(
             f"{outcome.target.remote_branch} as authorized ({outcome.detail})"
         )
     return None
+
+
+def _pin_siblings(
+    repo_root: Path, stages: Sequence[PlannedStage], *, report: Reporter
+) -> tuple[SiblingRemotePin, ...]:
+    """Pin every sibling repository the plan declares, once per repository
+    and branch, with the same snapshot the primary gets.
+
+    A sibling that is not a repository yet, or cannot be pinned, is named
+    and left unpinned: its remote reads then use no repository transport
+    configuration at all and refuse while it sets any (see
+    :func:`agent_sparring.git_context.verify_pushed`).
+    """
+
+    pins: list[SiblingRemotePin] = []
+    seen: set[tuple[str, str]] = set()
+    for planned in stages:
+        for repository in planned.repositories:
+            root = sibling_root(repo_root, repository)
+            key = (str(root), repository.branch)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not (root / ".git").exists():
+                report(
+                    f"notice: sibling repository {repository.name!r} ({root}) is not a git "
+                    "repository yet, so its remote target is not pinned; its remote reads use "
+                    "no repository transport configuration"
+                )
+                continue
+            try:
+                entry = pin_sibling(root, repository.branch)
+            except GitContextError as exc:
+                report(
+                    f"notice: sibling repository {repository.name!r} ({root}) cannot be pinned "
+                    f"({exc}); its remote reads use no repository transport configuration"
+                )
+                continue
+            if entry.pin.destination is None:
+                report(
+                    f"notice: sibling repository {repository.name!r} ({root}) has no remote URL "
+                    "yet, so its remote target is not pinned; its remote reads use no repository "
+                    "transport configuration"
+                )
+                continue
+            pins.append(entry)
+            report(
+                f"sibling repository {repository.name!r} pinned for this run: {entry.pin.describe}"
+            )
+    return tuple(pins)
 
 
 def _pin_legacy_run(
@@ -4234,7 +4298,9 @@ def _drive(
         )
     pin = state.remote_pin
     guard = (
-        engine_git.trusted_config([Path(repo_root)], pin.trusted_config)
+        engine_git.trusted_config(
+            [Path(repo_root)], pin.trusted_config, destinations=(pin.destination,)
+        )
         if pin is not None
         else contextlib.nullcontext()
     )

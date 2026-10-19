@@ -133,6 +133,36 @@ def _remote_contains(cwd: Path, remote: str, branch: str, candidate: str) -> tup
     return False, f"{candidate} is not reachable from {remote}/{branch} ({remote_sha})"
 
 
+#: The ``candidate_not_pushed`` detail of a run with no pin to read with.
+REMOTE_NOT_CHECKED_NO_PIN = "remote state not checked: run has no pin"
+
+
+def _pinned_remote_contains(
+    repo_root: Path, record: ManagedRunRecord, state: Any, candidate: str
+) -> tuple[bool, str]:
+    """:func:`_remote_contains` read through the run's pin and trusted
+    snapshot -- the finish's own when one is running, else the pin in the
+    run state -- and never through the repository's live configuration.
+
+    A run with no pin is not read at all
+    (:data:`REMOTE_NOT_CHECKED_NO_PIN`), and a refusal is reported as the
+    check's detail: status never contacts a remote it cannot hold to a
+    snapshot, and never raises.
+    """
+
+    pin = _FINISH_PIN.get() or (getattr(state, "remote_pin", None) if state is not None else None)
+    if pin is None:
+        return False, REMOTE_NOT_CHECKED_NO_PIN
+    try:
+        with _pinned_finish(repo_root, record, pin):
+            destination = _destination(repo_root, record)
+            if not destination:
+                return False, "remote state not checked: the run's pin records no URL"
+            return _remote_contains(Path(record.worktree_path), destination, record.branch, candidate)
+    except (ManagedRunError, engine_git.GitContextError) as exc:
+        return False, f"remote state not checked: {exc}"
+
+
 def _is_ancestor(cwd: Path, ancestor: str, descendant: str) -> bool:
     return managed_run._git(cwd, "merge-base", "--is-ancestor", ancestor, descendant).returncode == 0
 
@@ -455,9 +485,7 @@ def finish_status(
     )
     if record.remote:
         if candidate and present:
-            pushed, detail = _remote_contains(
-                worktree, _destination(repo_root, record) or record.remote, record.branch, candidate
-            )
+            pushed, detail = _pinned_remote_contains(repo_root, record, state, candidate)
         else:
             pushed, detail = False, "no candidate in a present worktree to check against the remote"
         git["candidate_pushed"] = pushed
@@ -1048,7 +1076,8 @@ _FINISH_PIN: contextvars.ContextVar[Any] = contextvars.ContextVar(
 @contextlib.contextmanager
 def _pinned_finish(repo_root: Path, record: ManagedRunRecord, pin: Any):
     with engine_git.trusted_config(
-        [Path(repo_root), Path(record.worktree_path)], pin.trusted_config
+        [Path(repo_root), Path(record.worktree_path)], pin.trusted_config,
+        destinations=(pin.destination,),
     ):
         token = _FINISH_PIN.set(pin)
         try:

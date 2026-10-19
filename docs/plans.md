@@ -356,8 +356,18 @@ as a push authorization or an acknowledgement.
 Every Git command the engine runs goes through one path
 (`agent_sparring.engine_git`): repository hooks, `core.fsmonitor`, textconv
 and external diff and filter drivers never run, a merge refuses while any
-merge driver is configured, and any `include`/`includeIf` configuration is
-refused by name. Inside a run, a change to the repository's own credential,
+merge driver is configured, and an `include`/`includeIf` in the repository's
+own (local or worktree) configuration is refused by name. Includes in your
+global and system configuration keep working: Git resolves them for the
+repository the command runs in, so `includeIf "gitdir:..."` in
+`~/.gitconfig` still applies. The engine also removes Git's location,
+program and configuration-injection environment variables before it runs
+Git (`GIT_DIR`, `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`,
+`GIT_PROXY_COMMAND`, `GIT_EXEC_PATH`, `GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_PARAMETERS`,
+`GIT_CONFIG_COUNT`/`KEY_*`/`VALUE_*`, `GIT_TEMPLATE_DIR`, `GIT_EDITOR` and
+the rest listed in `engine_git._environment`); your configuration is the
+one Git finds from `HOME`. Inside a run, a change to the repository's own credential,
 SSH, URL-rewrite, remote, protocol, HTTP, signing, hook, fsmonitor or driver
 configuration since the run started is a typed refusal naming the key, and
 reordering values counts as a change; configuration that was already there
@@ -373,7 +383,8 @@ directory holding `.git` -- never a value read again afterwards. A directory
 the file system does not place in a repository gets a failed command, not a
 run against unvalidated configuration. Only commands that touch nothing executable --
 `rev-parse`, `config`, ref updates, `worktree` bookkeeping -- read the live
-file. Remote operations (push, `ls-remote`, the finish's target push and
+file; a `worktree add` that checks files out, like every `switch` or
+`checkout`, reads the validated copy. Remote operations (push, `ls-remote`, the finish's target push and
 branch deletion) go to the pinned destination -- the push URL as Git
 resolved it at run start, after `pushInsteadOf`/`insteadOf`, made absolute
 -- and run in a throwaway repository that borrows the objects and is
@@ -383,6 +394,31 @@ every `url.*` rewrite removed, so the destination is never rewritten a
 second time and the engine writes and reads the same repository. A remote with several URLs or push URLs is not pinned. Editing
 `.gitattributes` alone is not a change: a driver runs only if configuration
 defines it.
+
+No engine remote operation follows the repository's live configuration,
+inside a run or not. A remote command with no run guard and no pinned
+destination is refused (`unguarded_remote_operation`, naming the
+subcommand). The reads that happen outside a run's own commands use the
+run's pin: `sparring runs --json` and `finish-run --dry-run` read the run's
+remote branch at its pinned destination with its run-start snapshot, and a
+run with no pin reports `remote state not checked: run has no pin` without
+contacting the remote; `sparring handoff` for a stage a pinned run owns
+reads that run's pin. Declared sibling repositories are pinned the same way
+when the run starts, each with its own snapshot, and freeze/accept read a
+sibling's remote through its own pin. A read with no pin at all -- a stage
+no run owns, or a sibling that could not be pinned -- uses only your global
+and system configuration, and is refused (`repository_transport_config`,
+naming the key) while the repository itself sets any credential, SSH, proxy,
+protocol or HTTP key, a `url.*` rewrite, or a remote's `pushurl`,
+`uploadpack` or `receivepack`.
+
+A remote that is a local path (or `file://`) is a repository on this
+machine: when the engine pushes to it, Git runs *that* repository's own
+receive hooks and reads its configuration, in a process the engine's
+overrides do not reach. The engine therefore pushes to a local path only
+when it is the run's pinned destination -- a repository you chose when the
+run started -- and refuses any other (`unpinned_local_remote`). Reading a
+local-path remote runs its `upload-pack`, which runs no hooks.
 
 Permission is bound to what it was granted for: this run, this worktree,
 this branch, that one remote branch, and — for `--allow-push-candidate` —

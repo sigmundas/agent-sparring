@@ -323,7 +323,7 @@ def enter_review(
                 (repository.name, repository.path, repository.branch), repository
             )
     try:
-        repositories = pin_sibling_candidates(repo_root, tuple(declared.values()))
+        repositories = pin_sibling_candidates(repo_root, tuple(declared.values()), stage=stage)
     except AcceptanceError as exc:
         raise ReviewError(
             f"stage {stage.stage_id!r} cannot review the accepted candidate set: {exc}"
