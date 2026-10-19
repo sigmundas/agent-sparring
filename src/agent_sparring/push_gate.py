@@ -12,7 +12,10 @@ must be what the engine's own records explain (its push receipts and a
 person's acknowledgements); anything else is an
 :class:`~agent_sparring.remote_pin.UnauthorizedRemoteMovement`, and nothing
 is pushed, frozen or accepted until a person has looked. A candidate that
-is reachable *and* explained needs no push.
+is reachable *and* explained -- by a receipt, the start tip, the stage base
+or a person's per-commit ``authorized_without_push``, never by an
+acknowledgement -- needs no push; one that is reachable but unexplained is
+:class:`~agent_sparring.remote_pin.PushedCandidateUnauthorized`.
 
 What this module adds is the missing step in front of it. A reviewer says
 READY, the reviewed work is committed, and the commit was never pushed --
@@ -62,7 +65,7 @@ What an authorized push is allowed to be
 Exactly one command shape, built by :func:`push_command` and by nothing
 else::
 
-    git -c push.followTags=false push <pinned URL> <candidate sha>:refs/heads/<remote branch>
+    git -c push.followTags=false push --porcelain <pinned URL> <candidate sha>:refs/heads/<remote branch>
 
 The destination is the URL the run pinned, never a remote name, so no
 ``remote.<name>.*`` configuration can redirect it; the source is the exact
@@ -77,8 +80,11 @@ switches, creates or merges a branch, and nothing here touches a sibling
 repository: a declared sibling is a different repository, and authorizing
 this run's candidate says nothing about it.
 
-After the push the pinned ref is read again at the pinned URL and must be
-exactly the pushed commit. A push that reported success but left anything
+The push reports its own old->new (``--porcelain``). Unless that is exactly
+the tip observed before it -> the candidate, someone else wrote the ref in
+between, and the outcome is unauthorized remote movement, not a receipt;
+so is a push that changed nothing. After the push the pinned ref is read
+again at the pinned URL and must be exactly the pushed commit. A push that reported success but left anything
 else there is a failure, and the candidate is not accepted. A successful
 push yields a :class:`~agent_sparring.remote_pin.RemoteRecord` receipt for
 the caller to record. The push itself runs through
@@ -104,6 +110,7 @@ from agent_sparring.git_context import (
 )
 from agent_sparring.remote_pin import (
     SAFE_REF_RE,
+    RemotePause,
     RemotePin,
     RemoteRecord,
     UnauthorizedRemoteMovement,
@@ -335,8 +342,8 @@ class PushOutcome:
     Exactly one of the four states is true:
 
     - ``movement`` set: the pinned ref is somewhere the records do not
-      explain; nothing was pushed, and nothing may be until a person
-      acknowledges it;
+      explain, or the candidate on it is explained by nothing; no receipt
+      was made, and nothing may be pushed until a person acts on it;
     - ``required`` set: a person has to allow it; nothing was pushed;
     - ``pushed`` true: this call pushed it, re-read the pinned ref, and
       ``receipt`` is the record to keep;
@@ -348,7 +355,7 @@ class PushOutcome:
     required: PushRequired | None = None
     pushed: bool = False
     detail: str | None = None
-    movement: UnauthorizedRemoteMovement | None = None
+    movement: RemotePause | None = None
     receipt: RemoteRecord | None = None
 
     @property
@@ -396,9 +403,68 @@ def push_command(target: PushTarget) -> list[str]:
         "-c",
         "push.followTags=false",
         "push",
+        "--porcelain",
         target.url or target.remote,
         f"{target.candidate_sha}:refs/heads/{target.remote_branch}",
     ]
+
+
+def _pushed_update(stdout: str, target: PushTarget) -> tuple[str, str | None, str | None] | None:
+    """``(flag, old, new)`` of the one ref update ``git push --porcelain``
+    reported for ``target``'s destination ref (``<flag>\\t<from>:<to>\\t<summary>``);
+    ``old``/``new`` as Git printed them (possibly abbreviated), ``None``
+    where the summary names none. ``None`` when the output names no such
+    update."""
+
+    destination = f"refs/heads/{target.remote_branch}"
+    for line in stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3 or len(parts[0]) != 1 or parts[1].rpartition(":")[2] != destination:
+            continue
+        flag, summary = parts[0], parts[2].split(" ", 1)[0]
+        if ".." in summary:
+            old, _, new = summary.replace("...", "..").partition("..")
+            return flag, old, new
+        return flag, None, None
+    return None
+
+
+def _race_detail(
+    stdout: str, target: PushTarget, observed: str | None
+) -> str | None:
+    """Why the push just made is not the push the checks before it
+    authorized, or ``None`` when its old->new is exactly observed->candidate.
+
+    Between :func:`~agent_sparring.remote_pin.check_movement` and the push,
+    anyone who can write the ref can move it. A push that found the ref
+    already at the candidate (a no-op), or moved it from anything but the
+    observed tip, would otherwise leave a receipt absorbing that write."""
+
+    update = _pushed_update(stdout, target)
+    if update is None:
+        return (
+            "git push reported no update of the pinned ref, so this push cannot be shown to have "
+            f"moved it (a no-op, or a write by someone else); it was observed at "
+            f"{observed or 'nothing (absent)'} just before"
+        )
+    flag, old, new = update
+    if flag == "=":
+        return (
+            f"the push was a no-op: the ref was already at {target.candidate_sha} when it ran, "
+            f"though it was observed at {observed or 'nothing (absent)'} just before"
+        )
+    if flag == "*":
+        if observed is not None:
+            return f"the push created the ref, though it was observed at {observed} just before"
+        return None
+    if flag != " " or not old or not new:
+        return f"git push reported {flag!r} {old or ''}..{new or ''}, not a fast-forward"
+    if observed is None or not observed.startswith(old) or not target.candidate_sha.startswith(new):
+        return (
+            f"the push moved the ref {old}..{new}, but the checks before it observed "
+            f"{observed or 'nothing (absent)'} and authorized {target.candidate_sha}"
+        )
+    return None
 
 
 def pinned_target(pin: RemotePin, candidate_sha: str) -> PushTarget:
@@ -441,8 +507,10 @@ def ensure_candidate_pushed(
     5. otherwise ``authorization`` is checked against the exact commit,
        branch, remote, URL and remote branch. No permission means
        :class:`PushRequired`, and **nothing is pushed**;
-    6. only then is :func:`push_command` run, and the pinned ref re-read: it
-       must be exactly the candidate. Either failure raises
+    6. only then is :func:`push_command` run, and the pinned ref re-read. A
+       push whose reported old->new is not observed->candidate, or that
+       changed nothing, is movement and carries no receipt. Otherwise the
+       ref must be exactly the candidate; a failure raises
        :class:`PushError`, leaving the candidate unaccepted. Success carries
        a push receipt for the caller to record.
 
@@ -529,6 +597,21 @@ def ensure_candidate_pushed(
             f"{where} was pushed, but it could not be read back ({exc}); the candidate was not "
             "accepted"
         ) from exc
+    raced = _race_detail(result.stdout or "", target, observed)
+    if raced is not None:
+        # Someone else wrote the ref between the checks and this push: the
+        # tip is not one this push explains, so no receipt is made for it.
+        movement = UnauthorizedRemoteMovement(
+            stage_id=stage_id,
+            remote=pin.remote,
+            url=pin.destination,
+            ref=pin.ref,
+            expected_tip=observed,
+            observed_tip=landed,
+            candidate_sha=candidate_sha,
+            detail=raced,
+        )
+        return PushOutcome(target=target, movement=movement, detail=movement.describe)
     if landed != candidate_sha:
         raise PushError(
             f"{where} was pushed, but it is still not exactly {candidate_sha} (it is "

@@ -40,7 +40,7 @@ from unittest import mock
 
 import conftest_path  # noqa: F401
 
-from agent_sparring import engine_git
+from agent_sparring import engine_git, managed_run
 from agent_sparring.acceptance import (
     AcceptanceError,
     UnauthorizedRemoteMovementError,
@@ -1144,12 +1144,15 @@ class LegacyRunTests(_AuthorityCase):
         head = _head_sha(self.repo)
         # What an agent did under the old instructions: pushed it itself.
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
-        # And the state as an engine from before pins wrote it.
+        # And the state as an engine from before pins wrote it -- which
+        # also wrote no record outside the project directory saying the run
+        # was pinned.
         payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         del payload["remote_pin"]
         payload.pop("remote_records", None)
         self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         self.assertIsNone(PlanRunState.load(self.state_path).remote_pin)
+        managed_run.run_flag_path(self.repo, self.run_key).unlink()
 
         reports: list[str] = []
         result = self._resume(

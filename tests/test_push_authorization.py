@@ -30,6 +30,7 @@ from unittest import mock
 
 import conftest_path  # noqa: F401
 
+from agent_sparring.acceptance import AcceptanceError, freeze_candidate
 from agent_sparring.cli import main
 from agent_sparring.plan import (
     PlanError,
@@ -37,7 +38,14 @@ from agent_sparring.plan import (
     PlanRunState,
     PlanRunStatus,
     acknowledge_remote_movement,
+    authorize_pushed_candidate,
     resume_plan,
+)
+from agent_sparring.remote_pin import (
+    AUTHORIZED_WITHOUT_PUSH,
+    MOVEMENT_ACKNOWLEDGED,
+    PUSH_RECEIPT,
+    PUSHED_CANDIDATE_UNAUTHORIZED,
 )
 from agent_sparring.push_gate import (
     PUSH_AUTHORIZATION_REQUIRED,
@@ -59,6 +67,7 @@ from test_plan import (  # noqa: E402  (shared scripted adapters, verdicts and f
     READY,
     S1,
     S2,
+    SEND_BACK,
     _PlanRepoTestCase,
     _SparringAdapter,
     _fixed,
@@ -137,6 +146,8 @@ class PushCommandShapeTests(unittest.TestCase):
                 "-c",
                 "push.followTags=false",
                 "push",
+                # Its old->new is compared with the tip observed before it.
+                "--porcelain",
                 "/srv/pinned.git",
                 f"{'a' * 40}:refs/heads/feature/x",
             ],
@@ -757,15 +768,186 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertEqual(result.awaiting.expected_tip, self.remote_before)
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
-        # A person who has looked acknowledges exactly what they saw; the
-        # run then accepts the reviewed commit without pushing anything.
+        # A person who has looked acknowledges exactly what they saw. That
+        # records the observation and nothing else: the candidate on the
+        # remote is still explained by no engine receipt, so the run stops
+        # again, on the candidate this time.
         acknowledge_remote_movement(self.sparring_dir, run_key=self.run_key, observed=sha, by="tester")
         result = self._resume(self._unpushed(), _SparringAdapter([]), stop_after_stage=S1)
 
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.awaiting.kind, PUSHED_CANDIDATE_UNAUTHORIZED)
+        self.assertEqual(result.awaiting.candidate_sha, sha)
+        self.assertEqual(result.awaiting.observed_tip, sha)
+        self.assertEqual(result.accepted, ())
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+
+        # Neither push permission clears it: the one-candidate flag is refused
+        # outright, and a run-level grant is recorded while the pause stands.
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(self._unpushed(), _SparringAdapter([]), allow_push_candidate=sha)
+        self.assertIn("authorize-pushed-candidate", str(ctx.exception))
+        stage_adapter, sparring_adapter = self._unpushed(), _SparringAdapter([])
+        result = self._resume(
+            stage_adapter, sparring_adapter, allow_push_for_run=True, stop_after_stage=S1
+        )
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.awaiting.kind, PUSHED_CANDIDATE_UNAUTHORIZED)
+        self.assertEqual(stage_adapter.turns, 0)
+        self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
+        self.assertEqual(self._plan_state().push_authorization.scope, PushScope.RUN)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+
+        # The explicit per-commit action names the run and the exact commit,
+        # and is recorded on its own, with who and when.
+        with self.assertRaises(PlanError):
+            authorize_pushed_candidate(
+                self.sparring_dir, run_key=self.run_key, candidate_sha=self.remote_before, by="tester"
+            )
+        with self.assertRaises(PlanError):
+            authorize_pushed_candidate(
+                self.sparring_dir, run_key=self.run_key, candidate_sha=sha[:12], by="tester"
+            )
+        record = authorize_pushed_candidate(
+            self.sparring_dir, run_key=self.run_key, candidate_sha=sha, by="tester"
+        )
+        state = self._plan_state()
+        self.assertIsNone(state.awaiting)
+        self.assertEqual(
+            [r.kind for r in state.remote_records], [MOVEMENT_ACKNOWLEDGED, AUTHORIZED_WITHOUT_PUSH]
+        )
+        self.assertEqual(state.remote_records[-1], record)
+        self.assertEqual((record.candidate_sha, record.stage_id, record.by), (sha, S1, "tester"))
+        self.assertTrue(record.recorded_at)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+
+        # Accepted now only because the reviewer's READY is for this exact
+        # commit; nothing was pushed by the engine.
+        result = self._resume(self._unpushed(), _SparringAdapter([]), stop_after_stage=S1)
+
+        s1 = self._stage(S1).read_state()
+        self.assertIs(s1.status, StageStatus.ACCEPTED)
+        self.assertEqual(s1.candidate_sha, sha)
         self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1])
-        self.assertIsNone(self._plan_state().push_authorization)
+        self.assertNotIn(PUSH_RECEIPT, [r.kind for r in self._plan_state().remote_records])
         self.assertPushed(sha)
+
+    def _paused_on_a_pushed_candidate(self) -> str:
+        """Reviewed, pushed by hand, the movement acknowledged, and the run
+        stopped again on the candidate."""
+
+        self._start(self._unpushed(), _SparringAdapter([READY]), stop_after_stage=S1)
+        sha = _head_sha(self.repo)
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        self._resume(self._unpushed(), _SparringAdapter([]), stop_after_stage=S1)
+        acknowledge_remote_movement(self.sparring_dir, run_key=self.run_key, observed=sha, by="tester")
+        result = self._resume(self._unpushed(), _SparringAdapter([]), stop_after_stage=S1)
+        self.assertEqual(result.awaiting.kind, PUSHED_CANDIDATE_UNAUTHORIZED)
+        return sha
+
+    def test_deleting_the_acknowledgement_after_authorizing_changes_nothing(self):
+        sha = self._paused_on_a_pushed_candidate()
+        authorize_pushed_candidate(self.sparring_dir, run_key=self.run_key, candidate_sha=sha, by="tester")
+        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        payload["remote_records"] = [
+            entry for entry in payload["remote_records"] if entry["kind"] != MOVEMENT_ACKNOWLEDGED
+        ]
+        self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        result = self._resume(self._unpushed(), _SparringAdapter([]), stop_after_stage=S1)
+
+        self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1])
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+        self.assertEqual(
+            [r.kind for r in self._plan_state().remote_records], [AUTHORIZED_WITHOUT_PUSH]
+        )
+
+    def test_a_forged_acknowledgement_authorizes_nothing(self):
+        sha = self._paused_on_a_pushed_candidate()
+        # Someone who can write the run state adds an "acknowledgement" naming
+        # an unrelated commit -- and, for good measure, one naming the
+        # candidate itself -- and clears the pause by hand.
+        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        real = payload["remote_records"][-1]
+        forged = [
+            {**real, "tip": tip, "previous_tip": tip, "by": "forger"}
+            for tip in (self.remote_before, sha)
+        ]
+        payload["remote_records"] = forged + payload["remote_records"]
+        payload["awaiting"] = None
+        self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        stage_adapter = self._unpushed()
+        result = self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
+
+        self.assertEqual(stage_adapter.turns, 0)
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.awaiting.kind, PUSHED_CANDIDATE_UNAUTHORIZED)
+        self.assertEqual(result.accepted, ())
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        stage = self._stage(S1)
+        with self.assertRaises(AcceptanceError):
+            freeze_candidate(stage, self.sparring_dir, self.repo, expected_branch="feature/x")
+        self.assertIs(stage.read_state().status, StageStatus.WORKING)
+
+    def test_an_acknowledged_candidate_is_not_accepted_without_a_ready_review(self):
+        # The agent pushes its own commit during its turn; the movement is
+        # caught after that turn, before any review, and acknowledged. The
+        # reviewer then sends it back: nothing is accepted, and there is no
+        # pushed-candidate pause for anyone to authorize.
+        stage_adapter = _Implementer(self.repo, push=True)
+        result = self._start(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
+        pushed = _head_sha(self.repo)
+        self.assertEqual(result.awaiting.kind, "unauthorized_remote_movement")
+        acknowledge_remote_movement(
+            self.sparring_dir, run_key=self.run_key, observed=pushed, by="tester"
+        )
+
+        stage_adapter.push = False
+        result = self._resume(
+            stage_adapter, _SparringAdapter([SEND_BACK, NEEDS_YOU]), stop_after_stage=S1
+        )
+
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.accepted, ())
+        s1 = self._stage(S1).read_state()
+        self.assertIs(s1.status, StageStatus.WORKING)
+        self.assertIsNone(s1.candidate_sha)
+        with self.assertRaises(PlanError):
+            authorize_pushed_candidate(
+                self.sparring_dir, run_key=self.run_key, candidate_sha=pushed, by="tester"
+            )
+        self.assertNotIn(
+            AUTHORIZED_WITHOUT_PUSH, [r.kind for r in self._plan_state().remote_records]
+        )
+
+    def test_the_paused_run_prints_the_per_commit_command(self):
+        sha = self._paused_on_a_pushed_candidate()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch(
+            "agent_sparring.cli._build_loop_adapters",
+            return_value=(self._unpushed(), _SparringAdapter([])),
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main([
+                "--sparring-dir", str(self.sparring_dir), "resume-plan", str(self.plan_path),
+                "--repo-root", str(self.repo), "--expected-branch", "feature/x",
+                "--stop-after-stage", S1,
+            ])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn(f"needs: {PUSHED_CANDIDATE_UNAUTHORIZED}", out.getvalue())
+        self.assertIn(
+            f"authorize-pushed-candidate --run-key {self.run_key} --sha {sha}", out.getvalue()
+        )
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main([
+                "--sparring-dir", str(self.sparring_dir), "authorize-pushed-candidate",
+                "--run-key", self.run_key, "--sha", sha, "--repo-root", str(self.repo),
+            ])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn(AUTHORIZED_WITHOUT_PUSH, out.getvalue())
+        self.assertEqual(self._plan_state().remote_records[-1].kind, AUTHORIZED_WITHOUT_PUSH)
 
     def test_an_agent_pushing_its_own_candidate_stops_the_run_even_under_a_run_grant(self):
         # A run-level grant is permission for the *engine* to push. An agent

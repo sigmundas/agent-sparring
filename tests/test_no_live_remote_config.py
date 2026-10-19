@@ -341,18 +341,26 @@ class _SiblingMatrix(_Planting, unittest.TestCase):
     def _freeze(self, stage: Stage):
         return freeze_candidate(stage, self.sparring_dir, self.primary, expected_branch=self.PRIMARY_BRANCH)
 
+    def _write_run_state(self, sibling_entry) -> None:
+        plans = self.sparring_dir / "plans"
+        plans.mkdir(parents=True, exist_ok=True)
+        (plans / f"{self.RUN}.json").write_text(
+            json.dumps({
+                "remote_pin": pin_remote(self.primary, self.PRIMARY_BRANCH).to_dict(),
+                "sibling_pins": [sibling_entry.to_dict()],
+            }),
+            encoding="utf-8",
+        )
+
     def _run_sibling(self, item: str, scope: str) -> None:
         # Frozen before the planting: its acceptance must not need the
         # sibling's remote at all.
         frozen = self._stage("frozen-before")
         self.assertEqual(self._freeze(frozen).repositories[0].candidate_sha, self.sibling_sha)
-        # A stage of a run that pinned the sibling at run start.
+        # A stage of a run that pinned its primary and the sibling at run
+        # start (an owned stage of an unpinned run is refused outright).
         entry = pin_sibling(self.sibling, self.SIBLING_BRANCH)
-        plans = self.sparring_dir / "plans"
-        plans.mkdir(parents=True, exist_ok=True)
-        (plans / f"{self.RUN}.json").write_text(
-            json.dumps({"sibling_pins": [entry.to_dict()]}), encoding="utf-8"
-        )
+        self._write_run_state(entry)
         owned = self._stage("owned", run=self.RUN)
         unowned = self._stage("unowned")
         second = self.second(self.sibling)
@@ -394,11 +402,7 @@ class SiblingPinTests(_SiblingMatrix):
         _plain_ok(self.sibling, "config", "credential.helper", "store --file=/nonexistent")
         entry = pin_sibling(self.sibling, self.SIBLING_BRANCH)
         self.assertIn(("credential.helper", "store --file=/nonexistent"), entry.pin.trusted_config)
-        plans = self.sparring_dir / "plans"
-        plans.mkdir(parents=True, exist_ok=True)
-        (plans / f"{self.RUN}.json").write_text(
-            json.dumps({"sibling_pins": [entry.to_dict()]}), encoding="utf-8"
-        )
+        self._write_run_state(entry)
         # Trusted at run start, so the pinned read uses it rather than
         # refusing it (the unpinned read would refuse).
         owned = self._stage("owned", run=self.RUN)

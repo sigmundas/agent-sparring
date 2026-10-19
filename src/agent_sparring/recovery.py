@@ -91,7 +91,7 @@ from agent_sparring.git_context import (
 )
 from agent_sparring.manifest import ManifestError
 from agent_sparring.plan_model import PlanSource, PlannedStage
-from agent_sparring.remote_pin import UnauthorizedRemoteMovement
+from agent_sparring.remote_pin import PushedCandidateUnauthorized, UnauthorizedRemoteMovement
 from agent_sparring.stage import (
     STAGES_DIRNAME,
     Stage,
@@ -801,8 +801,10 @@ def reset_stage(
     # decision about the run, which this operation does not revisit.
     # Unauthorized remote movement is not about the stage at all -- it is
     # about the run's pinned remote ref -- and only an explicit
-    # acknowledgement clears it, so a reset leaves it standing.
-    if not isinstance(run_state.awaiting, UnauthorizedRemoteMovement):
+    # acknowledgement clears it, so a reset leaves it standing. So does a
+    # pushed candidate's: the commit stays on the remote whatever happens to
+    # the stage, and only its explicit per-commit authorization clears it.
+    if not isinstance(run_state.awaiting, (UnauthorizedRemoteMovement, PushedCandidateUnauthorized)):
         run_state.awaiting = None
     run_state.save(state_path)
 

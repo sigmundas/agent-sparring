@@ -1035,8 +1035,12 @@ def _run_guard(repo_root: Path, record: ManagedRunRecord):
     Fails closed: a copy that exists but cannot be read is never taken to
     mean "no pin". If another copy is readable and pinned, that one is
     used; otherwise the finish stops (:class:`_StepFailed`) before any Git
-    invocation. Only a run with no recorded state anywhere -- one that
-    predates pins -- finishes under the hardened Git path alone.
+    invocation. A run whose engine record outside the project directory
+    says it was pinned (the managed record's ``pinned``, or its run file)
+    and whose pin is missing -- state deleted, ``remote_pin`` removed, or
+    replaced with a legacy-shaped file -- stops with ``remote_pin_missing``.
+    Only a run whose engine record proves it predates pins finishes under
+    the hardened Git path alone.
     """
 
     from agent_sparring.remote_pin import RemotePinError, load_run_remote_state
@@ -1063,7 +1067,15 @@ def _run_guard(repo_root: Path, record: ManagedRunRecord):
             f"run_state_unreadable: the run's recorded push authority cannot be read ({detail}); "
             "refusing to finish without it -- nothing was merged, pushed or deleted by this finish",
         )
-    # Readable but unpinned, or absent: a run recorded before pins.
+    if record.pinned or managed_run.run_flag_pinned(repo_root, record.run_key):
+        raise _StepFailed(
+            "checks",
+            "remote_pin_missing: the engine's record says this run was pinned, but no pin can be "
+            "found in its run state; refusing to finish without it -- nothing was merged, pushed "
+            "or deleted by this finish",
+        )
+    # Readable but unpinned, or absent, and the engine's record agrees: a
+    # run recorded before pins.
     return contextlib.nullcontext()
 
 

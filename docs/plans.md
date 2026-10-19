@@ -299,7 +299,7 @@ with a notice that this is weaker than a run-start pin.
 An authorized push is exactly one thing:
 
 ```sh
-git -c push.followTags=false push <pinned URL> <candidate sha>:refs/heads/<remote branch>
+git -c push.followTags=false push --porcelain <pinned URL> <candidate sha>:refs/heads/<remote branch>
 ```
 
 Ordinary, non-force, the exact authorized commit to one fully qualified ref
@@ -312,15 +312,19 @@ other branch, and no sibling repository — a declared sibling is a different
 repository, and authorizing this run's candidate says nothing about it. The
 engine then re-reads the pinned ref, which must be exactly that commit, and
 only then runs the acceptance gate. A push that fails, or one that reports
-success without landing, stops the run with nothing accepted.
+success without landing, stops the run with nothing accepted. The push's
+own report of the ref's old and new value must be exactly the tip observed
+just before it and the candidate: if someone else wrote the ref in between,
+or the push changed nothing because the commit was already there, no receipt
+is recorded and the run stops on `unauthorized_remote_movement`.
 
 #### Remote movement the engine did not make
 
-After every agent turn, before every engine push and before freeze or
-accept, the engine compares the pinned ref's tip with what its own records
-explain: the start tip, then each push receipt and each acknowledgement. A
-tip nothing explains -- including a candidate an agent pushed itself before
-review -- stops the run:
+After every agent turn (including a turn that failed or timed out), before
+every engine push and before freeze or accept, the engine compares the
+pinned ref's tip with what its own records explain: the start tip, then
+each push receipt and each acknowledgement. A tip nothing explains --
+including a candidate an agent pushed itself before review -- stops the run:
 
 ```json
 "awaiting": {
@@ -343,13 +347,60 @@ sparring acknowledge-remote-movement --run-key <run> --observed f2e455c…
 sparring resume-plan …
 ```
 
-The acknowledgement is recorded in the run's state with who and when. It is
-not a review, an acceptance or a push authorization.
+The acknowledgement is recorded in the run's state with who and when. It
+records what you observed and nothing more: it clears this pause and makes
+the observed tip the baseline for detecting *further* movement. It is not a
+review, an acceptance or a push authorization, and it never explains a
+candidate.
+
+A candidate is explained only by an engine push receipt, the tip pinned when
+the run started, or the stage's base. So when the candidate itself is
+already on the remote with no receipt for it -- the usual case after you
+acknowledged an agent's own push -- the run stops again, on the candidate:
+
+```json
+"awaiting": {
+  "kind": "pushed_candidate_unauthorized",
+  "stage_id": "…-stage-4-…",
+  "candidate_sha": "f2e455c…",
+  "remote": "origin",
+  "ref": "refs/heads/feature/add-reference-dialog",
+  "observed_tip": "f2e455c…"
+}
+```
+
+A push authorization -- for one candidate or for the whole run -- does not
+clear this. Only a separate, explicit action naming the run and the exact
+commit does:
+
+```sh
+sparring authorize-pushed-candidate --run-key <run> --sha f2e455c…   # the full 40-character id
+sparring resume-plan …
+```
+
+It is recorded on its own in the run's state, with who and when, as
+`authorized_without_push`. It is not a review or an acceptance: the stage is
+accepted only after the independent reviewer says READY for that exact
+commit, and a SEND_BACK leaves it unaccepted as usual. Deleting or forging
+an acknowledgement changes nothing about what is authorized.
+
+A run is also recorded as *pinned* outside the project directory -- in its
+managed-run record (`"pinned": true`) under `<git-common-dir>/agent-sparring/`,
+or for an unmanaged run in `<git-common-dir>/agent-sparring/runs/<run key>.json`.
+If such a run's state file is deleted, its pin removed, or the state replaced
+with one shaped like a run from before pins, `finish-run`, freeze, accept and
+resume refuse with `remote_pin_missing` instead of falling back to the live
+configuration or re-pinning. Only a run whose engine record shows it
+predates pins is pinned on its first resume (with a visible notice). Freeze
+and accept of a stage find its run from the run state positioned at the
+stage as well as from the stage's own record, and refuse for a run that
+predates pins and has not been resumed since -- they never fall back to
+reachability alone.
 
 This is detection, not prevention: it watches only the pinned ref, and it
 is a blocking backstop rather than a substitute for agents being unable to
 push. Nothing in a plan, brief, notes, handoff or agent output is ever read
-as a push authorization or an acknowledgement.
+as a push authorization, an acknowledgement or an `authorized_without_push`.
 
 #### Engine Git
 

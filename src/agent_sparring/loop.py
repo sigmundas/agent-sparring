@@ -240,6 +240,11 @@ class LoopResult:
             )
 
 
+def _after_turn(after_turn: Callable[[], None] | None) -> None:
+    if after_turn is not None:
+        after_turn()
+
+
 def run_unattended_loop(
     stage: Stage,
     sparring_dir: Path,
@@ -258,10 +263,12 @@ def run_unattended_loop(
     """Drive the stage<->sparring loop until a terminal routing action.
 
     ``after_turn``, when given, is called after every agent turn (stage and
-    sparring alike) that returned, before anything else looks at its
-    result. The managed plan runner uses it to check its pinned remote ref
-    for movement its records do not explain; whatever it raises propagates
-    unchanged and stops the loop.
+    sparring alike), before anything else looks at its result -- including
+    a turn that raised or timed out, since the agent may have acted before
+    it failed. The managed plan runner uses it to check its pinned remote
+    ref for movement its records do not explain; whatever it raises
+    propagates unchanged and stops the loop, taking precedence over the
+    turn's own failure (which stays attached as its context).
 
     ``pending_deferred`` is the managed run's ledger of human verification
     already owed, passed straight through to every sparring turn of this
@@ -422,11 +429,14 @@ def run_unattended_loop(
                     self_check=self_check,
                     finalize_only=finalizing,
                 )
-            except StageAgentRunError as exc:
+            except Exception as exc:
+                # The agent may have acted before the turn failed.
+                _after_turn(after_turn)
+                if not isinstance(exc, StageAgentRunError):
+                    raise
                 activity.emit("loop.stopped", cycle=cycle, summary="stage-agent turn failed")
                 raise LoopError(f"stage-agent turn failed: {exc}") from exc
-            if after_turn is not None:
-                after_turn()
+            _after_turn(after_turn)
 
         if stage_run is not None and stage_run.result.is_error:
             # The provider's own machine-readable output reported this turn
@@ -560,12 +570,14 @@ def run_unattended_loop(
                 evidence_first=evidence_first,
                 pending_deferred=pending_deferred,
             )
-        except SparringAgentRunError as exc:
+        except Exception as exc:
+            _after_turn(after_turn)
+            if not isinstance(exc, SparringAgentRunError):
+                raise
             activity.emit("loop.stopped", cycle=cycle, summary="sparring-agent turn failed")
             raise LoopError(f"sparring-agent turn failed: {exc}") from exc
+        _after_turn(after_turn)
         finalization_note = None
-        if after_turn is not None:
-            after_turn()
 
         cycle_records.append(
             LoopCycleRecord(

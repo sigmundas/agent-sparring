@@ -12,6 +12,14 @@ Fields other than ``events`` never change after creation. Lifecycle is the
 append-only ``events`` list and is derived from it, never stored twice.
 This module covers creation, resume lookup and the read-only listing; merge
 and cleanup are not implemented here.
+
+It also keeps the one engine fact about a run that must survive the loss of
+its plan-run state: that the run was *pinned* (see
+:mod:`agent_sparring.remote_pin`). A managed record says so with
+``pinned: true``; any other run says so in
+``<git-common-dir>/agent-sparring/runs/<run-key>.json``. Both live outside
+the project directory, so deleting or replacing ``.sparring/plans/<run>.json``
+cannot turn a pinned run back into one that predates pins.
 """
 
 from __future__ import annotations
@@ -31,6 +39,8 @@ from agent_sparring import engine_git
 
 SCHEMA_VERSION = 1
 RECORDS_SUBDIR = Path("agent-sparring") / "worktrees"
+#: Where a run that has no managed record saying so records that it is pinned.
+RUNS_SUBDIR = Path("agent-sparring") / "runs"
 INPUT_KINDS = ("markdown", "manifest")
 EVENTS = (
     "created",
@@ -63,9 +73,11 @@ _RECORD_KEYS = frozenset(
         "events",
     }
 )
-#: Optional in schema v1 (absent means ``.sparring``): the project
-#: directory relative to the worktree, always contained in it.
-_OPTIONAL_KEYS = frozenset({"project_dir"})
+#: Optional in schema v1: ``project_dir``, the project directory relative
+#: to the worktree and always contained in it (absent means ``.sparring``);
+#: and ``pinned``, ``true`` for every run created since runs pin their
+#: remote target (absent means the run predates pins).
+_OPTIONAL_KEYS = frozenset({"project_dir", "pinned"})
 DEFAULT_PROJECT_DIR = ".sparring"
 
 
@@ -216,6 +228,10 @@ class ManagedRunRecord:
     project_dir: str = DEFAULT_PROJECT_DIR
     created_by: str = "engine"
     events: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    #: The run pins its remote target when it starts (see
+    #: :data:`_OPTIONAL_KEYS`). ``False`` only for a record written before
+    #: pins existed.
+    pinned: bool = False
 
     @property
     def lifecycle(self) -> str:
@@ -271,6 +287,7 @@ class ManagedRunRecord:
             "created_by": self.created_by,
             "project_dir": self.project_dir,
             "events": [dict(event) for event in self.events],
+            **({"pinned": True} if self.pinned else {}),
         }
 
     @classmethod
@@ -310,6 +327,9 @@ class ManagedRunRecord:
         remote = payload["remote"]
         if remote is not None and (not isinstance(remote, str) or not remote):
             raise bad("remote must be a string or null")
+        pinned = payload.get("pinned", False)
+        if not isinstance(pinned, bool):
+            raise bad("pinned must be true or false")
         run_key = text("run_key")
         if not _RUN_KEY_RE.match(run_key):
             raise bad(f"run_key {run_key!r} is not a valid run key")
@@ -345,6 +365,7 @@ class ManagedRunRecord:
             project_dir=project_dir,
             created_by="engine",
             events=tuple(dict(event) for event in events),
+            pinned=pinned,
         )
 
 
@@ -443,6 +464,54 @@ def append_event(repo_root: Path, run_key: str, event: str, detail: Mapping[str,
     finally:
         temp.unlink(missing_ok=True)
     return updated
+
+
+def run_flag_path(repo_root: Path, run_key: str) -> Path:
+    _check_run_key(run_key)
+    return git_common_dir(repo_root) / RUNS_SUBDIR / f"{run_key}.json"
+
+
+def run_flag_pinned(repo_root: Path, run_key: str) -> bool:
+    """Does the engine's run file say ``run_key`` is pinned? A file that
+    exists but cannot be read says yes: it is never taken to mean "no
+    pin"."""
+
+    path = run_flag_path(repo_root, run_key)
+    if not os.path.lexists(path):
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not (isinstance(payload, Mapping) and payload.get("pinned") is False)
+
+
+def engine_says_pinned(repo_root: Path, run_key: str) -> bool:
+    """Whether an engine record outside the project directory says
+    ``run_key`` is pinned: its managed record's ``pinned``, or its run
+    file. An unreadable managed record refuses rather than answering."""
+
+    record = read_record(repo_root, run_key)
+    return (record is not None and record.pinned) or run_flag_pinned(repo_root, run_key)
+
+
+def mark_pinned(repo_root: Path, run_key: str) -> None:
+    """Record outside the project directory that ``run_key`` is pinned.
+
+    Written for every run pinned without a managed record that says so
+    already: an unmanaged run at its start, and any run recorded before
+    pins when it is pinned late. Idempotent; never cleared."""
+
+    if engine_says_pinned(repo_root, run_key):
+        return
+    path = run_flag_path(repo_root, run_key)
+    temp = _write_temp(
+        path.parent, {"schema_version": SCHEMA_VERSION, "run_key": run_key, "pinned": True, "at": _now()}
+    )
+    try:
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def record_for_worktree(repo_root: Path, worktree: Path) -> ManagedRunRecord | None:
@@ -601,6 +670,7 @@ def plan_managed_run(
         remote=remote,
         created_at=_now(),
         project_dir=project_rel.as_posix(),
+        pinned=True,
     )
     return ManagedRunPlan(record=record, uncommitted=dirty_paths(invoking_top))
 

@@ -80,6 +80,7 @@ from agent_sparring.plan import (
     PAUSE_SESSION_UNRESUMABLE,
     ProviderPause,
     acknowledge_remote_movement,
+    authorize_pushed_candidate,
     load_plan_source,
     plan_label,
     plan_state_not_ignored_message,
@@ -94,7 +95,12 @@ from agent_sparring.deferred_gate import (
 )
 from agent_sparring.plan_model import PlanSource
 from agent_sparring.push_gate import PUSH_AUTHORIZATION_REQUIRED
-from agent_sparring.remote_pin import UNAUTHORIZED_REMOTE_MOVEMENT, UnauthorizedRemoteMovement
+from agent_sparring.remote_pin import (
+    PUSHED_CANDIDATE_UNAUTHORIZED,
+    UNAUTHORIZED_REMOTE_MOVEMENT,
+    PushedCandidateUnauthorized,
+    UnauthorizedRemoteMovement,
+)
 from agent_sparring.providers.claude_cli import (
     DEFAULT_PERMISSION_MODE,
     PROVIDER_ID as CLAUDE_PROVIDER_ID,
@@ -1853,6 +1859,10 @@ def _report_plan_result(
         _report_unauthorized_remote_movement(result, args, stage)
         return
 
+    if isinstance(result.awaiting, PushedCandidateUnauthorized):
+        _report_pushed_candidate_unauthorized(result, args, stage)
+        return
+
     if result.awaiting is not None:
         _report_push_authorization_required(result, args, stage)
         return
@@ -2027,23 +2037,75 @@ def _report_unauthorized_remote_movement(
     )
 
 
-def _cmd_acknowledge_remote_movement(args: argparse.Namespace) -> int:
+def _report_pushed_candidate_unauthorized(
+    result: PlanRunResult, args: argparse.Namespace, stage: Stage
+) -> None:
+    """A run stopped because its candidate is already on the pinned remote
+    ref and no engine receipt explains it. Neither an acknowledgement nor a
+    push authorization answers this; only the per-commit action does."""
+
+    pause = result.awaiting
+    assert isinstance(pause, PushedCandidateUnauthorized)  # the caller checked
+    print(f"plan paused: {result.plan}")
+    print(f"stage: {result.stage_id} ({stage.directory})")
+    print(f"needs: {PUSHED_CANDIDATE_UNAUTHORIZED}")
+    for stage_id, sha in result.accepted:
+        print(f"  accepted {stage_id} at {sha}")
+    print(f"remote: {pause.remote} ({pause.url or 'no URL'})")
+    print(f"ref: {pause.ref}")
+    print(f"observed tip: {pause.observed_tip or 'absent'}")
+    print(f"candidate: {pause.candidate_sha}")
+    if pause.detail:
+        print(f"why: {pause.detail}")
+    print()
+    print(
+        "The candidate is already on the run's pinned remote ref, but the engine did not push "
+        "it. An acknowledgement records what was observed; it does not authorize a candidate, "
+        "and a run-level push grant does not clear this. Nothing was pushed, frozen or accepted."
+    )
+    print()
+    print("If you have looked and accept this exact commit as though the engine had pushed it:")
+    print(f"  sparring authorize-pushed-candidate --run-key {result.run} --sha {pause.candidate_sha}")
+    print()
+    print(
+        "That is recorded on its own, with who and when, as authorized_without_push. It is not "
+        "a review: the stage is accepted only after the independent reviewer says READY for it."
+    )
+
+
+def _run_sparring_dir(args: argparse.Namespace) -> Path:
+    """The run's own project directory: a managed run's, from its record,
+    else the one given."""
+
     sparring_dir = Path(args.sparring_dir)
+    repo_root = _resolve_repo_root(args, sparring_dir)
     try:
-        repo_root = _resolve_repo_root(args, sparring_dir)
-        try:
-            record = managed_run.read_record(repo_root, args.run_key)
-        except ManagedRunError as exc:
-            if exc.code != "not_a_repository":
-                raise
-            record = None
-        if record is not None:
-            sparring_dir = record.sparring_dir
+        record = managed_run.read_record(repo_root, args.run_key)
+    except ManagedRunError as exc:
+        if exc.code != "not_a_repository":
+            raise
+        record = None
+    return record.sparring_dir if record is not None else sparring_dir
+
+
+def _cmd_acknowledge_remote_movement(args: argparse.Namespace) -> int:
+    try:
         acknowledge_remote_movement(
-            sparring_dir, run_key=args.run_key, observed=args.observed, report=print
+            _run_sparring_dir(args), run_key=args.run_key, observed=args.observed, report=print
         )
     except (PlanError, ManagedRunError, ProjectConfigError, GitContextError) as exc:
         print(f"could not acknowledge remote movement: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_authorize_pushed_candidate(args: argparse.Namespace) -> int:
+    try:
+        authorize_pushed_candidate(
+            _run_sparring_dir(args), run_key=args.run_key, candidate_sha=args.sha, report=print
+        )
+    except (PlanError, ManagedRunError, ProjectConfigError, GitContextError) as exc:
+        print(f"could not authorize the pushed candidate: {exc}", file=sys.stderr)
         return 1
     return 0
 
@@ -4406,6 +4468,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     acknowledge.add_argument("--repo-root", default=None, help=repo_root_help)
     acknowledge.set_defaults(func=_cmd_acknowledge_remote_movement)
+
+    authorize_pushed = subparsers.add_parser(
+        "authorize-pushed-candidate",
+        help=(
+            "authorize exactly one candidate a plan run is paused on because it is already on "
+            "the remote with no engine push receipt, naming the run and the full commit id; "
+            "recorded with who and when as authorized_without_push, and never a review or an "
+            "acceptance"
+        ),
+    )
+    authorize_pushed.add_argument("--run-key", required=True, help="the paused run")
+    authorize_pushed.add_argument(
+        "--sha", required=True, help="the candidate the run reported, as a full 40-character id"
+    )
+    authorize_pushed.add_argument("--repo-root", default=None, help=repo_root_help)
+    authorize_pushed.set_defaults(func=_cmd_authorize_pushed_candidate)
 
     freeze = subparsers.add_parser(
         "freeze-candidate",

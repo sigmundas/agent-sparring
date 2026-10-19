@@ -198,7 +198,7 @@ from agent_sparring.gate_answers import (
     repeat_asking_count,
     stalled_checks,
 )
-from agent_sparring.git_context import GitContextError, is_ignored, resolve_commit
+from agent_sparring.git_context import GitContextError, is_full_sha, is_ignored, resolve_commit
 from agent_sparring.loop import (
     DEFAULT_MAX_SEND_BACK_CYCLES,
     CandidateRefused,
@@ -237,13 +237,19 @@ from agent_sparring.push_gate import (
 from agent_sparring import engine_git
 from agent_sparring.remote_pin import (
     ABSENT,
+    AUTHORIZED_WITHOUT_PUSH,
+    PUSHED_CANDIDATE_UNAUTHORIZED,
+    REMOTE_PIN_MISSING,
     UNAUTHORIZED_REMOTE_MOVEMENT,
+    PushedCandidateUnauthorized,
     RemoteMovementDetected,
+    RemotePause,
     RemotePin,
     RemoteRecord,
     SiblingRemotePin,
     UnauthorizedRemoteMovement,
     acknowledgement,
+    authorization_without_push,
     check_movement,
     pin_remote,
     pin_sibling,
@@ -557,13 +563,15 @@ class PlanRunState:
     #: Why this run is stopped, when the reason is a typed one the runner
     #: itself recorded rather than a reviewer's verdict:
     #: :class:`~agent_sparring.push_gate.PushRequired`,
-    #: :class:`~agent_sparring.deferred_gate.DeferredVerificationRequired`, or
-    #: :class:`~agent_sparring.remote_pin.UnauthorizedRemoteMovement`.
+    #: :class:`~agent_sparring.deferred_gate.DeferredVerificationRequired`,
+    #: :class:`~agent_sparring.remote_pin.UnauthorizedRemoteMovement` or
+    #: :class:`~agent_sparring.remote_pin.PushedCandidateUnauthorized`.
     #: Cleared whenever the run enters a stage for execution, so it can never
     #: describe an older pause than the one the run is actually in -- except
-    #: unauthorized remote movement, which a run never leaves by entering a
-    #: stage: only an explicit acknowledgement clears it.
-    awaiting: PushRequired | DeferredVerificationRequired | UnauthorizedRemoteMovement | None = None
+    #: the two remote pauses, which a run never leaves by entering a stage:
+    #: only an explicit acknowledgement clears unauthorized movement, and only
+    #: an explicit per-commit authorization clears a pushed candidate.
+    awaiting: PushRequired | DeferredVerificationRequired | RemotePause | None = None
     #: The obligation ledger: human verification a reviewer deferred rather
     #: than stopped for (see :mod:`agent_sparring.deferred_gate`).
     #:
@@ -614,8 +622,10 @@ class PlanRunState:
     #: it (as a weaker, legacy pin). Omitted while ``None``.
     remote_pin: RemotePin | None = None
     #: Every explained movement of the pinned ref, in order: the engine's
-    #: push receipts and a person's acknowledgements of movement the engine
-    #: did not make. The pinned ref is expected at the last one's tip.
+    #: push receipts, a person's acknowledgements of movement the engine
+    #: did not make, and a person's per-commit ``authorized_without_push``
+    #: of a candidate already on the ref. The pinned ref is expected at the
+    #: last one's tip.
     #: Omitted while empty.
     remote_records: tuple[RemoteRecord, ...] = field(default_factory=tuple)
     #: Every declared sibling repository's remote target and trusted
@@ -806,7 +816,7 @@ def _managed_flag(value: Any) -> bool:
 
 def _awaiting_from_dict(
     payload: Any,
-) -> "PushRequired | DeferredVerificationRequired | UnauthorizedRemoteMovement | None":
+) -> "PushRequired | DeferredVerificationRequired | RemotePause | None":
     """The typed pause a recorded run is stopped on.
 
     Dispatched on ``kind`` and on nothing else, so adding a reason is adding
@@ -823,6 +833,8 @@ def _awaiting_from_dict(
         return DeferredVerificationRequired.from_dict(payload)
     if kind == UNAUTHORIZED_REMOTE_MOVEMENT:
         return UnauthorizedRemoteMovement.from_dict(payload)
+    if kind == PUSHED_CANDIDATE_UNAUTHORIZED:
+        return PushedCandidateUnauthorized.from_dict(payload)
     return PushRequired.from_dict(payload)
 
 
@@ -1219,8 +1231,10 @@ class PlanRunResult:
     #: which field is populated.
     #:
     #: And :class:`~agent_sparring.remote_pin.UnauthorizedRemoteMovement`:
-    #: the pinned remote ref is somewhere the engine's records do not explain.
-    awaiting: PushRequired | DeferredVerificationRequired | UnauthorizedRemoteMovement | None = None
+    #: the pinned remote ref is somewhere the engine's records do not explain;
+    #: or :class:`~agent_sparring.remote_pin.PushedCandidateUnauthorized`:
+    #: the candidate is already on it and nothing explains the candidate.
+    awaiting: PushRequired | DeferredVerificationRequired | RemotePause | None = None
     #: The obligations a :class:`DeferredVerificationRequired` pause is
     #: about, in full, so a caller can render them without re-reading the
     #: run state. Empty otherwise.
@@ -1495,6 +1509,9 @@ def start_plan(
         report(f"push authorization recorded for this run: {state.push_authorization.describe}")
     if managed:
         _write_plan_snapshot(repo_root, sparring_dir, key)
+    # Outside the project directory, before the state that holds the pin:
+    # losing that state can then never make this run look unpinned.
+    _mark_pinned(repo_root, key)
     state.save(state_path)
     # Claimed only now that the run exists: a refusal above must not leave a
     # stage marked as owned by a run that was never recorded.
@@ -1517,6 +1534,21 @@ def start_plan(
         report=report,
         stop_after_stage=stop_after_stage,
     )
+
+
+def _mark_pinned(repo_root: Path, run_key: str) -> None:
+    """Record outside the project directory that this run is pinned (see
+    :func:`agent_sparring.managed_run.mark_pinned`)."""
+
+    from agent_sparring.managed_run import ManagedRunError, mark_pinned
+
+    try:
+        mark_pinned(Path(repo_root), run_key)
+    except (ManagedRunError, OSError) as exc:
+        raise PlanError(
+            f"cannot record that run {run_key} is pinned outside the project directory ({exc}); "
+            "nothing was run"
+        ) from exc
 
 
 def _require_managed_record(repo_root: Path, run_key: str, expected_branch: str) -> None:
@@ -2470,6 +2502,9 @@ def _grant_push_authorization(
                     "; it is stopped on unauthorized remote movement, which a push "
                     "authorization does not clear (see acknowledge-remote-movement)"
                     if isinstance(state.awaiting, UnauthorizedRemoteMovement)
+                    else "; its candidate is already on the remote with no engine receipt, which "
+                    "a push authorization does not clear (see authorize-pushed-candidate)"
+                    if isinstance(state.awaiting, PushedCandidateUnauthorized)
                     else ""
                 )
             )
@@ -2511,7 +2546,7 @@ def _ensure_candidate_pushed(
     stage: Stage,
     *,
     report: Reporter,
-) -> PushRequired | UnauthorizedRemoteMovement | None:
+) -> PushRequired | RemotePause | None:
     """Put the verified candidate where the acceptance gate requires it, or
     say that a person has to allow that first, or stop on remote movement
     the engine's records do not explain.
@@ -2635,10 +2670,31 @@ def _pin_legacy_run(
     state: PlanRunState, state_path: Path, repo_root: Path, *, report: Reporter
 ) -> None:
     """Pin a run recorded before pins existed, from the configuration as it
-    is now, and say so plainly: this is weaker than a run-start pin."""
+    is now, and say so plainly: this is weaker than a run-start pin.
 
+    Only a run the engine's own record outside the project directory does
+    not already call pinned: a pinned run whose pin is gone -- its state
+    replaced by a legacy-shaped one, say -- refuses with
+    ``remote_pin_missing`` instead of being re-pinned from whatever the
+    configuration says now. Either way the run ends up recorded as pinned
+    there (a run pinned before that record existed included)."""
+
+    key = _RunOwner.of(state).key
     if state.remote_pin is not None:
+        _mark_pinned(repo_root, key)
         return
+    from agent_sparring.managed_run import ManagedRunError, engine_says_pinned
+
+    try:
+        pinned_before = engine_says_pinned(Path(repo_root), key)
+    except (ManagedRunError, OSError) as exc:
+        raise PlanError(f"cannot read the engine's record of run {key} ({exc}); nothing was run") from exc
+    if pinned_before:
+        raise PlanError(
+            f"refusing: {REMOTE_PIN_MISSING}: the engine's record says plan run {key} was pinned, "
+            "but its run state holds no pin; it is not re-pinned from the current configuration. "
+            "Nothing was run"
+        )
     try:
         pin = pin_remote(repo_root, state.expected_branch, legacy=True)
     except GitContextError as exc:
@@ -2646,6 +2702,7 @@ def _pin_legacy_run(
             f"plan run {_RunOwner.of(state).key} was recorded before runs pinned their remote "
             f"target, and it cannot be pinned now ({exc}); nothing was run"
         ) from exc
+    _mark_pinned(repo_root, key)
     state.remote_pin = pin
     state.save(state_path)
     report(
@@ -2662,14 +2719,28 @@ def _stop_for_movement(
     state: PlanRunState,
     state_path: Path,
     activity: ActivityEmitter | None,
-    movement: UnauthorizedRemoteMovement,
+    movement: RemotePause,
     *,
     report: Reporter,
 ) -> None:
-    """Record the typed pause for remote movement nobody explained."""
+    """Record the typed pause for remote movement nobody explained, or for
+    a candidate already on the remote that nothing explains."""
 
     state.awaiting = movement
     _pause(state, state_path)
+    if isinstance(movement, PushedCandidateUnauthorized):
+        if activity is not None:
+            activity.emit("plan.paused", summary="pushed candidate unauthorized")
+        report(
+            f"stage {movement.stage_id}: {PUSHED_CANDIDATE_UNAUTHORIZED}: {movement.describe}. "
+            "The plan is paused; nothing was pushed, frozen or accepted. An acknowledgement "
+            "does not authorize a candidate and a run-level push grant does not clear this. "
+            "If you have looked and accept this exact commit as though the engine had pushed "
+            "it, say so with `sparring authorize-pushed-candidate --run-key "
+            f"{_RunOwner.of(state).key} --sha {movement.candidate_sha}`. That is not a review: "
+            "the stage is accepted only after the independent reviewer says READY for it."
+        )
+        return
     if activity is not None:
         activity.emit("plan.paused", summary="unauthorized remote movement")
     report(
@@ -2688,9 +2759,10 @@ def _movement_now(
     stage: Stage,
     *,
     candidate_sha: str | None = None,
-) -> UnauthorizedRemoteMovement | None:
-    """Unexplained movement of the pinned ref right now, if any. Raises
-    :class:`GitContextError` when the check itself cannot be made."""
+) -> RemotePause | None:
+    """Unexplained movement of the pinned ref right now, or an unexplained
+    ``candidate_sha`` on it, if any. Raises :class:`GitContextError` when
+    the check itself cannot be made."""
 
     if state.remote_pin is None:
         return None
@@ -2728,6 +2800,57 @@ def _after_turn_check(state: PlanRunState, repo_root: Path, stage: Stage) -> Cal
             raise RemoteMovementDetected(movement)
 
     return check
+
+
+def authorize_pushed_candidate(
+    sparring_dir: Path,
+    *,
+    run_key: str,
+    candidate_sha: str,
+    by: str | None = None,
+    report: Reporter = lambda message: None,
+) -> RemoteRecord:
+    """A person's explicit authorization of exactly one commit that is
+    already on the pinned ref with no engine receipt, naming the run and the
+    full commit id.
+
+    Refused unless the run is paused on ``pushed_candidate_unauthorized`` for
+    exactly that commit. Recorded in the run's state as its own
+    ``authorized_without_push`` record, with who and when; the pause is
+    cleared and the run stays paused, to be resumed separately. It is not a
+    review or an acceptance: the stage is accepted only after the
+    independent reviewer's READY for that commit.
+    """
+
+    state_path = run_state_path(sparring_dir, run_key)
+    if not state_path.is_file():
+        raise PlanError(f"no plan run {run_key!r} is recorded at {state_path}")
+    state = PlanRunState.load(state_path)
+    pause = state.awaiting
+    if not isinstance(pause, PushedCandidateUnauthorized):
+        raise PlanError(
+            f"plan run {run_key} is not paused on {PUSHED_CANDIDATE_UNAUTHORIZED}; there is no "
+            "pushed candidate to authorize"
+        )
+    wanted = candidate_sha.strip().lower()
+    if not is_full_sha(wanted) or wanted != pause.candidate_sha.lower():
+        raise PlanError(
+            f"plan run {run_key} is paused on candidate {pause.candidate_sha}, not "
+            f"{candidate_sha}; refusing to authorize a commit the run is not paused on (give the "
+            "full 40-character commit id)"
+        )
+    record = authorization_without_push(run=run_key, pause=pause, by=by or who())
+    state.remote_records = state.remote_records + (record,)
+    state.awaiting = None
+    state.status = PlanRunStatus.PAUSED
+    state.save(state_path)
+    report(
+        f"{AUTHORIZED_WITHOUT_PUSH} recorded by {record.by} at {record.recorded_at}: candidate "
+        f"{pause.candidate_sha} of stage {pause.stage_id!r}, already on {pause.remote} "
+        f"{pause.ref}. Nothing was reviewed or accepted; resume the run to continue -- the stage "
+        "is accepted only after the independent reviewer says READY for this commit."
+    )
+    return record
 
 
 def acknowledge_remote_movement(
@@ -4277,17 +4400,30 @@ def _drive(
     A run paused on unauthorized remote movement stays paused: nothing --
     not a push authorization, not evidence, not a resume -- moves it on
     except an explicit acknowledgement (:func:`acknowledge_remote_movement`).
+    A run paused on a pushed candidate likewise, except the explicit
+    per-commit authorization (:func:`authorize_pushed_candidate`); a
+    run-level push grant does not.
     """
 
     movement = state.awaiting
-    if isinstance(movement, UnauthorizedRemoteMovement):
+    if isinstance(movement, (UnauthorizedRemoteMovement, PushedCandidateUnauthorized)):
         _pause(state, state_path)
         report: Reporter = kwargs.get("report") or (lambda message: None)
+        key = _RunOwner.of(state).key
+        if isinstance(movement, PushedCandidateUnauthorized):
+            action = (
+                f"Authorize exactly that commit with `sparring authorize-pushed-candidate "
+                f"--run-key {key} --sha {movement.candidate_sha}` once you have looked; a "
+                "run-level push grant does not clear this."
+            )
+        else:
+            action = (
+                f"Acknowledge it with `sparring acknowledge-remote-movement --run-key {key} "
+                f"--observed {movement.observed_label}` once you have looked."
+            )
         report(
-            f"plan {state.plan}: still paused on {UNAUTHORIZED_REMOTE_MOVEMENT}: "
-            f"{movement.describe}. Nothing was run, pushed, frozen or accepted. Acknowledge it "
-            f"with `sparring acknowledge-remote-movement --run-key {_RunOwner.of(state).key} "
-            f"--observed {movement.observed_label}` once you have looked."
+            f"plan {state.plan}: still paused on {movement.kind}: {movement.describe}. Nothing "
+            f"was run, pushed, frozen or accepted. {action}"
         )
         return PlanRunResult(
             status=PlanRunStatus.PAUSED,
@@ -5164,6 +5300,7 @@ __all__ = [
     "PlannedStage",
     "RecordedRun",
     "acknowledge_remote_movement",
+    "authorize_pushed_candidate",
     "describe_source",
     "find_runs",
     "legacy_run_key",

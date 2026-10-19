@@ -15,14 +15,22 @@ So the destination is a record, and so is every movement of it:
                                 tip then (or its absence) and the trusted
                                 snapshot of the repository's own
                                 security-relevant configuration
-    RemoteRecord                one engine push (a *receipt*) or one human
+    RemoteRecord                one engine push (a *receipt*), one human
                                 acknowledgement of movement the engine did
-                                not make
+                                not make, or one person's explicit
+                                authorization of a candidate already on the
+                                remote without an engine push
     UnauthorizedRemoteMovement  the typed pause: the pinned ref is somewhere
                                 the records do not explain
+    PushedCandidateUnauthorized the typed pause: the ref is where the records
+                                say, but the candidate is already on it and
+                                no engine receipt explains it
 
-All three live in the plan-run state (``.sparring/plans/<run>.json``),
-which the engine writes and reads. Nothing here ever reads prose:
+All of these live in the plan-run state (``.sparring/plans/<run>.json``),
+which the engine writes and reads. That the run *was* pinned is recorded
+outside the project directory as well (see
+:mod:`agent_sparring.managed_run`), so a missing pin is a refusal
+(``remote_pin_missing``), never "no pin". Nothing here ever reads prose:
 ``notes.md``, handoffs, stage output and reviewer output are not authority
 for a push, a pin or an acknowledgement, whatever they say.
 
@@ -31,12 +39,25 @@ What the records explain
 
 The *expected* tip of the pinned ref is the last record's tip, or the
 start tip when there are none. Any other observed tip is unauthorized
-movement. A candidate that is already reachable from the pinned ref but is
-covered by no record (and is not part of the stage's own base) is too --
+movement.
+
+A *candidate* is explained only by an engine push receipt (it is reachable
+from a pushed tip), by the pinned start tip, by the stage's own base, or by
+a person's ``authorized_without_push`` record naming exactly that commit.
+An acknowledgement records an observed movement and nothing else: it clears
+the movement pause and becomes the baseline for detecting *further*
+movement, but it never authorizes a push and never explains a candidate. A
+candidate already reachable from the pinned ref that nothing explains --
 the Sporely Stage 4b case, where a stage agent pushed its own unreviewed
-commit. For a legacy run, pinned on first resume rather than at run start,
-the tip observed then is taken as the start but explains no candidate: it
-was never observed before anyone could have pushed to it.
+commit -- is ``pushed_candidate_unauthorized``, which only the explicit
+per-commit action clears (a run-level push grant does not). Neither that
+action nor an acknowledgement is a review: acceptance still needs the
+independent reviewer's verdict for the exact commit.
+
+For a legacy run, pinned on first resume rather than at run start, the tip
+observed then is taken as the start but explains no candidate: it was never
+observed before anyone could have pushed to it, so a candidate on it is
+unauthorized movement until a person has looked.
 
 This is detection, not prevention. It watches only the pinned ref, and an
 agent that can run Git as the user can still write to it, to other refs
@@ -68,8 +89,12 @@ from agent_sparring.git_context import (
 )
 
 UNAUTHORIZED_REMOTE_MOVEMENT = "unauthorized_remote_movement"
+PUSHED_CANDIDATE_UNAUTHORIZED = "pushed_candidate_unauthorized"
 PUSH_RECEIPT = "push_receipt"
 MOVEMENT_ACKNOWLEDGED = "movement_acknowledged"
+AUTHORIZED_WITHOUT_PUSH = "authorized_without_push"
+#: A run the engine's record says was pinned has no readable pin.
+REMOTE_PIN_MISSING = "remote_pin_missing"
 
 #: How an acknowledgement names a ref that the observed state says is gone.
 ABSENT = "absent"
@@ -219,7 +244,11 @@ class RemoteRecord:
     ``PUSH_RECEIPT``: the engine pushed ``tip`` over ``previous_tip``.
     ``MOVEMENT_ACKNOWLEDGED``: a person, ``by``, acknowledged that the ref
     was at ``tip`` when the records explained ``previous_tip``. An
-    acknowledgement is not a review, an acceptance or a push authorization.
+    acknowledgement is not a review, an acceptance or a push authorization,
+    and it explains no candidate.
+    ``AUTHORIZED_WITHOUT_PUSH``: a person, ``by``, authorized exactly
+    ``candidate_sha`` of ``stage_id``, already on the ref at ``tip``, as
+    though the engine had pushed it. Not a review and not an acceptance.
     """
 
     kind: str
@@ -232,6 +261,8 @@ class RemoteRecord:
     tip: str | None
     recorded_at: str
     by: str | None = None
+    #: ``AUTHORIZED_WITHOUT_PUSH`` only: the one commit it authorizes.
+    candidate_sha: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -247,6 +278,8 @@ class RemoteRecord:
         }
         if self.by is not None:
             payload["by"] = self.by
+        if self.candidate_sha is not None:
+            payload["candidate_sha"] = self.candidate_sha
         return payload
 
     @classmethod
@@ -254,7 +287,7 @@ class RemoteRecord:
         if not isinstance(payload, Mapping):
             raise RemotePinError(f"a remote record must be an object, got {payload!r}")
         kind = _text(payload, "kind")
-        if kind not in (PUSH_RECEIPT, MOVEMENT_ACKNOWLEDGED):
+        if kind not in (PUSH_RECEIPT, MOVEMENT_ACKNOWLEDGED, AUTHORIZED_WITHOUT_PUSH):
             raise RemotePinError(f"unknown remote record kind {kind!r}")
         record = cls(
             kind=kind,
@@ -267,11 +300,18 @@ class RemoteRecord:
             tip=_optional_sha(payload, "tip"),
             recorded_at=_text(payload, "recorded_at"),
             by=_optional(payload, "by"),
+            candidate_sha=_optional_sha(payload, "candidate_sha"),
         )
         if kind == PUSH_RECEIPT and record.tip is None:
             raise RemotePinError("a push receipt must name the pushed commit")
-        if kind == MOVEMENT_ACKNOWLEDGED and not record.by:
-            raise RemotePinError("an acknowledgement must record who made it")
+        if kind in (MOVEMENT_ACKNOWLEDGED, AUTHORIZED_WITHOUT_PUSH) and not record.by:
+            raise RemotePinError(f"a {kind} record must record who made it")
+        if kind == AUTHORIZED_WITHOUT_PUSH and not (record.candidate_sha and record.stage_id):
+            raise RemotePinError(
+                "an authorization without push must name the stage and the exact commit"
+            )
+        if kind != AUTHORIZED_WITHOUT_PUSH and record.candidate_sha is not None:
+            raise RemotePinError(f"a {kind} record names no candidate")
         return record
 
 
@@ -339,10 +379,84 @@ class UnauthorizedRemoteMovement:
         )
 
 
+@dataclass(frozen=True)
+class PushedCandidateUnauthorized:
+    """The typed pause: ``candidate_sha`` is already reachable from the
+    pinned ref, which is where the records say, but no engine receipt, start
+    tip or stage base explains the candidate itself.
+
+    Cleared only by a person's explicit per-commit action naming the run and
+    this exact commit (``sparring authorize-pushed-candidate``), recorded as
+    ``authorized_without_push``. A run-level push grant does not clear it,
+    and an acknowledgement does not explain it.
+    """
+
+    stage_id: str
+    candidate_sha: str
+    remote: str
+    url: str | None
+    ref: str
+    observed_tip: str | None
+    detail: str | None = None
+    kind: str = PUSHED_CANDIDATE_UNAUTHORIZED
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "kind": self.kind,
+            "stage_id": self.stage_id,
+            "candidate_sha": self.candidate_sha,
+            "remote": self.remote,
+            "url": self.url,
+            "ref": self.ref,
+            "observed_tip": self.observed_tip,
+        }
+        if self.detail:
+            payload["detail"] = self.detail
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "PushedCandidateUnauthorized":
+        if not isinstance(payload, Mapping):
+            raise RemotePinError(f"awaiting must be an object, got {payload!r}")
+        if payload.get("kind") != PUSHED_CANDIDATE_UNAUTHORIZED:
+            raise RemotePinError(f"not a {PUSHED_CANDIDATE_UNAUTHORIZED} pause: {payload!r}")
+        candidate = _optional_sha(payload, "candidate_sha")
+        if candidate is None:
+            raise RemotePinError("a pushed_candidate_unauthorized pause must name its candidate")
+        return cls(
+            stage_id=_text(payload, "stage_id"),
+            candidate_sha=candidate,
+            remote=_text(payload, "remote"),
+            url=_optional(payload, "url"),
+            ref=_text(payload, "ref"),
+            observed_tip=_optional_sha(payload, "observed_tip"),
+            detail=_optional(payload, "detail"),
+        )
+
+    @property
+    def describe(self) -> str:
+        return (
+            f"candidate {self.candidate_sha} is already on {self.remote} {self.ref} (at "
+            f"{self.observed_tip or 'nothing (absent)'}), but no engine push receipt explains it"
+        )
+
+
+#: Either typed pause about the pinned ref.
+RemotePause = UnauthorizedRemoteMovement | PushedCandidateUnauthorized
+
+REMOTE_PAUSE_KINDS = (UNAUTHORIZED_REMOTE_MOVEMENT, PUSHED_CANDIDATE_UNAUTHORIZED)
+
+
+def remote_pause_from_dict(payload: Any) -> "RemotePause":
+    if isinstance(payload, Mapping) and payload.get("kind") == PUSHED_CANDIDATE_UNAUTHORIZED:
+        return PushedCandidateUnauthorized.from_dict(payload)
+    return UnauthorizedRemoteMovement.from_dict(payload)
+
+
 class RemoteMovementDetected(Exception):
     """Raised from an after-turn check so a driver can pause on it."""
 
-    def __init__(self, movement: UnauthorizedRemoteMovement) -> None:
+    def __init__(self, movement: "RemotePause") -> None:
         super().__init__(movement.describe)
         self.movement = movement
 
@@ -463,7 +577,17 @@ def _covered(
     candidate_sha: str,
     stage_base: str | None,
 ) -> bool:
-    explained = [record.tip for record in records if record.tip]
+    """Is ``candidate_sha`` explained? Only by an engine push receipt, the
+    (non-legacy) start tip, the stage's base, or a person's
+    ``authorized_without_push`` of exactly this commit -- never by an
+    acknowledgement, which records an observation and nothing more."""
+
+    if any(
+        record.kind == AUTHORIZED_WITHOUT_PUSH and record.candidate_sha == candidate_sha
+        for record in records
+    ):
+        return True
+    explained = [record.tip for record in records if record.kind == PUSH_RECEIPT and record.tip]
     if pin.start_tip and not pin.legacy:
         explained.append(pin.start_tip)
     if stage_base:
@@ -479,8 +603,14 @@ def check_movement(
     stage_id: str,
     candidate_sha: str | None = None,
     stage_base: str | None = None,
-) -> tuple[str | None, UnauthorizedRemoteMovement | None]:
+) -> tuple[str | None, "RemotePause | None"]:
     """``(observed tip, deviation or None)`` for the pinned ref.
+
+    The deviation is :class:`UnauthorizedRemoteMovement` when the ref is not
+    where the records say -- or, for a legacy pin nobody has looked past
+    yet, when the candidate is on it -- and
+    :class:`PushedCandidateUnauthorized` when the ref is where the records
+    say but the candidate on it is explained by nothing.
 
     Raises :class:`GitContextError` (including the typed
     :class:`GitConfigRefusal`) when the target was retargeted, the
@@ -512,9 +642,25 @@ def check_movement(
         and is_ancestor(repo_root, candidate_sha, observed)
         and not _covered(repo_root, pin, records, candidate_sha, stage_base)
     ):
-        return observed, movement(
-            f"candidate {candidate_sha} is already reachable from the pinned ref, but no engine "
-            "push receipt or acknowledgement covers it"
+        if pin.legacy and not records:
+            # Nobody has looked at this ref yet: its tip was first observed
+            # when the run was pinned late, after anyone could have pushed.
+            return observed, movement(
+                f"candidate {candidate_sha} is already reachable from the pinned ref, which this "
+                "run first observed when it was pinned late; no engine push receipt covers it"
+            )
+        return observed, PushedCandidateUnauthorized(
+            stage_id=stage_id,
+            candidate_sha=candidate_sha,
+            remote=pin.remote,
+            url=pin.destination,
+            ref=pin.ref,
+            observed_tip=observed,
+            detail=(
+                "an acknowledgement records what was observed; it does not authorize a candidate"
+                if any(record.kind == MOVEMENT_ACKNOWLEDGED for record in records)
+                else None
+            ),
         )
     return observed, None
 
@@ -565,6 +711,29 @@ def acknowledgement(
         tip=movement.observed_tip,
         recorded_at=now(),
         by=by,
+    )
+
+
+def authorization_without_push(
+    *, run: str, pause: PushedCandidateUnauthorized, by: str
+) -> RemoteRecord:
+    """A person's per-commit authorization of the candidate ``pause`` names.
+    Its tip is the tip observed with it, so it is also the baseline for
+    detecting further movement -- whatever happens to an earlier
+    acknowledgement."""
+
+    return RemoteRecord(
+        kind=AUTHORIZED_WITHOUT_PUSH,
+        run=run,
+        stage_id=pause.stage_id,
+        remote=pause.remote,
+        url=pause.url,
+        ref=pause.ref,
+        previous_tip=pause.observed_tip,
+        tip=pause.observed_tip,
+        recorded_at=now(),
+        by=by,
+        candidate_sha=pause.candidate_sha,
     )
 
 
@@ -637,7 +806,7 @@ class RunRemoteState:
     run: str
     pin: RemotePin | None
     records: tuple[RemoteRecord, ...]
-    movement: UnauthorizedRemoteMovement | None
+    movement: "RemotePause | None"
     #: The declared sibling repositories pinned at run start.
     siblings: tuple[SiblingRemotePin, ...] = ()
 
@@ -659,8 +828,8 @@ def load_run_remote_state(sparring_dir: Path, run_key: str) -> RunRemoteState | 
     pin_payload = payload.get("remote_pin")
     awaiting = payload.get("awaiting")
     movement = (
-        UnauthorizedRemoteMovement.from_dict(awaiting)
-        if isinstance(awaiting, Mapping) and awaiting.get("kind") == UNAUTHORIZED_REMOTE_MOVEMENT
+        remote_pause_from_dict(awaiting)
+        if isinstance(awaiting, Mapping) and awaiting.get("kind") in REMOTE_PAUSE_KINDS
         else None
     )
     return RunRemoteState(
@@ -674,11 +843,17 @@ def load_run_remote_state(sparring_dir: Path, run_key: str) -> RunRemoteState | 
 
 __all__ = [
     "ABSENT",
+    "AUTHORIZED_WITHOUT_PUSH",
     "MOVEMENT_ACKNOWLEDGED",
+    "PUSHED_CANDIDATE_UNAUTHORIZED",
     "PUSH_RECEIPT",
+    "REMOTE_PAUSE_KINDS",
+    "REMOTE_PIN_MISSING",
     "SAFE_REF_RE",
     "UNAUTHORIZED_REMOTE_MOVEMENT",
+    "PushedCandidateUnauthorized",
     "RemoteMovementDetected",
+    "RemotePause",
     "RemotePin",
     "RemotePinError",
     "RemoteRecord",
@@ -686,6 +861,7 @@ __all__ = [
     "SiblingRemotePin",
     "UnauthorizedRemoteMovement",
     "acknowledgement",
+    "authorization_without_push",
     "check_movement",
     "expected_tip",
     "find_sibling_pin",
@@ -695,6 +871,7 @@ __all__ = [
     "pin_sibling",
     "push_receipt",
     "records_from",
+    "remote_pause_from_dict",
     "require_pinned_target",
     "sibling_pins_from",
     "verify_pinned",

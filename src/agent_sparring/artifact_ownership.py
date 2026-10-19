@@ -130,8 +130,10 @@ ARTIFACTS: tuple[ArtifactOwnership, ...] = (
             "the run's position, expected branch and plan digest, plus the descriptive "
             "provider_pause record of a classified provider failure; and the run's push "
             "authority: push authorizations, the pinned remote target with its trusted "
-            "configuration snapshot, push receipts and remote-movement acknowledgements, "
-            "which the engine reads from here and nowhere else"
+            "configuration snapshot, push receipts, remote-movement acknowledgements and "
+            "per-commit authorized_without_push records, which the engine reads from here "
+            "and nowhere else (that the run is pinned at all is also recorded outside the "
+            "project directory, so a missing pin refuses)"
         ),
     ),
     ArtifactOwnership(

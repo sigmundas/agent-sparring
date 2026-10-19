@@ -83,6 +83,7 @@ and, like every other refusal here, leaves ``state.json`` untouched.
 from __future__ import annotations
 
 import contextlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -100,11 +101,12 @@ from agent_sparring.git_context import (
 )
 from agent_sparring.prompt_capture import PROMPTS_DIRNAME, is_prompt_artifact
 from agent_sparring.remote_pin import (
-    UNAUTHORIZED_REMOTE_MOVEMENT,
+    REMOTE_PIN_MISSING,
+    PushedCandidateUnauthorized,
+    RemotePause,
     RemotePinError,
     RunRemoteState,
     SiblingRemotePin,
-    UnauthorizedRemoteMovement,
     check_movement,
     find_sibling_pin,
     load_run_remote_state,
@@ -206,14 +208,21 @@ class AcceptanceResult:
 
 class UnauthorizedRemoteMovementError(AcceptanceError):
     """The run this stage belongs to has unexplained movement on its pinned
-    remote ref (see :mod:`agent_sparring.remote_pin`): nothing is frozen or
-    accepted until a person acknowledges it."""
+    remote ref, or an unexplained candidate already on it (see
+    :mod:`agent_sparring.remote_pin`): nothing is frozen or accepted until a
+    person has acted on it."""
 
-    def __init__(self, movement: UnauthorizedRemoteMovement) -> None:
+    def __init__(self, movement: RemotePause) -> None:
+        if isinstance(movement, PushedCandidateUnauthorized):
+            action = (
+                "authorize exactly that commit (sparring authorize-pushed-candidate) once you "
+                "have looked; a run-level push grant does not"
+            )
+        else:
+            action = "acknowledge the movement (sparring acknowledge-remote-movement) once you have looked"
         super().__init__(
-            f"refusing: {UNAUTHORIZED_REMOTE_MOVEMENT}: {movement.describe}. Nothing was frozen "
-            "or accepted; acknowledge the movement (sparring acknowledge-remote-movement) once "
-            "you have looked"
+            f"refusing: {movement.kind}: {movement.describe}. Nothing was frozen or accepted; "
+            f"{action}"
         )
         self.movement = movement
 
@@ -225,27 +234,111 @@ def _read_state(stage: Stage) -> StageState:
         raise AcceptanceError(f"cannot read stage state: {exc}") from exc
 
 
-def _run_remote(stage: Stage) -> RunRemoteState | None:
-    """The remote records of the managed run that owns ``stage``, read from
-    that run's engine-written state -- never from any stage artifact.
-    ``None`` for an unowned (hand-driven) stage or a run with no state."""
+def _runs_positioned_at(sparring_dir: Path, stage_id: str) -> set[str]:
+    """The run keys whose engine-written run state
+    (``<sparring_dir>/plans/<run>.json``) is positioned at ``stage_id``.
 
-    run = _read_state(stage).run
+    A run state that cannot be read refuses: it cannot be shown not to own
+    the stage."""
+
+    plans = Path(sparring_dir) / "plans"
+    if not plans.is_dir():
+        return set()
+    owners: set[str] = set()
+    for path in sorted(plans.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AcceptanceError(
+                f"cannot read run state {path} to establish who owns stage {stage_id!r}: {exc}"
+            ) from exc
+        if isinstance(payload, dict) and payload.get("current_stage") == stage_id:
+            owners.add(str(payload.get("run") or path.stem))
+    return owners
+
+
+def _owning_run(stage: Stage) -> str | None:
+    """The run that owns ``stage``, from engine run state.
+
+    The stage's own ``state.json`` names its owner, but an emptied or
+    rewritten ``run`` field must not make an owned stage look hand-driven
+    (and so skip the pin and movement checks): every run whose state is
+    positioned at this stage owns it too, and a claim that contradicts them
+    refuses. ``None`` only when neither names a run."""
+
+    claimed = _read_state(stage).run
+    positioned = _runs_positioned_at(Path(stage.directory).parent.parent, stage.stage_id)
+    if claimed:
+        if positioned and claimed not in positioned:
+            raise AcceptanceError(
+                f"refusing: stage {stage.stage_id!r} records run {claimed!r} as its owner, but "
+                f"the run state positioned at it is {', '.join(sorted(positioned))}; nothing was "
+                "frozen or accepted"
+            )
+        return claimed
+    if len(positioned) > 1:
+        raise AcceptanceError(
+            f"refusing: runs {', '.join(sorted(positioned))} are all positioned at stage "
+            f"{stage.stage_id!r}; nothing was frozen or accepted"
+        )
+    return next(iter(positioned), None)
+
+
+def _engine_says_pinned(repo_root: Path, run: str) -> bool:
+    from agent_sparring.managed_run import ManagedRunError, engine_says_pinned
+
+    try:
+        return engine_says_pinned(Path(repo_root), run)
+    except (ManagedRunError, OSError) as exc:
+        raise AcceptanceError(
+            f"refusing: cannot read the engine's record of run {run} ({exc}); nothing was "
+            "frozen or accepted"
+        ) from exc
+
+
+def _run_remote(
+    stage: Stage, repo_root: Path, *, require_pin: bool = True
+) -> RunRemoteState | None:
+    """The remote records of the run that owns ``stage`` (see
+    :func:`_owning_run`), read from that run's engine-written state -- never
+    from any stage artifact. ``None`` only for a stage no run owns.
+
+    With ``require_pin``, an owned stage whose run has no readable pin
+    refuses, and never falls back to reachability:
+    ``remote_pin_missing`` when the engine's record outside the project
+    directory says the run was pinned, otherwise because the run predates
+    pins and a resume has to pin it first (with its visible notice)."""
+
+    run = _owning_run(stage)
     if not run:
         return None
     sparring_dir = Path(stage.directory).parent.parent
     try:
-        return load_run_remote_state(sparring_dir, run)
+        remote = load_run_remote_state(sparring_dir, run)
     except RemotePinError as exc:
         raise AcceptanceError(f"cannot read the remote records of run {run}: {exc}") from exc
+    if not require_pin or (remote is not None and remote.pin is not None):
+        return remote
+    if _engine_says_pinned(repo_root, run):
+        raise AcceptanceError(
+            f"refusing: {REMOTE_PIN_MISSING}: the engine's record says run {run} was pinned, but "
+            "its run state holds no pin; nothing was frozen or accepted"
+        )
+    raise AcceptanceError(
+        f"refusing: run {run} was recorded before runs pinned their remote target and has not "
+        "been pinned; resume it (resume-plan), which pins it with a visible notice, before "
+        "freezing or accepting its stage -- reachability alone is never taken as pushed. "
+        "Nothing was frozen or accepted"
+    )
 
 
 @contextlib.contextmanager
 def _run_guard(stage: Stage, repo_root: Path) -> Iterator[RunRemoteState | None]:
     """Hold this operation's Git invocations to the owning run's trusted
-    configuration snapshot, when the run has one."""
+    configuration snapshot. An owned stage always has one (see
+    :func:`_run_remote`)."""
 
-    remote = _run_remote(stage)
+    remote = _run_remote(stage, repo_root)
     if remote is not None and remote.pin is not None:
         with engine_git.trusted_config(
             [Path(repo_root)], remote.pin.trusted_config, destinations=(remote.pin.destination,)
@@ -638,7 +731,7 @@ def pin_sibling_candidates(
     supplies its owning run's sibling pins.
     """
 
-    remote = _run_remote(stage) if stage is not None else None
+    remote = _run_remote(stage, repo_root, require_pin=False) if stage is not None else None
     return _freeze_siblings(
         repo_root, repositories, remote.siblings if remote is not None else ()
     )
