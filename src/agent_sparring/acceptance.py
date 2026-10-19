@@ -234,12 +234,20 @@ def _read_state(stage: Stage) -> StageState:
         raise AcceptanceError(f"cannot read stage state: {exc}") from exc
 
 
-def _runs_positioned_at(sparring_dir: Path, stage_id: str) -> set[str]:
+def _pin_missing(run: str, why: str) -> AcceptanceError:
+    return AcceptanceError(
+        f"refusing: {REMOTE_PIN_MISSING}: the engine's record says run {run} was pinned, but "
+        f"{why}; nothing was frozen or accepted"
+    )
+
+
+def _runs_positioned_at(sparring_dir: Path, stage_id: str, repo_root: Path) -> set[str]:
     """The run keys whose engine-written run state
     (``<sparring_dir>/plans/<run>.json``) is positioned at ``stage_id``.
 
     A run state that cannot be read refuses: it cannot be shown not to own
-    the stage."""
+    the stage. For a run the engine's record calls pinned, that is
+    ``remote_pin_missing``."""
 
     plans = Path(sparring_dir) / "plans"
     if not plans.is_dir():
@@ -249,6 +257,8 @@ def _runs_positioned_at(sparring_dir: Path, stage_id: str) -> set[str]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
+            if _engine_says_pinned(repo_root, path.stem):
+                raise _pin_missing(path.stem, f"its run state cannot be read ({exc})") from exc
             raise AcceptanceError(
                 f"cannot read run state {path} to establish who owns stage {stage_id!r}: {exc}"
             ) from exc
@@ -257,7 +267,7 @@ def _runs_positioned_at(sparring_dir: Path, stage_id: str) -> set[str]:
     return owners
 
 
-def _owning_run(stage: Stage) -> str | None:
+def _owning_run(stage: Stage, repo_root: Path) -> str | None:
     """The run that owns ``stage``, from engine run state.
 
     The stage's own ``state.json`` names its owner, but an emptied or
@@ -267,7 +277,7 @@ def _owning_run(stage: Stage) -> str | None:
     refuses. ``None`` only when neither names a run."""
 
     claimed = _read_state(stage).run
-    positioned = _runs_positioned_at(Path(stage.directory).parent.parent, stage.stage_id)
+    positioned = _runs_positioned_at(Path(stage.directory).parent.parent, stage.stage_id, repo_root)
     if claimed:
         if positioned and claimed not in positioned:
             raise AcceptanceError(
@@ -309,21 +319,20 @@ def _run_remote(
     directory says the run was pinned, otherwise because the run predates
     pins and a resume has to pin it first (with its visible notice)."""
 
-    run = _owning_run(stage)
+    run = _owning_run(stage, repo_root)
     if not run:
         return None
     sparring_dir = Path(stage.directory).parent.parent
     try:
         remote = load_run_remote_state(sparring_dir, run)
     except RemotePinError as exc:
+        if _engine_says_pinned(repo_root, run):
+            raise _pin_missing(run, f"its recorded push authority cannot be read ({exc})") from exc
         raise AcceptanceError(f"cannot read the remote records of run {run}: {exc}") from exc
     if not require_pin or (remote is not None and remote.pin is not None):
         return remote
     if _engine_says_pinned(repo_root, run):
-        raise AcceptanceError(
-            f"refusing: {REMOTE_PIN_MISSING}: the engine's record says run {run} was pinned, but "
-            "its run state holds no pin; nothing was frozen or accepted"
-        )
+        raise _pin_missing(run, "its run state holds no pin")
     raise AcceptanceError(
         f"refusing: run {run} was recorded before runs pinned their remote target and has not "
         "been pinned; resume it (resume-plan), which pins it with a visible notice, before "

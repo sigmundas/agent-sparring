@@ -47,6 +47,7 @@ from agent_sparring.remote_pin import (
 )
 from agent_sparring.stage import StageStatus
 from test_engine_git_authority import _AuthorityCase, _remote_sha
+from test_independent_review import REVIEW_STAGE, _ReviewRepoTestCase
 from test_managed_finish import _FinishTestCase
 from test_managed_run import _git
 from test_plan import READY, S1, _SparringAdapter, _StageAdapter, _fixed, _head_sha, _run_git
@@ -119,6 +120,17 @@ class FinishWithoutThePinTests(_FinishTestCase):
 
         self._refused(legacy)
 
+    def test_the_state_file_unreadable(self):
+        self._refused(lambda path: path.write_text("{broken", encoding="utf-8"))
+
+    def test_the_pin_malformed(self):
+        def malformed(path: Path) -> None:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["remote_pin"] = {"branch": 7}
+            path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        self._refused(malformed)
+
     def test_a_record_from_before_pins_is_the_one_unguarded_case(self):
         record, _ = self._complete()
         payload = json.loads(managed_run.record_path(self.repo, record.run_key).read_text(encoding="utf-8"))
@@ -189,11 +201,9 @@ class LegacyAcceptTests(_AuthorityCase):
         self.assertIn("recorded before runs pinned", err)
         self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
 
-    def test_a_pinned_run_whose_pin_is_gone_refuses_freeze(self):
+    def _freeze_refused_after(self, damage) -> None:
         self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
-        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        del payload["remote_pin"]
-        self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        damage(self.state_path)
 
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -205,6 +215,22 @@ class LegacyAcceptTests(_AuthorityCase):
         self.assertEqual(code, 1)
         self.assertIn(REMOTE_PIN_MISSING, err.getvalue())
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+
+    def _rewrite(self, path: Path, change) -> None:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        change(payload)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def test_a_pinned_run_whose_pin_is_gone_refuses_freeze(self):
+        self._freeze_refused_after(lambda path: self._rewrite(path, lambda p: p.pop("remote_pin")))
+
+    def test_a_pinned_run_whose_pin_is_malformed_refuses_freeze(self):
+        self._freeze_refused_after(
+            lambda path: self._rewrite(path, lambda p: p.__setitem__("remote_pin", {"branch": 7}))
+        )
+
+    def test_a_pinned_run_whose_state_is_unreadable_refuses_freeze(self):
+        self._freeze_refused_after(lambda path: path.write_text("{broken", encoding="utf-8"))
 
     def test_resuming_a_pinned_run_whose_pin_is_gone_does_not_re_pin_it(self):
         self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
@@ -380,8 +406,39 @@ class _PushesThenFails(_StageAdapter):
         raise ProviderError("the provider timed out after the agent pushed")
 
 
+class _Interrupted(BaseException):
+    """What an interrupt or a hard timeout looks like to the loop: not an
+    ``Exception``. (Not ``KeyboardInterrupt`` itself, so a regression fails
+    this test instead of stopping the test session.)"""
+
+
+class _PushesThenIsInterrupted(_StageAdapter):
+    def _turn(self, session_id):
+        super()._turn(session_id)
+        raise _Interrupted("interrupted after the agent pushed")
+
+
 class FailedTurnTests(_AuthorityCase):
     GRANT_PUSH_FOR_RUN = False
+
+    def test_an_interrupted_turn_after_an_out_of_band_push_is_still_checked(self):
+        result = self._start(
+            _PushesThenIsInterrupted(self.repo, commit=True, push=True),
+            _SparringAdapter([READY]),
+            stop_after_stage=S1,
+        )
+
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
+        self.assertEqual(result.awaiting.observed_tip, _head_sha(self.repo))
+        stage_adapter, sparring_adapter = _StageAdapter(self.repo, commit=True), _SparringAdapter([READY])
+        again = resume_plan(
+            self.plan_path, self.sparring_dir, self.repo, _fixed(stage_adapter, sparring_adapter),
+            expected_branch="feature/x", stop_after_stage=S1,
+        )
+        self.assertEqual(again.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
+        self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
+        self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
 
     def test_a_turn_that_raises_after_an_out_of_band_push_is_still_checked(self):
         failing = _PushesThenFails(self.repo, commit=True, push=True)
@@ -406,6 +463,46 @@ class FailedTurnTests(_AuthorityCase):
         self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
         self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+
+
+class _ReviewerPushesThenFails(_SparringAdapter):
+    """READY for the build stage; then, as the independent reviewer, a
+    commit is pushed out of band and the reviewer's turn fails."""
+
+    def __init__(self, repo: Path, verdicts):
+        super().__init__(verdicts)
+        self.repo = repo
+        self.calls = 0
+
+    def _next(self, session_id):
+        self.calls += 1
+        if self.calls == 2:
+            tree = subprocess.run(
+                ["git", "-C", str(self.repo), "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "out of band"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            _run_git(self.repo, "push", "-q", "origin", f"{tree}:refs/heads/feature/x")
+            raise ProviderError("the reviewer's provider timed out")
+        return super()._next(session_id)
+
+
+class FailedReviewTurnTests(_ReviewRepoTestCase):
+    def test_a_failed_review_only_turn_is_still_checked_and_resume_runs_nothing(self):
+        result = self.start(
+            _StageAdapter(self.repo, commit=True), _ReviewerPushesThenFails(self.repo, [READY])
+        )
+
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.stage_id, REVIEW_STAGE)
+        self.assertEqual(result.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
+        self.assertEqual(self.plan_state().awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
+
+        stage_adapter, sparring_adapter = _StageAdapter(self.repo, commit=True), _SparringAdapter([READY])
+        again = self.resume(stage_adapter, sparring_adapter)
+        self.assertEqual(again.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
+        self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
+        self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
+        self.assertIs(self.stage(REVIEW_STAGE).read_state().status, StageStatus.WORKING)
 
 
 if __name__ == "__main__":  # pragma: no cover

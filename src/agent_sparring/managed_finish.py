@@ -1060,14 +1060,19 @@ def _run_guard(repo_root: Path, record: ManagedRunRecord):
             continue
         if remote is not None and remote.pin is not None:
             return _pinned_finish(repo_root, record, remote.pin)
+    pinned = record.pinned or managed_run.run_flag_pinned(repo_root, record.run_key)
     if unreadable:
         step, detail = unreadable[0]
         raise _StepFailed(
             step,
-            f"run_state_unreadable: the run's recorded push authority cannot be read ({detail}); "
-            "refusing to finish without it -- nothing was merged, pushed or deleted by this finish",
+            ("remote_pin_missing: the engine's record says this run was pinned, but its pin "
+             "cannot be read (" if pinned else "")
+            + f"run_state_unreadable: the run's recorded push authority cannot be read ({detail})"
+            + (")" if pinned else "")
+            + "; refusing to finish without it -- nothing was merged, pushed or deleted by this "
+            "finish",
         )
-    if record.pinned or managed_run.run_flag_pinned(repo_root, record.run_key):
+    if pinned:
         raise _StepFailed(
             "checks",
             "remote_pin_missing: the engine's record says this run was pinned, but no pin can be "

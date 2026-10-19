@@ -2802,6 +2802,19 @@ def _after_turn_check(state: PlanRunState, repo_root: Path, stage: Stage) -> Cal
     return check
 
 
+def _movement_after_failed_turn(
+    state: PlanRunState, repo_root: Path, stage: Stage, failure: BaseException
+) -> RemotePause | None:
+    """The after-turn check for a turn that did not return. A check that
+    cannot be made is noted on ``failure``, which then stands."""
+
+    try:
+        return _movement_now(state, repo_root, stage)
+    except GitContextError as exc:
+        failure.add_note(f"the after-turn remote check could not be made either: {exc}")
+        return None
+
+
 def authorize_pushed_candidate(
     sparring_dir: Path,
     *,
@@ -4694,23 +4707,42 @@ def _drive_pinned(
                 # preceding stages already accepted (see
                 # agent_sparring.review), and all four of its routing
                 # actions are terminal.
-                review = _run_review(
-                    stages,
-                    state,
-                    state_path,
-                    sparring_dir,
-                    repo_root,
-                    make_adapters,
-                    plan_stage,
-                    stage,
-                    activity,
-                    position=position,
-                    evidence_first=sparrer_first,
-                    pending_deferred=state.unresolved_deferred,
-                    fresh_roles=entering_fresh,
-                    fresh_reason=fresh_reason,
-                    report=report,
-                )
+                try:
+                    review = _run_review(
+                        stages,
+                        state,
+                        state_path,
+                        sparring_dir,
+                        repo_root,
+                        make_adapters,
+                        plan_stage,
+                        stage,
+                        activity,
+                        position=position,
+                        evidence_first=sparrer_first,
+                        pending_deferred=state.unresolved_deferred,
+                        fresh_roles=entering_fresh,
+                        fresh_reason=fresh_reason,
+                        report=report,
+                    )
+                except BaseException as failure:
+                    # A reviewer turn that failed, timed out or was
+                    # interrupted is checked too: movement found now is the
+                    # pause the run stops on, ahead of the turn's failure, so
+                    # a resume meets it before any provider turn.
+                    movement = _movement_after_failed_turn(state, repo_root, stage, failure)
+                    if movement is None:
+                        raise
+                    state.left_provider_pause = None
+                    _stop_for_movement(state, state_path, activity, movement, report=report)
+                    return PlanRunResult(
+                        status=PlanRunStatus.PAUSED,
+                        plan=state.plan,
+                        run=_RunOwner.of(state).key,
+                        stage_id=stage.stage_id,
+                        awaiting=movement,
+                        accepted=tuple(accepted),
+                    )
                 sparrer_first = False  # only the stage this resume entered
                 _retire_pending_evidence(state, state_path)
                 # After the reviewer's turn, as after every agent turn.

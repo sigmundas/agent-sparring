@@ -320,7 +320,8 @@ is recorded and the run stops on `unauthorized_remote_movement`.
 
 #### Remote movement the engine did not make
 
-After every agent turn (including a turn that failed or timed out), before
+After every agent turn (including one that failed, timed out or was
+interrupted, where movement found then takes precedence over the failure), before
 every engine push and before freeze or accept, the engine compares the
 pinned ref's tip with what its own records explain: the start tip, then
 each push receipt and each acknowledgement. A tip nothing explains --

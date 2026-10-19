@@ -107,9 +107,10 @@ configured limit.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from agent_sparring.deferred_gate import DeferredObligation
 from agent_sparring.finalization import (
@@ -127,6 +128,7 @@ from agent_sparring.next_turn import (
     record_next_turn,
     verify_candidate,
 )
+from agent_sparring.remote_pin import RemoteMovementDetected
 from agent_sparring.providers import (
     SparringAgentAdapter,
     StageAgentAdapter,
@@ -240,9 +242,32 @@ class LoopResult:
             )
 
 
-def _after_turn(after_turn: Callable[[], None] | None) -> None:
-    if after_turn is not None:
-        after_turn()
+@contextlib.contextmanager
+def checked_turn(after_turn: Callable[[], None] | None) -> Iterator[None]:
+    """Run ``after_turn`` once the agent turn in the block is over, however
+    it ended: returned, raised, timed out or interrupted -- the agent may
+    have acted before it failed.
+
+    Movement the check finds (:class:`RemoteMovementDetected`) takes
+    precedence over the turn's own failure, which stays attached as its
+    context. Any other failure of the check after a failed turn is noted on
+    the turn's failure rather than replacing it; after a turn that returned,
+    it propagates as it always did."""
+
+    if after_turn is None:
+        yield
+        return
+    try:
+        yield
+    except BaseException as failure:
+        try:
+            after_turn()
+        except RemoteMovementDetected:
+            raise
+        except Exception as check_failure:
+            failure.add_note(f"the after-turn remote check could not be made either: {check_failure}")
+        raise
+    after_turn()
 
 
 def run_unattended_loop(
@@ -419,24 +444,20 @@ def run_unattended_loop(
                 # Implementation work is owed from here until this turn and
                 # all of its records succeed.
                 record_next_turn(stage, NEXT_TURN_STAGE)
-            try:
-                stage_run = run_stage_agent(
-                    stage,
-                    sparring_dir,
-                    repo_root,
-                    stage_adapter,
-                    expected_branch=expected_branch,
-                    self_check=self_check,
-                    finalize_only=finalizing,
-                )
-            except Exception as exc:
-                # The agent may have acted before the turn failed.
-                _after_turn(after_turn)
-                if not isinstance(exc, StageAgentRunError):
-                    raise
-                activity.emit("loop.stopped", cycle=cycle, summary="stage-agent turn failed")
-                raise LoopError(f"stage-agent turn failed: {exc}") from exc
-            _after_turn(after_turn)
+            with checked_turn(after_turn):
+                try:
+                    stage_run = run_stage_agent(
+                        stage,
+                        sparring_dir,
+                        repo_root,
+                        stage_adapter,
+                        expected_branch=expected_branch,
+                        self_check=self_check,
+                        finalize_only=finalizing,
+                    )
+                except StageAgentRunError as exc:
+                    activity.emit("loop.stopped", cycle=cycle, summary="stage-agent turn failed")
+                    raise LoopError(f"stage-agent turn failed: {exc}") from exc
 
         if stage_run is not None and stage_run.result.is_error:
             # The provider's own machine-readable output reported this turn
@@ -559,24 +580,21 @@ def run_unattended_loop(
                     raise CandidateRefused(str(exc)) from exc
                 raise LoopError(str(exc)) from exc
 
-        try:
-            sparring_run = run_sparring_agent(
-                stage,
-                sparring_dir,
-                repo_root,
-                sparring_adapter,
-                expected_branch=expected_branch,
-                finalization=finalization_note,
-                evidence_first=evidence_first,
-                pending_deferred=pending_deferred,
-            )
-        except Exception as exc:
-            _after_turn(after_turn)
-            if not isinstance(exc, SparringAgentRunError):
-                raise
-            activity.emit("loop.stopped", cycle=cycle, summary="sparring-agent turn failed")
-            raise LoopError(f"sparring-agent turn failed: {exc}") from exc
-        _after_turn(after_turn)
+        with checked_turn(after_turn):
+            try:
+                sparring_run = run_sparring_agent(
+                    stage,
+                    sparring_dir,
+                    repo_root,
+                    sparring_adapter,
+                    expected_branch=expected_branch,
+                    finalization=finalization_note,
+                    evidence_first=evidence_first,
+                    pending_deferred=pending_deferred,
+                )
+            except SparringAgentRunError as exc:
+                activity.emit("loop.stopped", cycle=cycle, summary="sparring-agent turn failed")
+                raise LoopError(f"sparring-agent turn failed: {exc}") from exc
         finalization_note = None
 
         cycle_records.append(
