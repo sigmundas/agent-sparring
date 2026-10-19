@@ -927,19 +927,70 @@ def is_local_url(url: str) -> bool:
     return "://" not in url and not _SCP_LIKE_RE.match(url)
 
 
+#: ``-c`` settings an engine remote operation may pass. Any other (a
+#: ``url.*.insteadOf``, ``remote.*.receivepack`` ...) could redirect the
+#: operation or name a program, so it is refused.
+_REMOTE_CONFIG_ALLOWED = frozenset({"push.followtags"})
+
+#: The only options an engine ``push`` uses. Anything else -- ``--repo``,
+#: ``--mirror``, ``--all``, ``--receive-pack``/``--exec``, ``-o`` with its
+#: separate value, ``--`` -- is refused rather than parsed, so the
+#: repository Git writes is always the one argument checked below.
+_PUSH_FLAGS = frozenset({"--porcelain", "--delete", "-q", "--quiet"})
+_PUSH_PREFIXES = ("--force-with-lease=",)
+
+#: The only options an engine read (``ls-remote``, ``fetch``) uses.
+_READ_FLAGS = frozenset({"--exit-code", "-q", "--quiet", "--refs", "--heads", "--tags"})
+
+
+def _unsupported(arg: str, name: str | None, why: str) -> GitConfigRefusal:
+    return GitConfigRefusal(
+        "unsupported_remote_form",
+        arg,
+        f"refusing to run git {name or ''}: {arg!r} {why}; the engine runs remote operations "
+        "only in the forms it can check, where the repository is one plain argument",
+    )
+
+
 def _destination(args: Sequence[str]) -> str | None:
-    """The repository argument of a remote command: its first argument
-    after the subcommand that is not an option."""
+    """The repository a remote command contacts: the first argument after
+    the subcommand, once every argument is known to be one of the forms
+    the engine uses.
+
+    Raises :class:`GitConfigRefusal` (``unsupported_remote_form``) for any
+    global option other than an allowed ``-c`` setting, any option the
+    engine does not use, or a push that names no repository: those are the
+    forms (``--repo=``, ``--mirror``, an option whose value is a separate
+    argument) in which the first plain argument would not be the
+    repository Git writes.
+    """
 
     index, name = subcommand(args)
+    i = 0
+    while i < index:
+        arg = args[i]
+        if arg == "-c" and i + 1 < index:
+            key = args[i + 1].split("=", 1)[0].lower()
+            if key not in _REMOTE_CONFIG_ALLOWED:
+                raise _unsupported(args[i + 1], name, "is a setting a remote operation may not take")
+            i += 2
+            continue
+        raise _unsupported(arg, name, "is a global option a remote operation may not take")
     if name is None:
         return None
+    flags = _PUSH_FLAGS if name == "push" else _READ_FLAGS
+    positional: list[str] = []
     for arg in args[index + 1 :]:
-        if arg == "--":
-            continue
-        if not arg.startswith("-"):
-            return arg
-    return None
+        if arg.startswith("-"):
+            if arg in flags or (name == "push" and arg.startswith(_PUSH_PREFIXES)):
+                continue
+            raise _unsupported(arg, name, "is an option the engine does not use")
+        positional.append(arg)
+    if not positional:
+        if name == "push":
+            raise _unsupported(name, name, "names no repository")
+        return None
+    return positional[0]
 
 
 def _same_local(a: str, b: str) -> bool:
@@ -968,7 +1019,10 @@ def run_remote(
     neutralizing overrides as :func:`run` apply, and no repository-scope
     entry -- set or included -- is read into the operation.
 
-    A push to a local-path destination is refused
+    A remote command is accepted only in the forms the engine uses (see
+    :func:`_destination`; anything else is ``unsupported_remote_form``),
+    so its repository is always one plain argument. A push to a local-path
+    destination is refused
     (``unpinned_local_remote``) unless that destination is ``pinned`` (one
     URL, or several): Git runs a local repository's receive hooks and reads
     its configuration in a process the engine's overrides do not reach, so
@@ -988,7 +1042,7 @@ def run_remote(
     """
 
     _, name = subcommand(args)
-    destination = _destination(args)
+    destination = _destination(args) if name in REMOTE_COMMANDS else None
     if name == "push" and destination is not None and is_local_url(destination):
         allowed = [pinned] if isinstance(pinned, str) else list(pinned or ())
         if not any(_same_local(destination, url) for url in allowed if url):

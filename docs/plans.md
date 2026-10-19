@@ -418,7 +418,14 @@ receive hooks and reads its configuration, in a process the engine's
 overrides do not reach. The engine therefore pushes to a local path only
 when it is the run's pinned destination -- a repository you chose when the
 run started -- and refuses any other (`unpinned_local_remote`). Reading a
-local-path remote runs its `upload-pack`, which runs no hooks.
+local-path remote runs its `upload-pack`, which runs no hooks. So that the
+repository checked is always the one Git contacts, an engine remote
+operation is accepted only in the plain forms the engine itself uses (the
+repository as one argument, a few known options, `-c push.followTags`);
+anything else -- `--repo`, `--mirror`, `--all`, `--receive-pack`,
+`--upload-pack`, an option with a separate value, another `-c` setting or
+global option, a push naming no repository -- is refused
+(`unsupported_remote_form`).
 
 Permission is bound to what it was granted for: this run, this worktree,
 this branch, that one remote branch, and — for `--allow-push-candidate` —

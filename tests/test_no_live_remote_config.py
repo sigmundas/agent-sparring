@@ -516,6 +516,88 @@ class UnguardedRemoteTests(_EngineCase):
         _plain(self.repo, "push", "-q", str(other), f"{sha}:refs/heads/x")
         self.assertTrue(self.marker.exists())
 
+    def _hooked_bare(self, name: str) -> Path:
+        """A disposable bare repository whose pre-receive hook touches the
+        marker, holding one branch a ``--mirror`` push would delete."""
+
+        path = self.scratch / name
+        subprocess.run(["git", "init", "-q", "--bare", str(path)], check=True, capture_output=True)
+        _plain_ok(self.repo, "push", "-q", str(path), "HEAD:refs/heads/keep")
+        hook = path / "hooks" / "pre-receive"
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text(self.script("receive").read_text(encoding="utf-8"), encoding="utf-8")
+        hook.chmod(0o755)
+        return path
+
+    def test_push_forms_that_hide_the_destination_are_refused(self):
+        # The repository Git writes must be the one argument checked: a form
+        # whose first plain argument is not the destination (or that names
+        # none) is refused, never parsed.
+        pin = pin_remote(self.repo, "feature/x")
+        sha = self.commit("one.txt")
+        other = self._hooked_bare("other.git")
+        before = _refs(other)
+        pinned_before = _refs(self.remote)
+        upload = self.script("upload-pack")
+        forms = [
+            ("push", f"--repo={other}", "--mirror"),
+            ("push", "--repo", str(other), f"{sha}:refs/heads/x"),
+            ("push", "--mirror", str(other)),
+            ("push", "--all", str(other)),
+            ("push", "-o", pin.destination, str(other), f"{sha}:refs/heads/x"),
+            ("push", "--push-option", pin.destination, str(other), f"{sha}:refs/heads/x"),
+            ("push", f"--receive-pack={upload}", pin.destination, f"{sha}:refs/heads/x"),
+            ("push", "--exec", str(upload), pin.destination, f"{sha}:refs/heads/x"),
+            ("push", "--", str(other), f"{sha}:refs/heads/x"),
+            ("push",),
+            ("-c", f"url.{other}.insteadOf={pin.destination}", "push", pin.destination,
+             f"{sha}:refs/heads/x"),
+            ("-c", f"remote.x.receivepack={upload}", "push", pin.destination, f"{sha}:refs/heads/x"),
+            ("--git-dir", str(other), "push", pin.destination, f"{sha}:refs/heads/x"),
+            ("ls-remote", f"--upload-pack={upload}", pin.destination),
+            ("ls-remote", "-u", str(upload), pin.destination),
+            ("fetch", f"--upload-pack={upload}", pin.destination),
+        ]
+        for args in forms:
+            with self.subTest(args=args):
+                with self.assertRaises(GitConfigRefusal) as ctx:
+                    engine_git.run_remote(
+                        self.repo, pin.trusted_config, *args, pinned=pin.destination
+                    )
+                self.assertEqual(ctx.exception.code, "unsupported_remote_form")
+                with engine_git.trusted_config(
+                    [self.repo], pin.trusted_config, destinations=(pin.destination,)
+                ), self.assertRaises(GitConfigRefusal) as ctx:
+                    engine_git.run(self.repo, *args)
+                self.assertEqual(ctx.exception.code, "unsupported_remote_form")
+        self.assertNoMarker()
+        self.assertEqual(_refs(other), before)
+        self.assertEqual(_refs(self.remote), pinned_before)
+
+        # The forms the engine does use still work.
+        with engine_git.trusted_config([self.repo], pin.trusted_config, destinations=(pin.destination,)):
+            listed = engine_git.run(self.repo, "ls-remote", "--exit-code", pin.destination, "refs/heads/feature/x")
+            pushed = engine_git.run(
+                self.repo, "-c", "push.followTags=false", "push", "--porcelain", pin.destination,
+                f"{sha}:refs/heads/feature/x",
+            )
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(pushed.returncode, 0, pushed.stderr)
+        self.assertNoMarker()
+
+        # Positive controls: plain git with these forms does reach the
+        # unpinned repository (its hook runs, a mirror push deletes its
+        # branch) and does run a named upload-pack.
+        _plain(self.repo, "push", f"--repo={other}", "--mirror")
+        self.assertTrue(self.marker.exists(), "plain git --repo= --mirror did not reach the repository")
+        self.assertNotIn("refs/heads/keep", _refs(other))
+        self.marker.unlink()
+        _plain(self.repo, "push", "--repo", str(other), f"{sha}:refs/heads/x")
+        self.assertTrue(self.marker.exists(), "plain git --repo <path> did not reach the repository")
+        self.marker.unlink()
+        _plain(self.repo, "ls-remote", f"--upload-pack={upload}", pin.destination)
+        self.assertTrue(self.marker.exists(), "plain git did not run --upload-pack")
+
 
 class IncludeTests(_EngineCase):
     def test_a_global_conditional_include_keeps_engine_git_working(self):
