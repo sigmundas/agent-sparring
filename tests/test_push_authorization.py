@@ -845,6 +845,44 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertEqual(result.awaiting.kind, PUSHED_CANDIDATE_UNAUTHORIZED)
         return sha
 
+    def test_an_authorized_candidate_sent_back_by_its_review_is_not_accepted(self):
+        # Authorized without push, then reviewed again (the person resumes
+        # with evidence, so the reviewer judges before anything is accepted)
+        # and sent back: the authorization is not a review and accepts nothing.
+        sha = self._paused_on_a_pushed_candidate()
+        record = authorize_pushed_candidate(
+            self.sparring_dir, run_key=self.run_key, candidate_sha=sha, by="tester"
+        )
+
+        stage_adapter = self._unpushed()
+        sparring_adapter = _SparringAdapter([SEND_BACK, NEEDS_YOU])
+        result = self._resume(
+            stage_adapter,
+            sparring_adapter,
+            evidence="Looked at the pushed commit again.",
+            stop_after_stage=S1,
+        )
+
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.accepted, ())
+        # The reviewer ran first and its SEND_BACK routed to an implementation
+        # turn -- not to the push or acceptance gates.
+        self.assertEqual(len(sparring_adapter.start_calls + sparring_adapter.resume_calls), 2)
+        self.assertEqual(stage_adapter.turns, 1)
+        s1 = self._stage(S1).read_state()
+        self.assertIs(s1.status, StageStatus.WORKING)
+        self.assertIsNone(s1.candidate_sha)
+        state = self._plan_state()
+        self.assertEqual(state.current_stage_index, 0)
+        self.assertFalse(self._stage(S2).exists())
+        # The authorization stands on its own, unchanged, and no receipt or
+        # other record was made out of the review.
+        self.assertEqual(
+            [r.kind for r in state.remote_records], [MOVEMENT_ACKNOWLEDGED, AUTHORIZED_WITHOUT_PUSH]
+        )
+        self.assertEqual(state.remote_records[-1], record)
+        self.assertPushed(sha)
+
     def test_deleting_the_acknowledgement_after_authorizing_changes_nothing(self):
         sha = self._paused_on_a_pushed_candidate()
         authorize_pushed_candidate(self.sparring_dir, run_key=self.run_key, candidate_sha=sha, by="tester")
