@@ -483,6 +483,9 @@ class UnguardedRemoteTests(_EngineCase):
         self.assertNoMarker()
         self.assertNotIn("elsewhere", _refs(self.remote))
         self.positive_control(self.repo, "uploadpack", second)
+        # Positive control for the refused push: plain git makes it.
+        _plain_ok(self.repo, "-c", "push.followTags=false", "push", "-q", "origin", "HEAD:refs/heads/elsewhere")
+        self.assertIn("refs/heads/elsewhere", _refs(self.remote))
 
     def test_a_guarded_remote_command_runs_against_the_snapshot(self):
         pin = pin_remote(self.repo, "feature/x")
@@ -596,11 +599,134 @@ class UnguardedRemoteTests(_EngineCase):
         self.assertTrue(self.marker.exists(), "plain git --repo= --mirror did not reach the repository")
         self.assertNotIn("refs/heads/keep", _refs(other))
         self.marker.unlink()
-        _plain(self.repo, "push", "--repo", str(other), f"{sha}:refs/heads/x")
-        self.assertTrue(self.marker.exists(), "plain git --repo <path> did not reach the repository")
+        # A fresh repository: the first mirror push left ``other`` up to date.
+        spaced = self._hooked_bare("spaced.git")
+        _plain(self.repo, "push", "--repo", str(spaced), "--mirror")
+        self.assertTrue(self.marker.exists(), "plain git --repo <path> --mirror did not reach the repository")
+        self.assertNotIn("refs/heads/keep", _refs(spaced))
         self.marker.unlink()
         _plain(self.repo, "ls-remote", f"--upload-pack={upload}", pin.destination)
         self.assertTrue(self.marker.exists(), "plain git did not run --upload-pack")
+        self.marker.unlink()
+
+        # The other refused forms under plain git: a destination hidden
+        # behind an option or rewrite reaches the unpinned repository (its
+        # hook runs), and a named program runs. (Bare ``push`` and
+        # ``--git-dir`` have no unpinned repository to show reached: they
+        # are refused for naming no checked destination.)
+        for index, args in enumerate((
+            ("push", "--mirror", "{other}"),
+            ("push", "--all", "{other}"),
+            ("push", "--", "{other}", f"{sha}:refs/heads/x"),
+            ("push", "-o", pin.destination, "{other}", f"{sha}:refs/heads/x"),
+            ("push", "--push-option", pin.destination, "{other}", f"{sha}:refs/heads/x"),
+            ("-c", "url.{other}.insteadOf=" + pin.destination, "push", pin.destination, f"{sha}:refs/heads/x"),
+            ("push", f"--receive-pack={upload}", pin.destination, f"{sha}:refs/heads/x"),
+            ("push", "--exec", str(upload), pin.destination, f"{sha}:refs/heads/x"),
+            ("-c", f"remote.x.url={pin.destination}", "-c", f"remote.x.receivepack={upload}",
+             "push", "x", f"{sha}:refs/heads/x"),
+            ("fetch", f"--upload-pack={upload}", pin.destination),
+        )):
+            with self.subTest(control=args):
+                target = self._hooked_bare(f"control-{index}.git")
+                _plain_ok(target, "config", "receive.advertisePushOptions", "true")
+                _plain(self.repo, *(a.replace("{other}", str(target)) for a in args))
+                self.assertTrue(self.marker.exists(), f"plain git {args} reached nothing")
+                self.marker.unlink()
+        # ``ls-remote -u`` is refused for its shape; Git 2.53.0 itself has no
+        # such switch, so plain git runs nothing either (asserted, so a Git
+        # that adds it fails here rather than leaving the refusal untested).
+        unknown = _plain(self.repo, "ls-remote", "-u", str(upload), pin.destination)
+        self.assertEqual(unknown.returncode, 129, unknown.stderr)
+        self.assertIn("unknown switch", unknown.stderr)
+        self.assertNoMarker()
+
+    def test_plain_git_push_repo_reaches_the_repository_only_without_a_refspec(self):
+        # Git 2.53.0: ``--repo X`` stands in for the repository argument only
+        # when none is given. With a refspec, the refspec is taken as the
+        # repository -- ``<sha>:refs/heads/x`` reads as scp-style
+        # ``host:path``, so Git starts ssh to host ``<sha>`` -- and X is never
+        # contacted; with ``--mirror`` (no refspec) X is the destination. The
+        # refused-forms test relies on both. A stand-in ssh records the host.
+        sha = self.commit("one.txt")
+        other = self._hooked_bare("other.git")
+        before = _refs(other)
+        called = self.scratch / "SSH_ARGS"
+        ssh = self.script("ssh", f"#!/bin/sh\necho \"$@\" > '{called}'\nexit 255\n")
+
+        with_refspec = _plain(
+            self.repo, "push", "--repo", str(other), f"{sha}:refs/heads/x", env={"GIT_SSH_COMMAND": str(ssh)}
+        )
+        self.assertNotEqual(with_refspec.returncode, 0, with_refspec.stderr)
+        self.assertIn(sha, called.read_text(encoding="utf-8").split())
+        self.assertFalse(self.marker.exists(), "--repo <path> <refspec> reached the repository")
+        self.assertEqual(_refs(other), before)
+
+        mirror = _plain(self.repo, "push", "--repo", str(other), "--mirror")
+        self.assertEqual(mirror.returncode, 0, mirror.stderr)
+        self.assertTrue(self.marker.exists(), "--repo <path> --mirror did not reach the repository")
+        self.assertNotEqual(_refs(other), before)
+        self.assertNotIn("refs/heads/keep", _refs(other))
+
+
+class PlantedTransportProgramTests(_EngineCase):
+    """The ``core.sshCommand`` and ``credential.helper`` checks with a
+    transport that would consult them: the matrix above refuses before any
+    transport, and its local bare remotes consult neither, so there "no
+    marker" alone would be vacuous. Here the remote operation itself runs,
+    against an ``ssh://`` URL and a credential request, after the planting,
+    and is shown to reach the transport (a stand-in ``ssh`` on ``PATH``; a
+    trusted helper that answers nothing, so Git would go on to the next);
+    plain ``git`` in the same checkout runs the planted program."""
+
+    SSH_URL = "ssh://example.invalid/x.git"
+
+    def _unplant(self, key: str, scope: str) -> None:
+        _plain_ok(self.repo, "config", *(("--worktree",) if scope == "worktree" else ()), "--unset", key)
+
+    def test_a_planted_ssh_command_never_runs_for_an_ssh_remote(self):
+        # Git's default transport program, found on PATH: it records that
+        # the engine's command did reach the transport, and fails.
+        default = self.scratch / "DEFAULT_SSH"
+        bin_dir = self.scratch / "bin"
+        bin_dir.mkdir()
+        self.script("bin/ssh", f"#!/bin/sh\ntouch '{default}'\nexit 255\n")
+        path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+        pin = pin_remote(self.repo, "feature/x")
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                key = self.plant(self.repo, "ssh_command", scope, self.scratch)
+                with mock.patch.dict(os.environ, {"GIT_TERMINAL_PROMPT": "0", "PATH": path}):
+                    result = engine_git.run_remote(self.repo, pin.trusted_config, "ls-remote", self.SSH_URL)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(default.exists(), "the engine's ls-remote never reached the transport")
+                default.unlink()
+                self.assertNoMarker()
+                self.positive_control(self.repo, "ssh_command", self.scratch)
+                self.marker.unlink()
+                self._unplant(key, scope)
+
+    def test_a_planted_credential_helper_is_never_consulted(self):
+        # Trusted at pin time, answering nothing: Git asks it and then every
+        # later helper it knows of.
+        asked = self.scratch / "TRUSTED_ASKED"
+        trusted = self.script("trusted-helper", f"#!/bin/sh\ntouch '{asked}'\nexit 0\n")
+        _plain_ok(self.repo, "config", "credential.helper", f"!{trusted}")
+        pin = pin_remote(self.repo, "feature/x")
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                key = self.plant(self.repo, "credential_helper", scope, self.scratch)
+                with mock.patch.dict(os.environ, {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "SSH_ASKPASS": ""}):
+                    result = engine_git.run_remote(
+                        self.repo, pin.trusted_config, "credential", "fill", input=CREDENTIAL_REQUEST
+                    )
+                self.assertTrue(asked.exists(), "the engine's credential fill asked no helper")
+                asked.unlink()
+                self.assertNotIn("password=", result.stdout)
+                self.assertNoMarker()
+                self.positive_control(self.repo, "credential_helper", self.scratch)
+                self.marker.unlink()
+                self._unplant(key, scope)
 
 
 class IncludeTests(_EngineCase):

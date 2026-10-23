@@ -5,7 +5,7 @@ What these tests hold, one sentence each:
 - a run the engine's record outside the project directory calls pinned,
   whose pin is gone (state deleted, ``remote_pin`` removed, or a
   legacy-shaped state in its place), refuses ``finish-run`` with
-  ``remote_pin_missing`` and touches no ref of either remote;
+  ``remote_pin_missing`` (exit 3) and touches no ref of either remote;
 - freeze/accept of a stage resolve its owner from engine run state and,
   for an unpinned legacy run, refuse rather than fall back to reachability;
 - an acknowledgement is a baseline for further movement, never an
@@ -28,9 +28,9 @@ from unittest import mock
 
 import conftest_path  # noqa: F401
 
-from agent_sparring import engine_git, managed_run
+from agent_sparring import acceptance, engine_git, managed_run
 from agent_sparring.cli import main
-from agent_sparring.plan import PlanRunStatus, resume_plan
+from agent_sparring.plan import PlanRunError, PlanRunStatus, resume_plan
 from agent_sparring.providers import ProviderError
 from agent_sparring.push_gate import authorization_for_run, ensure_candidate_pushed
 from agent_sparring.remote_pin import (
@@ -72,19 +72,24 @@ class FinishWithoutThePinTests(_FinishTestCase):
     def _refs_everywhere(self, mirror: Path) -> tuple[str, str, str]:
         return (_git(self.remote, "for-each-ref"), _git(mirror, "for-each-ref"), _git(self.repo, "for-each-ref"))
 
+    def _mirror(self) -> Path:
+        mirror = self.remote.parent / "push.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(mirror)], check=True, capture_output=True)
+        return mirror
+
     def _refused(self, damage) -> None:
         record, head = self._complete()
         self.assertTrue(managed_run.read_record(self.repo, record.run_key).pinned)
         state_path = record.sparring_dir / "plans" / f"{record.run_key}.json"
         damage(state_path)
-        mirror = self.remote.parent / "push.git"
-        subprocess.run(["git", "init", "-q", "--bare", str(mirror)], check=True, capture_output=True)
+        mirror = self._mirror()
         _run_git(self.repo, "remote", "set-url", "--push", "origin", str(mirror))
         before = self._refs_everywhere(mirror)
 
         code, report, err = self._finish(record, "--push-target")
 
-        self.assertEqual(code, 1, err)
+        # 3: refused by its checks (docs/plans.md, finish-run).
+        self.assertEqual(code, 3, err)
         self.assertEqual(report["stopped_at"], "checks")
         self.assertIn(REMOTE_PIN_MISSING, report["reason"])
         self.assertEqual(report["completed_steps"], [])
@@ -130,6 +135,21 @@ class FinishWithoutThePinTests(_FinishTestCase):
             path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
         self._refused(malformed)
+
+    def test_an_intact_pin_finishes_and_the_mirror_stays_empty(self):
+        # Positive control for the five refusals above: the same run, its
+        # pin intact and no pushurl planted, does finish -- so their exit 3
+        # is the missing pin, not a fixture that could never finish.
+        record, head = self._complete()
+        self.assertTrue(managed_run.read_record(self.repo, record.run_key).pinned)
+        mirror = self._mirror()
+
+        code, report, err = self._finish(record, "--push-target")
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("merged", self._events(record))
+        self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), head)
+        self.assertEqual(_git(mirror, "for-each-ref"), "")
 
     def test_a_record_from_before_pins_is_the_one_unguarded_case(self):
         record, _ = self._complete()
@@ -201,20 +221,54 @@ class LegacyAcceptTests(_AuthorityCase):
         self.assertIn("recorded before runs pinned", err)
         self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
 
-    def _freeze_refused_after(self, damage) -> None:
-        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
-        damage(self.state_path)
+    def test_without_the_owner_check_the_legacy_candidate_would_be_accepted(self):
+        # Positive control for the two refusals above: with the owning-run
+        # lookup disabled in this test only, the same frozen stage is
+        # accepted on reachability -- the fallback they refuse.
+        self._legacy_with_the_candidate_on_the_remote()
 
+        with mock.patch.object(acceptance, "_owning_run", return_value=None):
+            code, err = self._accept()
+
+        self.assertEqual(code, 0, err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+
+    def _freeze(self) -> tuple[int, str]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = main([
                 "--sparring-dir", str(self.sparring_dir), "freeze-candidate", S1,
                 "--repo-root", str(self.repo), "--expected-branch", "feature/x",
             ])
+        return code, err.getvalue()
+
+    def _freeze_refused_after(self, damage) -> None:
+        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
+        damage(self.state_path)
+
+        code, err = self._freeze()
 
         self.assertEqual(code, 1)
-        self.assertIn(REMOTE_PIN_MISSING, err.getvalue())
+        self.assertIn(REMOTE_PIN_MISSING, err)
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+
+    def test_without_the_pin_check_a_damaged_pin_would_be_frozen_on_reachability(self):
+        # Positive control for the three freeze refusals below: the pin
+        # removed and the candidate pushed by hand, with the owning-run
+        # lookup disabled in this test only, freezes on reachability -- the
+        # fallback a missing pin must never reach.
+        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
+        self._rewrite(self.state_path, lambda p: p.pop("remote_pin"))
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        code, err = self._freeze()
+        self.assertEqual(code, 1)
+        self.assertIn(REMOTE_PIN_MISSING, err)
+
+        with mock.patch.object(acceptance, "_owning_run", return_value=None):
+            code, err = self._freeze()
+
+        self.assertEqual(code, 0, err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
 
     def _rewrite(self, path: Path, change) -> None:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -245,6 +299,20 @@ class LegacyAcceptTests(_AuthorityCase):
         self.assertIn(REMOTE_PIN_MISSING, str(ctx.exception))
         self.assertNotIn("remote_pin", json.loads(self.state_path.read_text(encoding="utf-8")))
         self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
+
+    def test_resuming_a_run_the_engine_never_pinned_does_pin_it(self):
+        # Positive control for the refusal above: the same missing pin, with
+        # the engine's record of the pin gone too (a run from before pins),
+        # is re-pinned on resume -- what the record must prevent.
+        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
+        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        del payload["remote_pin"]
+        self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        managed_run.run_flag_path(self.repo, self.run_key).unlink()
+
+        self._resume(_StageAdapter(self.repo), _SparringAdapter([READY]), stop_after_stage=S1)
+
+        self.assertIn("remote_pin", json.loads(self.state_path.read_text(encoding="utf-8")))
 
 
 # -- what an acknowledgement explains -------------------------------------------
@@ -464,24 +532,47 @@ class FailedTurnTests(_AuthorityCase):
         self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
+    # Positive controls for the two tests above: the same failing turns,
+    # without the out-of-band push, are not a movement pause -- so the pause
+    # there is the push being checked, not the failure itself.
+
+    def test_an_interrupted_turn_without_a_push_is_not_movement(self):
+        with self.assertRaises(_Interrupted):
+            self._start(
+                _PushesThenIsInterrupted(self.repo, commit=True), _SparringAdapter([READY]),
+                stop_after_stage=S1,
+            )
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
+        self.assertIsNone(self._plan_state().awaiting)
+
+    def test_a_turn_that_raises_without_a_push_is_not_movement(self):
+        with self.assertRaises(PlanRunError) as ctx:
+            self._start(_PushesThenFails(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
+        self.assertIn("stage-agent turn failed", str(ctx.exception))
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
+        self.assertIsNone(self._plan_state().awaiting)
+
 
 class _ReviewerPushesThenFails(_SparringAdapter):
     """READY for the build stage; then, as the independent reviewer, a
-    commit is pushed out of band and the reviewer's turn fails."""
+    commit is pushed out of band (unless ``push`` is false) and the
+    reviewer's turn fails."""
 
-    def __init__(self, repo: Path, verdicts):
+    def __init__(self, repo: Path, verdicts, *, push: bool = True):
         super().__init__(verdicts)
         self.repo = repo
+        self.push = push
         self.calls = 0
 
     def _next(self, session_id):
         self.calls += 1
         if self.calls == 2:
-            tree = subprocess.run(
-                ["git", "-C", str(self.repo), "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "out of band"],
-                check=True, capture_output=True, text=True,
-            ).stdout.strip()
-            _run_git(self.repo, "push", "-q", "origin", f"{tree}:refs/heads/feature/x")
+            if self.push:
+                tree = subprocess.run(
+                    ["git", "-C", str(self.repo), "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "out of band"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                _run_git(self.repo, "push", "-q", "origin", f"{tree}:refs/heads/feature/x")
             raise ProviderError("the reviewer's provider timed out")
         return super()._next(session_id)
 
@@ -503,6 +594,16 @@ class FailedReviewTurnTests(_ReviewRepoTestCase):
         self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
         self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
         self.assertIs(self.stage(REVIEW_STAGE).read_state().status, StageStatus.WORKING)
+
+    def test_a_failed_review_turn_without_a_push_is_not_movement(self):
+        # Positive control for the test above: the same failing review turn,
+        # with no out-of-band push, does not pause on movement.
+        with self.assertRaises(PlanRunError) as ctx:
+            self.start(
+                _StageAdapter(self.repo, commit=True), _ReviewerPushesThenFails(self.repo, [READY], push=False)
+            )
+        self.assertIn("independent-review turn failed", str(ctx.exception))
+        self.assertIsNone(self.plan_state().awaiting)
 
 
 if __name__ == "__main__":  # pragma: no cover

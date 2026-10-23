@@ -875,14 +875,44 @@ class HardenedGitTests(_AuthorityCase):
         _run_git(self.repo, "config", f"url.{evil}.pushInsteadOf", str(self.remote))
         _run_git(self.repo, "config", "credential.helper", f"!{self.script('helper')}")
 
+        # The pinned path: the one repository the run may write.
         result = engine_git.run_remote(
-            self.repo, pin.trusted_config, "push", str(self.remote), f"{sha}:refs/heads/feature/x"
+            self.repo, pin.trusted_config, "push", str(self.remote), f"{sha}:refs/heads/feature/x",
+            pinned=pin.destination,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_remote_sha(self.remote, "feature/x"), sha)
         self.assertEqual(_refs(evil), "")
         self.assertNoMarker()
+
+        # Positive control: plain git in the same checkout follows the
+        # planted pushInsteadOf, and evil receives the push.
+        subprocess.run(
+            ["git", "-C", str(self.repo), "push", "-q", str(self.remote), f"{sha}:refs/heads/control"],
+            capture_output=True, check=False, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        self.assertEqual(_remote_sha(evil, "control"), sha)
+        self.assertIsNone(_remote_sha(self.remote, "control"))
+
+    def test_a_remote_push_without_the_pin_is_unpinned_local_remote(self):
+        # Asserted separately from the pinned push above: a local-path
+        # destination that is not the pinned one is refused before transport.
+        pin = pin_remote(self.repo, "feature/x")
+        sha = self.commit("one.txt")
+        with self.assertRaises(GitConfigRefusal) as ctx:
+            engine_git.run_remote(
+                self.repo, pin.trusted_config, "push", str(self.remote), f"{sha}:refs/heads/feature/x"
+            )
+        self.assertEqual(ctx.exception.code, "unpinned_local_remote")
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
+        # Positive control: the same push, through the pinned path, lands.
+        result = engine_git.run_remote(
+            self.repo, pin.trusted_config, "push", str(self.remote), f"{sha}:refs/heads/feature/x",
+            pinned=pin.destination,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), sha)
 
     def test_a_snapshot_credential_helper_is_the_one_remote_operations_consult(self):
         # Proven without a network: `git credential fill` in the isolated
