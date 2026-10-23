@@ -415,12 +415,19 @@ class ReviewRecord:
     ``head_sha`` is the primary repository's ``HEAD`` at the verdict and
     ``clean`` whether its working tree then held nothing that commit does
     not represent; ``repositories`` is each declared sibling's ``HEAD`` by
-    name. Acceptance needs this at the exact candidate (I-L2)."""
+    name, and ``dirty_repositories`` names every sibling whose working tree
+    then held changes its ``HEAD`` does not represent. Acceptance needs this
+    at the exact candidate set, clean in every repository (I-L2).
+
+    ``head_sha`` is ``None`` when what the verdict was over could not be
+    captured: the record then still replaces any earlier one, and can never
+    authorize an acceptance."""
 
     action: str
-    head_sha: str
+    head_sha: str | None
     clean: bool
     repositories: tuple[SiblingPin, ...] = ()
+    dirty_repositories: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -430,6 +437,8 @@ class ReviewRecord:
         }
         if self.repositories:
             payload["repositories"] = [repo.to_dict() for repo in self.repositories]
+        if self.dirty_repositories:
+            payload["dirty_repositories"] = list(self.dirty_repositories)
         return payload
 
     @classmethod
@@ -439,16 +448,20 @@ class ReviewRecord:
         action = _optional_str_field(payload, "action")
         head = _optional_str_field(payload, "head_sha")
         clean = payload.get("clean")
-        if not action or not head or not isinstance(clean, bool):
+        if not action or not isinstance(clean, bool):
             raise StageError("state.json field 'review' needs action, head_sha and clean")
         raw = payload.get("repositories") or []
         if not isinstance(raw, list):
             raise StageError("review.repositories must be a list")
+        dirty = payload.get("dirty_repositories") or []
+        if not isinstance(dirty, list) or not all(isinstance(name, str) for name in dirty):
+            raise StageError("review.dirty_repositories must be a list of names")
         return cls(
             action=action,
             head_sha=head,
             clean=clean,
             repositories=tuple(SiblingPin.from_dict(entry) for entry in raw),
+            dirty_repositories=tuple(dirty),
         )
 
 

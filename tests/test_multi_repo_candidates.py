@@ -215,6 +215,30 @@ class CrossRepositoryCandidateTests(unittest.TestCase):
         self.assertIn("verdict_not_at_candidate", str(ctx.exception))
         self.assertIs(self.stage.read_state().status, StageStatus.FROZEN)
 
+    def test_a_review_over_uncommitted_sibling_work_refuses_accept(self):
+        # The reviewer saw the sibling with a change its HEAD does not hold;
+        # the change is then discarded, so the sibling is clean at the same
+        # HEAD at freeze and accept -- but that content was never reviewed.
+        self._declare()
+        (self.sibling / "migration.sql").write_text("reviewed, never committed\n", encoding="utf-8")
+        record_review(self.stage, self.primary, RoutingAction.READY)
+        self.assertEqual(self.stage.read_state().review.dirty_repositories, ("sporely-web",))
+        _git(self.sibling, "checkout", "--", "migration.sql")
+        freeze_candidate(self.stage, self.sparring_dir, self.primary, expected_branch=self.PRIMARY_BRANCH)
+        with self.assertRaises(AcceptanceError) as ctx:
+            self._accept()
+        self.assertIn("verdict_not_at_candidate", str(ctx.exception))
+        self.assertIn("uncommitted sibling work (sporely-web)", str(ctx.exception))
+        self.assertIs(self.stage.read_state().status, StageStatus.FROZEN)
+
+    def test_positive_control_a_review_over_the_clean_sibling_is_accepted(self):
+        # The same steps with the sibling clean when reviewed: accepted.
+        self._declare()
+        record_review(self.stage, self.primary, RoutingAction.READY)
+        self.assertEqual(self.stage.read_state().review.dirty_repositories, ())
+        freeze_candidate(self.stage, self.sparring_dir, self.primary, expected_branch=self.PRIMARY_BRANCH)
+        self.assertEqual(self._accept().repositories[0].candidate_sha, self.sibling_sha)
+
     def test_accept_refuses_a_declared_but_never_pinned_sibling(self):
         # Freeze pins siblings, so this can only happen if state.json was
         # edited by hand between the two steps. It must not be waved through.

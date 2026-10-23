@@ -851,10 +851,13 @@ def _cmd_record_sparring(args: argparse.Namespace) -> int:
         content = record_sparring(stage, result, findings=args.findings or "")
         # What the verdict is over, read from the repository by the engine:
         # without it no acceptance can rest on this verdict (I-L2).
+        # An unresolvable root still replaces the earlier evidence (with a
+        # record that authorizes nothing): it never leaves an older READY.
         try:
-            record_review(stage, _resolve_repo_root(args, sparring_dir), result.action)
+            reviewed_root: Path | None = _resolve_repo_root(args, sparring_dir)
         except ProjectConfigError:
-            pass
+            reviewed_root = None
+        record_review(stage, reviewed_root, result.action)
     except (StageError, RoutingResultError, HumanGateError) as exc:
         print(f"could not record sparring outcome: {exc}", file=sys.stderr)
         return 1

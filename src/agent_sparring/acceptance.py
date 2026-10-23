@@ -554,41 +554,67 @@ def _local_detail(sha: str, branch: str) -> str:
 _HANDED_TO_A_PERSON = (RoutingAction.ESCALATE.value, RoutingAction.NEEDS_YOU.value)
 
 
-def record_review(stage: Stage, repo_root: Path, action: RoutingAction) -> None:
+def record_review(stage: Stage, repo_root: Path | None, action: RoutingAction) -> None:
     """Record, beside the verdict just written, exactly what it was given
-    over: the primary ``HEAD``, whether the working tree then held nothing
-    that commit does not represent, and each declared sibling's ``HEAD``
-    (see :class:`~agent_sparring.stage.ReviewRecord`). Engine-written, from
-    the repository itself -- never from the reviewer's words."""
+    over: the primary ``HEAD`` and whether its working tree then held
+    nothing that commit does not represent, and each declared sibling's
+    ``HEAD`` and whether its working tree was clean (see
+    :class:`~agent_sparring.stage.ReviewRecord`). Engine-written, from the
+    repositories themselves -- never from the reviewer's words.
 
+    Fails closed. A new verdict always replaces the evidence of the one
+    before it: the earlier record is invalidated first, and when what this
+    verdict was over cannot be captured (``repo_root`` unknown, a
+    repository unreadable) the record says so and can authorize nothing --
+    neither it nor any earlier READY. A stage with no state has nothing to
+    record into."""
+
+    try:
+        state = stage.read_state()
+    except StageError:
+        return
+    # Invalidate before capturing anything: if the capture below fails in
+    # any way, no earlier review evidence survives this verdict.
+    state.review = ReviewRecord(action=action.value, head_sha=None, clean=False)
+    stage.write_state(state)
+    if repo_root is None:
+        return
     try:
         head = resolve_commit(repo_root, "HEAD", label="reviewed HEAD")
         blocking, _ignored = _partition_dirty(repo_root, stage)
-        state = stage.read_state()
-    except (GitContextError, AcceptanceError, StageError):
-        # Nothing can be recorded, so no acceptance will rest on it.
-        return
-    siblings = []
-    for repository in state.repositories:
-        try:
-            sibling_head: str | None = resolve_commit(
-                sibling_root(repo_root, repository), "HEAD", label=f"{repository.name} HEAD"
+        siblings = []
+        dirty_siblings = []
+        for repository in state.repositories:
+            root = sibling_root(repo_root, repository)
+            siblings.append(
+                SiblingPin(
+                    name=repository.name,
+                    head_sha=resolve_commit(root, "HEAD", label=f"{repository.name} HEAD"),
+                )
             )
-        except GitContextError:
-            sibling_head = None
-        siblings.append(SiblingPin(name=repository.name, head_sha=sibling_head))
+            if dirty_entries(root, all_untracked=True):
+                dirty_siblings.append(repository.name)
+    except (GitContextError, AcceptanceError, OSError):
+        # The invalidated record written above stands: it authorizes nothing.
+        return
     state.review = ReviewRecord(
-        action=action.value, head_sha=head, clean=not blocking, repositories=tuple(siblings)
+        action=action.value,
+        head_sha=head,
+        clean=not blocking,
+        repositories=tuple(siblings),
+        dirty_repositories=tuple(dirty_siblings),
     )
     stage.write_state(state)
 
 
 def _review_covers(review: ReviewRecord, sha: str, siblings: tuple[CandidateRepository, ...]) -> bool:
-    if not review.clean or review.head_sha != sha:
+    if review.head_sha is None or not review.clean or review.head_sha != sha:
         return False
     reviewed = {entry.name: entry.head_sha for entry in review.repositories}
     return all(
-        repository.candidate_sha is not None and reviewed.get(repository.name) == repository.candidate_sha
+        repository.candidate_sha is not None
+        and reviewed.get(repository.name) == repository.candidate_sha
+        and repository.name not in review.dirty_repositories
         for repository in siblings
     )
 
@@ -615,16 +641,19 @@ def _require_verdict_at(state: StageState, stage: Stage, sha: str) -> None:
         if review.action == RoutingAction.READY.value or review.action in _HANDED_TO_A_PERSON:
             if _review_covers(review, sha, state.repositories):
                 return
+            if review.head_sha is None:
+                over = "a candidate that could not be recorded"
+            elif review.head_sha != sha or not review.clean:
+                over = f"{review.head_sha}{'' if review.clean else ' with uncommitted work'}"
+            else:
+                over = (
+                    f"{review.head_sha} with other sibling commits or uncommitted sibling work"
+                    + (f" ({', '.join(review.dirty_repositories)})" if review.dirty_repositories else "")
+                )
             raise VerdictNotAtCandidateError(
                 f"refusing: {VERDICT_NOT_AT_CANDIDATE}: stage {stage.stage_id!r} would accept "
-                f"{sha}, but the reviewer's recorded {review.action} was over "
-                f"{review.head_sha}{'' if review.clean else ' with uncommitted work'}"
-                + (
-                    " and other sibling commits"
-                    if review.head_sha == sha and review.clean
-                    else ""
-                )
-                + ". Acceptance needs the review at that exact candidate; have it reviewed. "
+                f"{sha}, but the reviewer's recorded {review.action} was over {over}. "
+                "Acceptance needs the review at that exact candidate; have it reviewed. "
                 "Nothing was accepted"
             )
         raise VerdictNotAtCandidateError(

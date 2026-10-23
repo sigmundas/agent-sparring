@@ -268,7 +268,11 @@ primary and each declared sibling):
   review is recorded at all. The engine records what each verdict was over
   as it writes it (`review` in the stage's `state.json`: run-loop,
   run-sparring, managed runs, and `record-sparring` for a verdict a person
-  records). After ESCALATE or NEEDS_YOU the reviewer has handed the decision
+  records) -- each repository's `HEAD` and whether its working tree was
+  clean; a review over uncommitted work in any repository authorizes
+  nothing. Each new verdict replaces the evidence of the one before; if
+  what it was over cannot be captured, the record says so and no earlier
+  READY survives it. After ESCALATE or NEEDS_YOU the reviewer has handed the decision
   to a person, whose explicit `accept-candidate` is that decision -- for
   exactly the reviewed commit;
 - accepted history only grows, per repository: the repository's stage base

@@ -789,6 +789,53 @@ class LocalRuleTests(_World):
         self.assertCode(ctx, VERDICT_NOT_AT_CANDIDATE)
         self.assertIn("uncommitted work", str(ctx.exception))
 
+    def _record_by_hand(self, action: str, repo_root: Path) -> int:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return main([
+                "--sparring-dir", str(self.sparring_dir), "record-sparring", "rules-1",
+                "--action", action, "--summary", "by hand", "--repo-root", str(repo_root),
+            ])
+
+    def test_a_later_verdict_whose_review_cannot_be_captured_leaves_no_ready_usable(self):
+        # A READY at the candidate, recorded both ways the engine records one
+        # (review record and loop marker); then a later ESCALATE recorded with
+        # a root it cannot read. The ESCALATE is written, its review cannot be
+        # captured -- and neither the old record nor the old marker may still
+        # authorize the candidate.
+        self.ready_at(self.candidate)
+        record_review(self.s, self.repo, RoutingAction.READY)
+        self.assertEqual(self._record_by_hand("ESCALATE", self.root / "no-such-repository"), 0)
+        review = self.s.read_state().review
+        self.assertEqual((review.action, review.head_sha), ("ESCALATE", None))
+        self.freeze()
+        with self.assertRaises(AcceptanceError) as ctx:
+            self.accept()
+        self.assertCode(ctx, VERDICT_NOT_AT_CANDIDATE)
+        self.assertIn("could not be recorded", str(ctx.exception))
+        self.assertIs(self.s.read_state().status, StageStatus.FROZEN)
+
+    def test_positive_control_without_the_invalidation_the_old_ready_would_accept(self):
+        # The same steps with the replacement's review recording disabled in
+        # this test only: the earlier READY survives and accepts -- so the
+        # refusal above is the invalidation.
+        self.ready_at(self.candidate)
+        record_review(self.s, self.repo, RoutingAction.READY)
+        with mock.patch("agent_sparring.cli.record_review"):
+            self.assertEqual(self._record_by_hand("ESCALATE", self.root / "no-such-repository"), 0)
+        self.freeze()
+        self.assertEqual(self.accept().candidate_sha, self.candidate)
+
+    def test_a_later_verdict_recorded_properly_replaces_the_ready(self):
+        # A later SEND_BACK, captured normally at the same commit, replaces
+        # the READY: the candidate is no longer one the reviewer approved.
+        record_review(self.s, self.repo, RoutingAction.READY)
+        self.assertEqual(self._record_by_hand("SEND_BACK", self.repo), 0)
+        self.assertEqual(self.s.read_state().review.action, "SEND_BACK")
+        self.freeze()
+        with self.assertRaises(AcceptanceError) as ctx:
+            self.accept()
+        self.assertCode(ctx, VERDICT_NOT_AT_CANDIDATE)
+
     def test_a_recorded_send_back_refuses_accept(self):
         record_review(self.s, self.repo, RoutingAction.SEND_BACK)
         self.freeze()
