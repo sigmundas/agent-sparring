@@ -1,21 +1,19 @@
 # Local-first engine (issue #5, Plan L)
 
-**Decision (the user, 2026-10-22).** Agent Sparring is local-first.
-Implementation, review, acceptance and `finish-run` work entirely in the local
-repository. Neither agents nor the engine push to GitHub or GitLab as part of
-normal work.
-- Publishing a commit for external review becomes a separate, explicit,
-  human-triggered action, **Push to review**. It never implies acceptance.
-- The original reason for automatic pushing was to make candidates visible to
-  a web-chat reviewer. That need is met by Push to review.
+**Decision (the user, 2026-10-22; scope approved 2026-10-23).** Agent Sparring
+is local-first. Implementation, review, acceptance and `finish-run` work
+entirely in the local repositories. Neither agents nor the engine contact
+GitHub, GitLab or any other remote as part of normal work.
+- Publishing a commit for external review is a separate, explicit,
+  human-triggered action, **Push to review**. It is specified in Plan P
+  (`docs/plans/issue5-p-push-to-review.md`), not here. It never implies
+  acceptance.
 
-**This plan replaces Plan R2**
-(`docs/plans/issue5-r2-complete-and-verify-engine-git-authority.md`, at
-`d658eef`, with its kit at `d7f672d`).
-- Plan R2 is kept unchanged, for reference. Its Stage 1 is reused here as
-  Stage 1, narrowed.
-- Its Stages 2 and 3 are re-scoped below. Most of what they protected is the
-  engine's own automatic remote authority, which this plan removes.
+**This plan replaces Plan R2.**
+- R2 (`docs/plans/issue5-r2-complete-and-verify-engine-git-authority.md`, at
+  `d658eef`, with its kit at `d7f672d`) is kept unchanged, for reference.
+- The first draft of this plan is `bad8811`. This revision applies the
+  independent design review of 2026-10-23, with the user's corrections.
 
 **Inputs:**
 - Plan R: `docs/plans/issue5-r-complete-engine-git-authority.md` (base
@@ -26,11 +24,14 @@ normal work.
   tests, 7 failures. The evidence is in
   `/Users/Shared/sparring-recovery-r2/evidence/test-r-36e2cea-20261022T174121Z/`.
 
-**Base.** `plan/issue5-local-first`: `36e2cea` plus planning documents only.
-Plan R's local Git hardening is kept, and so is its remote-operation
-machinery, which publication reuses.
+**Base.** `plan/issue5-local-first`: `36e2cea` plus planning documents and
+earlier kits only.
 
 **Separate from:**
+- **Plan P** (Push to review, engine side). It goes after Plan L and gets its
+  own security review.
+- **The VS Code companion plan.** It lives in `agent-sparring-vscode`, and
+  feature-detects the engine's `local_first` capability (see Stage 2).
 - **Plan D.** This is the real boundary between agents and the user's
   credentials and trusted engine state. A `git push` deny rule in Claude
   settings is a workflow setting, not an OS boundary. Until Plan D, a
@@ -39,123 +40,122 @@ machinery, which publication reuses.
 - **Plan 2** (required verification evidence), which stays in the backlog.
   Until it exists, mandatory tests are enforced by this run's human gates.
 - **Plans A to C.** No provider launch, sandbox or credential-guarantee work.
-- **The VS Code extension.** It lives in another repository. Its companion
-  plan is described under "Effects", and is not part of this plan.
 
 ## Invariants (every later refactor must keep these)
 
-- **I-L1. No remote contact in normal work.** None of these runs a Git command
-  that contacts a remote:
-  - `start-plan`, `run-plan`, `resume-plan`;
-  - `run-stage`, `run-sparring`, `run-loop`;
-  - `freeze-candidate`, `accept-candidate`;
-  - review, the handoff;
-  - `runs`/status polling;
-  - `slice-branch`;
-  - `finish-run` without a publication flag.
-
-  The remote commands are `push`, `fetch`, `pull`, `ls-remote`,
-  `remote update`, `remote show`, a `clone` or `submodule update` from a URL,
-  and any command given a URL. `engine_git` refuses each of them, with
-  `remote_operation_not_allowed`, unless it runs inside an explicit
-  publication context. That context is created only by the publication
-  command (Stage 4) and by the legacy compatibility path (Stage 3).
+- **I-L1. No remote contact.**
+  - No engine command runs a Git command that contacts a remote. That
+    covers every run, stage, review, acceptance, status, handoff,
+    slice-branch and finish path.
+  - The remote commands are `push`, `fetch`, `pull`, `ls-remote`,
+    `remote update`, `remote show`, a `clone` or `submodule update` from a
+    URL, and any command given a URL.
+  - `engine_git.run` refuses every one of them, unconditionally, with
+    `remote_operation_not_allowed`. There is no exception context in
+    Plan L.
+  - Plan R's isolated remote primitive (`engine_git.run_remote` and its
+    form allowlist) stays in the code for Plan P, with no production caller.
+    A test asserts that it has none.
 - **I-L2. Acceptance is local.** Freeze and accept require:
-  - the exact candidate commit on the stage's or run's branch in the local
-    repository;
+  - the exact candidate commit at `HEAD` of the expected branch, in each
+    participating repository;
   - a working tree clean apart from the engine's own artifacts;
   - for accept, the reviewer's verdict at that exact SHA.
 
-  Remote state is never an input to freeze, accept or finish.
-- **I-L3. Publication and acceptance are separate.**
-  - Publication never changes stage, run or acceptance state.
-  - Acceptance never requires publication.
-  - A publication receipt is stored apart from run and stage state. No freeze,
-    accept, review or finish code reads it. A test asserts that by importing.
-- **I-L4. Publication is explicit and exact.** A publish runs only with a
-  confirmation token from its own preview. That token binds:
-  - the commit SHA;
-  - the repository path;
-  - the remote name and URL;
-  - the destination ref;
-  - the expected current tip of the destination;
-  - the trusted configuration snapshot.
+  Remote state is never an input.
+- **I-L2b. Accepted history only grows, per repository.** For the primary
+  repository and for each sibling repository, separately:
+  - freeze, accept and `enter_review` require that repository's stage base
+    and every earlier accepted candidate of the run *in that repository* to
+    be ancestors of (or equal to) that repository's current candidate;
+  - `finish-run` requires, in every participating repository, every
+    accepted candidate of the run to be an ancestor of the commit it
+    integrates.
 
-  It refuses if any of these has changed. The token protects against
-  accidents and drift. It is not a boundary against a same-user agent
-  (Plan D).
-- **I-L5. Local Git stays hardened.**
+  A violation refuses with `run_history_rewritten`, naming the repository and
+  the missing commit.
+  - Before Plan L, a candidate had to be pushed with an ordinary push, and
+    remote movement was checked. That is where append-only history came
+    from. Local-first must keep it explicitly.
+- **I-L3. Nothing grants acceptance by implication.**
+  - Acknowledging a recorded incident pause clears only that pause. It never
+    counts as review or acceptance.
+  - A legacy push permission never becomes acceptance (L-D1).
+- **I-L4. Local Git stays hardened.**
   - Every engine Git command, read-only ones included, keeps Plan R's local
     protections:
     - base overrides;
     - the include refusal;
     - the trusted-snapshot comparison in a guard;
     - the environment strip;
-    - no hooks and no fsmonitor;
-    - the remote-form allowlist.
+    - no hooks and no fsmonitor.
   - Stage 5 adds signing programs, submodule recursion and the
     configuration-listing failure.
   - A repository's own configuration never makes an engine Git command run a
     helper, hook, filter, signing tool or other program.
-- **I-L6. Mandatory tests run at the reviewed SHA.** "Deferred" or "could not
+- **I-L5. Mandatory tests run at the reviewed SHA.** "Deferred" or "could not
   run" never satisfies a mandatory test.
+- **I-L6. Explicit actions keep their meaning.**
+  - A flag or command an older client sends either does what it always
+    meant, or refuses with a typed deprecation code and guidance.
+  - It is never silently reinterpreted.
+  - JSON stays `schema_version` 1, with fields only added.
 
 ## What becomes of Plan R's changes
 
-| Plan R change (at `36e2cea`) | Under local-first |
+| Plan R change (at `36e2cea`) | Under Plan L |
 |---|---|
-| `engine_git` local hardening (overrides, include refusal, snapshot comparison, environment strip) | **Kept.** I-L5. |
-| `engine_git` remote machinery (refusing unguarded remote commands, isolated bare repository for remote operations, allowlisted forms, `unpinned_local_remote`) | **Kept, narrowed.** Used only inside a publication context. |
-| `remote_pin` snapshot of remote, URL and trusted configuration | **Kept, as the publication snapshot.** Taken at the publish preview and bound to its token, instead of at run start. |
-| Run-start pins, sibling pins, `engine_says_pinned` flag, pin-missing refusals | **Unnecessary for new runs.** Kept read-only for legacy runs (Stage 3). |
-| Per-turn remote movement checks, push receipts, `unauthorized_remote_movement` / `pushed_candidate_unauthorized` pauses | **Unnecessary in normal work.** They needed `ls-remote` after every turn and detected only one ref. Plan D prevents instead. Existing pauses in legacy runs stay answerable (Stage 3). |
-| `acknowledge-remote-movement`, `authorize-pushed-candidate` | **Legacy only.** They stay for paused legacy runs, and are documented as deprecated. |
-| `push_gate.ensure_candidate_pushed`, `--allow-push-for-run`, the `push_authorization_required` pause | **Removed from runs.** The push half is reused by publication. |
-| `finish-run --push-target`, `[finish] delete_remote_branch` | **Removed from finish.** It refuses with a pointer to publication. A deliberate legacy path exists (Stage 3). |
-| Failed-turn checking (`checked_turn`) | **Kept for local integrity checks**, for example an unexpected branch or `HEAD` movement. Remote movement is dropped. |
+| `engine_git` local hardening (overrides, include refusal, snapshot comparison, environment strip) | **Kept.** I-L4. |
+| `engine_git.run_remote`, its isolated bare repository and form allowlist, `unpinned_local_remote` | **Kept, unused.** No production caller until Plan P. The tests keep it correct. |
+| `remote_pin` snapshot | **Kept for Plan P.** In Plan L it is only read inertly from legacy runs. |
+| Run-start pins, sibling pins, the `engine_says_pinned` flag, pin-missing refusals | **Removed from new runs.** Legacy records load inertly (Stage 4). |
+| Per-turn remote movement checks, push receipts, the movement pauses | **Removed from normal runs (L-D2).** Recorded incident pauses stay answerable (Stage 4). |
+| `acknowledge-remote-movement`, `authorize-pushed-candidate` | **Legacy only**, local, never acceptance (I-L3). |
+| `push_gate.ensure_candidate_pushed`, `--allow-push-for-run`, the `push_authorization_required` pause | **Removed from runs.** The push primitive stays for Plan P. |
+| `finish-run --push-target`, `[finish] delete_remote_branch` | **Refused** with a typed code (Stage 4). |
+| Failed-turn checking (`checked_turn`) | **Kept for local checks.** Remote movement is dropped. |
 
-**Audit findings under local-first:**
+**Audit findings under Plan L:**
 
 | Finding | Disposition |
 |---|---|
-| R-1 live-configuration remote reads | **Removed with the reads.** Freeze, accept and handoff no longer read remotes. Publication reads only its snapshot. |
-| R-2 siblings | **Moot.** Siblings are local, like the primary. |
-| R-3 `base_sha` explains a candidate, R-4 ownership from `.sparring/`, R-13 pin digest | **Moot for authority.** No remote authority remains to bypass. R-4's ownership question stays a local-integrity issue (see Stage 2). |
-| R-5 legacy finish | **Stage 3.** |
-| R-6 signing, R-7 submodules, R-8 listing failure | **Stage 5.** Still applicable: they are local, privileged Git execution. |
-| R-9, R-10, R-11 | **Moot.** The code paths are removed or become legacy-only and read-only. |
+| R-1 live-configuration remote reads | **Removed with the reads** (Stages 2 and 3). |
+| R-2 siblings | **Moot for remotes.** Siblings get I-L2b. |
+| R-3 `base_sha` explains a candidate, R-13 pin digest | **Moot.** No remote authority remains. |
+| R-4 ownership from `.sparring/` | **Stage 5** (local integrity). |
+| R-5 legacy finish | **Stage 4.** |
+| R-6 signing, R-7 submodules, R-8 listing failure | **Stage 5.** |
+| R-9, R-10, R-11 | **Moot.** The code paths are removed or become legacy-only. |
 | R-12 resume and push-then-rewind | **Moot for normal work.** It is a Plan D residual. |
-| R-14 abbreviated SHA comparison | **Stage 4** (publication's lease check). |
+| R-14 abbreviated SHA comparison | **Plan P.** |
 | R-15 VS Code raw `git` | **Companion extension plan.** |
 
 ## The seven failing tests
 
-None is deleted. Each is repaired, retargeted or reclassified, and the
-handoff of each stage records what happened to it.
+None is deleted. Each stage's traceability table records what happened to
+each one.
 
-| Test (at `36e2cea`) | Status under local-first | Stage |
+| Test (at `36e2cea`) | Status | Stage |
 |---|---|---|
-| `HardenedGitTests::test_remote_operations_never_read_the_repositorys_own_configuration` | **Applicable, publication path.** A planted `pushInsteadOf` must never redirect a publish. It is repaired so the property is reached, then becomes a publication test. | 1, then 4 |
-| `UnguardedRemoteTests::test_push_forms_that_hide_the_destination_are_refused` | **Applicable, publication path.** The forms that hide the destination stay refused. The `--repo` control is replaced (Git 2.53.0: `--repo X <refspec>` never contacts X; `--repo X --mirror` does). | 1, then 4 |
-| `FinishWithoutThePinTests::test_the_pin_malformed` | **The default finish no longer uses pins.** The exit code is fixed to `3` first, so the security assertions run. Then it is retargeted: a legacy remote finish, and a publish, with a malformed record refuse and change no ref. | 1, then 3 |
-| `FinishWithoutThePinTests::test_the_pin_removed_from_the_state` | Same as above, for a removed pin. | 1, then 3 |
-| `FinishWithoutThePinTests::test_the_state_file_deleted` | Same as above, for a deleted state file. | 1, then 3 |
-| `FinishWithoutThePinTests::test_the_state_file_unreadable` | Same as above, for an unreadable state file. | 1, then 3 |
-| `FinishWithoutThePinTests::test_the_state_replaced_with_a_legacy_shaped_one` | Same as above, for a legacy-shaped state. | 1, then 3 |
+| `HardenedGitTests::test_remote_operations_never_read_the_repositorys_own_configuration` | **Applicable to the retained remote primitive (Plan P).** It is repaired so a planted `pushInsteadOf` is reached and never followed. It keeps exercising `run_remote` directly. | 1 |
+| `UnguardedRemoteTests::test_push_forms_that_hide_the_destination_are_refused` | **Applicable to the retained primitive.** The `--repo` control is replaced (Git 2.53.0: `--repo X <refspec>` never contacts X; `--repo X --mirror` does). | 1 |
+| `FinishWithoutThePinTests::test_the_state_file_deleted` | **Still applicable, as local integrity.** The exit code is fixed to `3` (Stage 1). In Stage 4 the reason becomes the run-state integrity refusal; nothing is merged, and no ref changes anywhere. | 1, 4 |
+| `FinishWithoutThePinTests::test_the_state_file_unreadable` | Same as above. | 1, 4 |
+| `FinishWithoutThePinTests::test_the_state_replaced_with_a_legacy_shaped_one` | Same as above. | 1, 4 |
+| `FinishWithoutThePinTests::test_the_pin_malformed` | **The remote half is obsolete; a local property remains.** Exit code fixed in Stage 1. In Stage 4: a damaged legacy pin is inert. `--push-target` refuses with `remote_finish_removed`, and the remote's refs are unchanged. A local finish contacts no remote. The original property (no remote write without an intact pin) passes to Plan P. | 1, 4 |
+| `FinishWithoutThePinTests::test_the_pin_removed_from_the_state` | Same as above. | 1, 4 |
 
-**Obsolete for normal work, not deleted:** the tests whose subject is push
-authorization during a run (mainly `tests/test_push_authorization.py`, and the
-movement and pin tests in `tests/test_fail_closed_pins.py`). Each one is:
-- **kept, for legacy runs** (Stage 3); or
-- **converted** into an assertion of the new invariant (no remote command
-  runs, I-L1; acceptance is local, I-L2); or
-- **removed**, only when another test covers the same property. The handoff's
-  traceability table gives a reason for each removal.
+**Obsolete for normal work, not deleted.** These are the tests whose subject
+is push authorization during a run, and the movement and pin tests. Each one
+is:
+- **kept, for legacy runs** (Stage 4); or
+- **converted** into an assertion of the new invariants (I-L1, I-L2,
+  I-L2b); or
+- **removed**, only when the traceability table names the test that now
+  covers its property.
 
 ## Verification rules (every stage)
 
-These are the same rules as Plan R2, because the reason for them has not
-changed.
 - **Tests run, at the exact candidate commit.** The stage agent runs:
   - its focused tests;
   - the eight Stage 1 baseline files plus `tests/test_no_live_remote_config.py`
@@ -173,36 +173,44 @@ changed.
   - The handoff lists every converted or removed test, with the test that now
     covers its property.
   - The full-suite count may fall only by removals the handoff names.
-- **Positive controls.** Every negative test shows that the same attack
-  succeeds without the protection: plain `git`, an already protected path, or
-  a `mock.patch` that disables the protection in the test only.
+- **Positive controls.** Every negative test shows that the same attack or
+  rewrite succeeds without the protection: plain `git`, an already
+  protected path, or a `mock.patch` that disables the protection in the test
+  only.
 - **Real repositories.**
-  - Git tests use real disposable repositories and bare remotes.
-  - I-L1 is proven by a recorder: a `git` wrapper first on `PATH` (or a
-    `GIT_TRACE2` event file) that logs every subcommand the engine runs.
-  - It is never proven by mocking `engine_git`.
+  - Git tests use real disposable repositories, and bare remotes where a
+    remote must be shown untouched.
+  - I-L1 is proven by a `git` wrapper placed first on `PATH`, which logs
+    every subcommand the engine runs. `engine_git` calls `git` through
+    `PATH`. It is never proven by mocking `engine_git`.
 - **Traceability.** The handoff has a table: acceptance item → test id →
   positive-control test id. The reviewer checks it statically.
-- **A human gate before each later stage and before completion.** At each
-  gate, the credential-free isolated test runs at the exact accepted SHA.
-  The human gate, not the reviewer's `READY`, is the evidence.
+- **Exact-SHA evidence.**
+  - Before each later stage and before completion, the run stops at a human
+    gate.
+  - A person runs the credential-free isolated test of the accepted SHA. Its
+    evidence records `git rev-parse HEAD`, an empty `git status --porcelain`
+    and the junit test counts and ids.
+  - Each must match the handoff's SHA and counts.
+  - The gate, not the reviewer's `READY`, is the evidence.
+- **Send-back cap.** `--max-send-back-cycles 3`. After that, a person reviews
+  the design before any further round.
 
 ## Stage 1 — Repair verification
 
-This is Plan R2's Stage 1, narrowed to what local-first still needs.
-
 **Outcome:**
-- **`pushInsteadOf` regression.** It pins, plants `url.<evil>.pushInsteadOf`
-  after pinning, and pushes through the pinned path. The push lands on the
-  pinned remote, and `<evil>` receives nothing.
+- **The `pushInsteadOf` regression.** It pins, plants
+  `url.<evil>.pushInsteadOf` after pinning, and pushes through the pinned
+  path of `run_remote`. The push lands on the pinned remote, and `<evil>`
+  receives nothing.
   - Positive control: plain `git push` reaches `<evil>`.
   - `unpinned_local_remote` stays asserted separately.
 - **The five finish tests** assert exit `3`, the documented code for "refused
   by its checks". Every later assertion then runs unchanged.
-  - Positive control: the same run with an intact pin and no planted
-    `pushurl` finishes, and `push.git` stays empty.
+  - Positive control: the same run, with an intact pin and no planted
+    `pushurl`, finishes, and `push.git` stays empty.
 - **The `--repo` control** is `plain git push --repo <path> --mirror`. A test
-  asserts the Git 2.53.0 semantics directly, so a change in Git fails loudly.
+  asserts the Git 2.53.0 semantics directly.
 - **Positive controls** are added to every negative test in the two new test
   files, including the `sshCommand` and credential-helper checks.
 
@@ -217,201 +225,219 @@ This is Plan R2's Stage 1, narrowed to what local-first still needs.
   - The suite is green at an exact SHA in the isolated test.
   - The seven ids are present and passing in its junit XML.
 
-## Stage 2 — Local acceptance and runs
+## Stage 2 — Local acceptance and history preservation
 
 **Outcome:**
 - **Freeze, accept and `enter_review` are local (I-L2).**
-  - They require the candidate on the local stage or run branch, which is
-    either its tip or, for an advanced head, the existing reviewed
-    fast-forward rule. They also require a clean tree, and for accept the
+  - They require the candidate at `HEAD` of the expected branch, in each
+    participating repository, and a clean tree. Accept also requires the
     verdict at the exact SHA.
-  - They read no remote and no remote configuration. This applies to the
-    primary and to siblings alike.
-  - The refusal "not available on the intended remote branch" is removed. In
-    its place, a typed `candidate_not_on_branch` refusal states the local
-    rule.
-- **Runs never push or watch a remote.**
+  - They read no remote and no remote configuration.
+  - The refusal "not available on the intended remote branch" is removed.
+    Where the local rule fails, a typed `candidate_not_on_branch` refusal
+    states the rule.
+- **History is preserved per repository (I-L2b).**
+  - The engine records each accepted candidate per repository in run state:
+    the primary, and each sibling by its recorded name and path.
+  - Freeze, accept and `enter_review` refuse with `run_history_rewritten`
+    when that repository's stage base, or an earlier accepted candidate in
+    it, is not an ancestor of its current candidate.
+- **Runs never push.**
   - `start-plan`, `run-plan` and `resume-plan` no longer push, pin a remote,
     pause for push authorization, or check remote movement after a turn.
-  - `--allow-push-for-run` is refused with `push_not_part_of_runs`, whose
-    message points to Push to review. It is not silently ignored, so a
-    script that relied on it learns immediately.
-  - Failed-turn checking keeps its local integrity checks.
-- **Status and polling are offline.** `runs --json`, `slice-branch --json`
-  and the handoff run no remote command. The handoff's "Pushed" line becomes
-  "Local commit: <sha> on <branch>".
-- **Enforced in `engine_git` (I-L1).** Outside a publication context, every
-  remote command refuses with `remote_operation_not_allowed`. That includes
-  forms reached through aliases, `-c` options or `--git-dir`.
-- **Ownership (R-4, local integrity).** In a managed worktree, the owning run
-  comes from the managed record. A `.sparring/` claim that contradicts it
-  refuses with `stage_owner_mismatch`. This is a local-integrity check.
-  `.git` and `.sparring/` stay same-user writable until Plan D.
+  - Failed-turn checking keeps its local checks.
+- **Deprecated flags refuse, with guidance (I-L6).**
+  - `--allow-push-for-run` refuses with `push_not_part_of_runs`. Nothing is
+    created, and the message points to Plan P's Push to review.
+  - `resume-plan --allow-push-candidate <sha>` refuses with
+    `push_permission_deprecated`. Nothing changes.
+    - The message says that runs are local-first.
+    - It says a legacy push pause converts only on a plain `resume-plan`,
+      under the L-D1 rules (Stage 4).
+    - It names the command.
+  - Neither flag is ever an alias for local progression.
+- **A capability flag.** `runs --json`, the handoff JSON and `finish-run
+  --json` gain `"capabilities": ["local_first"]` (an added field;
+  `schema_version` stays 1). `sparring capabilities --json` prints the same
+  list. The companion extension uses it to hide its push UI.
 
 **Starting points:**
-- `acceptance.py` (`_pushed`, `_sibling_pushed`, `_require_explained`,
-  `_run_remote`, the freeze, accept and review paths).
+- `acceptance.py` (`_pushed`, `_sibling_pushed`, `_freeze_siblings`,
+  `_verify_siblings`, `_require_explained`, `_run_remote`, the freeze,
+  accept and review paths), `review.py` (`enter_review`).
 - `plan.py` (start, resume and turn paths; `_pin_siblings`; the push and
-  movement pauses), `loop.py`, `push_gate.py` (callers only),
-  `git_context.py` (`verify_pushed` callers), `handoff.py`, `cli.py`,
-  `engine_git.py` (the remote-command refusal), `managed_run.py`.
+  movement pauses; per-repository accepted records), `loop.py`, `cli.py`.
 
 **Boundaries:**
-- `finish-run` is Stage 3. Publication is Stage 4.
-- Legacy run state still loads. Its remote records are read only by Stage 3
-  code.
+- The unconditional `engine_git` refusal and offline status are Stage 3.
+  Finish and legacy migration are Stage 4.
+- Legacy run state still loads.
 
-**Acceptance evidence:**
-- **End-to-end runs.** A managed run and a hand-driven stage each run to
-  acceptance, with fake providers and real Git, in each of two setups:
-  1. a repository with **no remote at all**;
-  2. a repository whose `origin` is a real bare remote.
+**Acceptance evidence (real repositories):**
+- **End-to-end.** A managed run and a hand-driven stage each run to
+  acceptance with fake providers:
+  - in a repository with no remote at all;
+  - with a sibling repository;
+  - in a repository whose `origin` is a real bare remote, whose refs are
+    unchanged byte for byte.
+- **I-L2b, positive.** Legitimate advances are accepted:
+  - a new commit on top of the accepted candidate;
+  - several commits;
+  - a merge commit that contains the accepted candidate;
+  - a sibling that advances while the primary does not, and the other way
+    round.
+- **I-L2b, negative.** Each of the following refuses with
+  `run_history_rewritten`, names the repository, and freezes and accepts
+  nothing:
+  - in the primary, `git reset --hard` to before the accepted candidate
+    between stages;
+  - in the primary, an interactive-equivalent rebase that rewrites the
+    accepted commit;
+  - in a sibling, the same two cases.
+  - Positive control: the same reset with the check disabled through
+    `mock.patch` is accepted. That shows the check, not a side effect, is
+    what refuses.
+- **Local rules.** A candidate that is not `HEAD` of the expected branch, or a
+  dirty tree, refuses with `candidate_not_on_branch`. A verdict recorded at
+  another SHA refuses accept.
+- **Flags.** `--allow-push-for-run` refuses with `push_not_part_of_runs`, and
+  nothing is created. `--allow-push-candidate` refuses with
+  `push_permission_deprecated`, and the run state is byte-identical.
+- **Capabilities.** The capability field is present, and `schema_version` is
+  1.
+- **Old assertions.** Every test that asserted the removed "not pushed"
+  refusal or a push pause is converted or reclassified in the traceability
+  table.
 
-  In both, the recorder shows no remote subcommand, and in the second, the
-  bare remote's refs are unchanged byte for byte.
-- **Planted configuration.** A repository whose live configuration plants:
-  - `remote.origin.url` at a decoy;
-  - `url.*.insteadOf`;
-  - `core.sshCommand` and `credential.helper` at marker scripts.
-
-  It still runs to acceptance. No marker runs and no remote command is
-  recorded.
-  - Positive control: plain `git ls-remote` in that repository does run the
-    planted program.
-- **The remote-command refusal.** One test per remote command form refuses
-  outside a publication context.
-  - Positive control: the same form works inside a test publication context.
-- **Flag refusal.** `--allow-push-for-run` refuses with
-  `push_not_part_of_runs`, and nothing is created.
-- **Local acceptance.** A candidate that is not on the branch, or a dirty
-  tree, refuses with `candidate_not_on_branch`. A verdict recorded at another
-  SHA refuses accept.
-- **Every old assertion is accounted for.** Every test that asserted the
-  removed "not pushed" refusal or a push pause is converted or reclassified
-  in the traceability table.
-
-## Stage 3 — Local finish and legacy compatibility
+## Stage 3 — Unconditional remote refusal and offline operations
 
 **Outcome:**
-- **The default finish is local.** `finish-run` merges into the local target,
-  then cleans up (optional plan removal, worktree removal, local branch
-  deletion). It contacts no remote.
-  - `--push-target` and `[finish] delete_remote_branch = true` refuse with
-    `remote_finish_removed`. The message names the Push to review command
-    for the target branch.
-  - A project config that still sets `delete_remote_branch` is reported by
-    `check-config`. It is never silently ignored.
-- **Legacy runs.** These are runs recorded before Plan L: with a pin, with
-  `allow_push`, or paused on a remote reason.
-  - Every legacy state still loads.
-  - **`push_authorization_required`.** A pause of this kind came after a
-    reviewer's `READY`, and was only about pushing. On `resume-plan` it is
-    replaced, with a visible notice, by local acceptance under the normal
-    rules (I-L2). The candidate must still be the reviewed SHA.
-  - **`unauthorized_remote_movement` and `pushed_candidate_unauthorized`.**
-    These pauses stay until a person answers them with the existing commands.
-    They report that something other than the engine pushed, and that
-    deserves a human look. The commands are documented as legacy-only.
-  - **A legacy run that expects a remote finish**, and a project that needs
-    the old behaviour once, use one deliberate path:
-    1. `finish-run` (local);
-    2. then a publication (Stage 4) of the target branch.
-
-    There is no hidden remote step.
-- **The five `FinishWithoutThePinTests`** are retargeted. Under a publication
-  of the target, and under `finish-run --push-target` (now refused), each
-  damaged-record case refuses and changes no ref anywhere.
-  - Positive control: an intact publication of the same target succeeds.
+- **The refusal (I-L1).** `engine_git.run` refuses every remote command form
+  with `remote_operation_not_allowed`. That includes forms reached through
+  aliases, `-c` options, `--git-dir` or `-C`.
+  - `run_remote` has no production caller. A test scans `src/` and asserts
+    that.
+- **Offline status.**
+  - `runs --json` (the extension's poll), `slice-branch --json`, the handoff
+    and `finish-run --dry-run` run no remote command.
+  - The handoff's push line becomes "Local commit: <sha> on <branch>". Its
+    `- Branch:` line is kept for the current extension.
+- **The recorder.** A reusable test fixture puts a `git` wrapper first on
+  `PATH`, which logs every subcommand to a file. Every end-to-end test in
+  this plan uses it.
 
 **Starting points:**
-- `managed_finish.py` (`_run_guard`, `candidate_not_pushed`, the
-  `push_target` and `delete_remote_branch` steps, `_destination`).
-- `config.py` (`[finish]`), `plan.py` (resume of a paused legacy run),
-  `cli.py` (`finish-run`).
+- `engine_git.py` (`run`, `_checked`, the remote-command classifier),
+  `git_context.py`, `managed_run.py` (`runs` report), `intake_branch.py`,
+  `handoff.py`, `cli.py`.
 
 **Boundaries:**
-- No publication internals (Stage 4), beyond the hand-off to them.
+- No change to acceptance rules (Stage 2) or to finish (Stage 4).
 
 **Acceptance evidence:**
-- **Local finish.** A finish on a repository with and without a bare remote:
-  - the target is merged locally;
+- **The refusal.** One test per remote command form refuses through
+  `engine_git.run`. Positive control: the same form under plain `git` does
+  contact a local bare remote, whose hook marker runs.
+- **Planted configuration, end to end.** A repository plants
+  `remote.origin.url` at a decoy, `url.*.insteadOf`, `core.sshCommand`, and
+  `credential.helper` at marker scripts.
+  - A full managed run, `runs --json` polling and the handoff record no
+    remote subcommand, and no marker runs.
+  - Positive control: plain `git ls-remote` in that repository runs the
+    planted program.
+- **No production caller.** The `src/` scan finds no caller of `run_remote`.
+
+## Stage 4 — Local finish and safe legacy migration
+
+**Outcome:**
+- **The default finish is local.** `finish-run` merges into the local target
+  in every participating repository, after I-L2b holds in each. It then
+  cleans up (optional plan removal, worktree removal, local branch
+  deletion). It contacts no remote.
+  - It no longer emits `keep_remote_branch` or `candidate_not_pushed`. The
+    current extension then hides its push choice by itself.
+  - `--push-target` and `[finish] delete_remote_branch = true` refuse with
+    `remote_finish_removed`, naming Plan P's Push to review. `check-config`
+    reports a config that still sets `delete_remote_branch`.
+- **Legacy push pauses (L-D1, strict).** On a plain `resume-plan`, a legacy
+  `push_authorization_required` pause converts only if **all** of these hold:
+  1. `awaiting` is exactly that pause, for the current stage, and the stage is
+     not accepted;
+  2. the recorded verdict (`read_recorded_outcome`) is `READY`, and its
+     reviewed commit equals the paused candidate SHA and `HEAD` of the
+     expected branch;
+  3. the tree is clean apart from stage artifacts, every sibling is at its
+     recorded candidate, and the plan digest is unchanged;
+  4. no deferred obligation is promoted, and the recorded verdict names no
+     `promote_deferred`;
+  5. the recorded verdict has no deferred gate without an instance id;
+  6. every human check of the stage's recorded gate is answered Pass.
+
+  **Then it runs the ordinary post-`READY` sequence, unchanged:**
+  1. local freeze and accept, I-L2b included;
+  2. `_reconcile_deferred` over the recorded verdict;
+  3. the promoted, `gates_before` and completion checks.
+
+  It records `legacy_push_pause_converted` (stage, SHA, time) and prints a
+  notice. If any condition fails, the pause stays, and resume reports which
+  condition failed. Nothing is pushed or granted, and the stage is never
+  re-entered as an implementation turn.
+- **Recorded incident pauses (L-D2).** `unauthorized_remote_movement` and
+  `pushed_candidate_unauthorized` pauses stay until a person answers them
+  with the existing local commands.
+  - The answer clears only that pause (I-L3).
+  - A pause raised mid-loop then resumes the stage normally.
+  - A pause raised after `READY` then goes through the L-D1 conditions above.
+- **Legacy records.** Legacy pins and remote records load inertly. They are
+  never read to authorize, accept or finish.
+
+**Starting points:**
+- `managed_finish.py` (`_run_guard`, `candidate_not_pushed`,
+  `keep_remote_branch`, the `push_target` and `delete_remote_branch` steps,
+  `_destination`), `config.py` (`[finish]`).
+- `plan.py` (resume of paused legacy runs, `_reconcile_deferred`),
+  `acceptance.py`, `cli.py`.
+
+**Boundaries:**
+- No remote contact anywhere. There is no publication (Plan P).
+
+**Acceptance evidence (real repositories, legacy-shaped state fixtures):**
+- **Local finish.** With and without a bare remote, and with a sibling:
+  - the target is merged locally in each repository;
   - the recorder shows no remote subcommand;
   - the remote's refs are unchanged.
-- **Refusals.** `--push-target` and `delete_remote_branch` each refuse with
+- **Finish history.** A finish after an accepted commit was rewritten away in
+  the primary, or in a sibling, refuses with `run_history_rewritten`, and
+  nothing is merged. Positive control: the unrewritten run finishes.
+- **Refusals.** `--push-target` and `delete_remote_branch` refuse with
   `remote_finish_removed`, and nothing is merged.
-- **Legacy states.** Fixtures in legacy shape:
-  - pinned and paused at `push_authorization_required` → resume accepts
-    locally, with the notice;
-  - paused at `unauthorized_remote_movement` → it stays paused until
-    acknowledged;
-  - legacy unpinned, with a remote → it finishes locally.
-- **The retargeted tests.** The five, with their control.
+- **Conversion, positive.**
+  - A pause meeting every condition converts, is accepted locally, and
+    records `legacy_push_pause_converted`.
+  - A pause followed by a `gates_before` on the next stage converts, then
+    stops at that gate.
+  - A recorded verdict that defers a check converts, and the obligation is in
+    the ledger afterwards.
+- **Conversion, negative.** Each of the following stays paused, names the
+  failed condition, and leaves state byte-identical:
+  - a promoted obligation;
+  - a moved `HEAD`;
+  - a non-`READY` verdict;
+  - a dirty tree;
+  - a moved sibling;
+  - an edited plan;
+  - an unanswered human check.
+- **Incident pauses.** They stay until answered. The answer clears only the
+  pause and accepts nothing.
+- **The five finish tests,** retargeted as in "The seven failing tests".
 
-## Stage 4 — Explicit publication (Push to review, engine side)
+## Stage 5 — Remaining local Git hardening
 
-**Outcome:**
-- **The command.** `sparring publish --repo-root <path> --sha <full sha> --remote <name> --branch <destination> [--json]`
-  is a preview. It writes nothing and prints:
-  - the repository path;
-  - the commit SHA and subject;
-  - the remote name and its URL, resolved from a trusted snapshot of user
-    and system configuration only;
-  - the destination ref and its current tip;
-  - whether the push is a fast-forward, a new branch, or refused as
-    non-fast-forward;
-  - a confirmation token binding all of these (I-L4).
-- **The push.** `… --confirm <token>` re-reads everything. It refuses with
-  `publish_preview_changed` if anything differs. It then pushes only that SHA
-  to only that ref:
-  - through the hardened isolated remote path;
-  - with an explicit expected old tip (`--force-with-lease=<ref>:<old>`);
-  - comparing full SHAs (R-14).
-  - There is no force push and no tag push.
-  - A destination of `main`, `master` or the repository's default branch
-    refuses unless `--allow-default-branch` is given. That flag is shown in
-    the preview.
-- **A publication receipt** goes to
-  `<git-common-dir>/agent-sparring/publications/` (time, SHA, destination,
-  result). No freeze, accept, review or finish code reads it (I-L3). The
-  output says plainly "Published for review. This does not accept the
-  candidate."
-- **The two applicable tests** (Stage 1 #1 and #2) become publication tests:
-  - planted `pushInsteadOf`, `pushurl` and `insteadOf` never redirect a
-    publish;
-  - forms that hide the destination stay refused.
-- **VS Code contract.** The JSON schema of the preview and the result is
-  documented in `docs/reference.md`, so the extension can show exactly those
-  fields and require an explicit click.
-
-**Starting points:**
-- `push_gate.py` (the push half), `remote_pin.py` (the snapshot),
-  `engine_git.py` (the remote path), `cli.py`, `docs/reference.md`.
-
-**Boundaries:**
-- Engine only. The VS Code button is the companion plan.
-- No credential guarantees (Plan D).
-
-**Acceptance evidence (real bare remotes):**
-- **Success.** Preview then confirm pushes exactly the SHA to exactly the ref,
-  and the receipt is written. Stage, run and acceptance state are byte-
-  identical before and after.
-- **Drift.** After the preview, changing the SHA, the branch, the remote URL,
-  the destination tip, or a planted transport key → `publish_preview_changed`.
-  Nothing is pushed.
-- **A race.** A destination moved by someone else between preview and
-  confirm makes the lease refuse, and the ref is unchanged.
-  - Positive control: plain `git push` without a lease overwrites it.
-- **Planted configuration.** Planted `pushInsteadOf`, `pushurl` or
-  `insteadOf` never redirects the push. The decoy's refs and hook marker
-  show nothing.
-  - Positive control: plain `git push` is redirected.
-- **The default branch** refuses without the flag.
-- **Separation.** An import test shows that the acceptance, review and finish
-  modules never import the receipt reader.
-
-## Stage 5 — Local Git hardening completion
-
-**Outcome (audit R-6 to R-8):**
+**Outcome (audit R-4 and R-6 to R-8):**
+- **R-4, ownership.** In a managed worktree, the owning run comes from the
+  managed record. A `.sparring/` claim that contradicts it refuses with
+  `stage_owner_mismatch`. That covers `run` cleared, `current_stage`
+  changed, or plan state deleted.
 - **R-6, signing programs.**
   - Marker tests establish which engine commands run a signing or
     verification program from local or worktree scope: `log --format=%H`,
@@ -427,13 +453,16 @@ This is Plan R2's Stage 1, narrowed to what local-first still needs.
   refuses with `repository_config_unreadable`.
 
 **Starting points:**
-- `engine_git.py` (`BASE_OVERRIDES`, `config_entries`, `_checked`),
-  `managed_finish.py`, `managed_run.py`, `git_context.py`.
+- `acceptance.py` (`_owning_run`), `managed_run.py` (`record_for_worktree`),
+  `engine_git.py` (`BASE_OVERRIDES`, `config_entries`, `_checked`),
+  `managed_finish.py`, `git_context.py`.
 
 **Acceptance evidence:**
-- **R-6.** For each engine command, a marker script set as a local-scope
-  signing program runs under plain Git (positive control) and not under the
-  engine. A globally configured signer still signs the finish merge.
+- **R-4.** Each ownership manipulation refuses with `stage_owner_mismatch`.
+  Positive control: the unmanipulated stage is accepted.
+- **R-6.** For each engine command, a local-scope marker signing program runs
+  under plain Git (positive control) and not under the engine. A globally
+  configured signer still signs the finish merge.
 - **R-7.** A populated submodule with a clean-filter marker in its own
   configuration: the marker runs under plain `git status`, and not under the
   engine's. An uncommitted gitlink change is still reported dirty.
@@ -441,34 +470,33 @@ This is Plan R2's Stage 1, narrowed to what local-first still needs.
 
 ## Design decisions
 
-- **L-D1, legacy push pauses.** A paused `push_authorization_required` is
-  converted to local acceptance on resume. The alternative is to require a
-  person to answer it once.
-  - Conversion is safe because that pause only ever followed a `READY` at the
-    same SHA.
-  - **Confirm before approval.**
-- **L-D2, remote movement detection.** Remote movement detection is dropped
-  from normal runs, not kept as an option.
-  - It needed `ls-remote` after every turn, saw only one ref, and was
-    detection rather than prevention.
-  - Plan D is the prevention. A publication's lease still detects a moved
-    destination at publish time.
-  - **Confirm before approval.**
-- **L-D3, `--allow-push-for-run`.** It is refused, not silently ignored.
-- **L-D4, publishing the default branch** needs a visible extra flag.
-- **L-D5, stage count.** Five small stages, each gated, instead of Plan R2's
-  three broad ones.
-  - Stages 4 and 5 are independent of each other. Stage 5 could run before 4.
+- **L-D1 (approved 2026-10-23, conditional).** A legacy push pause converts
+  only under the six conditions in Stage 4. Each is verified at conversion,
+  never assumed. Then the ordinary post-`READY` sequence runs. A push-only
+  permission never becomes acceptance of unreviewed code.
+- **L-D2 (approved 2026-10-23).** Remote-movement monitoring and all remote
+  contact are removed from normal runs. Recorded incident pauses stay
+  available for explicit resolution.
+- **L-D3.** Deprecated flags refuse with typed codes and guidance
+  (`push_not_part_of_runs`, `push_permission_deprecated`,
+  `remote_finish_removed`). They are never aliases (I-L6, the user's
+  correction of 2026-10-23).
+- **L-D4.** Publication is Plan P. Plan L has no remote exception at all.
+- **L-D5.** I-L2b is per repository (the user's correction of 2026-10-23).
 
 ## After Plan L is accepted (human)
 
 1. Run the credential-free isolated test at the final exact SHA.
 2. Run an independent security review of `36e2cea..<final sha>`, focused on
-   I-L1 to I-L5.
-3. Write the companion plan in `agent-sparring-vscode`:
-   - remove the push choice and the push-authorization prompts;
-   - make polling offline;
-   - add **Push to review**, which shows the preview fields and needs an
-     explicit click;
-   - label it "not acceptance".
-4. Plan D next, then Plan 2.
+   I-L1 to I-L6.
+3. Run the companion extension plan in `agent-sparring-vscode`:
+   - feature-detect `local_first`;
+   - hide the auto-push start option, the "Allow push" panel and the finish
+     push choice;
+   - show converted legacy pauses as "Continue locally (no push)", which runs
+     a plain `resume-plan`;
+   - make polling offline.
+
+   It can ship after Stage 2 is integrated. Older extensions keep working,
+   and receive typed refusals for the removed push actions.
+4. Then Plan P, then Plan D, then Plan 2.
