@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -1070,6 +1071,12 @@ def _run_guard(repo_root: Path, record: ManagedRunRecord):
             continue
         if remote is not None and remote.pin is not None:
             return _pinned_finish(repo_root, record, remote.pin)
+        snapshot = _local_snapshot(root, record.run_key)
+        if snapshot is not None:
+            # A local-first run: held to the snapshot it took at its start.
+            return engine_git.trusted_config(
+                [Path(repo_root), Path(record.worktree_path)], snapshot
+            )
     pinned = record.pinned or managed_run.run_flag_pinned(repo_root, record.run_key)
     if unreadable:
         step, detail = unreadable[0]
@@ -1082,6 +1089,13 @@ def _run_guard(repo_root: Path, record: ManagedRunRecord):
             + "; refusing to finish without it -- nothing was merged, pushed or deleted by this "
             "finish",
         )
+    if managed_run.engine_recorded_snapshot(repo_root, record.run_key):
+        raise _StepFailed(
+            "checks",
+            "trusted_config_missing: the engine's record says this run held a trusted "
+            "configuration snapshot, but none can be found in its run state; refusing to finish "
+            "without it -- nothing was merged, pushed or deleted by this finish",
+        )
     if pinned:
         raise _StepFailed(
             "checks",
@@ -1092,6 +1106,28 @@ def _run_guard(repo_root: Path, record: ManagedRunRecord):
     # Readable but unpinned, or absent, and the engine's record agrees: a
     # run recorded before pins.
     return contextlib.nullcontext()
+
+
+def _local_snapshot(sparring_dir: Path, run_key: str) -> Any:
+    """A local-first run's trusted configuration snapshot from its run state
+    under ``sparring_dir``, or ``None``. A state that cannot be read, or a
+    malformed snapshot, gives ``None`` (and so, for a run the engine says
+    held one, a refusal)."""
+
+    from agent_sparring.trusted_snapshots import SnapshotError, parse_entries
+
+    path = Path(sparring_dir) / "plans" / f"{run_key}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    raw = payload.get("config_snapshot") if isinstance(payload, dict) else None
+    if raw is None:
+        return None
+    try:
+        return parse_entries(raw, "config_snapshot")
+    except SnapshotError:
+        return None
 
 
 #: The pin of the run being finished, while its finish runs.

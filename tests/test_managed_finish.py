@@ -40,6 +40,9 @@ class _FinishTestCase(_ManagedRepoTestCase):
         run_state.remote_pin = pin_remote(Path(record.worktree_path), record.branch)
         run_state.config_snapshot = None
         run_state.save(state_path)
+        # An engine from before local-first runs never wrote the snapshot
+        # record either.
+        managed_run.snapshot_flag_path(self.repo, record.run_key).unlink(missing_ok=True)
 
     def _complete(self, *, push: bool = True, legacy_pin: bool = True):
         """A managed run with every stage accepted at the worktree's HEAD

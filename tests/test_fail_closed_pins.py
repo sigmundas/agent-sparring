@@ -7,9 +7,11 @@ What these tests hold, one sentence each:
   legacy-shaped state in its place), refuses ``finish-run`` with
   ``remote_pin_missing`` (exit 3) and touches no ref of either remote
   (Stage 4 of Plan L replaces this with the run-state integrity refusal);
-- Plan L: freeze/accept still resolve a stage's owner from engine run
-  state, but are decided locally -- a legacy pin, intact or damaged, is
-  inert and reachability is never an input;
+- Plan L: freeze/accept resolve a stage's owner from engine run state and
+  are decided locally -- reachability is never an input -- but never
+  unguarded: a trusted snapshot (a legacy pin's) that is gone or damaged
+  refuses with ``trusted_config_missing``, and a run from before snapshots
+  refuses until a resume records one;
 - an acknowledgement is a baseline for further movement, never an
   explanation of a candidate -- not even one behind the acknowledged tip;
 - a push raced by someone else between the movement check and the engine's
@@ -33,7 +35,7 @@ import conftest_path  # noqa: F401
 
 from agent_sparring import acceptance, engine_git, managed_run
 from agent_sparring.cli import main
-from agent_sparring.plan import PlanRunError, PlanRunStatus, resume_plan
+from agent_sparring.plan import PlanError, PlanRunError, PlanRunStatus, resume_plan
 from agent_sparring.providers import ProviderError
 from agent_sparring.push_gate import authorization_for_run, ensure_candidate_pushed
 from agent_sparring.remote_pin import (
@@ -167,10 +169,15 @@ class FinishWithoutThePinTests(_FinishTestCase):
 
 
 class LegacyAcceptTests(_AuthorityCase):
-    """Plan L (I-L2): freeze and accept are local. A legacy run's pin --
-    present, missing or damaged -- is inert, and reachability is never an
-    input; the owning run is still resolved from engine run state, because
-    its accepted history and any recorded remote pause still apply."""
+    """Plan L: freeze and accept are local (I-L2) -- reachability is never an
+    input -- but never unguarded (I-L4). An owned stage's run must hold the
+    trusted configuration snapshot its Git commands are compared with: a
+    local-first run's own, or a legacy run's pin. A snapshot the engine's
+    outside record says existed, and that is gone or damaged, refuses
+    (``trusted_config_missing``); a run from before any snapshot refuses
+    until a resume records one. The owning run is resolved from engine run
+    state, because its snapshot, accepted history and any recorded remote
+    pause apply to the stage."""
 
     GRANT_PUSH_FOR_RUN = False
 
@@ -191,16 +198,29 @@ class LegacyAcceptTests(_AuthorityCase):
         pin = pin_remote(self.repo, "feature/x")
         self._rewrite(self.state_path, lambda p: (p.pop("config_snapshot", None),
                                                   p.__setitem__("remote_pin", pin.to_dict())))
+        managed_run.snapshot_flag_path(self.repo, self.run_key).unlink(missing_ok=True)
         managed_run.mark_pinned(self.repo, self.run_key)
 
-    def _legacy_with_the_candidate_on_the_remote(self) -> str:
-        """A run recorded by an engine from before pins (no pin, no engine
-        record of one), its candidate pushed by hand, and the stage frozen as
-        such an engine could have left it."""
+    def _from_before_snapshots(self) -> None:
+        """The run state as an engine from before pins left it: no pin, no
+        snapshot, and no engine record outside the project directory of
+        either."""
+
+        self._rewrite(self.state_path, lambda p: (p.pop("config_snapshot", None), p.pop("remote_pin", None)))
+        managed_run.snapshot_flag_path(self.repo, self.run_key).unlink(missing_ok=True)
+        managed_run.run_flag_path(self.repo, self.run_key).unlink(missing_ok=True)
+
+    def _legacy_with_the_candidate_on_the_remote(self, *, pinned: bool = False) -> str:
+        """A run recorded by an older engine -- pinned, or from before pins --
+        its candidate pushed by hand, and the stage frozen as such an engine
+        could have left it."""
 
         head = self._ready_not_accepted()
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
-        self._rewrite(self.state_path, lambda p: (p.pop("config_snapshot", None), p.pop("remote_pin", None)))
+        if pinned:
+            self._legacy_pinned()
+        else:
+            self._from_before_snapshots()
         stage = self._stage(S1)
         state = stage.read_state()
         state.status = StageStatus.FROZEN
@@ -224,17 +244,33 @@ class LegacyAcceptTests(_AuthorityCase):
             ])
         return code, err.getvalue()
 
-    def test_accept_candidate_on_an_unpinned_legacy_run_is_decided_locally(self):
-        # Was ..._refuses: an unpinned legacy run is no longer refused for
-        # lacking a pin, and reachability is still never taken as anything.
-        # The same acceptance with the candidate deleted from the remote
-        # again succeeds: the remote is not an input either way.
-        head = self._legacy_with_the_candidate_on_the_remote()
-        _run_git(self.repo, "push", "-q", "origin", "--delete", "feature/x")
+    def test_accept_candidate_on_an_unpinned_legacy_run_refuses(self):
+        # Still refuses -- never falling back to reachability -- now for want
+        # of a trusted snapshot (Plan L), and the refusal says a resume
+        # records one.
+        self._legacy_with_the_candidate_on_the_remote()
 
         code, err = self._accept()
 
-        self.assertEqual(code, 0, err)
+        self.assertEqual(code, 1)
+        self.assertIn("trusted_config_missing", err)
+        self.assertIn("resume the run", err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
+
+    def test_after_a_resume_records_a_snapshot_the_legacy_run_is_decided_locally(self):
+        # Positive control for the refusal above: the resume records the
+        # snapshot (visibly), and acceptance then follows on the local rules
+        # and the reviewer's READY -- with the candidate deleted from the
+        # remote, which is not an input.
+        head = self._legacy_with_the_candidate_on_the_remote()
+        _run_git(self.repo, "push", "-q", "origin", "--delete", "feature/x")
+        reports: list[str] = []
+
+        self._resume(_StageAdapter(self.repo), _SparringAdapter([]), stop_after_stage=S1,
+                     report=reports.append)
+
+        self.assertTrue(any("weaker than a run-start snapshot" in line for line in reports), reports)
+        self.assertIn("config_snapshot", json.loads(self.state_path.read_text(encoding="utf-8")))
         state = self._stage(S1).read_state()
         self.assertIs(state.status, StageStatus.ACCEPTED)
         self.assertEqual(state.candidate_sha, head)
@@ -242,7 +278,7 @@ class LegacyAcceptTests(_AuthorityCase):
     def test_an_emptied_owner_field_does_not_make_the_stage_hand_driven(self):
         # The run state is positioned at the stage, so the run owns it, and
         # the remote incident it recorded still refuses acceptance.
-        self._legacy_with_the_candidate_on_the_remote()
+        self._legacy_with_the_candidate_on_the_remote(pinned=True)
         self._with_a_recorded_movement_pause()
         stage = self._stage(S1)
         state = stage.read_state()
@@ -259,7 +295,7 @@ class LegacyAcceptTests(_AuthorityCase):
         # Positive control for the refusal above: with the owning-run lookup
         # disabled in this test only, the same frozen stage is accepted --
         # the run's recorded pause would no longer apply to it.
-        self._legacy_with_the_candidate_on_the_remote()
+        self._legacy_with_the_candidate_on_the_remote(pinned=True)
         self._with_a_recorded_movement_pause()
         stage = self._stage(S1)
         state = stage.read_state()
@@ -292,54 +328,69 @@ class LegacyAcceptTests(_AuthorityCase):
         change(payload)
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
-    # Was: ..._refuses_freeze with remote_pin_missing. A legacy pin is inert
-    # under Plan L, so a pinned run whose pin is gone or damaged freezes on
-    # the local rules -- its candidate is not on the remote at all -- and is
-    # not refused for the pin.
+    # A pinned legacy run's pin carries its trusted snapshot. Gone or
+    # damaged, it is never read as "no snapshot, so no guard": freeze refuses
+    # with trusted_config_missing (it used to say remote_pin_missing).
 
-    def test_a_pinned_run_whose_pin_is_gone_freezes_locally(self):
+    def test_a_pinned_run_whose_pin_is_gone_refuses_freeze(self):
         code, err = self._freeze_after(lambda path: self._rewrite(path, lambda p: p.pop("remote_pin")))
-        self.assertEqual(code, 0, err)
-        self.assertNotIn(REMOTE_PIN_MISSING, err)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
-        self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
+        self.assertEqual(code, 1)
+        self.assertIn("trusted_config_missing", err)
+        self.assertIn("not taken again", err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
-    def test_a_pinned_run_whose_pin_is_malformed_freezes_locally(self):
+    def test_a_pinned_run_whose_pin_is_malformed_refuses_freeze(self):
         code, err = self._freeze_after(
             lambda path: self._rewrite(path, lambda p: p.__setitem__("remote_pin", {"branch": 7}))
         )
-        self.assertEqual(code, 0, err)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
+        self.assertEqual(code, 1)
+        self.assertIn("trusted_config_missing", err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
     def test_a_pinned_run_whose_state_is_unreadable_refuses_freeze(self):
-        # Still refused: who owns the stage cannot be established, so its
-        # history and pause cannot be read (local integrity, not a pin).
         code, err = self._freeze_after(lambda path: path.write_text("{broken", encoding="utf-8"))
         self.assertEqual(code, 1)
         self.assertIn("cannot read run state", err)
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
     def test_positive_control_the_intact_legacy_state_freezes(self):
-        # The refusal above is the unreadable state, not the fixture.
+        # The three refusals above are the damage, not the fixture.
         code, err = self._freeze_after(lambda path: None)
         self.assertEqual(code, 0, err)
         self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
 
-    def test_a_local_rule_still_refuses_a_run_whose_pin_is_damaged(self):
-        # A damaged pin decides nothing, in either direction: a dirty tree
-        # still refuses with candidate_not_on_branch.
-        def damage(path: Path) -> None:
-            self._rewrite(path, lambda p: p.__setitem__("remote_pin", {"branch": 7}))
-            (self.repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
-
-        code, err = self._freeze_after(damage)
+    def test_damaging_the_pin_does_not_let_a_changed_configuration_through(self):
+        # The point of refusing: with the pin intact, a watched setting
+        # changed since the run started is refused by name...
+        code, err = self._freeze_after(
+            lambda path: _run_git(self.repo, "config", "core.sshCommand", "/bin/false")
+        )
         self.assertEqual(code, 1)
-        self.assertIn("candidate_not_on_branch", err)
+        self.assertIn("repository_config_changed", err)
+        # ...and damaging the pin as well does not turn that into an
+        # unguarded freeze.
+        self._rewrite(self.state_path, lambda p: p.__setitem__("remote_pin", {"branch": 7}))
+        code, err = self._freeze()
+        self.assertEqual(code, 1)
+        self.assertIn("trusted_config_missing", err)
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
-    # Was: resuming a pinned run whose pin is gone refused (remote_pin_missing)
-    # and a never-pinned one was re-pinned. Runs are local-first: a resume
-    # neither pins nor needs a pin, and completes on the local rules.
+    def test_positive_control_without_the_guard_the_changed_configuration_is_followed(self):
+        # The same change, with the trusted-configuration guard disabled in
+        # this test only: the freeze goes through, so the refusals above are
+        # the guard's.
+        from agent_sparring import trusted_snapshots
+
+        with mock.patch.object(trusted_snapshots, "guard", lambda *a, **k: contextlib.nullcontext()):
+            code, err = self._freeze_after(
+                lambda path: _run_git(self.repo, "config", "core.sshCommand", "/bin/false")
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
+
+    # A resume never pins (runs are local-first), and never re-takes a
+    # snapshot the engine's record says existed; a run from before any
+    # snapshot gets one, visibly.
 
     def test_resuming_a_pinned_run_whose_pin_is_gone_does_not_re_pin_it(self):
         self._ready_not_accepted()
@@ -347,20 +398,28 @@ class LegacyAcceptTests(_AuthorityCase):
         self._rewrite(self.state_path, lambda p: p.pop("remote_pin"))
 
         stage_adapter = _StageAdapter(self.repo)
-        result = self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
 
-        self.assertNotIn("remote_pin", json.loads(self.state_path.read_text(encoding="utf-8")))
+        self.assertIn("trusted_config_missing", str(ctx.exception))
+        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertNotIn("remote_pin", payload)
+        self.assertNotIn("config_snapshot", payload)
         self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
-        self.assertIsNone(result.awaiting)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
-    def test_resuming_a_run_the_engine_never_pinned_does_not_pin_it(self):
+    def test_resuming_a_run_the_engine_never_pinned_records_a_snapshot_not_a_pin(self):
+        # Positive control for the refusal above: with no engine record of a
+        # pin or snapshot (a run from before either), the resume records a
+        # snapshot -- and still no pin -- and the stage completes.
         self._ready_not_accepted()
-        self._rewrite(self.state_path, lambda p: p.pop("config_snapshot", None))
+        self._from_before_snapshots()
 
         self._resume(_StageAdapter(self.repo), _SparringAdapter([]), stop_after_stage=S1)
 
-        self.assertNotIn("remote_pin", json.loads(self.state_path.read_text(encoding="utf-8")))
+        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertNotIn("remote_pin", payload)
+        self.assertIn("config_snapshot", payload)
         self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
 
 

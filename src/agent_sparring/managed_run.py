@@ -42,6 +42,9 @@ SCHEMA_VERSION = 1
 RECORDS_SUBDIR = Path("agent-sparring") / "worktrees"
 #: Where a run that has no managed record saying so records that it is pinned.
 RUNS_SUBDIR = Path("agent-sparring") / "runs"
+#: Where the engine records that a local-first run holds a trusted
+#: configuration snapshot (see :func:`mark_snapshot_recorded`).
+SNAPSHOTS_SUBDIR = Path("agent-sparring") / "snapshots"
 INPUT_KINDS = ("markdown", "manifest")
 EVENTS = (
     "created",
@@ -508,6 +511,74 @@ def mark_pinned(repo_root: Path, run_key: str) -> None:
     path = run_flag_path(repo_root, run_key)
     temp = _write_temp(
         path.parent, {"schema_version": SCHEMA_VERSION, "run_key": run_key, "pinned": True, "at": _now()}
+    )
+    try:
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def snapshot_flag_path(repo_root: Path, run_key: str) -> Path:
+    _check_run_key(run_key)
+    return git_common_dir(repo_root) / SNAPSHOTS_SUBDIR / f"{run_key}.json"
+
+
+def engine_recorded_snapshot(repo_root: Path, run_key: str) -> bool:
+    """Does the engine's record outside the project directory say that
+    ``run_key``'s trusted configuration snapshot was recorded? A file that
+    exists but cannot be read says yes: it is never taken to mean "none was
+    recorded", so a damaged or removed snapshot in the run state refuses
+    rather than dropping the guard."""
+
+    path = snapshot_flag_path(repo_root, run_key)
+    if not os.path.lexists(path):
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not (isinstance(payload, Mapping) and payload.get("snapshot") is False)
+
+
+def recorded_snapshot_siblings(repo_root: Path, run_key: str) -> frozenset[str] | None:
+    """The resolved sibling paths whose snapshots the engine's record says
+    were taken for ``run_key``; ``None`` when the record exists but cannot
+    be read (every sibling is then taken to have one)."""
+
+    path = snapshot_flag_path(repo_root, run_key)
+    if not os.path.lexists(path):
+        return frozenset()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    siblings = payload.get("siblings") if isinstance(payload, Mapping) else None
+    if siblings is None:
+        return frozenset()
+    if not isinstance(siblings, list) or not all(isinstance(entry, str) for entry in siblings):
+        return None
+    return frozenset(siblings)
+
+
+def mark_snapshot_recorded(repo_root: Path, run_key: str, *, siblings: tuple[str, ...] = ()) -> None:
+    """Record outside the project directory that ``run_key`` holds a trusted
+    configuration snapshot -- and for which sibling repositories, by
+    resolved path (see :mod:`agent_sparring.trusted_snapshots`). Written
+    before the run state that holds them; only ever extended, never cleared."""
+
+    known = recorded_snapshot_siblings(repo_root, run_key)
+    if engine_recorded_snapshot(repo_root, run_key) and (known is None or set(siblings) <= known):
+        return
+    path = snapshot_flag_path(repo_root, run_key)
+    temp = _write_temp(
+        path.parent,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "run_key": run_key,
+            "snapshot": True,
+            "siblings": sorted(set(siblings) | set(known or ())),
+            "at": _now(),
+        },
     )
     try:
         os.replace(temp, path)

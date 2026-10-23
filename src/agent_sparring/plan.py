@@ -257,6 +257,13 @@ from agent_sparring.remote_pin import (
     who,
 )
 from agent_sparring.capabilities import push_not_part_of_runs, push_permission_deprecated
+from agent_sparring import trusted_snapshots
+from agent_sparring.trusted_snapshots import (
+    RunSnapshots,
+    SiblingSnapshot,
+    SnapshotError,
+    sibling_snapshots_from,
+)
 from agent_sparring.run_history import (
     AcceptedCandidate,
     RunHistoryError,
@@ -642,6 +649,11 @@ class PlanRunState:
     #: command the run makes there is held to it. ``None`` -- and omitted --
     #: for a run recorded before it existed, which uses its legacy pin's.
     config_snapshot: tuple[tuple[str, str], ...] | None = None
+    #: Each declared sibling repository's trusted snapshot, by resolved path,
+    #: taken locally when the run started or, for a sibling that was not a
+    #: repository then, when its stage was first entered (see
+    #: :mod:`agent_sparring.trusted_snapshots`). Omitted while empty.
+    sibling_snapshots: tuple[SiblingSnapshot, ...] = field(default_factory=tuple)
     #: Every candidate this run accepted, per repository, in order (see
     #: :mod:`agent_sparring.run_history`): its accepted history, which only
     #: grows. Omitted while empty.
@@ -674,6 +686,10 @@ class PlanRunState:
             payload["accepted_candidates"] = [entry.to_dict() for entry in self.accepted_candidates]
         else:
             payload.pop("accepted_candidates", None)
+        if self.sibling_snapshots:
+            payload["sibling_snapshots"] = [entry.to_dict() for entry in self.sibling_snapshots]
+        else:
+            payload.pop("sibling_snapshots", None)
         payload["deferred_human_checks"] = [
             obligation.to_dict() for obligation in self.deferred_human_checks
         ]
@@ -811,8 +827,9 @@ class PlanRunState:
                 sibling_pins=sibling_pins_from(payload.get("sibling_pins")),
                 config_snapshot=_snapshot_from(payload.get("config_snapshot")),
                 accepted_candidates=accepted_records_from(payload.get("accepted_candidates")),
+                sibling_snapshots=sibling_snapshots_from(payload.get("sibling_snapshots")),
             )
-        except (PushError, DeferredGateError, GitContextError, RunHistoryError) as exc:
+        except (PushError, DeferredGateError, GitContextError, RunHistoryError, SnapshotError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -1526,13 +1543,18 @@ def start_plan(
     # nothing about a remote is pinned, read or contacted.
     try:
         state.config_snapshot = engine_git.capture_snapshot(Path(repo_root))
+        state.sibling_snapshots = _capture_sibling_snapshots(Path(repo_root), stages, ())
     except GitContextError as exc:
         raise PlanError(
-            f"refusing a fresh run of {label}: cannot snapshot the repository's configuration "
+            f"refusing a fresh run of {label}: cannot snapshot a repository's configuration "
             f"({exc})"
         ) from exc
     if managed:
         _write_plan_snapshot(repo_root, sparring_dir, key)
+    # Outside the project directory, before the state that holds them:
+    # removing them from the run state can then never make this run look as
+    # if it never had them.
+    _mark_snapshots(repo_root, key, state)
     state.save(state_path)
     # Claimed only now that the run exists: a refusal above must not leave a
     # stage marked as owned by a run that was never recorded.
@@ -1555,6 +1577,162 @@ def start_plan(
         report=report,
         stop_after_stage=stop_after_stage,
     )
+
+
+def _sibling_roots(repo_root: Path, stages: Sequence[PlannedStage]) -> list[tuple[Any, Path]]:
+    """Every declared sibling repository, once per resolved path, with its
+    root."""
+
+    seen: set[str] = set()
+    found: list[tuple[Any, Path]] = []
+    for planned in stages:
+        for repository in planned.repositories:
+            root = sibling_root(repo_root, repository)
+            path = trusted_snapshots.resolved(root)
+            if path not in seen:
+                seen.add(path)
+                found.append((repository, root))
+    return found
+
+
+def _capture_sibling_snapshots(
+    repo_root: Path, stages: Sequence[PlannedStage], existing: tuple[SiblingSnapshot, ...]
+) -> tuple[SiblingSnapshot, ...]:
+    """``existing`` plus a fresh snapshot of every declared sibling that is a
+    repository and has none yet (a run start)."""
+
+    have = {entry.path for entry in existing}
+    captured = list(existing)
+    for _repository, root in _sibling_roots(repo_root, stages):
+        path = trusted_snapshots.resolved(root)
+        if path in have or not (root / ".git").exists():
+            continue
+        captured.append(SiblingSnapshot(path=path, entries=trusted_snapshots.capture(root)))
+        have.add(path)
+    return tuple(captured)
+
+
+def _mark_snapshots(repo_root: Path, run_key: str, state: "PlanRunState") -> None:
+    """Record outside the project directory that ``run_key`` holds trusted
+    snapshots, and for which siblings (see
+    :func:`agent_sparring.managed_run.mark_snapshot_recorded`)."""
+
+    from agent_sparring.managed_run import ManagedRunError, mark_snapshot_recorded
+
+    try:
+        mark_snapshot_recorded(
+            Path(repo_root), run_key, siblings=tuple(entry.path for entry in state.sibling_snapshots)
+        )
+    except (ManagedRunError, OSError) as exc:
+        raise PlanError(
+            f"cannot record run {run_key}'s trusted configuration snapshots outside the project "
+            f"directory ({exc}); nothing was run"
+        ) from exc
+
+
+def _run_snapshots(state: "PlanRunState") -> RunSnapshots:
+    try:
+        return trusted_snapshots.from_run_state(state.to_dict())
+    except SnapshotError as exc:
+        raise PlanError(f"malformed plan-run state: {exc}") from exc
+
+
+def _recorded_siblings(repo_root: Path, run_key: str) -> frozenset[str] | None:
+    from agent_sparring.managed_run import ManagedRunError, recorded_snapshot_siblings
+
+    try:
+        return recorded_snapshot_siblings(Path(repo_root), run_key)
+    except (ManagedRunError, OSError):
+        return None
+
+
+def _snapshot_for_sibling(
+    state: "PlanRunState",
+    state_path: Path,
+    repo_root: Path,
+    root: Path,
+    repository: Any,
+    *,
+    report: Reporter,
+) -> SiblingSnapshot | None:
+    """Make sure the run holds ``root``'s trusted snapshot, taking it now if
+    the engine never took one. Returns the snapshot taken now, ``None`` when
+    one was already held or ``root`` is not a repository yet. A snapshot the
+    engine's outside record says was taken, and the run state no longer
+    holds, refuses: it is never taken again from the current configuration."""
+
+    key = _RunOwner.of(state).key
+    if not (root / ".git").exists() or _run_snapshots(state).for_sibling(root) is not None:
+        return None
+    path = trusted_snapshots.resolved(root)
+    known = _recorded_siblings(repo_root, key)
+    if known is None or path in known:
+        raise PlanError(
+            trusted_snapshots.missing_message(
+                repo_root, key, what=f"sibling repository {repository.name!r} ({root})",
+                consequence="Nothing was run",
+            )
+        )
+    try:
+        entry = SiblingSnapshot(path=path, entries=trusted_snapshots.capture(root))
+    except GitContextError as exc:
+        raise PlanError(
+            f"cannot snapshot the configuration of sibling repository {repository.name!r} "
+            f"({root}): {exc}; nothing was run"
+        ) from exc
+    state.sibling_snapshots = state.sibling_snapshots + (entry,)
+    _mark_snapshots(repo_root, key, state)
+    state.save(state_path)
+    report(
+        f"sibling repository {repository.name!r} ({root}): trusted configuration snapshot "
+        "recorded now, as it is the first time this run works in it"
+    )
+    return entry
+
+
+def _ensure_snapshots(
+    state: "PlanRunState",
+    state_path: Path,
+    repo_root: Path,
+    stages: Sequence[PlannedStage],
+    *,
+    report: Reporter,
+) -> None:
+    """Before a resume runs anything: the run holds a trusted snapshot of
+    the primary repository and of every declared sibling that is a
+    repository. A run recorded before snapshots existed gets them now, from
+    the current configuration, with a notice that this is weaker than a
+    run-start snapshot; a snapshot the engine's outside record says was
+    taken and the run state no longer holds refuses, and is never taken
+    again."""
+
+    key = _RunOwner.of(state).key
+    if _run_snapshots(state).primary is None:
+        if trusted_snapshots.engine_recorded(repo_root, key):
+            raise PlanError(
+                trusted_snapshots.missing_message(
+                    repo_root, key, what="the primary repository", consequence="Nothing was run"
+                )
+            )
+        try:
+            state.config_snapshot = trusted_snapshots.capture(Path(repo_root))
+        except GitContextError as exc:
+            raise PlanError(
+                f"plan run {key} holds no trusted configuration snapshot and one cannot be taken "
+                f"now ({exc}); nothing was run"
+            ) from exc
+        _mark_snapshots(repo_root, key, state)
+        state.save(state_path)
+        report(
+            f"notice: plan run {key} was recorded before runs held a trusted configuration "
+            "snapshot, so one is recorded now, from the current configuration. This is weaker "
+            "than a run-start snapshot: configuration changed before this moment is taken as "
+            "trusted. A later change to it is refused."
+        )
+    elif state.config_snapshot is not None:
+        _mark_snapshots(repo_root, key, state)
+    for repository, root in _sibling_roots(Path(repo_root), stages):
+        _snapshot_for_sibling(state, state_path, Path(repo_root), root, repository, report=report)
 
 
 def _require_managed_record(repo_root: Path, run_key: str, expected_branch: str) -> None:
@@ -2044,6 +2222,7 @@ def resume_plan(
             next_turn,
             evidence=bool(evidence and evidence.strip()),
         )
+    _ensure_snapshots(state, state_path, Path(repo_root), stages, report=report)
     rollback: tuple[Path, ...] = ()
     if accept_advanced_head is not None:
         # Likewise validated in full before anything is written: a refused
@@ -2812,7 +2991,15 @@ def _ensure_stage(
     return stage
 
 
-def _declare_repositories(stage: Stage, planned: PlannedStage, repo_root: Path) -> None:
+def _declare_repositories(
+    stage: Stage,
+    planned: PlannedStage,
+    repo_root: Path,
+    *,
+    run_state: PlanRunState | None = None,
+    state_path: Path | None = None,
+    report: Reporter = lambda message: None,
+) -> tuple[SiblingSnapshot, ...]:
     """Record this stage's declared sibling repositories in ``state.json``.
 
     Declaring them here, rather than passing them into the acceptance gate,
@@ -2828,13 +3015,28 @@ def _declare_repositories(stage: Stage, planned: PlannedStage, repo_root: Path) 
     candidate must descend from (see :mod:`agent_sparring.run_history`).
     Recorded once and kept, like the stage's own ``base_sha``; never taken
     from the plan input.
+
+    And the run's trusted snapshot of each sibling (``run_state``): a
+    sibling that was not a repository when the run started gets one here,
+    the first time a stage of the run declares it -- returned, so the caller
+    can hold the rest of the run to it too. One the engine's outside record
+    says was taken and the run state no longer holds refuses.
     """
 
     declared = tuple(
         replace(repository, base_sha=None) for repository in planned.repositories
     )
     if not declared:
-        return
+        return ()
+    captured: list[SiblingSnapshot] = []
+    if run_state is not None and state_path is not None:
+        for repository in declared:
+            entry = _snapshot_for_sibling(
+                run_state, state_path, repo_root, sibling_root(repo_root, repository), repository,
+                report=report,
+            )
+            if entry is not None:
+                captured.append(entry)
     try:
         state = stage.read_state()
     except StageError as exc:
@@ -2864,10 +3066,10 @@ def _declare_repositories(stage: Stage, planned: PlannedStage, repo_root: Path) 
                 base_sha=base,
             )
         )
-    if tuple(repositories) == state.repositories:
-        return
-    state.repositories = tuple(repositories)
-    stage.write_state(state)
+    if tuple(repositories) != state.repositories:
+        state.repositories = tuple(repositories)
+        stage.write_state(state)
+    return tuple(captured)
 
 
 def _record_accepted(state: PlanRunState, state_path: Path, stage: Stage) -> None:
@@ -4126,17 +4328,20 @@ def _drive(
             stage_id=movement.stage_id,
             awaiting=movement,
         )
-    snapshot = state.config_snapshot
-    if snapshot is None and state.remote_pin is not None:
-        # A run recorded before runs were local-first: its legacy pin carries
-        # the snapshot it trusted. Nothing else of the pin is used.
-        snapshot = state.remote_pin.trusted_config
-    guard = (
-        engine_git.trusted_config([Path(repo_root)], snapshot)
-        if snapshot is not None
-        else contextlib.nullcontext()
-    )
-    with guard:
+    # Every engine Git command of the run, in the primary repository and in
+    # each sibling, is held to that repository's trusted snapshot (a legacy
+    # run's come from its pins). Start and resume make sure they exist; a
+    # run without the primary's is never driven unguarded.
+    snapshots = _run_snapshots(state)
+    if snapshots.primary is None:
+        raise PlanError(
+            trusted_snapshots.missing_message(
+                Path(repo_root), _RunOwner.of(state).key, what="the primary repository",
+                consequence="Nothing was run",
+            )
+        )
+    with contextlib.ExitStack() as guards:
+        guards.enter_context(trusted_snapshots.guard(Path(repo_root), snapshots))
         return _drive_pinned(
             source,
             stages,
@@ -4145,6 +4350,7 @@ def _drive(
             sparring_dir,
             repo_root,
             make_adapters,
+            guards=guards,
             **kwargs,
         )
 
@@ -4166,9 +4372,13 @@ def _drive_pinned(
     next_turn_choice: str | None = None,
     fresh_roles: tuple[str, ...] = (),
     fresh_reason: str | None = None,
+    guards: contextlib.ExitStack | None = None,
 ) -> PlanRunResult:
     """Walk the plan's stages from the recorded position until it pauses,
     fails or completes.
+
+    ``guards`` holds the run's trusted-configuration guards; a sibling
+    snapshot taken when its stage is first entered joins it at once.
 
     One loop for both plan inputs and for both entry modes: ``sparrer_first``
     only changes where the *first* stage entered starts (see
@@ -4371,7 +4581,12 @@ def _drive_pinned(
             # The declared cross-repository candidate set belongs to the
             # stage, so the acceptance gate finds it wherever it is invoked
             # from. Written before any provider turn.
-            _declare_repositories(stage, plan_stage, Path(repo_root))
+            for entry in _declare_repositories(
+                stage, plan_stage, Path(repo_root), run_state=state, state_path=state_path,
+                report=report,
+            ):
+                if guards is not None:
+                    guards.enter_context(engine_git.trusted_config([Path(entry.path)], entry.entries))
 
             if plan_stage.review_only:
                 _refuse_unapplied(

@@ -20,6 +20,7 @@ from agent_sparring.acceptance import (
     AcceptanceError,
     StaleCandidateError,
     accept_reviewed_candidate,
+    record_review,
 )
 from agent_sparring.manifest import ManifestError, manifest_digest, parse_manifest
 from agent_sparring.plan import (
@@ -445,7 +446,22 @@ class ReviewCompletionTests(_ReviewRepoTestCase):
         enter_review(
             review, self.repo, expected_branch="feature/x", preceding=((planned[0], build),)
         )
+        # The independent reviewer's READY, recorded with what it was over
+        # (Plan L, I-L2: completion needs the verdict at the exact commit).
+        record_review(review, self.repo, RoutingAction.READY)
         return review, head
+
+    def test_completion_without_a_recorded_review_refuses(self):
+        # Plan L (I-L2). The positive control is the test below: the same
+        # entered stage, with the READY recorded, completes.
+        review, _head = self._entered_review()
+        state = review.read_state()
+        state.review = None
+        review.write_state(state)
+        with self.assertRaises(AcceptanceError) as ctx:
+            accept_reviewed_candidate(review, self.repo, expected_branch="feature/x")
+        self.assertIn("verdict_not_at_candidate", str(ctx.exception))
+        self.assertIs(review.read_state().status, StageStatus.WORKING)
 
     def test_accepts_the_reviewed_commit_without_a_freeze_or_a_new_commit(self):
         review, head = self._entered_review()

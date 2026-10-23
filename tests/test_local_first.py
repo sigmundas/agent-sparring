@@ -36,6 +36,7 @@ from unittest import mock
 import conftest_path  # noqa: F401
 
 from agent_sparring import acceptance
+from agent_sparring import trusted_snapshots
 from agent_sparring.acceptance import (
     CANDIDATE_NOT_ON_BRANCH,
     RUN_HISTORY_REWRITTEN,
@@ -43,7 +44,10 @@ from agent_sparring.acceptance import (
     AcceptanceError,
     accept_candidate,
     freeze_candidate,
+    pin_sibling_candidates,
+    record_review,
 )
+from agent_sparring.trusted_snapshots import TRUSTED_CONFIG_MISSING
 from agent_sparring.capabilities import PUSH_NOT_PART_OF_RUNS, PUSH_PERMISSION_DEPRECATED
 from agent_sparring.cli import main
 from agent_sparring.next_turn import record_next_turn
@@ -750,6 +754,49 @@ class LocalRuleTests(_World):
             self.accept()
         self.assertCode(ctx, VERDICT_NOT_AT_CANDIDATE)
 
+    def test_no_recorded_review_refuses_accept(self):
+        # No review of the candidate is recorded at all: accept refuses, and
+        # nothing is accepted. Positive controls: the two tests below.
+        self.freeze()
+        with self.assertRaises(AcceptanceError) as ctx:
+            self.accept()
+        self.assertCode(ctx, VERDICT_NOT_AT_CANDIDATE)
+        self.assertIn("no review of it is recorded", str(ctx.exception))
+        self.assertIs(self.s.read_state().status, StageStatus.FROZEN)
+
+    def test_positive_control_a_ready_recorded_with_the_verdict_is_accepted(self):
+        record_review(self.s, self.repo, RoutingAction.READY)
+        self.freeze()
+        self.assertEqual(self.accept().candidate_sha, self.candidate)
+
+    def test_a_ready_recorded_over_an_earlier_commit_refuses(self):
+        record_review(self.s, self.repo, RoutingAction.READY)
+        commit_file(self.repo, "later.txt")
+        self.freeze()
+        with self.assertRaises(AcceptanceError) as ctx:
+            self.accept()
+        self.assertCode(ctx, VERDICT_NOT_AT_CANDIDATE)
+
+    def test_a_ready_recorded_over_uncommitted_work_refuses(self):
+        # The reviewer saw more than the commit: the same HEAD with
+        # uncommitted work. That is not a review of the commit alone.
+        (self.repo / "work.txt").write_text("reviewed but never committed\n", encoding="utf-8")
+        record_review(self.s, self.repo, RoutingAction.READY)
+        git(self.repo, "checkout", "--", "work.txt")
+        self.freeze()
+        with self.assertRaises(AcceptanceError) as ctx:
+            self.accept()
+        self.assertCode(ctx, VERDICT_NOT_AT_CANDIDATE)
+        self.assertIn("uncommitted work", str(ctx.exception))
+
+    def test_a_recorded_send_back_refuses_accept(self):
+        record_review(self.s, self.repo, RoutingAction.SEND_BACK)
+        self.freeze()
+        with self.assertRaises(AcceptanceError) as ctx:
+            self.accept()
+        self.assertCode(ctx, VERDICT_NOT_AT_CANDIDATE)
+        self.assertIn("not a READY", str(ctx.exception))
+
     def test_a_last_step_that_is_not_ready_refuses_accept(self):
         record_next_turn(self.s, "stage")
         self.freeze()
@@ -770,6 +817,176 @@ class LocalRuleTests(_World):
 
     def base_of_candidate(self) -> str:
         return git(self.repo, "rev-parse", f"{self.candidate}~1")
+
+
+# -- trusted configuration snapshots, per repository (I-L4) -----------------
+
+
+def _no_guard(*_args, **_kwargs):
+    return contextlib.nullcontext()
+
+
+class TrustedSnapshotTests(_HistoryWorld):
+    """Every participating repository's Git is held to the snapshot the run
+    trusted. A snapshot that should be there and is not refuses
+    (``trusted_config_missing``) rather than letting the operation run
+    unguarded. Watched local configuration changed after the run trusted it
+    is refused by name (``repository_config_changed``)."""
+
+    def _paused_before_freeze(self, *, sibling: bool) -> Stage:
+        """The reviewer said READY over a commit (in both repositories when
+        ``sibling``) and the run stopped before the acceptance gate."""
+
+        with mock.patch("agent_sparring.plan.freeze_candidate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                if sibling:
+                    self.run_with_sibling(_then(_commit(self.repo), _commit(self.sibling)), None)
+                else:
+                    self.run_primary(_commit(self.repo), None)
+        self.key = "sib-run" if sibling else RUN_KEY
+        self.run_state = run_state_path(self.sparring_dir, self.key)
+        return self.stage("sib-s1" if sibling else S1)
+
+    def _rewrite(self, change) -> None:
+        payload = json.loads(self.run_state.read_text(encoding="utf-8"))
+        change(payload)
+        self.run_state.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def _freeze(self, stage: Stage):
+        return freeze_candidate(stage, self.sparring_dir, self.repo, expected_branch="feature/x")
+
+    def _assert_refused(self, stage: Stage, code: str) -> str:
+        with self.assertRaises(AcceptanceError) as ctx:
+            self._freeze(stage)
+        self.assertIn(code, str(ctx.exception))
+        self.assertIs(stage.read_state().status, StageStatus.WORKING)
+        return str(ctx.exception)
+
+    # -- the primary ----------------------------------------------------
+
+    def test_a_changed_primary_configuration_refuses_freeze_by_name(self):
+        stage = self._paused_before_freeze(sibling=False)
+        git(self.repo, "config", "core.sshCommand", "/bin/false")
+        message = self._assert_refused(stage, "repository_config_changed")
+        self.assertIn("core.sshcommand", message.lower())
+
+    def test_positive_control_without_the_guard_the_primary_change_is_followed(self):
+        stage = self._paused_before_freeze(sibling=False)
+        git(self.repo, "config", "core.sshCommand", "/bin/false")
+        with mock.patch.object(trusted_snapshots, "guard", _no_guard):
+            self._freeze(stage)
+        self.assertIs(stage.read_state().status, StageStatus.FROZEN)
+
+    def test_removing_the_primary_snapshot_refuses_instead_of_running_unguarded(self):
+        stage = self._paused_before_freeze(sibling=False)
+        git(self.repo, "config", "core.sshCommand", "/bin/false")
+        self._rewrite(lambda p: p.pop("config_snapshot"))
+        message = self._assert_refused(stage, TRUSTED_CONFIG_MISSING)
+        self.assertIn("not taken again", message)
+
+    def test_a_malformed_primary_snapshot_refuses(self):
+        stage = self._paused_before_freeze(sibling=False)
+        self._rewrite(lambda p: p.__setitem__("config_snapshot", "damaged"))
+        self._assert_refused(stage, TRUSTED_CONFIG_MISSING)
+
+    def test_resume_refuses_a_removed_primary_snapshot_and_runs_nothing(self):
+        self._paused_before_freeze(sibling=False)
+        self._rewrite(lambda p: p.pop("config_snapshot"))
+        before = self.run_state.read_bytes()
+        adapter = _Scripted([])
+        with self.assertRaises(PlanError) as ctx:
+            resume_plan(self.plan_path, self.sparring_dir, self.repo, lambda stage: (adapter, _AlwaysReady()),
+                        expected_branch="feature/x", run_key=self.key)
+        self.assertIn(TRUSTED_CONFIG_MISSING, str(ctx.exception))
+        self.assertEqual(self.run_state.read_bytes(), before)
+        self.assertEqual(adapter.calls, 0)
+
+    # -- a sibling ------------------------------------------------------
+
+    def test_a_run_snapshots_each_sibling_at_start(self):
+        self._paused_before_freeze(sibling=True)
+        state = PlanRunState.load(self.run_state)
+        self.assertEqual([entry.path for entry in state.sibling_snapshots], [str(self.sibling.resolve())])
+
+    def test_a_changed_sibling_configuration_refuses_freeze_by_name(self):
+        stage = self._paused_before_freeze(sibling=True)
+        git(self.sibling, "config", "core.sshCommand", "/bin/false")
+        message = self._assert_refused(stage, "repository_config_changed")
+        self.assertIn("core.sshcommand", message.lower())
+
+    def test_positive_control_without_the_guard_the_sibling_change_is_followed(self):
+        stage = self._paused_before_freeze(sibling=True)
+        git(self.sibling, "config", "core.sshCommand", "/bin/false")
+        with mock.patch.object(trusted_snapshots, "guard", _no_guard):
+            self._freeze(stage)
+        self.assertIs(stage.read_state().status, StageStatus.FROZEN)
+
+    def test_removing_the_sibling_snapshot_refuses_instead_of_running_unguarded(self):
+        stage = self._paused_before_freeze(sibling=True)
+        git(self.sibling, "config", "core.sshCommand", "/bin/false")
+        self._rewrite(lambda p: p.pop("sibling_snapshots"))
+        message = self._assert_refused(stage, TRUSTED_CONFIG_MISSING)
+        self.assertIn("sibling repository 'sib'", message)
+
+    def test_review_pinning_of_siblings_is_held_to_the_sibling_snapshot(self):
+        # The path an independent review takes into the sibling set
+        # (enter_review -> pin_sibling_candidates), standalone.
+        stage = self._paused_before_freeze(sibling=True)
+        repositories = stage.read_state().repositories
+        self.assertEqual(
+            pin_sibling_candidates(self.repo, repositories, stage=stage)[0].candidate_sha, head(self.sibling)
+        )
+        git(self.sibling, "config", "core.sshCommand", "/bin/false")
+        with self.assertRaises(AcceptanceError) as ctx:
+            pin_sibling_candidates(self.repo, repositories, stage=stage)
+        self.assertIn("repository_config_changed", str(ctx.exception))
+
+    def test_resume_refuses_a_removed_sibling_snapshot_and_runs_nothing(self):
+        self._paused_before_freeze(sibling=True)
+        self._rewrite(lambda p: p.pop("sibling_snapshots"))
+        before = self.run_state.read_bytes()
+        adapter = _Scripted([])
+        with self.assertRaises(PlanError) as ctx:
+            resume_plan(load_plan_source(self.repo / "sib.manifest.json", self.repo, manifest=True),
+                        self.sparring_dir, self.repo, lambda stage: (adapter, _AlwaysReady()),
+                        expected_branch="feature/x", run_key=self.key)
+        self.assertIn(TRUSTED_CONFIG_MISSING, str(ctx.exception))
+        self.assertEqual(self.run_state.read_bytes(), before)
+        self.assertEqual(adapter.calls, 0)
+
+    def test_a_sibling_created_during_the_run_is_snapshotted_when_first_declared(self):
+        # Stage 1 creates the sibling repository; stage 2 is the first to
+        # declare it, and its snapshot is taken then, before any turn there.
+        late = self.root / "late"
+        manifest = {
+            "version": 1, "plan_label": "docs/plan.md", "source_digest": "sha256:local",
+            "stages": [
+                {"stage_id": "late-s1", "label": "S1", "title": "Create", "brief": "Create it.",
+                 "mode": "implementation"},
+                {"stage_id": "late-s2", "label": "S2", "title": "Use", "brief": "Use it.",
+                 "mode": "implementation",
+                 "repositories": [{"name": "late", "path": str(late), "branch": "feature/x",
+                                   "candidate_sha": None}]},
+            ],
+        }
+        path = self.repo / "late.manifest.json"
+        path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        git(self.repo, "add", path.name)
+        git(self.repo, "commit", "-q", "-m", "manifest")
+        reports: list[str] = []
+        actions = {
+            "late-s1": [_then(_commit(self.repo), lambda: make_repo(late, plan=None))],
+            "late-s2": [_then(_commit(self.repo), _commit(late))],
+        }
+        result = start_plan(
+            load_plan_source(path, self.repo, manifest=True), self.sparring_dir, self.repo,
+            lambda stage: (_Scripted(actions[stage.stage_id]), _AlwaysReady()),
+            expected_branch="feature/x", run_key="late-run", report=reports.append,
+        )
+        self.assertEqual(result.status, PlanRunStatus.COMPLETE)
+        state = PlanRunState.load(run_state_path(self.sparring_dir, "late-run"))
+        self.assertEqual([entry.path for entry in state.sibling_snapshots], [str(late.resolve())])
+        self.assertTrue(any("first time this run works in it" in line for line in reports), reports)
 
 
 # -- retired flags (I-L6, L-D3) ---------------------------------------------
@@ -826,7 +1043,6 @@ class RetiredPushFlagTests(_CliWorld):
                            expected_branch="feature/x", run_key=RUN_KEY)
         state = PlanRunState.load(self.state_path)
         state.status = PlanRunStatus.PAUSED
-        state.config_snapshot = None
         state.awaiting = PushRequired(
             kind=PUSH_AUTHORIZATION_REQUIRED, stage_id=S1, candidate_sha=candidate,
             branch="feature/x", remote="origin", remote_branch="feature/x",

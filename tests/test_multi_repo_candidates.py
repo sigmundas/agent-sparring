@@ -19,7 +19,9 @@ from agent_sparring.acceptance import (
     StaleCandidateError,
     accept_candidate,
     freeze_candidate,
+    record_review,
 )
+from agent_sparring.routing import RoutingAction
 from agent_sparring.stage import CandidateRepository, Stage, StageState, StageStatus
 
 
@@ -89,6 +91,9 @@ class CrossRepositoryCandidateTests(unittest.TestCase):
         self.stage.write_state(state)
 
     def _freeze(self):
+        # The reviewer's READY over the candidate set, recorded with what it
+        # was over (Plan L, I-L2: accept needs it at the exact commits).
+        record_review(self.stage, self.primary, RoutingAction.READY)
         return freeze_candidate(
             self.stage, self.sparring_dir, self.primary, expected_branch=self.PRIMARY_BRANCH
         )
@@ -193,6 +198,22 @@ class CrossRepositoryCandidateTests(unittest.TestCase):
         with self.assertRaises(AcceptanceError) as ctx:
             self._freeze()
         self.assertIn("does not resolve to a git repository", str(ctx.exception))
+
+    def test_a_review_over_another_sibling_commit_refuses_accept(self):
+        # Plan L (I-L2): the verdict covers the whole candidate set. The
+        # READY was recorded over the sibling's earlier commit; the sibling
+        # then moved before the freeze, so the frozen set was never reviewed.
+        # (Positive control: test_freeze_pins_the_sibling_and_acceptance_
+        # verifies_it, where the review is over the frozen set.)
+        self._declare()
+        record_review(self.stage, self.primary, RoutingAction.READY)
+        moved = _commit(self.sibling, "later.sql", self.SIBLING_BRANCH)
+        freeze_candidate(self.stage, self.sparring_dir, self.primary, expected_branch=self.PRIMARY_BRANCH)
+        self.assertEqual(self.stage.read_state().repositories[0].candidate_sha, moved)
+        with self.assertRaises(AcceptanceError) as ctx:
+            self._accept()
+        self.assertIn("verdict_not_at_candidate", str(ctx.exception))
+        self.assertIs(self.stage.read_state().status, StageStatus.FROZEN)
 
     def test_accept_refuses_a_declared_but_never_pinned_sibling(self):
         # Freeze pins siblings, so this can only happen if state.json was

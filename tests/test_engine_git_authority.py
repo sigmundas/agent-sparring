@@ -1220,11 +1220,13 @@ class LegacyRunTests(_AuthorityCase):
         head = _head_sha(self.repo)
         # What an agent did under the old instructions: pushed it itself.
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
-        # And the state as an engine from before pins wrote it.
+        # And the state as an engine from before pins wrote it -- with no
+        # engine record outside the project directory of a pin or snapshot.
         payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         payload.pop("config_snapshot", None)
         payload.pop("remote_records", None)
         self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        managed_run.snapshot_flag_path(self.repo, self.run_key).unlink(missing_ok=True)
         self.assertIsNone(PlanRunState.load(self.state_path).remote_pin)
 
         reports: list[str] = []
@@ -1234,6 +1236,9 @@ class LegacyRunTests(_AuthorityCase):
 
         notice = "\n".join(reports)
         self.assertNotIn("weaker than a run-start pin", notice)
+        # Its Git is held to a snapshot again, taken now and said so.
+        self.assertIn("weaker than a run-start snapshot", notice)
+        self.assertIsNotNone(self._plan_state().config_snapshot)
         self.assertIsNone(self._plan_state().remote_pin)
         self.assertIsNone(result.awaiting)
         self.assertEqual(self._stage(S1).read_state().candidate_sha, head)

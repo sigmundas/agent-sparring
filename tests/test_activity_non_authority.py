@@ -32,6 +32,7 @@ from agent_sparring.acceptance import (
     StaleCandidateError,
     accept_candidate,
     freeze_candidate,
+    record_review,
 )
 from agent_sparring.loop import LoopError, LoopRunawayError, run_unattended_loop
 from agent_sparring.providers import ProviderError, SparringAgentResult, StageAgentResult
@@ -235,6 +236,12 @@ class NonAuthorityTests(_RepoCase):
         self.assertTrue(self.stage.activity_path().is_file())
 
         # Same scenario in a fresh stage whose activity path is a directory.
+        # The reference stage's own (untracked) artifacts are not this
+        # stage's, and would make its recorded review see an unclean tree
+        # (Plan L's review record); excluded so the two runs differ only in
+        # the activity path.
+        with open(self.repo / ".git" / "info" / "exclude", "a", encoding="utf-8") as handle:
+            handle.write("\n.sparring/stages/stage-1/\n")
         other = Stage.resolve(self.sparring_dir, "stage-2").create()
         (other.directory / "brief.md").write_text(
             "# Stage brief: stage-1\n\n## Goal\n\nDo the thing.\n", encoding="utf-8"
@@ -498,6 +505,9 @@ class AcceptanceEventTests(unittest.TestCase):
         )
 
     def _accept(self):
+        # Plan L (I-L2): accept needs the reviewer's READY recorded at the
+        # exact candidate; the engine records it as a verdict is written.
+        record_review(self.stage, self.repo, RoutingAction.READY)
         return accept_candidate(self.stage, self.repo, expected_branch="feature/x")
 
     def test_untracked_activity_log_does_not_block_freeze_or_accept(self):

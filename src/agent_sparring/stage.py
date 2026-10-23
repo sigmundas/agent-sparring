@@ -407,6 +407,52 @@ class TurnCandidate:
 
 
 @dataclass(frozen=True)
+class ReviewRecord:
+    """The reviewer's latest verdict and exactly what it was given over,
+    recorded by the engine when the verdict is written (see
+    :func:`agent_sparring.acceptance.record_review`).
+
+    ``head_sha`` is the primary repository's ``HEAD`` at the verdict and
+    ``clean`` whether its working tree then held nothing that commit does
+    not represent; ``repositories`` is each declared sibling's ``HEAD`` by
+    name. Acceptance needs this at the exact candidate (I-L2)."""
+
+    action: str
+    head_sha: str
+    clean: bool
+    repositories: tuple[SiblingPin, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "action": self.action,
+            "head_sha": self.head_sha,
+            "clean": self.clean,
+        }
+        if self.repositories:
+            payload["repositories"] = [repo.to_dict() for repo in self.repositories]
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "ReviewRecord":
+        if not isinstance(payload, dict):
+            raise StageError("state.json field 'review' must be an object or null")
+        action = _optional_str_field(payload, "action")
+        head = _optional_str_field(payload, "head_sha")
+        clean = payload.get("clean")
+        if not action or not head or not isinstance(clean, bool):
+            raise StageError("state.json field 'review' needs action, head_sha and clean")
+        raw = payload.get("repositories") or []
+        if not isinstance(raw, list):
+            raise StageError("review.repositories must be a list")
+        return cls(
+            action=action,
+            head_sha=head,
+            clean=clean,
+            repositories=tuple(SiblingPin.from_dict(entry) for entry in raw),
+        )
+
+
+@dataclass(frozen=True)
 class NextTurnResolution:
     """The immutable record of how an ambiguous legacy state was resolved:
     the turn chosen, whether a person chose it (``manual``) or the engine
@@ -596,9 +642,17 @@ class StageState:
     # until a fresh session is first started; until then the recorded
     # session ids above *are* generation 1.
     sessions: dict[str, list[SessionGeneration]] = field(default_factory=dict)
+    # The reviewer's latest verdict and what it was given over (see
+    # ReviewRecord). ``None`` -- and absent from state.json -- until the
+    # engine records a verdict, so existing files stay byte-identical.
+    review: ReviewRecord | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        if self.review is None:
+            payload.pop("review", None)
+        else:
+            payload["review"] = self.review.to_dict()
         if self.next_turn is None:
             payload.pop("next_turn", None)
         if self.next_turn_candidate is None:
@@ -742,6 +796,11 @@ class StageState:
             # execution -- its legacy run instance -- so reading it as the
             # owning run is not an interpretation, it is what it recorded.
             run=_optional_str_field(payload, "run" if "run" in payload else "plan"),
+            review=(
+                ReviewRecord.from_dict(payload["review"])
+                if payload.get("review") is not None
+                else None
+            ),
         )
 
 

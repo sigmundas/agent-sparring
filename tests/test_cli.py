@@ -599,6 +599,22 @@ class CliAcceptanceTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn(self.candidate_sha, stdout)
 
+        # Plan L (I-L2): accept needs the reviewer's READY at this exact SHA;
+        # without one it refuses...
+        exit_code, _stdout, stderr = self._invoke("accept-candidate")
+        self.assertEqual(exit_code, 1)
+        self.assertIn("verdict_not_at_candidate", stderr)
+        # ...and a READY recorded through the CLI (record-sparring records
+        # what it is over) lets the same command accept.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main([
+                    "--sparring-dir", str(self.sparring_dir), "record-sparring", "stage-1",
+                    "--action", "READY", "--summary", "reviewed", "--repo-root", str(self.repo),
+                ]),
+                0,
+            )
+
         exit_code, stdout, _stderr = self._invoke("accept-candidate")
         self.assertEqual(exit_code, 0)
         self.assertIn(self.candidate_sha, stdout)

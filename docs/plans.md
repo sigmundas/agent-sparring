@@ -262,10 +262,15 @@ primary and each declared sibling):
 - freeze and accept take the exact `HEAD` of the expected branch, with a
   working tree clean apart from the engine's own artifacts; anything else
   refuses with `candidate_not_on_branch`, stating that rule;
-- accept also needs the reviewer's READY recorded at that exact commit, and
-  refuses with `verdict_not_at_candidate` otherwise. After ESCALATE or
-  NEEDS_YOU the reviewer has handed the decision to a person, whose explicit
-  `accept-candidate` is that decision -- for exactly the reviewed commit;
+- accept also needs the reviewer's READY recorded at that exact commit (and,
+  for a cross-repository stage, at exactly the frozen sibling commits), and
+  refuses with `verdict_not_at_candidate` otherwise -- including when no
+  review is recorded at all. The engine records what each verdict was over
+  as it writes it (`review` in the stage's `state.json`: run-loop,
+  run-sparring, managed runs, and `record-sparring` for a verdict a person
+  records). After ESCALATE or NEEDS_YOU the reviewer has handed the decision
+  to a person, whose explicit `accept-candidate` is that decision -- for
+  exactly the reviewed commit;
 - accepted history only grows, per repository: the repository's stage base
   and every candidate the run already accepted there must be ancestors of
   (or equal to) its new candidate. New commits on top and a merge that
@@ -278,8 +283,17 @@ The run records each candidate it accepts in its run state
 (`accepted_candidates`: the primary, and each sibling by its recorded name
 and path), and each declared sibling's commit when its stage is entered
 (`base_sha` in the stage's `repositories`). The run state also holds a local
-snapshot of the repository's own security-relevant configuration, taken when
-the run starts (`config_snapshot`; see [Engine Git](#engine-git)).
+snapshot of each participating repository's own security-relevant
+configuration (`config_snapshot` for the primary, `sibling_snapshots` for
+each sibling, taken when the run starts or, for a sibling that is not a
+repository yet, when a stage first declares it; see
+[Engine Git](#engine-git)). Every engine Git command of the run, and freeze,
+accept and review entry of its stages, is held to them. The engine records
+outside the project directory that they were taken, so a snapshot removed
+from or damaged in the run state refuses (`trusted_config_missing`) instead
+of letting the operation run unguarded; a run from before snapshots gets
+them on its next resume, with a notice that this is weaker than a run-start
+snapshot.
 
 The flags that granted push permission are retired, and refuse rather than
 being reinterpreted: `--allow-push-for-run` (start-plan, run-plan,
@@ -397,11 +411,12 @@ directory -- in its managed-run record (`"pinned": true`) under
 `<git-common-dir>/agent-sparring/runs/<run key>.json`. If such a run's state
 file is deleted, its pin removed, or the state replaced with one shaped like
 a run from before pins, `finish-run` refuses with `remote_pin_missing`. Freeze,
-accept and resume no longer consult the pin at all: a legacy pin, intact or
-damaged, is inert there, and remote reachability is never an input. Freeze
-and accept of a stage still find its run from the run state positioned at
-the stage as well as from the stage's own record, because the run's accepted
-history and any recorded pause apply to it.
+accept and resume read only the trusted snapshot such a pin carries, never
+its remote: a gone or damaged pin refuses with `trusted_config_missing`, and
+remote reachability is never an input. Freeze and accept of a stage find its
+run from the run state positioned at the stage as well as from the stage's
+own record, because the run's snapshots, accepted history and any recorded
+pause apply to it.
 
 Nothing in a plan, brief, notes, handoff or agent output is ever read as a
 push authorization, an acknowledgement or an `authorized_without_push`.

@@ -26,8 +26,10 @@ and the surfaces, with no guard active:
   stage a pinned run owns (the pin's typed refusal);
 - freeze of a stage declaring a sibling repository, unowned and owned by a
   legacy run that pinned it at start, and acceptance of a stage frozen
-  before the planting. Since Plan L Stage 2 these read no remote at all, so
-  they freeze and accept on the local rules alone, with nothing planted run.
+  before the planting. Since Plan L Stage 2 these read no remote at all:
+  the unowned stage freezes on the local rules alone, the owned one is held
+  to the sibling's run-start snapshot (the planted change refuses by name),
+  and nothing planted runs.
 
 The status surfaces are exercised on a legacy (pinned) managed run, which
 is what still reads a remote until Plan L's Stage 4 makes finish local.
@@ -52,7 +54,8 @@ from unittest import mock
 import conftest_path  # noqa: F401
 
 from agent_sparring import engine_git, managed_finish
-from agent_sparring.acceptance import AcceptanceError, accept_candidate, freeze_candidate
+from agent_sparring.acceptance import AcceptanceError, accept_candidate, freeze_candidate, record_review
+from agent_sparring.routing import RoutingAction
 from agent_sparring.cli import main
 from agent_sparring.engine_git import GitConfigRefusal
 from agent_sparring.git_context import diff_patch, dirty_paths
@@ -358,13 +361,17 @@ class _SiblingMatrix(_Planting, unittest.TestCase):
         )
 
     def _run_sibling(self, item: str, scope: str) -> None:
-        # Plan L (I-L2): freeze and accept read no remote of any repository,
-        # so a sibling's planted transport configuration has nothing to act
-        # on. Was: the unpinned freeze refused it (repository_transport_config)
-        # and the pinned one refused the change (repository_config_changed);
-        # both now freeze on the local rules alone, with no planted program
-        # run and the second repository untouched.
+        # Plan L (I-L2): freeze and accept read no remote of any repository.
+        # A stage no run owns has no snapshot to hold the sibling to, and no
+        # remote read for the planted configuration to act on: it freezes on
+        # the local rules (was: refused as repository_transport_config). A
+        # stage of a run that trusted the sibling's configuration at its
+        # start is held to that snapshot (I-L4), so the planted change is
+        # refused by name, as before.
         frozen = self._stage("frozen-before")
+        # Reviewed READY over the candidate set before it is frozen (Plan L:
+        # accept needs the review at the exact commits).
+        record_review(frozen, self.primary, RoutingAction.READY)
         self.assertEqual(self._freeze(frozen).repositories[0].candidate_sha, self.sibling_sha)
         # A stage of a legacy run that pinned its primary and the sibling at
         # run start, and one no run owns.
@@ -374,11 +381,16 @@ class _SiblingMatrix(_Planting, unittest.TestCase):
         unowned = self._stage("unowned")
         second = self.second(self.sibling)
         before = _refs(second)
-        self.plant(self.sibling, item, scope, second)
+        key = self.plant(self.sibling, item, scope, second)
 
-        for stage in (unowned, owned):
-            self.assertEqual(self._freeze(stage).repositories[0].candidate_sha, self.sibling_sha)
-            self.assertIs(stage.read_state().status, StageStatus.FROZEN)
+        self.assertEqual(self._freeze(unowned).repositories[0].candidate_sha, self.sibling_sha)
+        self.assertIs(unowned.read_state().status, StageStatus.FROZEN)
+
+        with self.assertRaises(AcceptanceError) as ctx:
+            self._freeze(owned)
+        self.assertIn("repository_config_changed", str(ctx.exception))
+        self.assertIn(key.lower().rsplit(".", 1)[-1], str(ctx.exception).lower())
+        self.assertIs(owned.read_state().status, StageStatus.WORKING)
 
         accepted = accept_candidate(frozen, self.primary, expected_branch=self.PRIMARY_BRANCH)
         self.assertEqual(accepted.repositories[0].candidate_sha, self.sibling_sha)

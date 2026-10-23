@@ -92,6 +92,7 @@ from agent_sparring.git_context import (
 from agent_sparring.providers import ProviderError, SparringAgentAdapter, SparringAgentResult
 from agent_sparring.routing import RoutingResult, RoutingResultError
 from agent_sparring.sparring_exchange import record_sparring_result
+from agent_sparring.acceptance import record_review
 from agent_sparring.prompt_capture import capture_prompt
 from agent_sparring.review_prompt import assemble_review_prompt
 from agent_sparring.sessions import (
@@ -547,6 +548,10 @@ def _run_sparring_agent_locked(
     stage.write_state(current_state)
 
     recorded = record_sparring_result(stage, routing, findings=findings_text)
+    # What the verdict was given over, read from the repository by the
+    # engine (the turn above left it unchanged): what acceptance holds the
+    # candidate to (I-L2).
+    record_review(stage, repo_root, routing.action)
     sparring_content = recorded.content
     # The verdict *as recorded*, so this turn's caller and this turn's
     # sparring.md name the same gate instances. Returning the pre-mint object

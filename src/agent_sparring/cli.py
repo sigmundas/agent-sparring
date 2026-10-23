@@ -21,6 +21,7 @@ from agent_sparring.acceptance import (
     AcceptanceError,
     accept_candidate,
     freeze_candidate,
+    record_review,
 )
 from agent_sparring.agent_config import (
     AgentConfigError,
@@ -848,6 +849,12 @@ def _cmd_record_sparring(args: argparse.Namespace) -> int:
             human_gate=gate,
         )
         content = record_sparring(stage, result, findings=args.findings or "")
+        # What the verdict is over, read from the repository by the engine:
+        # without it no acceptance can rest on this verdict (I-L2).
+        try:
+            record_review(stage, _resolve_repo_root(args, sparring_dir), result.action)
+        except ProjectConfigError:
+            pass
     except (StageError, RoutingResultError, HumanGateError) as exc:
         print(f"could not record sparring outcome: {exc}", file=sys.stderr)
         return 1
@@ -3782,6 +3789,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "JSON file holding the structured human gate (category/title/checks) for a "
             "NEEDS_YOU outcome; required for NEEDS_YOU and refused for every other action"
+        ),
+    )
+    record_sparring_parser.add_argument(
+        "--repo-root",
+        default=None,
+        help=(
+            "repository root whose current HEAD the recorded verdict is over (default: "
+            "[repo].root from project.toml, else the parent of --sparring-dir)"
         ),
     )
     record_sparring_parser.set_defaults(func=_cmd_record_sparring)
