@@ -448,31 +448,19 @@ def _update_run(
 ) -> Path | None:
     """Point the slice's paused run at the moved branch (idempotently).
 
-    The run never ran a turn (the move refuses otherwise), so its remote pin
-    -- made for the old branch -- is replaced by a fresh one for the new
-    branch. A run that already has push receipts or acknowledgements has a
-    history on its old target and is not re-pinned.
+    The run never ran a turn (the move refuses otherwise). Runs are
+    local-first, so there is no remote target to re-pin: only the branch
+    the run works on changes, and nothing about a remote is read.
+    ``repo_root`` is accepted for callers that pass it and is not used.
     """
 
-    from agent_sparring.remote_pin import pin_remote
-
+    del repo_root
     path = run_state_path(sparring_dir, approval.run_key)
     if not path.is_file():
         return None
     state = PlanRunState.load(path)
-    changed = False
     if state.expected_branch != branch:
         state.expected_branch = branch
-        changed = True
-    if repo_root is not None and (state.remote_pin is None or state.remote_pin.branch != branch):
-        if state.remote_records:
-            raise IntakeError(
-                f"run {approval.run_key} has remote records on its old target and cannot be "
-                "re-pinned to the moved branch"
-            )
-        state.remote_pin = pin_remote(Path(repo_root), branch)
-        changed = True
-    if changed:
         state.save(path)
     return path
 

@@ -151,13 +151,16 @@ class CrossRepositoryCandidateTests(unittest.TestCase):
 
     # -- refusals at freeze time -------------------------------------------
 
-    def test_freeze_refuses_an_unpushed_sibling_candidate(self):
-        _commit(self.sibling, "local-only.sql", self.SIBLING_BRANCH, push=False)
+    def test_an_unpushed_sibling_candidate_is_frozen_locally(self):
+        # Plan L (I-L2): was test_freeze_refuses_an_unpushed_sibling_candidate.
+        # A sibling's remote is never read; its local rule refuses instead
+        # (the dirty and wrong-branch tests below, with candidate_not_on_branch).
+        local_only = _commit(self.sibling, "local-only.sql", self.SIBLING_BRANCH, push=False)
         self._declare()
-        with self.assertRaises(AcceptanceError) as ctx:
-            self._freeze()
-        self.assertIn("not available on the intended remote branch", str(ctx.exception))
-        self.assertIs(self.stage.read_state().status, StageStatus.WORKING)
+        self._freeze()
+        state = self.stage.read_state()
+        self.assertIs(state.status, StageStatus.FROZEN)
+        self.assertEqual(state.repositories[0].candidate_sha, local_only)
 
     def test_freeze_refuses_a_dirty_sibling(self):
         (self.sibling / "scratch.sql").write_text("wip\n", encoding="utf-8")

@@ -70,8 +70,8 @@ def _finalization_section(expected_branch: str) -> list[str]:
         "freezes an exact commit. Turn this exact working tree into that "
         "commit, and change nothing about it.",
         "",
-        f"- Commit the stage's work on `{expected_branch}`. Do not push it: the "
-        "engine pushes after authorization.",
+        f"- Commit the stage's work on `{expected_branch}`. Do not push it: runs "
+        "are local-first, and the commit is accepted locally.",
         "- Report the exact committed SHA.",
         "- Run only the checks you need in order to commit safely.",
         "- Do not re-implement, refactor, rename, reformat, reword or "

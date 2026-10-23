@@ -185,12 +185,14 @@ class DirectRouteTests(_Start):
         self.assertIn("permission mode bypassPermissions", out)
         self.assertIn(f"sparring dir {self.sparring_dir.resolve()}", out)
 
-    def test_a_changed_plan_or_push_choice_refuses_the_token(self):
+    def test_the_retired_push_choice_refuses_even_with_a_valid_token(self):
+        # Plan L: --allow-push-for-run no longer changes the token; it is
+        # refused outright (push_not_part_of_runs), before anything runs.
         _, status, _ = self.start(plan=self.direct)
         with self.ran() as run:
             code, refused, _ = self.start("--allow-push-for-run", plan=self.direct, confirm=status["confirm_token"])
         self.assertEqual((code, refused["status"]), (1, "refused"))
-        self.assertIn("confirm token does not match", refused["error"])
+        self.assertIn("push_not_part_of_runs", refused["error"])
         run.assert_not_called()
 
 

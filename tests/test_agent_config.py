@@ -866,7 +866,7 @@ class IndependentReviewResolutionTests(_ReviewRepoTestCase):
                 [
                     "--sparring-dir", str(self.sparring_dir), "run-plan",
                     "--manifest", str(self.manifest_path), "--repo-root", str(self.repo),
-                    "--expected-branch", "feature/x", "--allow-push-for-run",
+                    "--expected-branch", "feature/x",
                 ]
             )
         self.assertEqual(code, 0, err.getvalue())

@@ -185,9 +185,6 @@ class _ReviewRepoTestCase(unittest.TestCase):
         return PlanRunState.load(self.state_path)
 
     def start(self, stage_adapter, sparring_adapter, **kwargs):
-        # The engine pushes each verified candidate; these runs hold the
-        # run-level grant a person gives at start unless a test says not.
-        kwargs.setdefault("allow_push_for_run", True)
         return start_plan(
             self.source(),
             self.sparring_dir,

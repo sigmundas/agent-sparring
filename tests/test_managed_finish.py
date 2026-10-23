@@ -19,10 +19,37 @@ from test_plan import _run_git
 
 
 class _FinishTestCase(_ManagedRepoTestCase):
-    def _complete(self, *, push: bool = True):
-        """A managed run with every stage accepted at the worktree's HEAD."""
+    def _legacy_pin(self, record) -> None:
+        """Make ``record``'s run what an engine from before local-first runs
+        left: its managed record says ``pinned``, and its run state holds the
+        remote pin taken at its start (with that pin's trusted snapshot)
+        instead of a local-first run's own snapshot.
+
+        Plan L: local-first runs pin nothing, and finish of such a run is
+        Stage 4's. Until then these tests keep proving what finish does for
+        a pinned (legacy) run -- the remote finish, its pin and its guard."""
+
+        from agent_sparring.remote_pin import pin_remote
+
+        path = managed_run.record_path(self.repo, record.run_key)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["pinned"] = True
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        state_path = record.sparring_dir / "plans" / f"{record.run_key}.json"
+        run_state = PlanRunState.load(state_path)
+        run_state.remote_pin = pin_remote(Path(record.worktree_path), record.branch)
+        run_state.config_snapshot = None
+        run_state.save(state_path)
+
+    def _complete(self, *, push: bool = True, legacy_pin: bool = True):
+        """A managed run with every stage accepted at the worktree's HEAD
+        (a legacy pinned run unless ``legacy_pin`` is false; see
+        :meth:`_legacy_pin`)."""
 
         self._start_managed()
+        if legacy_pin:
+            (started,) = self._records()
+            self._legacy_pin(started)
         (record,) = self._records()
         worktree = Path(record.worktree_path)
         (worktree / "feature.txt").write_text("done\n", encoding="utf-8")
@@ -298,7 +325,11 @@ class ManagedFinishTests(_FinishTestCase):
             "finish-run", "--run-key", record.run_key, "--repo-root", str(self.repo), "--dry-run", "--json"
         )
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out), run["finish"])
+        # Plan L adds the engine's capabilities to finish-run --json (an
+        # added field); everything else is the same report.
+        dry_run = json.loads(out)
+        self.assertEqual(dry_run.pop("capabilities"), ["local_first"])
+        self.assertEqual(dry_run, run["finish"])
         self.assertEqual(set(run["git"]), {
             "head", "branch_tip", "clean", "final_candidate", "candidate_pushed",
             "target_tip", "target_contains_candidate", "target_checked_out_at",

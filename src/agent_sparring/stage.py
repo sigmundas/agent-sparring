@@ -178,20 +178,30 @@ class CandidateRepository:
     with the resolved HEAD, and from then on it is the pinned candidate. A
     declaration that already carries a ``candidate_sha`` is an assertion:
     freezing refuses if the sibling is not exactly there.
+
+    ``base_sha`` is the sibling's commit when the stage was entered, the
+    sibling's counterpart of the stage's own ``base_sha``: its candidate must
+    descend from it (see :mod:`agent_sparring.run_history`). ``None`` -- and
+    absent from ``state.json`` -- for a declaration recorded before it
+    existed, or a sibling that was not a repository yet.
     """
 
     name: str
     path: str
     branch: str
     candidate_sha: str | None = None
+    base_sha: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "name": self.name,
             "path": self.path,
             "branch": self.branch,
             "candidate_sha": self.candidate_sha,
         }
+        if self.base_sha is not None:
+            payload["base_sha"] = self.base_sha
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Any) -> "CandidateRepository":
@@ -204,11 +214,15 @@ class CandidateRepository:
         sha = payload.get("candidate_sha")
         if sha is not None and not isinstance(sha, str):
             raise StageError("repository entry field 'candidate_sha' must be a string or null")
+        base = payload.get("base_sha")
+        if base is not None and not isinstance(base, str):
+            raise StageError("repository entry field 'base_sha' must be a string or null")
         return cls(
             name=str(payload["name"]),
             path=str(payload["path"]),
             branch=str(payload["branch"]),
             candidate_sha=sha,
+            base_sha=base,
         )
 
 

@@ -112,9 +112,6 @@ class _Sealed(_Repo):
 
     def start(self, approval, adapters, *, repo=None, branch=APP_BRANCH, **kwargs):
         repo = repo or self.repo
-        # The engine pushes each verified candidate, under the run-level
-        # grant a person gives at start.
-        kwargs.setdefault("allow_push_for_run", True)
         return start_plan(
             self.source(approval, repo), repo / ".sparring", repo, adapters, expected_branch=branch, **kwargs
         )

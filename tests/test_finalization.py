@@ -274,9 +274,6 @@ class _RepoCase(unittest.TestCase):
         return lambda _stage: (stage_adapter, sparring_adapter)
 
     def _start(self, stage_adapter, sparring_adapter, **kwargs):
-        # The engine pushes each verified candidate, under the run-level
-        # grant a person gives at start.
-        kwargs.setdefault("allow_push_for_run", True)
         return start_plan(
             self.plan_path,
             self.sparring_dir,
@@ -345,14 +342,14 @@ class HumanGatedStageLifecycleTests(_RepoCase):
         self.assertEqual(s1.candidate_sha, accepted_sha)
         self.assertEqual(s1.base_sha, base)
 
-        # 4. The accepted commit contains the work the human verified, and
-        #    it is pushed -- the whole point of the invariant.
+        # 4. The accepted commit contains the work the human verified -- the
+        #    whole point of the invariant. Runs are local-first (Plan L): it
+        #    is the branch's local HEAD, and the remote is left as it was.
         committed = _run_git(self.repo, "show", "--name-only", "--format=", accepted_sha)
         for name in IMPLEMENTATION:
             self.assertIn(name, committed)
-        self.assertEqual(
-            _run_git(self.remote, "rev-parse", "refs/heads/feature/x"), accepted_sha
-        )
+        self.assertEqual(_run_git(self.repo, "rev-parse", "refs/heads/feature/x"), accepted_sha)
+        self.assertEqual(_run_git(self.remote, "rev-parse", "refs/heads/feature/x"), base)
         self.assertEqual(
             _run_git(self.repo, "status", "--porcelain", "--untracked-files=all"), ""
         )
@@ -615,9 +612,10 @@ class StuckRunRecoveryTests(_RepoCase):
         self.assertNotEqual(accepted, base)
         self.assertEqual(accepted, _head(self.repo))
         self.assertIs(stage.read_state().status, StageStatus.ACCEPTED)
-        self.assertEqual(
-            _run_git(self.remote, "rev-parse", "refs/heads/feature/x"), accepted
-        )
+        # Local-first (Plan L): accepted as the branch's local HEAD; the
+        # remote never receives it from the engine.
+        self.assertEqual(_run_git(self.repo, "rev-parse", "refs/heads/feature/x"), accepted)
+        self.assertNotEqual(_run_git(self.remote, "rev-parse", "refs/heads/feature/x"), accepted)
         # Both recorded sessions were reused, not replaced.
         self.assertEqual(stage.read_state().implementation_session_id, "impl-1")
         self.assertEqual(stage.read_state().sparring_session_id, "spar-1")

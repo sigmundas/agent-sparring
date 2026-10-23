@@ -143,9 +143,6 @@ class _TwoPlanRepoTestCase(unittest.TestCase):
             run_key=run_key,
             adopt=adopt,
             report=report or (lambda message: None),
-            # The engine pushes each verified candidate, under the run-level
-            # grant a person gives at start.
-            allow_push_for_run=True,
         )
         return result, len(self.stage_adapter.start_calls) - before
 

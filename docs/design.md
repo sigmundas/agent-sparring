@@ -738,28 +738,26 @@ The orchestrator only decides WHERE control goes next.
 the router: a reviewed plan's `## Stage <n> — <title>` sections become stages
 in order, each with a fresh implementation and sparring session; `READY`
 invokes the existing `freeze_candidate` / `accept_candidate` gate on the exact
-pushed SHA and the next stage starts; `NEEDS_YOU`, `ESCALATE`, any failure and
+local SHA the reviewer ruled on and the next stage starts; `NEEDS_YOU`, `ESCALATE`, any failure and
 the end of the plan stop it. The only state it adds is the run position (plan,
 digest of the stage sections, branch, current stage, status) under
 `.sparring/plans/`. Human evidence goes into the current stage's `notes.md`
 and the same stage resumes. Stage boundaries are a fixed heading convention,
 never inferred.
 
-One thing stands between a `READY` candidate and that gate, and it is a
-permission rather than a check: the gate requires the commit to be reachable
-from its intended remote ref, and a reviewed candidate is often not pushed,
-because the project's instructions forbid an agent from pushing unasked.
-`agent_sparring.push_gate` makes that a capability instead of an impasse. No
-authorization is the default; a verified candidate that is not on the remote
-pauses the run with a *typed* reason in the run state (`awaiting.kind =
-push_authorization_required`, with the exact commit, branch, remote and
-remote branch), which is what lets a consumer present a permission question
-instead of mining a reviewer's prose for one. A person's answer is recorded
-as data in the same state — bound to one candidate, or to the run — and
-survives a reload. An authorized push is one non-force, fully-qualified
-refspec of the run's own branch, built in one function; reachability is then
-re-proven and the gate itself runs unchanged. Nothing about acceptance is
-relaxed by any of it, and no sibling repository is ever pushed.
+Runs are local-first (issue #5, Plan L). The gate no longer requires the
+commit to be reachable from a remote, so nothing stands between a `READY`
+candidate and the gate: it takes the exact, clean `HEAD` of the expected
+branch in each participating repository, at the reviewer's READY over that
+exact commit, and refuses `run_history_rewritten` when a repository's stage
+base or an earlier accepted candidate of the run is not an ancestor of its
+new candidate -- the append-only history that pushing used to give for free,
+kept explicitly and per repository (`agent_sparring.run_history`).
+Publishing a commit for external review is a separate, explicit action that
+never implies acceptance. The earlier design -- a typed
+`push_authorization_required` pause answered by a person's push permission
+(`agent_sparring.push_gate`) -- survives only as legacy state that still
+loads, and as the push primitive kept for that separate action.
 
 ### Deferred human verification
 

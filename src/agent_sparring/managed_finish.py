@@ -483,7 +483,17 @@ def finish_status(
         f"HEAD, {record.branch} and the final accepted candidate are {candidate}" if agreed
         else f"HEAD {git['head']}, branch tip {git['branch_tip']}, final accepted candidate {candidate} differ",
     )
-    if record.remote:
+    local_first = (
+        state is not None
+        and getattr(state, "config_snapshot", None) is not None
+        and getattr(state, "remote_pin", None) is None
+    )
+    if local_first:
+        # A local-first run never pushes and never reads a remote: its
+        # candidate is not required anywhere but here, and nothing is read
+        # to check it. (Runs recorded before then keep the check below.)
+        checks.add("candidate_not_pushed", True, "local-first run: no remote is required or read")
+    elif record.remote:
         if candidate and present:
             pushed, detail = _pinned_remote_contains(repo_root, record, state, candidate)
         else:

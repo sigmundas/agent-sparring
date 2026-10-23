@@ -1,7 +1,14 @@
-"""Push authorization: the permission a managed run needs before a verified
-candidate can be put where the acceptance gate requires it.
+"""Push authorization: the push primitive kept for Plan P, and what became of
+run-time push permission when runs became local-first (Plan L).
 
-The behaviour these tests hold, in one sentence each:
+Since Plan L Stage 2 a run never pushes: ``ManagedRunPushTests`` and
+``PushAuthorizationCliTests`` hold that a verified candidate is accepted
+locally, that the retired flags refuse with typed codes, and that pauses an
+older engine recorded are kept until resolved explicitly and are never
+acceptance. The primitive tests below (command shape, binding, the gate)
+are unchanged.
+
+The behaviour the primitive tests hold, in one sentence each:
 
 - by default nothing is ever pushed, and a verified candidate that is not on
   its intended remote branch stops the run with a *typed* request naming the
@@ -41,11 +48,14 @@ from agent_sparring.plan import (
     authorize_pushed_candidate,
     resume_plan,
 )
+from agent_sparring.capabilities import PUSH_NOT_PART_OF_RUNS, PUSH_PERMISSION_DEPRECATED
 from agent_sparring.remote_pin import (
     AUTHORIZED_WITHOUT_PUSH,
     MOVEMENT_ACKNOWLEDGED,
     PUSH_RECEIPT,
     PUSHED_CANDIDATE_UNAUTHORIZED,
+    PushedCandidateUnauthorized,
+    UnauthorizedRemoteMovement,
 )
 from agent_sparring.push_gate import (
     PUSH_AUTHORIZATION_REQUIRED,
@@ -521,102 +531,118 @@ class PushGateTests(_RemoteAwareTestCase):
 
 
 class ManagedRunPushTests(_RemoteAwareTestCase):
-    """The whole loop: a managed run reaching READY with an unpushed
-    candidate, and what each answer to that does."""
+    """Plan L: runs are local-first. A managed run reaching READY with an
+    unpushed candidate accepts it locally and pushes nothing; the retired
+    push permissions refuse with typed codes; and the pauses an older
+    engine recorded (push permission, remote movement, a pushed candidate)
+    are kept until resolved explicitly, and never become acceptance (I-L3).
+
+    Each test keeps its pre-Plan L name where the property carries over, and
+    says what it was where it changed. The push primitive itself is still
+    tested above (PushGateTests), for Plan P."""
 
     def _unpushed(self) -> _Implementer:
         return _Implementer(self.repo)
 
-    def test_a_verified_candidate_that_is_not_on_the_remote_pauses_the_run(self):
+    def _ready_not_accepted(self, stage_adapter=None) -> str:
+        """The reviewer said READY over a commit and the run stopped before
+        the acceptance gate (interrupted), as an older engine's push pause
+        left it."""
+
+        with mock.patch("agent_sparring.plan.freeze_candidate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self._start(stage_adapter or self._unpushed(), _SparringAdapter([READY]))
+        return _head_sha(self.repo)
+
+    def _legacy_pause(self, awaiting) -> None:
+        state = self._plan_state()
+        state.status = PlanRunStatus.PAUSED
+        state.awaiting = awaiting
+        state.save(self.state_path)
+
+    def _legacy_push_pause(self) -> str:
+        sha = self._ready_not_accepted()
+        self._legacy_pause(PushRequired(
+            kind=PUSH_AUTHORIZATION_REQUIRED, stage_id=S1, candidate_sha=sha, branch="feature/x",
+            remote="origin", remote_branch="feature/x",
+        ))
+        return sha
+
+    def _movement(self, observed: str) -> UnauthorizedRemoteMovement:
+        return UnauthorizedRemoteMovement(
+            stage_id=S1, remote="origin", url=str(self.remote), ref="refs/heads/feature/x",
+            expected_tip=self.remote_before, observed_tip=observed,
+        )
+
+    def test_a_verified_candidate_that_is_not_on_the_remote_is_accepted_locally(self):
+        # Was ..._pauses_the_run (push_authorization_required).
         stage_adapter = self._unpushed()
         sparring_adapter = _SparringAdapter([READY, READY])
 
         result = self._start(stage_adapter, sparring_adapter)
 
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.stage_id, S1)
-        self.assertIsNone(result.routing)
-        self.assertIsNone(result.recorded)
-        self.assertIsNotNone(result.awaiting)
-        self.assertEqual(result.awaiting.kind, PUSH_AUTHORIZATION_REQUIRED)
-        self.assertEqual(result.awaiting.candidate_sha, _head_sha(self.repo))
-        self.assertEqual(result.awaiting.remote, "origin")
-        self.assertEqual(result.awaiting.remote_branch, "feature/x")
-        self.assertEqual(result.awaiting.stage_id, S1)
-        self.assertEqual(result.accepted, ())
-
-        # Nothing was pushed, nothing was frozen, nothing was accepted and the
-        # run did not advance.
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        self.assertIsNone(result.awaiting)
+        self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1, S2])
+        self.assertEqual(self._stage(S2).read_state().candidate_sha, _head_sha(self.repo))
         self.assertNothingPushed()
-        s1 = self._stage(S1).read_state()
-        self.assertIs(s1.status, StageStatus.WORKING)
-        self.assertIsNone(s1.candidate_sha)
-        self.assertFalse(self._stage(S2).exists())
         state = self._plan_state()
-        self.assertIs(state.status, PlanRunStatus.PAUSED)
-        self.assertEqual(state.current_stage_index, 0)
         self.assertIsNone(state.push_authorization)
-        self.assertEqual(state.awaiting, result.awaiting)
+        self.assertIsNone(state.remote_pin)
 
     def test_the_pause_is_recorded_in_the_run_state_and_survives_a_reload(self):
-        self._start(self._unpushed(), _SparringAdapter([READY, READY]))
+        # Now: a legacy push pause loads as written, and a plain resume keeps
+        # it exactly as it was -- no agent, no push, no acceptance.
+        sha = self._legacy_push_pause()
 
         reloaded = PlanRunState.load(self.state_path)
         payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-
         self.assertEqual(payload["awaiting"]["kind"], PUSH_AUTHORIZATION_REQUIRED)
-        self.assertEqual(payload["awaiting"]["candidate_sha"], _head_sha(self.repo))
-        self.assertIsNone(payload["push_authorization"])
+        self.assertEqual(payload["awaiting"]["candidate_sha"], sha)
         self.assertIsInstance(reloaded.awaiting, PushRequired)
 
-    def test_authorizing_the_exact_candidate_pushes_it_and_accepts_the_stage(self):
-        self._start(self._unpushed(), _SparringAdapter([READY, READY]))
-        sha = _head_sha(self.repo)
+        before = self.state_path.read_bytes()
+        stage_adapter, sparring_adapter = self._unpushed(), _SparringAdapter([])
+        result = self._resume(stage_adapter, sparring_adapter)
+        self.assertEqual(result.awaiting.kind, PUSH_AUTHORIZATION_REQUIRED)
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(stage_adapter.turns, 0)
+        self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        self.assertNothingPushed()
 
-        # The second stage is never reached: this resume is bounded to the one
-        # it was stopped on, so the scripted adapters below would be unused.
-        stage_adapter = _Implementer(self.repo)
-        sparring_adapter = _SparringAdapter([])
-        result = self._resume(
-            stage_adapter, sparring_adapter, allow_push_candidate=sha, stop_after_stage=S1
-        )
-
-        # No agent ran: the reviewer's READY was already on disk.
-        self.assertEqual(stage_adapter.start_calls, [])
-        self.assertEqual(stage_adapter.resume_calls, [])
-        self.assertEqual(sparring_adapter.start_calls, [])
-        self.assertEqual(sparring_adapter.resume_calls, [])
-
-        self.assertPushed(sha)
-        s1 = self._stage(S1).read_state()
-        self.assertIs(s1.status, StageStatus.ACCEPTED)
-        self.assertEqual(s1.candidate_sha, sha)
-        self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1])
-        state = self._plan_state()
-        self.assertIsNone(state.awaiting)
-        self.assertEqual(state.push_authorization.scope, PushScope.CANDIDATE)
-        self.assertEqual(state.push_authorization.candidate_sha, sha)
-
-    def test_authorizing_a_commit_the_run_is_not_waiting_on_is_refused(self):
-        self._start(self._unpushed(), _SparringAdapter([READY, READY]))
-        real = _head_sha(self.repo)
-        stale = "0" * 40
+    def test_authorizing_the_exact_candidate_is_refused_as_deprecated(self):
+        # Was ..._pushes_it_and_accepts_the_stage. --allow-push-candidate is
+        # never an alias for progression (I-L6): refused, nothing changed.
+        sha = self._legacy_push_pause()
+        before = self.state_path.read_bytes()
+        stage_adapter, sparring_adapter = _Implementer(self.repo), _SparringAdapter([])
 
         with self.assertRaises(PlanError) as ctx:
-            self._resume(
-                _Implementer(self.repo), _SparringAdapter([]), allow_push_candidate=stale
-            )
+            self._resume(stage_adapter, sparring_adapter, allow_push_candidate=sha, stop_after_stage=S1)
 
-        message = str(ctx.exception)
-        self.assertIn(real, message)
-        self.assertIn(stale, message)
-        self.assertNothingPushed()
+        self.assertIn(PUSH_PERMISSION_DEPRECATED, str(ctx.exception))
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(stage_adapter.turns, 0)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
         self.assertIsNone(self._plan_state().push_authorization)
+        self.assertNothingPushed()
+
+    def test_authorizing_a_commit_the_run_is_not_waiting_on_is_refused(self):
+        # Refused the same way, before the commit is even compared.
+        self._legacy_push_pause()
+        before = self.state_path.read_bytes()
+
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(_Implementer(self.repo), _SparringAdapter([]), allow_push_candidate="0" * 40)
+
+        self.assertIn(PUSH_PERMISSION_DEPRECATED, str(ctx.exception))
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertNothingPushed()
 
     def test_authorizing_a_candidate_when_nothing_is_waiting_is_refused(self):
         # A run paused for an ordinary reason -- its reviewer asked the human
-        # something. There is no candidate awaiting permission, so there is
-        # nothing this flag could be about.
+        # something. The retired flag is refused there too.
         self._start(
             _Implementer(self.repo), _SparringAdapter([NEEDS_YOU]), stop_after_stage=S1
         )
@@ -632,66 +658,55 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
                 allow_push_candidate="a" * 40,
             )
 
-        self.assertIn("not waiting", str(ctx.exception))
+        self.assertIn(PUSH_PERMISSION_DEPRECATED, str(ctx.exception))
 
-    def test_a_run_authorization_pushes_every_later_verified_candidate_without_asking(self):
-        stage_adapter = self._unpushed()
-        sparring_adapter = _SparringAdapter([READY, READY])
+    def test_a_run_authorization_is_refused_and_nothing_is_created(self):
+        # Was ..._pushes_every_later_verified_candidate_without_asking.
+        with self.assertRaises(PlanError) as ctx:
+            self._start(self._unpushed(), _SparringAdapter([READY, READY]), allow_push_for_run=True)
 
-        result = self._start(
-            stage_adapter, sparring_adapter, allow_push_for_run=True
-        )
+        self.assertIn(PUSH_NOT_PART_OF_RUNS, str(ctx.exception))
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(self._stage(S1).exists())
+        self.assertNothingPushed()
 
-        self.assertIs(result.status, PlanRunStatus.COMPLETE)
-        self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1, S2])
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
-        self.assertIs(self._stage(S2).read_state().status, StageStatus.ACCEPTED)
-        self.assertPushed(_head_sha(self.repo))
+    def test_granting_the_run_scope_at_a_pause_is_refused(self):
+        # Was ..._stops_the_asking_for_the_next_stage.
+        self._legacy_push_pause()
+        before = self.state_path.read_bytes()
+
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(self._unpushed(), _SparringAdapter([READY]), allow_push_for_run=True)
+
+        self.assertIn(PUSH_NOT_PART_OF_RUNS, str(ctx.exception))
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertNothingPushed()
+
+    def test_a_legacy_run_scoped_authorization_survives_a_reload_and_grants_nothing(self):
+        # Was test_a_run_scoped_authorization_survives_a_fresh_process_reading_
+        # the_state. A grant an older engine recorded still loads as written,
+        # and is inert: the run accepts locally and pushes nothing.
+        self._start(self._unpushed(), _SparringAdapter([READY]), stop_after_stage=S1)
         state = self._plan_state()
-        self.assertIsNone(state.awaiting)
-        self.assertEqual(state.push_authorization.scope, PushScope.RUN)
+        state.push_authorization = authorization_for_run(self.repo, branch="feature/x")
+        state.save(self.state_path)
 
-    def test_granting_the_run_scope_at_a_pause_stops_the_asking_for_the_next_stage(self):
-        # Stage 1 stops for permission. The person allows this candidate and
-        # opts out of being asked again; stage 2's candidate is then pushed
-        # without a second request.
-        self._start(self._unpushed(), _SparringAdapter([READY]))
-        sha = _head_sha(self.repo)
-
-        result = self._resume(
-            self._unpushed(),
-            _SparringAdapter([READY]),
-            allow_push_candidate=sha,
-            allow_push_for_run=True,
-        )
-
-        self.assertIs(result.status, PlanRunStatus.COMPLETE)
-        self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1, S2])
-        self.assertPushed(_head_sha(self.repo))
-        self.assertEqual(self._plan_state().push_authorization.scope, PushScope.RUN)
-
-    def test_a_run_scoped_authorization_survives_a_fresh_process_reading_the_state(self):
-        self._start(self._unpushed(), _SparringAdapter([READY]), allow_push_for_run=True,
-                    stop_after_stage=S1)
-
-        # Everything a later process has: the file on disk.
         reloaded = PlanRunState.load(self.state_path)
         self.assertEqual(reloaded.push_authorization.scope, PushScope.RUN)
         self.assertEqual(reloaded.push_authorization.repo_root, str(self.repo.resolve()))
-        self.assertEqual(reloaded.push_authorization.remote_branch, "feature/x")
 
         result = self._resume(self._unpushed(), _SparringAdapter([READY]))
 
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
         self.assertIs(self._stage(S2).read_state().status, StageStatus.ACCEPTED)
+        self.assertEqual(self._plan_state().push_authorization, reloaded.push_authorization)
+        self.assertNothingPushed()
 
-    def test_a_candidate_that_moved_since_the_pause_is_not_covered_by_its_authorization(self):
-        self._start(self._unpushed(), _SparringAdapter([READY]), stop_after_stage=S1)
-        first = _head_sha(self.repo)
+    def test_a_candidate_that_moved_since_the_ready_is_not_accepted(self):
+        # Was ..._since_the_pause_is_not_covered_by_its_authorization. The
+        # run stopped after READY; the candidate then moves on.
+        first = self._ready_not_accepted()
 
-        # The candidate moves on after the run stopped -- work committed on
-        # the branch while the person was deciding. They then authorize the
-        # commit they were shown, which is no longer the candidate.
         (self.repo / "later.txt").write_text("more work\n", encoding="utf-8")
         _run_git(self.repo, "add", "later.txt")
         _run_git(self.repo, "commit", "-q", "-m", "later")
@@ -699,17 +714,11 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertNotEqual(moved, first)
 
         stage_adapter = self._unpushed()
-        # HEAD had moved, so this resume is not the authorized push, and the
-        # stage's next_turn marker records READY over the *first* commit: the
-        # moved candidate is refused outright -- no agent turn, no push.
+        # The stage's next_turn marker records READY over the *first* commit:
+        # the moved candidate is refused outright -- no agent turn, no push.
         with self.assertRaises(PlanRunError) as ctx:
-            self._resume(
-                stage_adapter,
-                _SparringAdapter([READY]),
-                allow_push_candidate=first,
-                stop_after_stage=S1,
-            )
-        self.assertIn("Only that reviewed commit may be pushed and accepted", str(ctx.exception))
+            self._resume(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1)
+        self.assertIn("Only that reviewed commit may be accepted", str(ctx.exception))
         self.assertEqual(stage_adapter.turns, 0)
         self.assertNothingPushed()
 
@@ -730,73 +739,73 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertNothingPushed()
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
-    def test_a_push_failure_stops_the_run_and_accepts_nothing(self):
+    def test_a_remote_that_refuses_pushes_does_not_affect_a_run(self):
+        # Was test_a_push_failure_stops_the_run_and_accepts_nothing. A run
+        # pushes nothing, so a remote refusing pushes changes nothing.
         self._reject_pushes()
 
-        with self.assertRaises(PlanRunError) as ctx:
-            self._start(self._unpushed(), _SparringAdapter([READY]), allow_push_for_run=True)
+        result = self._start(self._unpushed(), _SparringAdapter([READY, READY]))
 
-        message = str(ctx.exception)
-        self.assertIn("could not be put on its intended remote branch", message)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
-        self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        self.assertNothingPushed()
 
-    def test_a_push_whose_result_cannot_be_verified_accepts_nothing(self):
-        with mock.patch("agent_sparring.push_gate.observe", return_value=self.remote_before):
-            with self.assertRaises(PlanRunError):
-                self._start(
-                    self._unpushed(), _SparringAdapter([READY]), allow_push_for_run=True
-                )
+    def test_a_run_never_calls_the_push_gate(self):
+        # Was test_a_push_whose_result_cannot_be_verified_accepts_nothing:
+        # there is no push result to verify, because a run never reaches the
+        # push gate (I-L1).
+        with mock.patch("agent_sparring.push_gate.ensure_candidate_pushed") as gate, \
+                mock.patch("agent_sparring.push_gate.observe") as observe:
+            result = self._start(self._unpushed(), _SparringAdapter([READY, READY]))
 
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
-        self.assertIs(self._plan_state().status, PlanRunStatus.PAUSED)
+        gate.assert_not_called()
+        observe.assert_not_called()
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
 
-    def test_pushing_it_yourself_is_unexplained_movement_until_acknowledged(self):
-        # A push made outside the engine is not one of its answers any more:
-        # nothing in the run's records explains it, so the run stops on it.
-        self._start(self._unpushed(), _SparringAdapter([READY]), stop_after_stage=S1)
-        sha = _head_sha(self.repo)
+    def test_pushing_it_yourself_is_not_monitored_and_accepts_on_the_ready(self):
+        # Was ..._is_unexplained_movement_until_acknowledged. Plan L (L-D2):
+        # runs do not watch the remote. A push made by hand is neither read
+        # nor a pause; the stage is accepted because the reviewer's READY is
+        # for this exact commit.
+        sha = self._ready_not_accepted()
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
 
         stage_adapter = self._unpushed()
         result = self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
 
         self.assertEqual(stage_adapter.turns, 0)
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.awaiting.kind, "unauthorized_remote_movement")
-        self.assertEqual(result.awaiting.observed_tip, sha)
-        self.assertEqual(result.awaiting.expected_tip, self.remote_before)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        self.assertIsNone(result.awaiting)
+        self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1])
+        self.assertEqual(self._stage(S1).read_state().candidate_sha, sha)
+        self.assertEqual(self._plan_state().remote_records, ())
 
-        # A person who has looked acknowledges exactly what they saw. That
-        # records the observation and nothing else: the candidate on the
-        # remote is still explained by no engine receipt, so the run stops
-        # again, on the candidate this time.
+    def test_a_legacy_pushed_candidate_pause_is_cleared_only_by_its_own_command(self):
+        # Kept for legacy runs (I-L3): an older engine stopped on movement,
+        # a person acknowledged it, and the engine stopped again on the
+        # pushed candidate. Neither the acknowledgement nor a push flag clears
+        # that; only the explicit per-commit action does, and it is not
+        # acceptance -- the READY at that exact commit is.
+        sha = self._ready_not_accepted()
+        _run_git(self.repo, "push", "-q", "origin", "feature/x")
+        self._legacy_pause(self._movement(sha))
         acknowledge_remote_movement(self.sparring_dir, run_key=self.run_key, observed=sha, by="tester")
-        result = self._resume(self._unpushed(), _SparringAdapter([]), stop_after_stage=S1)
+        self._legacy_pause(PushedCandidateUnauthorized(
+            stage_id=S1, candidate_sha=sha, remote="origin", url=str(self.remote),
+            ref="refs/heads/feature/x", observed_tip=sha,
+        ))
 
+        result = self._resume(self._unpushed(), _SparringAdapter([]), stop_after_stage=S1)
         self.assertIs(result.status, PlanRunStatus.PAUSED)
         self.assertEqual(result.awaiting.kind, PUSHED_CANDIDATE_UNAUTHORIZED)
-        self.assertEqual(result.awaiting.candidate_sha, sha)
-        self.assertEqual(result.awaiting.observed_tip, sha)
         self.assertEqual(result.accepted, ())
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
-        # Neither push permission clears it: the one-candidate flag is refused
-        # outright, and a run-level grant is recorded while the pause stands.
         with self.assertRaises(PlanError) as ctx:
             self._resume(self._unpushed(), _SparringAdapter([]), allow_push_candidate=sha)
-        self.assertIn("authorize-pushed-candidate", str(ctx.exception))
-        stage_adapter, sparring_adapter = self._unpushed(), _SparringAdapter([])
-        result = self._resume(
-            stage_adapter, sparring_adapter, allow_push_for_run=True, stop_after_stage=S1
-        )
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.awaiting.kind, PUSHED_CANDIDATE_UNAUTHORIZED)
-        self.assertEqual(stage_adapter.turns, 0)
-        self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
-        self.assertEqual(self._plan_state().push_authorization.scope, PushScope.RUN)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        self.assertIn(PUSH_PERMISSION_DEPRECATED, str(ctx.exception))
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(self._unpushed(), _SparringAdapter([]), allow_push_for_run=True)
+        self.assertIn(PUSH_NOT_PART_OF_RUNS, str(ctx.exception))
+        self.assertEqual(self._plan_state().awaiting.kind, PUSHED_CANDIDATE_UNAUTHORIZED)
 
         # The explicit per-commit action names the run and the exact commit,
         # and is recorded on its own, with who and when.
@@ -834,13 +843,17 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
 
     def _paused_on_a_pushed_candidate(self) -> str:
         """Reviewed, pushed by hand, the movement acknowledged, and the run
-        stopped again on the candidate."""
+        stopped again on the candidate -- the legacy pauses an older engine
+        recorded, written here as it wrote them (runs no longer reach them)."""
 
-        self._start(self._unpushed(), _SparringAdapter([READY]), stop_after_stage=S1)
-        sha = _head_sha(self.repo)
+        sha = self._ready_not_accepted()
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
-        self._resume(self._unpushed(), _SparringAdapter([]), stop_after_stage=S1)
+        self._legacy_pause(self._movement(sha))
         acknowledge_remote_movement(self.sparring_dir, run_key=self.run_key, observed=sha, by="tester")
+        self._legacy_pause(PushedCandidateUnauthorized(
+            stage_id=S1, candidate_sha=sha, remote="origin", url=str(self.remote),
+            ref="refs/heads/feature/x", observed_tip=sha,
+        ))
         result = self._resume(self._unpushed(), _SparringAdapter([]), stop_after_stage=S1)
         self.assertEqual(result.awaiting.kind, PUSHED_CANDIDATE_UNAUTHORIZED)
         return sha
@@ -904,7 +917,10 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         sha = self._paused_on_a_pushed_candidate()
         # Someone who can write the run state adds an "acknowledgement" naming
         # an unrelated commit -- and, for good measure, one naming the
-        # candidate itself -- and clears the pause by hand.
+        # candidate itself. (Plan L: runs no longer re-derive pauses from
+        # records, so the recorded pause is what stands; a record, forged or
+        # not, does not clear it. Clearing the pause itself by hand is run-
+        # state tampering, Stage 5's integrity work.)
         payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         real = payload["remote_records"][-1]
         forged = [
@@ -912,7 +928,6 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
             for tip in (self.remote_before, sha)
         ]
         payload["remote_records"] = forged + payload["remote_records"]
-        payload["awaiting"] = None
         self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
         stage_adapter = self._unpushed()
@@ -929,22 +944,21 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertIs(stage.read_state().status, StageStatus.WORKING)
 
     def test_an_acknowledged_candidate_is_not_accepted_without_a_ready_review(self):
-        # The agent pushes its own commit during its turn; the movement is
-        # caught after that turn, before any review, and acknowledged. The
-        # reviewer then sends it back: nothing is accepted, and there is no
-        # pushed-candidate pause for anyone to authorize.
+        # Kept for legacy runs (I-L3). The agent pushes its own commit and the
+        # reviewer does not say READY; an older engine recorded the movement,
+        # and a person acknowledges it. The acknowledgement clears only that
+        # pause: nothing is accepted, and there is no pushed-candidate pause
+        # for anyone to authorize.
         stage_adapter = _Implementer(self.repo, push=True)
-        result = self._start(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
+        self._start(stage_adapter, _SparringAdapter([SEND_BACK, NEEDS_YOU]), stop_after_stage=S1)
         pushed = _head_sha(self.repo)
-        self.assertEqual(result.awaiting.kind, "unauthorized_remote_movement")
+        self._legacy_pause(self._movement(pushed))
         acknowledge_remote_movement(
             self.sparring_dir, run_key=self.run_key, observed=pushed, by="tester"
         )
 
         stage_adapter.push = False
-        result = self._resume(
-            stage_adapter, _SparringAdapter([SEND_BACK, NEEDS_YOU]), stop_after_stage=S1
-        )
+        result = self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
 
         self.assertIs(result.status, PlanRunStatus.PAUSED)
         self.assertEqual(result.accepted, ())
@@ -987,20 +1001,18 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertIn(AUTHORIZED_WITHOUT_PUSH, out.getvalue())
         self.assertEqual(self._plan_state().remote_records[-1].kind, AUTHORIZED_WITHOUT_PUSH)
 
-    def test_an_agent_pushing_its_own_candidate_stops_the_run_even_under_a_run_grant(self):
-        # A run-level grant is permission for the *engine* to push. An agent
-        # that pushes on its own produced movement no record explains.
+    def test_an_agent_pushing_its_own_candidate_does_not_stop_the_run(self):
+        # Was ..._stops_the_run_even_under_a_run_grant. Plan L (L-D2): an
+        # agent's own push is neither read nor monitored by a run; the
+        # candidates are accepted on the local rules and the reviewer's READY.
+        # (An agent able to push at all is Plan D's boundary.)
         stage_adapter = _Implementer(self.repo, push=True)
 
-        result = self._start(
-            stage_adapter, _SparringAdapter([READY, READY]), allow_push_for_run=True
-        )
+        result = self._start(stage_adapter, _SparringAdapter([READY, READY]))
 
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.awaiting.kind, "unauthorized_remote_movement")
-        self.assertEqual(result.accepted, ())
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
-        self.assertFalse(self._stage(S2).exists())
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1, S2])
+        self.assertEqual(self._plan_state().remote_records, ())
 
     def test_a_run_recorded_before_push_authorization_existed_loads_as_no_authorization(self):
         self._start(self._unpushed(), _SparringAdapter([READY]), stop_after_stage=S1)
@@ -1014,10 +1026,12 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertIsNone(state.push_authorization)
         self.assertIsNone(state.awaiting)
 
-        # And such a run behaves as the default does: it asks.
+        # And such a run behaves as every run now does (Plan L): it does not
+        # ask; it accepts locally.
         result = self._resume(self._unpushed(), _SparringAdapter([READY]))
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertIsNotNone(result.awaiting)
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        self.assertIsNone(result.awaiting)
+        self.assertNothingPushed()
 
 
 class PushAuthorizationCliTests(_RemoteAwareTestCase):
@@ -1048,37 +1062,31 @@ class PushAuthorizationCliTests(_RemoteAwareTestCase):
                 )
         return code, out.getvalue(), err.getvalue()
 
-    def test_run_plan_reports_the_typed_request_with_both_ways_to_answer_it(self):
+    def test_run_plan_accepts_locally_and_asks_for_no_push(self):
+        # Was test_run_plan_reports_the_typed_request_with_both_ways_to_answer_it.
         code, out, _err = self._main("run-plan", str(self.plan_path), "--stop-after-stage", S1)
-        sha = _head_sha(self.repo)
 
         self.assertEqual(code, 0)
-        self.assertIn(f"needs: {PUSH_AUTHORIZATION_REQUIRED}", out)
-        self.assertIn(f"candidate: {sha}", out)
-        self.assertIn("push to: origin/feature/x", out)
-        self.assertIn(f"--allow-push-candidate {sha}", out)
-        self.assertIn("--allow-push-for-run", out)
-        # Not dressed up as a review outcome or a manual check.
-        self.assertNotIn("action:", out)
-        self.assertNotIn("required before READY", out)
+        self.assertNotIn(PUSH_AUTHORIZATION_REQUIRED, out)
+        self.assertNotIn("--allow-push-candidate", out)
+        self.assertNotIn("--allow-push-for-run", out)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
         self.assertNothingPushed()
 
-    def test_resume_plan_with_the_candidate_flag_pushes_and_accepts(self):
+    def test_resume_plan_with_the_candidate_flag_is_refused_as_deprecated(self):
+        # Was ..._pushes_and_accepts.
         self._main("run-plan", str(self.plan_path), "--stop-after-stage", S1)
         sha = _head_sha(self.repo)
+        before = self.state_path.read_bytes()
 
-        code, out, _err = self._main(
-            "resume-plan",
-            str(self.plan_path),
-            "--allow-push-candidate",
-            sha,
-            "--stop-after-stage",
-            S1,
+        code, _out, err = self._main(
+            "resume-plan", str(self.plan_path), "--allow-push-candidate", sha, "--stop-after-stage", S1,
         )
 
-        self.assertEqual(code, 0)
-        self.assertPushed(sha)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+        self.assertEqual(code, 1)
+        self.assertIn(PUSH_PERMISSION_DEPRECATED, err)
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertNothingPushed()
 
     def test_resume_plan_refuses_a_stale_candidate_flag(self):
         self._main("run-plan", str(self.plan_path), "--stop-after-stage", S1)
@@ -1088,20 +1096,19 @@ class PushAuthorizationCliTests(_RemoteAwareTestCase):
         )
 
         self.assertEqual(code, 1)
-        self.assertIn("refusing to authorize a commit this run is not waiting on", err)
+        self.assertIn(PUSH_PERMISSION_DEPRECATED, err)
         self.assertNothingPushed()
 
-    def test_run_plan_can_record_the_run_scoped_permission_up_front(self):
+    def test_run_plan_refuses_the_run_scoped_permission_up_front(self):
+        # Was ..._can_record_the_run_scoped_permission_up_front.
         code, _out, err = self._main(
             "run-plan", str(self.plan_path), "--allow-push-for-run", "--stop-after-stage", S1
         )
 
-        self.assertEqual(code, 0)
-        self.assertIn("push authorization recorded for this run", err)
-        self.assertPushed(_head_sha(self.repo))
-        self.assertEqual(
-            PlanRunState.load(self.state_path).push_authorization.scope, PushScope.RUN
-        )
+        self.assertEqual(code, 1)
+        self.assertIn(PUSH_NOT_PART_OF_RUNS, err)
+        self.assertFalse(self.state_path.exists())
+        self.assertNothingPushed()
 
 
 if __name__ == "__main__":  # pragma: no cover

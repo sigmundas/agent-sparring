@@ -45,7 +45,7 @@ class ManagedRunEndToEndTests(_ManagedRepoTestCase):
 
         code, _, err = self._main(
             "run-plan", str(self.plan_path), "--repo-root", str(self.repo), "--managed",
-            "--allow-push-for-run", adapters=adapters,
+            adapters=adapters,
         )
         self.assertEqual(code, 0, err)
         (record,) = self._records()

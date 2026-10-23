@@ -292,7 +292,9 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
             accept_advanced_head=advanced,
         )
 
-    def test_a_refused_flag_leaves_push_permission_and_run_state_unwritten(self):
+    def test_a_refused_flag_leaves_the_run_state_unwritten(self):
+        # Plan L: there is no push permission left to record (the retired
+        # flag is refused on its own, see test_local_first.py).
         stage_adapter, sparring_adapter, pinned = self._pause()
         self._land_other()
         self._refused(
@@ -300,7 +302,6 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
             "not the current HEAD",
             evidence="done",
             accept_advanced_head=pinned,
-            allow_push_for_run=True,
         )
 
     def test_a_stage_not_waiting_for_review_is_refused(self):
@@ -347,7 +348,7 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
 
     def test_a_failure_at_any_write_puts_everything_back(self):
         # The re-pin, the note and the run state land together or not at
-        # all, even with a push grant recorded first in the same resume.
+        # all.
         real_repin = plan_module.repin_after_authorized_advance
         proofs = []
 
@@ -374,7 +375,7 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
                     with self.assertRaises((OSError, PlanError)):
                         self._resume(
                             stage_adapter, sparring_adapter, evidence="done",
-                            accept_advanced_head=advanced, allow_push_for_run=True,
+                            accept_advanced_head=advanced,
                         )
                 self.assertEqual(self._snapshot(), before)
                 if label == "second proof":
@@ -390,7 +391,6 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
             "--deferred-result",
             evidence="done",
             accept_advanced_head=advanced,
-            allow_push_for_run=True,
             deferred_results=(DeferredAnswer(check_ref="nope:nope", outcome=CheckOutcome.PASS),),
         )
 
@@ -490,7 +490,7 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
             with self.assertRaises(OSError):
                 self._resume(
                     stage_adapter, sparring_adapter, evidence="done",
-                    accept_advanced_head=advanced, allow_push_for_run=True,
+                    accept_advanced_head=advanced,
                 )
         self.assertEqual(self._snapshot(), before)
         self._accepted((stage_adapter, sparring_adapter), advanced)
@@ -529,12 +529,12 @@ class AcceptAdvancedHeadTests(_PlanRepoTestCase):
                                 self.plan_path, self.sparring_dir, self.repo,
                                 mock.Mock(side_effect=factory_error),
                                 expected_branch="feature/x", evidence="done",
-                                accept_advanced_head=advanced, allow_push_for_run=True,
+                                accept_advanced_head=advanced,
                             )
                         else:
                             self._resume(
                                 stage_adapter, sparring_adapter, evidence="done",
-                                accept_advanced_head=advanced, allow_push_for_run=True,
+                                accept_advanced_head=advanced,
                                 **options,
                             )
                 self.assertEqual(self._snapshot(), before)

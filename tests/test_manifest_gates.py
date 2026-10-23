@@ -547,16 +547,17 @@ class AuthorizationGateRunTests(_ManifestRepoTestCase):
         self.assertIn("satisfied by the approved start", "\n".join(reports))
 
     def test_the_approved_start_authorizes_starting_not_pushing(self):
-        # Without a push grant, a satisfied go-ahead still leaves the push to
-        # the engine's own gate: the first verified candidate stops for it.
+        # Plan L: a satisfied go-ahead authorizes starting, and nothing about
+        # it is a push permission -- none is recorded, and none is needed:
+        # the run accepts its verified candidates locally and never pauses
+        # for a push.
         self._first_stage_gated([START])
-        result = self._start(
-            self.stage_adapter, _SparringAdapter([READY, READY]), allow_push_for_run=False
-        )
+        result = self._start(self.stage_adapter, _SparringAdapter([READY, READY]))
         self.assertTrue(self._owed("managed-run-approval").resolved)
-        self.assertEqual(result.awaiting.kind, "push_authorization_required")
-        self.assertEqual(result.accepted, ())
+        self.assertNotEqual(getattr(result.awaiting, "kind", None), "push_authorization_required")
+        self.assertTrue(result.accepted)
         self.assertIsNone(self._plan_state().push_authorization)
+        self.assertIsNone(self._plan_state().remote_pin)
 
     def test_g1c_is_not_asked_while_g1_has_not_passed(self):
         # The slice that starts at Stage 2: its start predates G1's evidence.

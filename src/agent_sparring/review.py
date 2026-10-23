@@ -65,8 +65,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent_sparring.acceptance import (
+    CANDIDATE_NOT_ON_BRANCH,
     AcceptanceError,
     pin_sibling_candidates,
+    require_primary_history,
     unrepresented_dirty,
 )
 from agent_sparring.deferred_gate import DeferredObligation
@@ -221,10 +223,14 @@ def enter_review(
     - the worktree holds no changes that commit does not represent (the
       acceptance gate's own check, via
       :func:`~agent_sparring.acceptance.unrepresented_dirty`);
+    - every candidate a preceding stage, or the owning run, accepted is an
+      ancestor of that commit, so accepted history was not rewritten
+      (``run_history_rewritten``);
     - every sibling candidate declared by an accepted stage is on its
-      branch, at its pinned commit, clean and pushed (the freeze's own
-      sibling handling, via
-      :func:`~agent_sparring.acceptance.pin_sibling_candidates`).
+      branch, at its pinned commit, clean and with its own history
+      preserved (the freeze's own sibling handling, via
+      :func:`~agent_sparring.acceptance.pin_sibling_candidates`). No remote
+      is read.
 
     On success the primary commit is recorded as this stage's ``base_sha``
     and the sibling set as its ``repositories``, before the reviewer runs.
@@ -272,8 +278,8 @@ def enter_review(
         raise ReviewError(str(exc)) from exc
     if branch != expected_branch:
         raise ReviewError(
-            f"expected branch {expected_branch!r} but {repo_root} is on {branch!r}; "
-            "refusing to review the wrong branch"
+            f"refusing: {CANDIDATE_NOT_ON_BRANCH}: expected branch {expected_branch!r} but "
+            f"{repo_root} is on {branch!r}; refusing to review the wrong branch"
         )
 
     try:
@@ -296,11 +302,26 @@ def enter_review(
     if blocking:
         listed = ", ".join(blocking)
         raise ReviewError(
-            f"refusing to review {head} for stage {stage.stage_id!r}: the working tree "
-            f"holds changes that commit does not represent ({listed}), so what the "
-            "reviewer would inspect is not the accepted candidate. Commit or discard "
-            "them first."
+            f"refusing: {CANDIDATE_NOT_ON_BRANCH}: refusing to review {head} for stage "
+            f"{stage.stage_id!r}: the working tree holds changes that commit does not "
+            f"represent ({listed}), so what the reviewer would inspect is not the accepted "
+            "candidate. Commit or discard them first."
         )
+
+    # Accepted history only grows (I-L2b): every candidate a preceding stage
+    # accepted, and every one the owning run accepted, is in what is about
+    # to be reviewed. The sibling half is checked as each sibling is pinned.
+    try:
+        require_primary_history(
+            stage,
+            repo_root,
+            head,
+            earlier=tuple((entry.stage_id, entry.candidate_sha) for entry in accepted),
+        )
+    except AcceptanceError as exc:
+        raise ReviewError(
+            f"stage {stage.stage_id!r} cannot review the accepted candidate set: {exc}"
+        ) from exc
 
     # The sibling candidates under review, deduplicated by identity: every
     # accepted stage's declarations, plus this stage's own. Several stages of
@@ -371,7 +392,7 @@ def describe_candidate_set(stage: Stage, subject: ReviewSubject) -> str:
         lines += [
             "",
             "Sibling repositories whose candidates are part of that set, each verified "
-            "just now to be on its branch, at its pinned commit, clean and pushed:",
+            "just now to be on its branch, at its pinned commit and clean:",
             "",
         ]
         for repository in subject.repositories:

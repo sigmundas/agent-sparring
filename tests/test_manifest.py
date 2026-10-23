@@ -46,6 +46,7 @@ from test_plan import (  # noqa: E402  (shared scripted adapters and verdicts)
     _SparringAdapter,
     _StageAdapter,
     _fixed,
+    _head_sha,
     _run_git,
 )
 
@@ -218,9 +219,6 @@ class _ManifestRepoTestCase(unittest.TestCase):
         return load_manifest_source(self.manifest_path)
 
     def _start(self, stage_adapter, sparring_adapter, **kwargs):
-        # The engine pushes each verified candidate, under the run-level
-        # grant a person gives at start.
-        kwargs.setdefault("allow_push_for_run", True)
         return start_plan(
             self.source(), self.sparring_dir, self.repo, _fixed(stage_adapter, sparring_adapter),
             expected_branch="feature/x", run_key=kwargs.pop("run_key", self.run_key), **kwargs,
@@ -349,10 +347,14 @@ class ManifestAdoptionTests(_ManifestRepoTestCase):
     def test_adopts_an_accepted_stage_and_advances_past_it(self):
         # Its brief predates the manifest and does not match; that is fine,
         # acceptance is terminal and nothing will run for it.
+        # A real accepted commit: the run's accepted history must be in what
+        # later stages build on (Plan L, I-L2b), so a fabricated id would be
+        # refused as run_history_rewritten.
+        accepted = _head_sha(self.repo)
         self._existing(
             "stage-3c-cloud-schema",
             brief="# an older, hand-written brief\n",
-            state=StageState(status=StageStatus.ACCEPTED, candidate_sha="a" * 40),
+            state=StageState(status=StageStatus.ACCEPTED, candidate_sha=accepted),
         )
         reported: list[str] = []
         stage_adapter = _StageAdapter(self.repo, commit=True)
@@ -362,7 +364,7 @@ class ManifestAdoptionTests(_ManifestRepoTestCase):
         )
 
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
-        self.assertEqual(result.accepted[0], ("stage-3c-cloud-schema", "a" * 40))
+        self.assertEqual(result.accepted[0], ("stage-3c-cloud-schema", accepted))
         # Only Stage 3D actually ran.
         self.assertEqual(len(stage_adapter.start_calls), 1)
         self.assertTrue(any("already ACCEPTED" in line for line in reported))
@@ -490,10 +492,14 @@ class ManifestAdoptionTests(_ManifestRepoTestCase):
         """Stage 3C accepted, Stage 3D reviewed and waiting for a person --
         the state a hand-driven sequence is actually in when it is adopted."""
 
+        # Real commits (Plan L, I-L2b): Stage 3D's base and Stage 3C's
+        # accepted candidate are both the current HEAD, which later work
+        # builds on.
+        self.accepted_3c = _head_sha(self.repo)
         self._existing(
             "stage-3c-cloud-schema",
             brief="# an older, hand-written brief\n",
-            state=StageState(status=StageStatus.ACCEPTED, candidate_sha="a" * 40),
+            state=StageState(status=StageStatus.ACCEPTED, candidate_sha=self.accepted_3c),
         )
         stage = self._existing(
             "stage-3d-snapshot-v2",
@@ -502,7 +508,7 @@ class ManifestAdoptionTests(_ManifestRepoTestCase):
                 status=StageStatus.WORKING,
                 implementation_session_id="impl-3d",
                 sparring_session_id="spar-3d",
-                base_sha="b" * 40,
+                base_sha=self.accepted_3c,
             ),
         )
         return stage, self._needs_you_sparring(stage, structured=structured)
@@ -535,7 +541,7 @@ class ManifestAdoptionTests(_ManifestRepoTestCase):
         self.assertEqual(after.run, self.run_key)
         # The accepted history was still walked past, and the run is now a
         # managed one, paused where the human already was.
-        self.assertEqual(result.accepted, (("stage-3c-cloud-schema", "a" * 40),))
+        self.assertEqual(result.accepted, (("stage-3c-cloud-schema", self.accepted_3c),))
         state = self._plan_state()
         self.assertIs(state.status, PlanRunStatus.PAUSED)
         self.assertEqual(state.current_stage, "stage-3d-snapshot-v2")
@@ -659,13 +665,13 @@ class ManifestCliTests(_ManifestRepoTestCase):
         stage = self._stage("stage-3c-cloud-schema").create(
             brief=manifest_payload()["stages"][0]["brief"]
         )
-        stage.write_state(StageState(status=StageStatus.ACCEPTED, candidate_sha="a" * 40))
+        # A real accepted commit (Plan L, I-L2b: later stages must contain it).
+        stage.write_state(StageState(status=StageStatus.ACCEPTED, candidate_sha=_head_sha(self.repo)))
         adapters = (_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]))
 
         code, out, err = self._main(
             "run-plan", "--manifest", str(self.manifest_path), "--adopt",
-            "--repo-root", str(self.repo), "--expected-branch", "feature/x",
-            "--allow-push-for-run", adapters=adapters,
+            "--repo-root", str(self.repo), "--expected-branch", "feature/x", adapters=adapters,
         )
         self.assertEqual(code, 0, err)
         self.assertIn("adopting Stage 3C — Cloud schema", err)

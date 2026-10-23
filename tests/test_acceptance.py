@@ -125,14 +125,23 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(_head_sha(self.repo), before_head)
         self.assertEqual(_commit_count(self.repo), before_count)
 
-    def test_unpushed_candidate_cannot_be_frozen(self):
+    def test_an_unpushed_candidate_is_frozen_locally_and_the_remote_is_untouched(self):
+        # Plan L (I-L2): was test_unpushed_candidate_cannot_be_frozen. Remote
+        # state is never an input; the local rule (exact clean HEAD of the
+        # expected branch) is what refuses, see test_local_first.LocalRuleTests.
+        remote_refs = subprocess.run(
+            ["git", "--git-dir", str(self.remote), "for-each-ref"], capture_output=True, text=True, check=True
+        ).stdout
         unpushed = self._commit_more("unpushed.txt", push=False)
-        with self.assertRaises(AcceptanceError) as ctx:
-            self._freeze()
-        self.assertIn(unpushed, str(ctx.exception))
-        state = self.stage.read_state()
-        self.assertEqual(state.status, StageStatus.WORKING)
-        self.assertIsNone(state.candidate_sha)
+        result = self._freeze()
+        self.assertEqual(result.candidate_sha, unpushed)
+        self.assertIs(self.stage.read_state().status, StageStatus.FROZEN)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "--git-dir", str(self.remote), "for-each-ref"], capture_output=True, text=True, check=True
+            ).stdout,
+            remote_refs,
+        )
 
     def test_dirty_working_tree_cannot_be_frozen(self):
         (self.repo / "impl.txt").write_text("uncommitted edit\n", encoding="utf-8")

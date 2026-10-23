@@ -118,10 +118,9 @@ class _StageAdapter:
     from resumed ones. Can commit a file on each turn, and can fail on a given
     1-indexed call.
 
-    It does not push by default: in a managed run the engine pushes, after
-    authorization (this module's runs hold a run-level grant). ``push=True``
-    models an agent pushing on its own, which the engine treats as
-    unauthorized remote movement."""
+    It does not push by default: runs are local-first and nothing pushes.
+    ``push=True`` models an agent pushing on its own, which a local-first
+    run neither needs nor reads."""
 
     def __init__(self, repo: Path, *, commit: bool = False, push: bool = False, fail_at: int | None = None):
         self.repo = repo
@@ -275,10 +274,11 @@ class _PlanRepoTestCase(unittest.TestCase):
         self.run_key = plan_key("docs/plan.md")
         self.state_path = run_state_path(self.sparring_dir, self.run_key)
 
-    #: The engine pushes a managed run's candidates, after authorization;
-    #: these runs are started with the run-level grant (as a person would give
-    #: it in start-plan's confirmation) unless a test says otherwise.
-    GRANT_PUSH_FOR_RUN = True
+    #: Runs are local-first and never push, so no run is started with the
+    #: retired run-level push grant (it refuses with push_not_part_of_runs;
+    #: see test_local_first.py). Kept as a switch only for a test that
+    #: asserts that refusal.
+    GRANT_PUSH_FOR_RUN = False
 
     def _start(self, stage_adapter, sparring_adapter, **kwargs):
         if self.GRANT_PUSH_FOR_RUN:
@@ -1012,7 +1012,7 @@ class PlanCliTests(_PlanRepoTestCase):
         adapters = (_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]))
         code, out, err = self._main(
             "run-plan", str(self.plan_path), "--repo-root", str(self.repo),
-            "--expected-branch", "feature/x", "--stop-after-stage", S1, "--allow-push-for-run",
+            "--expected-branch", "feature/x", "--stop-after-stage", S1,
             adapters=adapters,
         )
 

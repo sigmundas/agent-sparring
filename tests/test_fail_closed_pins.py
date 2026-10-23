@@ -2,18 +2,21 @@
 
 What these tests hold, one sentence each:
 
-- a run the engine's record outside the project directory calls pinned,
-  whose pin is gone (state deleted, ``remote_pin`` removed, or a
+- a legacy run the engine's record outside the project directory calls
+  pinned, whose pin is gone (state deleted, ``remote_pin`` removed, or a
   legacy-shaped state in its place), refuses ``finish-run`` with
-  ``remote_pin_missing`` (exit 3) and touches no ref of either remote;
-- freeze/accept of a stage resolve its owner from engine run state and,
-  for an unpinned legacy run, refuse rather than fall back to reachability;
+  ``remote_pin_missing`` (exit 3) and touches no ref of either remote
+  (Stage 4 of Plan L replaces this with the run-state integrity refusal);
+- Plan L: freeze/accept still resolve a stage's owner from engine run
+  state, but are decided locally -- a legacy pin, intact or damaged, is
+  inert and reachability is never an input;
 - an acknowledgement is a baseline for further movement, never an
   explanation of a candidate -- not even one behind the acknowledged tip;
 - a push raced by someone else between the movement check and the engine's
-  push is movement, not a receipt;
-- a turn that raises after an out-of-band push is still checked, so the
-  movement pause comes before any later turn.
+  push primitive is movement, not a receipt (the primitive is kept for
+  Plan P); a run never calls that primitive;
+- Plan L: a turn that raises after an out-of-band push fails exactly as it
+  would without the push -- runs no longer monitor remote movement.
 
 Real repositories and real bare remotes throughout; no network, no provider.
 """
@@ -164,29 +167,53 @@ class FinishWithoutThePinTests(_FinishTestCase):
 
 
 class LegacyAcceptTests(_AuthorityCase):
+    """Plan L (I-L2): freeze and accept are local. A legacy run's pin --
+    present, missing or damaged -- is inert, and reachability is never an
+    input; the owning run is still resolved from engine run state, because
+    its accepted history and any recorded remote pause still apply."""
+
     GRANT_PUSH_FOR_RUN = False
 
-    def _legacy_with_the_candidate_on_the_remote(self) -> str:
-        """A run that stopped for push permission; the candidate then pushed
-        by hand; the run state rewritten as an engine from before pins wrote
-        it, with no engine record of a pin; and the stage frozen as such an
-        engine could have left it."""
+    def _ready_not_accepted(self) -> str:
+        """The reviewer said READY over a commit and the run stopped before
+        the acceptance gate (here: interrupted)."""
 
-        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
-        head = _head_sha(self.repo)
+        with mock.patch("agent_sparring.plan.freeze_candidate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]))
+        return _head_sha(self.repo)
+
+    def _legacy_pinned(self) -> None:
+        """The run state rewritten as a pinning engine left it: a remote pin
+        and the engine's record outside the project directory that it was
+        pinned, and no local-first snapshot."""
+
+        pin = pin_remote(self.repo, "feature/x")
+        self._rewrite(self.state_path, lambda p: (p.pop("config_snapshot", None),
+                                                  p.__setitem__("remote_pin", pin.to_dict())))
+        managed_run.mark_pinned(self.repo, self.run_key)
+
+    def _legacy_with_the_candidate_on_the_remote(self) -> str:
+        """A run recorded by an engine from before pins (no pin, no engine
+        record of one), its candidate pushed by hand, and the stage frozen as
+        such an engine could have left it."""
+
+        head = self._ready_not_accepted()
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
-        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        del payload["remote_pin"]
-        payload.pop("remote_records", None)
-        payload["awaiting"] = None
-        self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        managed_run.run_flag_path(self.repo, self.run_key).unlink()
+        self._rewrite(self.state_path, lambda p: (p.pop("config_snapshot", None), p.pop("remote_pin", None)))
         stage = self._stage(S1)
         state = stage.read_state()
         state.status = StageStatus.FROZEN
         state.candidate_sha = head
         stage.write_state(state)
         return head
+
+    def _with_a_recorded_movement_pause(self) -> None:
+        movement = UnauthorizedRemoteMovement(
+            stage_id=S1, remote="origin", url=str(self.remote), ref="refs/heads/feature/x",
+            expected_tip=self.remote_before, observed_tip=_head_sha(self.repo),
+        )
+        self._rewrite(self.state_path, lambda p: p.__setitem__("awaiting", movement.to_dict()))
 
     def _accept(self) -> tuple[int, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -197,18 +224,26 @@ class LegacyAcceptTests(_AuthorityCase):
             ])
         return code, err.getvalue()
 
-    def test_accept_candidate_on_an_unpinned_legacy_run_refuses(self):
-        self._legacy_with_the_candidate_on_the_remote()
+    def test_accept_candidate_on_an_unpinned_legacy_run_is_decided_locally(self):
+        # Was ..._refuses: an unpinned legacy run is no longer refused for
+        # lacking a pin, and reachability is still never taken as anything.
+        # The same acceptance with the candidate deleted from the remote
+        # again succeeds: the remote is not an input either way.
+        head = self._legacy_with_the_candidate_on_the_remote()
+        _run_git(self.repo, "push", "-q", "origin", "--delete", "feature/x")
 
         code, err = self._accept()
 
-        self.assertEqual(code, 1)
-        self.assertIn("recorded before runs pinned", err)
-        self.assertIn("reachability alone is never taken as pushed", err)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
+        self.assertEqual(code, 0, err)
+        state = self._stage(S1).read_state()
+        self.assertIs(state.status, StageStatus.ACCEPTED)
+        self.assertEqual(state.candidate_sha, head)
 
     def test_an_emptied_owner_field_does_not_make_the_stage_hand_driven(self):
+        # The run state is positioned at the stage, so the run owns it, and
+        # the remote incident it recorded still refuses acceptance.
         self._legacy_with_the_candidate_on_the_remote()
+        self._with_a_recorded_movement_pause()
         stage = self._stage(S1)
         state = stage.read_state()
         state.run = None
@@ -216,16 +251,20 @@ class LegacyAcceptTests(_AuthorityCase):
 
         code, err = self._accept()
 
-        # The run state is positioned at the stage, so the run owns it.
         self.assertEqual(code, 1)
-        self.assertIn("recorded before runs pinned", err)
+        self.assertIn(UNAUTHORIZED_REMOTE_MOVEMENT, err)
         self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
 
-    def test_without_the_owner_check_the_legacy_candidate_would_be_accepted(self):
-        # Positive control for the two refusals above: with the owning-run
-        # lookup disabled in this test only, the same frozen stage is
-        # accepted on reachability -- the fallback they refuse.
+    def test_without_the_owner_check_the_stage_would_be_accepted(self):
+        # Positive control for the refusal above: with the owning-run lookup
+        # disabled in this test only, the same frozen stage is accepted --
+        # the run's recorded pause would no longer apply to it.
         self._legacy_with_the_candidate_on_the_remote()
+        self._with_a_recorded_movement_pause()
+        stage = self._stage(S1)
+        state = stage.read_state()
+        state.run = None
+        stage.write_state(state)
 
         with mock.patch.object(acceptance, "_owning_run", return_value=None):
             code, err = self._accept()
@@ -242,77 +281,87 @@ class LegacyAcceptTests(_AuthorityCase):
             ])
         return code, err.getvalue()
 
-    def _freeze_refused_after(self, damage) -> None:
-        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
+    def _freeze_after(self, damage) -> tuple[int, str]:
+        self._ready_not_accepted()
+        self._legacy_pinned()
         damage(self.state_path)
-
-        code, err = self._freeze()
-
-        self.assertEqual(code, 1)
-        self.assertIn(REMOTE_PIN_MISSING, err)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
-
-    def test_without_the_pin_check_a_damaged_pin_would_be_frozen_on_reachability(self):
-        # Positive control for the three freeze refusals below: the pin
-        # removed and the candidate pushed by hand, with the owning-run
-        # lookup disabled in this test only, freezes on reachability -- the
-        # fallback a missing pin must never reach.
-        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
-        self._rewrite(self.state_path, lambda p: p.pop("remote_pin"))
-        _run_git(self.repo, "push", "-q", "origin", "feature/x")
-        code, err = self._freeze()
-        self.assertEqual(code, 1)
-        self.assertIn(REMOTE_PIN_MISSING, err)
-
-        with mock.patch.object(acceptance, "_owning_run", return_value=None):
-            code, err = self._freeze()
-
-        self.assertEqual(code, 0, err)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
+        return self._freeze()
 
     def _rewrite(self, path: Path, change) -> None:
         payload = json.loads(path.read_text(encoding="utf-8"))
         change(payload)
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
-    def test_a_pinned_run_whose_pin_is_gone_refuses_freeze(self):
-        self._freeze_refused_after(lambda path: self._rewrite(path, lambda p: p.pop("remote_pin")))
+    # Was: ..._refuses_freeze with remote_pin_missing. A legacy pin is inert
+    # under Plan L, so a pinned run whose pin is gone or damaged freezes on
+    # the local rules -- its candidate is not on the remote at all -- and is
+    # not refused for the pin.
 
-    def test_a_pinned_run_whose_pin_is_malformed_refuses_freeze(self):
-        self._freeze_refused_after(
+    def test_a_pinned_run_whose_pin_is_gone_freezes_locally(self):
+        code, err = self._freeze_after(lambda path: self._rewrite(path, lambda p: p.pop("remote_pin")))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(REMOTE_PIN_MISSING, err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
+
+    def test_a_pinned_run_whose_pin_is_malformed_freezes_locally(self):
+        code, err = self._freeze_after(
             lambda path: self._rewrite(path, lambda p: p.__setitem__("remote_pin", {"branch": 7}))
         )
+        self.assertEqual(code, 0, err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
 
     def test_a_pinned_run_whose_state_is_unreadable_refuses_freeze(self):
-        self._freeze_refused_after(lambda path: path.write_text("{broken", encoding="utf-8"))
+        # Still refused: who owns the stage cannot be established, so its
+        # history and pause cannot be read (local integrity, not a pin).
+        code, err = self._freeze_after(lambda path: path.write_text("{broken", encoding="utf-8"))
+        self.assertEqual(code, 1)
+        self.assertIn("cannot read run state", err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+
+    def test_positive_control_the_intact_legacy_state_freezes(self):
+        # The refusal above is the unreadable state, not the fixture.
+        code, err = self._freeze_after(lambda path: None)
+        self.assertEqual(code, 0, err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.FROZEN)
+
+    def test_a_local_rule_still_refuses_a_run_whose_pin_is_damaged(self):
+        # A damaged pin decides nothing, in either direction: a dirty tree
+        # still refuses with candidate_not_on_branch.
+        def damage(path: Path) -> None:
+            self._rewrite(path, lambda p: p.__setitem__("remote_pin", {"branch": 7}))
+            (self.repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+        code, err = self._freeze_after(damage)
+        self.assertEqual(code, 1)
+        self.assertIn("candidate_not_on_branch", err)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+
+    # Was: resuming a pinned run whose pin is gone refused (remote_pin_missing)
+    # and a never-pinned one was re-pinned. Runs are local-first: a resume
+    # neither pins nor needs a pin, and completes on the local rules.
 
     def test_resuming_a_pinned_run_whose_pin_is_gone_does_not_re_pin_it(self):
-        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
-        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        del payload["remote_pin"]
-        self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        self._ready_not_accepted()
+        self._legacy_pinned()
+        self._rewrite(self.state_path, lambda p: p.pop("remote_pin"))
 
         stage_adapter = _StageAdapter(self.repo)
-        with self.assertRaises(Exception) as ctx:
-            self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
+        result = self._resume(stage_adapter, _SparringAdapter([]), stop_after_stage=S1)
 
-        self.assertIn(REMOTE_PIN_MISSING, str(ctx.exception))
         self.assertNotIn("remote_pin", json.loads(self.state_path.read_text(encoding="utf-8")))
         self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+        self.assertIsNone(result.awaiting)
 
-    def test_resuming_a_run_the_engine_never_pinned_does_pin_it(self):
-        # Positive control for the refusal above: the same missing pin, with
-        # the engine's record of the pin gone too (a run from before pins),
-        # is re-pinned on resume -- what the record must prevent.
-        self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1)
-        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        del payload["remote_pin"]
-        self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        managed_run.run_flag_path(self.repo, self.run_key).unlink()
+    def test_resuming_a_run_the_engine_never_pinned_does_not_pin_it(self):
+        self._ready_not_accepted()
+        self._rewrite(self.state_path, lambda p: p.pop("config_snapshot", None))
 
-        self._resume(_StageAdapter(self.repo), _SparringAdapter([READY]), stop_after_stage=S1)
+        self._resume(_StageAdapter(self.repo), _SparringAdapter([]), stop_after_stage=S1)
 
-        self.assertIn("remote_pin", json.loads(self.state_path.read_text(encoding="utf-8")))
+        self.assertNotIn("remote_pin", json.loads(self.state_path.read_text(encoding="utf-8")))
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
 
 
 # -- what an acknowledgement explains -------------------------------------------
@@ -435,17 +484,24 @@ class PushRaceTests(_AuthorityCase):
         self.assertIsNone(outcome.movement)
         self.assertEqual((outcome.receipt.previous_tip, outcome.receipt.tip), (self.remote_before, candidate))
 
-    def test_a_raced_engine_push_in_a_run_pauses_it_on_movement(self):
+    def test_a_run_never_reaches_the_push_primitive_so_there_is_nothing_to_race(self):
+        # Was test_a_raced_engine_push_in_a_run_pauses_it_on_movement. Runs
+        # are local-first (I-L1): the engine's push primitive is never called
+        # by a run, so no race exists to detect; the stage is accepted
+        # locally and the remote is untouched. The primitive itself is still
+        # race-checked by the three tests above (kept for Plan P).
         stage_adapter = _StageAdapter(self.repo, commit=True)
         patch, raced = self._racing_head()
-        with patch:
+        with patch as run_remote:
             result = self._start(stage_adapter, _SparringAdapter([READY]), stop_after_stage=S1)
 
-        self.assertEqual(len(raced), 1)
+        run_remote.assert_not_called()
+        self.assertEqual(raced, [])
         self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
+        self.assertIsNone(result.awaiting)
         self.assertEqual(self._plan_state().remote_records, ())
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
 
     def _racing_head(self):
         """As :meth:`_racing`, pushing whatever HEAD is when the engine
@@ -489,52 +545,46 @@ class _PushesThenIsInterrupted(_StageAdapter):
 class FailedTurnTests(_AuthorityCase):
     GRANT_PUSH_FOR_RUN = False
 
-    def test_an_interrupted_turn_after_an_out_of_band_push_is_still_checked(self):
-        result = self._start(
-            _PushesThenIsInterrupted(self.repo, commit=True, push=True),
-            _SparringAdapter([READY]),
-            stop_after_stage=S1,
-        )
+    # Was: a failed turn after an out-of-band push was checked and paused on
+    # remote movement. Plan L (L-D2) drops remote-movement monitoring from
+    # runs: the failed turn stands as the failure it is -- exactly as the
+    # same turn without a push (the two tests after these) -- no remote is
+    # read, and a resume carries on with local work.
 
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
-        self.assertEqual(result.awaiting.observed_tip, _head_sha(self.repo))
-        stage_adapter, sparring_adapter = _StageAdapter(self.repo, commit=True), _SparringAdapter([READY])
-        again = resume_plan(
-            self.plan_path, self.sparring_dir, self.repo, _fixed(stage_adapter, sparring_adapter),
-            expected_branch="feature/x", stop_after_stage=S1,
-        )
-        self.assertEqual(again.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
-        self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
-        self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
+    def test_an_interrupted_turn_after_an_out_of_band_push_fails_as_without_the_push(self):
+        with self.assertRaises(_Interrupted):
+            self._start(
+                _PushesThenIsInterrupted(self.repo, commit=True, push=True),
+                _SparringAdapter([READY]),
+                stop_after_stage=S1,
+            )
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), _head_sha(self.repo))
+        self.assertIsNone(self._plan_state().awaiting)
+        self.assertEqual(self._plan_state().remote_records, ())
 
-    def test_a_turn_that_raises_after_an_out_of_band_push_is_still_checked(self):
+    def test_a_turn_that_raises_after_an_out_of_band_push_fails_and_resume_carries_on(self):
         failing = _PushesThenFails(self.repo, commit=True, push=True)
 
-        result = self._start(failing, _SparringAdapter([READY]), stop_after_stage=S1)
+        with self.assertRaises(PlanRunError) as ctx:
+            self._start(failing, _SparringAdapter([READY]), stop_after_stage=S1)
 
-        pushed = _head_sha(self.repo)
-        self.assertEqual(_remote_sha(self.remote, "feature/x"), pushed)
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
-        self.assertEqual(result.awaiting.observed_tip, pushed)
+        self.assertIn("stage-agent turn failed", str(ctx.exception))
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), _head_sha(self.repo))
+        self.assertIsNone(self._plan_state().awaiting)
 
-        # On resume, the movement pause comes before any stage-agent turn.
-        stage_adapter = _StageAdapter(self.repo, commit=True)
+        # The resume is not stopped by what was pushed: the stage's work goes
+        # on locally and the stage is accepted.
+        stage_adapter = _StageAdapter(self.repo)
         sparring_adapter = _SparringAdapter([READY])
         again = resume_plan(
             self.plan_path, self.sparring_dir, self.repo, _fixed(stage_adapter, sparring_adapter),
             expected_branch="feature/x", stop_after_stage=S1,
         )
-        self.assertIs(again.status, PlanRunStatus.PAUSED)
-        self.assertEqual(again.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
-        self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
-        self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        self.assertIsNone(again.awaiting)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
 
-    # Positive controls for the two tests above: the same failing turns,
-    # without the out-of-band push, are not a movement pause -- so the pause
-    # there is the push being checked, not the failure itself.
+    # The same failing turns, without the out-of-band push: the same outcome,
+    # so the push makes no difference to a run.
 
     def test_an_interrupted_turn_without_a_push_is_not_movement(self):
         with self.assertRaises(_Interrupted):
@@ -578,26 +628,21 @@ class _ReviewerPushesThenFails(_SparringAdapter):
 
 
 class FailedReviewTurnTests(_ReviewRepoTestCase):
-    def test_a_failed_review_only_turn_is_still_checked_and_resume_runs_nothing(self):
-        result = self.start(
-            _StageAdapter(self.repo, commit=True), _ReviewerPushesThenFails(self.repo, [READY])
-        )
-
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.stage_id, REVIEW_STAGE)
-        self.assertEqual(result.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
-        self.assertEqual(self.plan_state().awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
-
-        stage_adapter, sparring_adapter = _StageAdapter(self.repo, commit=True), _SparringAdapter([READY])
-        again = self.resume(stage_adapter, sparring_adapter)
-        self.assertEqual(again.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
-        self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
-        self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
+    def test_a_failed_review_only_turn_after_an_out_of_band_push_fails_as_without_it(self):
+        # Was ..._is_still_checked_and_resume_runs_nothing: Plan L (L-D2)
+        # drops remote-movement monitoring from runs. The failed review turn
+        # stands as the failure it is, with no remote read and no pause.
+        with self.assertRaises(PlanRunError) as ctx:
+            self.start(
+                _StageAdapter(self.repo, commit=True), _ReviewerPushesThenFails(self.repo, [READY])
+            )
+        self.assertIn("independent-review turn failed", str(ctx.exception))
+        self.assertIsNone(self.plan_state().awaiting)
         self.assertIs(self.stage(REVIEW_STAGE).read_state().status, StageStatus.WORKING)
 
     def test_a_failed_review_turn_without_a_push_is_not_movement(self):
-        # Positive control for the test above: the same failing review turn,
-        # with no out-of-band push, does not pause on movement.
+        # The same failing review turn with no out-of-band push: the same
+        # outcome as the test above.
         with self.assertRaises(PlanRunError) as ctx:
             self.start(
                 _StageAdapter(self.repo, commit=True), _ReviewerPushesThenFails(self.repo, [READY], push=False)

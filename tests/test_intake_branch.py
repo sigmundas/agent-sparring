@@ -91,7 +91,6 @@ class _WebOnMain(_Sealed):
         # for one cannot be moved).
         return start_plan(
             self.web_source(approval), self.web_sparring, self.web, adapters, expected_branch=branch,
-            allow_push_for_run=branch != "main",
         )
 
     def failed_on_main(self):
@@ -118,7 +117,6 @@ class _WebOnMain(_Sealed):
         return resume_plan(
             self.web_source(web), self.web_sparring, self.web,
             lambda s: (stage, _SparringAdapter([READY] * 4)), expected_branch=branch,
-            allow_push_for_run=True,
         )
 
 

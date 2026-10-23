@@ -24,10 +24,13 @@ and the surfaces, with no guard active:
   run (the run's pin and snapshot: a typed refusal in the check's detail);
 - ``sparring handoff`` of a stage no run owns (a typed refusal) and of a
   stage a pinned run owns (the pin's typed refusal);
-- freeze of a stage declaring a sibling repository, unpinned (a typed
-  refusal) and pinned at run start (the sibling's own pin refuses), and
-  acceptance of a stage frozen before the planting (it never reads the
-  sibling's remote).
+- freeze of a stage declaring a sibling repository, unowned and owned by a
+  legacy run that pinned it at start, and acceptance of a stage frozen
+  before the planting. Since Plan L Stage 2 these read no remote at all, so
+  they freeze and accept on the local rules alone, with nothing planted run.
+
+The status surfaces are exercised on a legacy (pinned) managed run, which
+is what still reads a remote until Plan L's Stage 4 makes finish local.
 
 A read leaves no trace in a bare repository, so "the second bare
 repository receives no contact" is shown by its refs being unchanged, by
@@ -209,6 +212,8 @@ class _StatusMatrix(_Planting, _FinishTestCase):
         )
         self.assertEqual(code, 3, err)
         dry = json.loads(out)
+        # Plan L adds the engine's capabilities (an added field).
+        self.assertEqual(dry.pop("capabilities"), ["local_first"])
         self.assertEqual(dry, run["finish"])
         self.assertIn("repository_config_changed", self._candidate_check(dry)["detail"])
 
@@ -353,30 +358,27 @@ class _SiblingMatrix(_Planting, unittest.TestCase):
         )
 
     def _run_sibling(self, item: str, scope: str) -> None:
-        # Frozen before the planting: its acceptance must not need the
-        # sibling's remote at all.
+        # Plan L (I-L2): freeze and accept read no remote of any repository,
+        # so a sibling's planted transport configuration has nothing to act
+        # on. Was: the unpinned freeze refused it (repository_transport_config)
+        # and the pinned one refused the change (repository_config_changed);
+        # both now freeze on the local rules alone, with no planted program
+        # run and the second repository untouched.
         frozen = self._stage("frozen-before")
         self.assertEqual(self._freeze(frozen).repositories[0].candidate_sha, self.sibling_sha)
-        # A stage of a run that pinned its primary and the sibling at run
-        # start (an owned stage of an unpinned run is refused outright).
+        # A stage of a legacy run that pinned its primary and the sibling at
+        # run start, and one no run owns.
         entry = pin_sibling(self.sibling, self.SIBLING_BRANCH)
         self._write_run_state(entry)
         owned = self._stage("owned", run=self.RUN)
         unowned = self._stage("unowned")
         second = self.second(self.sibling)
         before = _refs(second)
-        key = self.plant(self.sibling, item, scope, second)
+        self.plant(self.sibling, item, scope, second)
 
-        with self.assertRaises(AcceptanceError) as ctx:
-            self._freeze(unowned)
-        self.assertIn("repository_transport_config", str(ctx.exception))
-        self.assertIn(key.lower().rsplit(".", 1)[-1], str(ctx.exception).lower())
-        self.assertIs(unowned.read_state().status, StageStatus.WORKING)
-
-        with self.assertRaises(AcceptanceError) as ctx:
-            self._freeze(owned)
-        self.assertRegex(str(ctx.exception), "repository_config_changed|remote_retargeted")
-        self.assertIs(owned.read_state().status, StageStatus.WORKING)
+        for stage in (unowned, owned):
+            self.assertEqual(self._freeze(stage).repositories[0].candidate_sha, self.sibling_sha)
+            self.assertIs(stage.read_state().status, StageStatus.FROZEN)
 
         accepted = accept_candidate(frozen, self.primary, expected_branch=self.PRIMARY_BRANCH)
         self.assertEqual(accepted.repositories[0].candidate_sha, self.sibling_sha)
@@ -403,37 +405,33 @@ class SiblingPinTests(_SiblingMatrix):
         entry = pin_sibling(self.sibling, self.SIBLING_BRANCH)
         self.assertIn(("credential.helper", "store --file=/nonexistent"), entry.pin.trusted_config)
         self._write_run_state(entry)
-        # Trusted at run start, so the pinned read uses it rather than
-        # refusing it (the unpinned read would refuse).
+        # Plan L: freeze reads no remote, so a sibling's transport
+        # configuration -- trusted at a legacy run's start or not -- decides
+        # nothing: the owned and the unowned stage both freeze locally. (Was:
+        # the unowned freeze refused it as repository_transport_config.)
         owned = self._stage("owned", run=self.RUN)
         frozen = self._freeze(owned)
         self.assertEqual(frozen.repositories[0].candidate_sha, self.sibling_sha)
         unowned = self._stage("unowned")
-        with self.assertRaises(AcceptanceError) as ctx:
-            self._freeze(unowned)
-        self.assertIn("repository_transport_config", str(ctx.exception))
+        self.assertEqual(self._freeze(unowned).repositories[0].candidate_sha, self.sibling_sha)
 
-    def test_a_plan_run_pins_its_declared_siblings_at_start(self):
-        from agent_sparring.plan import PlanRunState, PlanRunStatus, _pin_siblings
-        from agent_sparring.plan_model import PlannedStage
+    def test_legacy_sibling_pins_still_load_and_new_runs_record_none(self):
+        # Was test_a_plan_run_pins_its_declared_siblings_at_start. Plan L:
+        # runs pin no sibling (each declared sibling's stage base is recorded
+        # locally instead -- test_local_first.SiblingHistoryTests); the
+        # sibling pins a legacy run recorded still load unchanged.
+        from agent_sparring.plan import PlanRunState, PlanRunStatus
 
-        planned = PlannedStage(
-            position=1, label="1", title="one", stage_id="s1", brief="b",
-            repositories=(
-                CandidateRepository(name="sibling", path="../sibling", branch=self.SIBLING_BRANCH),
-                CandidateRepository(name="missing", path="../missing", branch="x"),
-            ),
-        )
-        notes: list[str] = []
-        pins = _pin_siblings(self.primary, (planned, planned), report=notes.append)
-        self.assertEqual([entry.path for entry in pins], [str(self.sibling.resolve())])
-        self.assertTrue(any("'missing'" in note and "not pinned" in note for note in notes))
+        pins = (pin_sibling(self.sibling, self.SIBLING_BRANCH),)
         state = PlanRunState(plan="p", plan_digest="d", expected_branch=self.PRIMARY_BRANCH,
                              current_stage_index=0, current_stage="s1",
                              status=PlanRunStatus.RUNNING, sibling_pins=pins)
         path = self.scratch / "state.json"
         state.save(path)
         self.assertEqual(PlanRunState.load(path).sibling_pins, pins)
+        fresh = PlanRunState(plan="p", plan_digest="d", expected_branch=self.PRIMARY_BRANCH,
+                             current_stage_index=0, current_stage="s1", status=PlanRunStatus.RUNNING)
+        self.assertNotIn("sibling_pins", fresh.to_dict())
 
 
 # -- engine_git itself ----------------------------------------------------------

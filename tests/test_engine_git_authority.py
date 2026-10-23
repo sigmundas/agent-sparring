@@ -7,12 +7,14 @@ remotes. Planted programs are shell scripts that touch a marker file, so
 
 What is under test, in one sentence each:
 
-- a candidate a stage agent pushed itself before review is
-  ``unauthorized_remote_movement`` (Sporely Stage 4b): freeze and accept
-  refuse it, a push authorization does not clear it, and only an explicit,
-  recorded acknowledgement does -- which accepts nothing;
-- the engine pushes only an authorized commit, only to the pinned ref, and
-  a permission for another commit, ref, remote or repository does not apply;
+- Plan L: a run neither pushes nor watches the remote, so an agent's own
+  push is not detected by a run; the ``unauthorized_remote_movement`` pause
+  an older engine recorded still makes freeze and accept refuse, no push
+  flag clears it, and only an explicit, recorded acknowledgement does --
+  which accepts nothing;
+- the push primitive (kept, unused by runs, for Plan P) pushes only an
+  authorized commit, only to the pinned ref, and a permission for another
+  commit, ref, remote or repository does not apply;
 - retargeting the branch or the remote after the run started is a typed
   refusal, and nothing reaches the new target;
 - prose -- notes.md, stage files, agent output -- never authorizes a push
@@ -20,8 +22,8 @@ What is under test, in one sentence each:
 - planted hooks, fsmonitor, includes and diff/merge/filter drivers never
   run, and changed credential/transport configuration is refused by name;
 - no prompt tells an agent to push;
-- a run recorded before pins existed is pinned on resume, visibly, and an
-  unexplained reachable candidate is still movement.
+- Plan L: a run recorded before pins existed is not pinned on resume, and
+  its reviewed candidate is accepted locally.
 
 This is detection, not prevention: these checks watch only the pinned ref.
 Keeping agents from writing to engine state and other refs is the next
@@ -36,6 +38,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import conftest_path  # noqa: F401
@@ -156,38 +159,53 @@ class _AuthorityCase(_PlanRepoTestCase):
 
 
 class Stage4bTests(_AuthorityCase):
+    """Plan L (L-D2): runs no longer watch the remote, so an agent's own push
+    is not detected by a run (the agent's ability to push at all is Plan
+    D's boundary). The ``unauthorized_remote_movement`` pause an older
+    engine recorded is kept until resolved explicitly: freeze and accept
+    refuse while it stands, no push flag clears it, and only the recorded
+    acknowledgement does -- which accepts nothing (I-L3)."""
+
     GRANT_PUSH_FOR_RUN = False
 
     def _agent_pushes(self):
-        """An agent that commits and pushes its own unreviewed candidate."""
+        """An agent that commits and pushes its own unreviewed candidate,
+        where an older engine stopped the run on it before review: the
+        reviewer has not ruled, and the legacy pause is recorded."""
 
+        stage_adapter = _StageAdapter(self.repo, commit=True, push=True)
+        sparring_adapter = _SparringAdapter([NEEDS_YOU])
+        self._start(stage_adapter, sparring_adapter, stop_after_stage=S1)
+        movement = UnauthorizedRemoteMovement(
+            stage_id=S1, remote="origin", url=str(self.remote), ref="refs/heads/feature/x",
+            expected_tip=self.remote_before, observed_tip=_head_sha(self.repo),
+        )
+        state = self._plan_state()
+        state.awaiting = movement
+        state.status = PlanRunStatus.PAUSED
+        state.save(self.state_path)
+        result = SimpleNamespace(status=PlanRunStatus.PAUSED, awaiting=movement)
+        return result, stage_adapter, sparring_adapter
+
+    def test_a_candidate_pushed_outside_the_engine_is_not_monitored_by_a_run(self):
+        # Was ..._before_review_is_unauthorized_movement.
         stage_adapter = _StageAdapter(self.repo, commit=True, push=True)
         sparring_adapter = _SparringAdapter([READY, READY])
         result = self._start(stage_adapter, sparring_adapter)
-        return result, stage_adapter, sparring_adapter
-
-    def test_a_candidate_pushed_outside_the_engine_before_review_is_unauthorized_movement(self):
-        result, _stage_adapter, sparring_adapter = self._agent_pushes()
         head = _head_sha(self.repo)
 
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        movement = result.awaiting
-        self.assertEqual(movement.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
-        self.assertEqual(movement.remote, "origin")
-        self.assertEqual(movement.ref, "refs/heads/feature/x")
-        self.assertEqual(movement.expected_tip, self.remote_before)
-        self.assertEqual(movement.observed_tip, head)
-        # Caught after the agent's own turn: the reviewer never saw it.
-        self.assertEqual(sparring_adapter.start_calls, [])
+        self.assertIs(result.status, PlanRunStatus.COMPLETE)
+        self.assertIsNone(result.awaiting)
+        # The reviewer did review each candidate; nothing about the remote
+        # entered the decision, and nothing was reset, forced or deleted.
+        self.assertEqual(len(sparring_adapter.start_calls + sparring_adapter.resume_calls), 2)
         state = self._plan_state()
-        self.assertEqual(state.awaiting, movement)
+        self.assertEqual(state.remote_records, ())
         self.assertIsNone(state.push_authorization)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
-        # Nothing was reset, forced or deleted: the remote is as the agent left it.
         self.assertEqual(_remote_sha(self.remote, "feature/x"), head)
 
     def test_freeze_and_accept_are_refused_while_the_movement_stands(self):
-        self._agent_pushes()
+        result, _, _ = self._agent_pushes()
         stage = self._stage(S1)
 
         with self.assertRaises(UnauthorizedRemoteMovementError):
@@ -196,24 +214,37 @@ class Stage4bTests(_AuthorityCase):
             accept_candidate(stage, self.repo, expected_branch="feature/x")
         self.assertIs(stage.read_state().status, StageStatus.WORKING)
 
+        # Positive control: once the pause is acknowledged, the same freeze
+        # goes through -- it was the recorded pause that refused.
+        acknowledge_remote_movement(
+            self.sparring_dir, run_key=self.run_key, observed=result.awaiting.observed_tip, by="tester"
+        )
+        freeze_candidate(stage, self.sparring_dir, self.repo, expected_branch="feature/x")
+        self.assertIs(stage.read_state().status, StageStatus.FROZEN)
+
     def test_a_push_authorization_does_not_clear_it(self):
         result, _, _ = self._agent_pushes()
         head = _head_sha(self.repo)
+        before = self.state_path.read_bytes()
 
         with self.assertRaises(PlanError) as ctx:
             self._resume(_StageAdapter(self.repo), _SparringAdapter([]), allow_push_candidate=head)
-        self.assertIn("unauthorized remote movement", str(ctx.exception))
+        self.assertIn("push_permission_deprecated", str(ctx.exception))
+        with self.assertRaises(PlanError) as ctx:
+            self._resume(_StageAdapter(self.repo), _SparringAdapter([]), allow_push_for_run=True)
+        self.assertIn("push_not_part_of_runs", str(ctx.exception))
+        self.assertEqual(self.state_path.read_bytes(), before)
 
         stage_adapter, sparring_adapter = _StageAdapter(self.repo), _SparringAdapter([])
-        again = self._resume(stage_adapter, sparring_adapter, allow_push_for_run=True)
+        again = self._resume(stage_adapter, sparring_adapter)
 
         self.assertIs(again.status, PlanRunStatus.PAUSED)
         self.assertEqual(again.awaiting, result.awaiting)
         self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
         self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
         state = self._plan_state()
-        self.assertEqual(state.push_authorization.scope, PushScope.RUN)  # recorded...
-        self.assertEqual(state.awaiting, result.awaiting)  # ...and the pause stands
+        self.assertIsNone(state.push_authorization)
+        self.assertEqual(state.awaiting, result.awaiting)  # the pause stands
         self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
     def test_the_acknowledgement_clears_it_is_recorded_and_accepts_nothing(self):
@@ -263,13 +294,15 @@ class Stage4bTests(_AuthorityCase):
         self.assertEqual(self._plan_state().remote_records[-1].kind, MOVEMENT_ACKNOWLEDGED)
 
     def test_the_paused_run_prints_the_typed_pause_and_the_acknowledgement_command(self):
+        # Now on a legacy pause, reported by a plain resume.
+        self._agent_pushes()
         out, err = io.StringIO(), io.StringIO()
-        adapters = (_StageAdapter(self.repo, commit=True, push=True), _SparringAdapter([READY]))
+        adapters = (_StageAdapter(self.repo), _SparringAdapter([]))
         with mock.patch("agent_sparring.cli._build_loop_adapters", return_value=adapters), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = main(
                 [
-                    "--sparring-dir", str(self.sparring_dir), "run-plan", str(self.plan_path),
+                    "--sparring-dir", str(self.sparring_dir), "resume-plan", str(self.plan_path),
                     "--repo-root", str(self.repo), "--expected-branch", "feature/x",
                     "--run-key", self.run_key,
                 ]
@@ -288,20 +321,21 @@ class Stage4bTests(_AuthorityCase):
 
 
 class ReceiptTests(_AuthorityCase):
-    def test_each_engine_push_records_a_receipt_that_explains_the_next_tip(self):
+    def test_a_run_pushes_nothing_so_it_records_no_receipt(self):
+        # Was test_each_engine_push_records_a_receipt_that_explains_the_next_
+        # tip. Plan L: a run makes no engine push, so there is no receipt; the
+        # accepted history is recorded locally instead (accepted_candidates).
+        # Receipts of the push primitive itself are still tested in
+        # test_fail_closed_pins.PushRaceTests (kept for Plan P).
         result = self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY, READY]))
 
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
-        receipts = self._plan_state().remote_records
-        self.assertEqual([r.kind for r in receipts], [PUSH_RECEIPT, PUSH_RECEIPT])
-        self.assertEqual([r.stage_id for r in receipts], [S1, S2])
-        self.assertEqual([r.run for r in receipts], [self.run_key, self.run_key])
-        self.assertEqual({r.ref for r in receipts}, {"refs/heads/feature/x"})
-        self.assertEqual({r.remote for r in receipts}, {"origin"})
-        self.assertEqual(receipts[0].previous_tip, self.remote_before)
-        self.assertEqual(receipts[1].previous_tip, receipts[0].tip)
-        self.assertEqual([r.tip for r in receipts], [sha for _, sha in result.accepted])
-        self.assertEqual(_remote_sha(self.remote, "feature/x"), _head_sha(self.repo))
+        state = self._plan_state()
+        self.assertEqual(state.remote_records, ())
+        self.assertEqual(
+            [(entry.stage_id, entry.sha) for entry in state.accepted_candidates], list(result.accepted)
+        )
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
 
 
 # -- the push path ------------------------------------------------------------
@@ -512,25 +546,20 @@ class PinnedPushTests(_AuthorityCase):
 
 
 class AcceptanceReachabilityTests(_AuthorityCase):
-    def test_an_acknowledged_deletion_does_not_let_an_unreachable_candidate_be_accepted(self):
-        # Paused with the candidate committed; the engine pushes it under the
-        # run's grant and records the receipt; it is frozen.
+    def test_remote_reachability_is_never_an_input_to_acceptance(self):
+        # Was test_an_acknowledged_deletion_does_not_let_an_unreachable_
+        # candidate_be_accepted. Plan L (I-L2): acceptance is local. Whether
+        # the candidate is on the remote -- pushed, never pushed, or deleted
+        # there and acknowledged -- does not change the outcome, and an
+        # acknowledgement accepts nothing by itself: here the frozen,
+        # exact, clean HEAD is accepted on the local rules, and the deleted
+        # branch is left deleted.
         self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([NEEDS_YOU]))
-        state = self._plan_state()
-        with self.guard(state.remote_pin):
-            outcome = ensure_candidate_pushed(
-                self.repo, stage_id=S1, expected_branch="feature/x",
-                authorization=state.push_authorization, pin=state.remote_pin,
-                records=state.remote_records, run=self.run_key,
-            )
-        self.assertTrue(outcome.pushed)
-        state.remote_records = state.remote_records + (outcome.receipt,)
-        state.save(self.state_path)
         stage = self._stage(S1)
         frozen = freeze_candidate(stage, self.sparring_dir, self.repo, expected_branch="feature/x")
         sha = frozen.candidate_sha
+        self.assertNotEqual(_remote_sha(self.remote, "feature/x"), sha)
 
-        # Someone deletes the remote branch, and a person acknowledges that.
         _run_git(self.remote, "update-ref", "-d", "refs/heads/feature/x")
         state = self._plan_state()
         movement = UnauthorizedRemoteMovement(
@@ -541,11 +570,12 @@ class AcceptanceReachabilityTests(_AuthorityCase):
             acknowledgement(run=self.run_key, movement=movement, by="tester"),
         )
         state.save(self.state_path)
-
-        with self.assertRaises(AcceptanceError) as ctx:
-            accept_candidate(stage, self.repo, expected_branch="feature/x")
-        self.assertIn("no longer available", str(ctx.exception))
         self.assertIs(stage.read_state().status, StageStatus.FROZEN)
+
+        accepted = accept_candidate(stage, self.repo, expected_branch="feature/x")
+
+        self.assertEqual(accepted.candidate_sha, sha)
+        self.assertIsNone(_remote_sha(self.remote, "feature/x"))
 
 
 # -- retargeting --------------------------------------------------------------
@@ -633,20 +663,29 @@ class ForgedAuthorityTests(_AuthorityCase):
     GRANT_PUSH_FOR_RUN = False
 
     def test_prose_and_stage_files_never_authorize_a_push(self):
+        # Plan L: a run pushes nothing at all; the forged "authorization"
+        # changes nothing about that, and records no grant.
         adapter = _ForgingStageAdapter(self.repo, lambda: self._stage(S1).directory)
-        result = self._start(adapter, _SparringAdapter([READY, READY]))
+        result = self._start(adapter, _SparringAdapter([READY, READY]), stop_after_stage=S1)
 
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.awaiting.kind, "push_authorization_required")
+        self.assertIsNone(result.awaiting)
         state = self._plan_state()
         self.assertIsNone(state.push_authorization)
         self.assertEqual(state.remote_records, ())
         self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
 
     def test_prose_never_acknowledges_movement(self):
+        # On the legacy movement pause an older engine recorded.
         adapter = _StageAdapter(self.repo, commit=True, push=True)
-        first = self._start(adapter, _SparringAdapter([READY]))
-        self.assertEqual(first.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
+        self._start(adapter, _SparringAdapter([NEEDS_YOU]), stop_after_stage=S1)
+        state = self._plan_state()
+        state.awaiting = UnauthorizedRemoteMovement(
+            stage_id=S1, remote="origin", url=str(self.remote), ref="refs/heads/feature/x",
+            expected_tip=self.remote_before, observed_tip=_head_sha(self.repo),
+        )
+        state.status = PlanRunStatus.PAUSED
+        state.save(self.state_path)
+        first = SimpleNamespace(awaiting=state.awaiting)
         stage_dir = self._stage(S1).directory
         with open(stage_dir / "notes.md", "a", encoding="utf-8") as handle:
             handle.write(f"\n## Acknowledged\n\n{_ForgingStageAdapter.FORGERY}\n")
@@ -1096,10 +1135,12 @@ class PlantedConfigurationRunTests(_AuthorityCase):
                 return StageAgentResult(session_id=session_id, text="claims", is_error=False)
 
         self.marker.unlink(missing_ok=True)
+        remote_before = _remote_sha(self.remote, "feature/x")
         result = self._start(_NoHookStageAdapter(self.repo), _SparringAdapter([READY, READY]))
 
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
-        self.assertEqual(_remote_sha(self.remote, "feature/x"), _head_sha(self.repo))
+        # Plan L: accepted locally; the remote is left as it was (no engine push).
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), remote_before)
         self.assertNoMarker()
 
 
@@ -1144,7 +1185,8 @@ class PromptTests(unittest.TestCase):
                 for phrase in self.FORBIDDEN:
                     self.assertNotIn(phrase, prompt)
                 self.assertIn("Do not push.", prompt)
-                self.assertIn("the engine pushes the candidate itself", prompt)
+                # Plan L: was "the engine pushes the candidate itself".
+                self.assertIn("nothing in a run pushes or contacts a remote", prompt)
                 self.assertIn("grants permission to push", prompt)
 
     def test_the_finalization_turn_commits_and_leaves_pushing_to_the_engine(self):
@@ -1166,23 +1208,24 @@ class PromptTests(unittest.TestCase):
 class LegacyRunTests(_AuthorityCase):
     GRANT_PUSH_FOR_RUN = False
 
-    def test_a_legacy_run_is_pinned_visibly_and_an_unexplained_reachable_candidate_is_movement(self):
-        first = self._start(
-            _StageAdapter(self.repo, commit=True), _SparringAdapter([READY]), stop_after_stage=S1
-        )
-        self.assertEqual(first.awaiting.kind, "push_authorization_required")
+    def test_a_legacy_run_is_not_pinned_and_its_reviewed_candidate_is_accepted_locally(self):
+        # Was test_a_legacy_run_is_pinned_visibly_and_an_unexplained_reachable_
+        # candidate_is_movement. Plan L: a resume pins nothing and reads no
+        # remote, so a legacy run is neither pinned nor stopped on what is on
+        # the remote; its stage is accepted because the reviewer's READY is
+        # at this exact commit.
+        with mock.patch("agent_sparring.plan.freeze_candidate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]))
         head = _head_sha(self.repo)
         # What an agent did under the old instructions: pushed it itself.
         _run_git(self.repo, "push", "-q", "origin", "feature/x")
-        # And the state as an engine from before pins wrote it -- which
-        # also wrote no record outside the project directory saying the run
-        # was pinned.
+        # And the state as an engine from before pins wrote it.
         payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        del payload["remote_pin"]
+        payload.pop("config_snapshot", None)
         payload.pop("remote_records", None)
         self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         self.assertIsNone(PlanRunState.load(self.state_path).remote_pin)
-        managed_run.run_flag_path(self.repo, self.run_key).unlink()
 
         reports: list[str] = []
         result = self._resume(
@@ -1190,25 +1233,17 @@ class LegacyRunTests(_AuthorityCase):
         )
 
         notice = "\n".join(reports)
-        self.assertIn("weaker than a run-start pin", notice)
-        self.assertIn("origin", notice)
-        self.assertIn(str(self.remote), notice)
-        self.assertIn("refs/heads/feature/x", notice)
-        pin = self._plan_state().remote_pin
-        self.assertTrue(pin.legacy)
-        self.assertEqual(pin.start_tip, head)
-        self.assertEqual(pin.url, str(self.remote))
-
-        self.assertIs(result.status, PlanRunStatus.PAUSED)
-        self.assertEqual(result.awaiting.kind, UNAUTHORIZED_REMOTE_MOVEMENT)
-        self.assertEqual(result.awaiting.candidate_sha, head)
-        self.assertEqual(result.awaiting.observed_tip, head)
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        self.assertNotIn("weaker than a run-start pin", notice)
+        self.assertIsNone(self._plan_state().remote_pin)
+        self.assertIsNone(result.awaiting)
+        self.assertEqual(self._stage(S1).read_state().candidate_sha, head)
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.ACCEPTED)
 
     def test_a_legacy_state_without_any_pin_fields_loads(self):
         self._start(_StageAdapter(self.repo), _SparringAdapter([NEEDS_YOU]))
         payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        del payload["remote_pin"]
+        payload.pop("remote_pin", None)
+        payload.pop("config_snapshot", None)
         state = PlanRunState.from_dict(payload)
         self.assertIsNone(state.remote_pin)
         self.assertEqual(state.remote_records, ())

@@ -817,7 +817,7 @@ def resolve_finalization(repo_root: Path, stage: Stage, state: StageState) -> st
         raise AmbiguousNextTurn(
             f"stage {stage.stage_id!r} was READY over the commit {reviewed.describe()}, but "
             f"the repository now holds {current.describe()}. Only that reviewed commit may be "
-            "pushed and accepted, and the engine will not start an agent turn on a READY stage "
+            "accepted, and the engine will not start an agent turn on a READY stage "
             "by itself; restore the reviewed commit, or deliberately choose how to continue "
             "(for example 'sparring reset-stage')."
         )

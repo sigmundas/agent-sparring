@@ -84,7 +84,14 @@ class ResumeHintTests(unittest.TestCase):
         self._check(_VERDICT, " --evidence")
 
     def test_push_authorization(self):
-        self._check(_PUSH, " --allow-push-candidate abc")
+        # Plan L: a legacy push pause is reported, but no command offering the
+        # retired permission is printed for either kind of run.
+        for managed in (True, False):
+            text = _report(_result(**_PUSH), managed=managed)
+            self.assertNotIn("--allow-push-candidate", text.replace(
+                "--allow-push-candidate is refused (push_permission_deprecated)", ""))
+            self.assertIn("push_permission_deprecated", text)
+            self.assertIn("push_authorization_required", text)
 
     def test_deferred_verification(self):
         self._check({**_DEFERRED, "deferred": ()}, " \\\n    --deferred-result")

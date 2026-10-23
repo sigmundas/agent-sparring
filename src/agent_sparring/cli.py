@@ -94,6 +94,11 @@ from agent_sparring.deferred_gate import (
     DeferredVerificationRequired,
 )
 from agent_sparring.plan_model import PlanSource
+from agent_sparring.capabilities import (
+    capabilities as engine_capabilities,
+    push_not_part_of_runs,
+    push_permission_deprecated,
+)
 from agent_sparring.push_gate import PUSH_AUTHORIZATION_REQUIRED
 from agent_sparring.remote_pin import (
     PUSHED_CANDIDATE_UNAUTHORIZED,
@@ -140,14 +145,12 @@ from agent_sparring.stage_agent import StageAgentRunError, run_stage_agent
 from agent_sparring.stage_prompt import build_stage_prompt
 from agent_sparring.templates import render_project_config
 
-# Said the same way by run-plan and resume-plan, because it is the same
-# permission: one run's own branch, to the remote branch the acceptance gate
-# already checks, by ordinary non-force push, and nothing else.
+# Said the same way by start-plan, run-plan and resume-plan. The flag is
+# still parsed so an older client gets a typed refusal, never a usage error
+# and never a silent reinterpretation.
 _ALLOW_RUN_HELP = (
-    "allow this run to push the verified candidates it produces to their intended remote "
-    "branch, so it does not stop to ask for each one. Bound to this run, this worktree, "
-    "this branch and that one remote branch; ordinary non-force push only, and no "
-    "acceptance check is relaxed by it. Default: no push authorization at all"
+    "retired: runs are local-first and never push. Refused with push_not_part_of_runs, "
+    "before anything is created; use Push to review to publish a commit for external review"
 )
 
 
@@ -801,7 +804,22 @@ def _cmd_handoff(args: argparse.Namespace) -> int:
     except (StageError, GitContextError, ProjectConfigError) as exc:
         print(f"could not generate handoff: {exc}", file=sys.stderr)
         return 1
-    print(content)
+    if getattr(args, "json", False):
+        json.dump(
+            _with_capabilities(
+                {
+                    "schema_version": 1,
+                    "stage_id": stage.stage_id,
+                    "path": str(stage.directory / "handoff.md"),
+                    "content": content,
+                }
+            ),
+            sys.stdout,
+            indent=2,
+        )
+        print()
+    else:
+        print(content)
     print(f"wrote handoff to {stage.directory / 'handoff.md'}", file=sys.stderr)
     return 0
 
@@ -2113,46 +2131,30 @@ def _cmd_authorize_pushed_candidate(args: argparse.Namespace) -> int:
 def _report_push_authorization_required(
     result: PlanRunResult, args: argparse.Namespace, stage: Stage
 ) -> None:
-    """A run stopped because a verified candidate needs a person's permission
-    to be pushed.
+    """A run an engine from before runs were local-first paused for a push
+    permission, still paused on that recorded reason.
 
-    Reported as the permission question it is, not as a review outcome and
-    not as a failure: the reviewer already said READY, nothing is wrong with
-    the candidate, and the two commands below are the whole decision.
+    Runs no longer push, and ``--allow-push-candidate`` refuses
+    (``push_permission_deprecated``), so no command here offers it: a
+    push-only permission never becomes acceptance.
     """
 
     awaiting = result.awaiting
     assert awaiting is not None  # the caller checked
-    resume = _resume_command(args, result.run)
     print(f"plan paused: {result.plan}")
     print(f"stage: {result.stage_id} ({stage.directory})")
-    print(f"needs: {PUSH_AUTHORIZATION_REQUIRED}")
+    print(f"needs: {PUSH_AUTHORIZATION_REQUIRED} (recorded by an older engine)")
     for stage_id, sha in result.accepted:
         print(f"  accepted {stage_id} at {sha}")
     print(f"candidate: {awaiting.candidate_sha}")
     print(f"branch: {awaiting.branch}")
-    print(f"push to: {awaiting.remote}/{awaiting.remote_branch}")
-    if awaiting.detail:
-        print(f"why: {awaiting.detail}")
     print()
     print(
-        "The review is finished and this exact commit is what would be accepted. It is not "
-        "on the remote branch the acceptance gate checks, and nothing has allowed a push."
-    )
-    print()
-    print("Allow this one commit to be pushed, and continue:")
-    print(f"  {resume} --allow-push-candidate {awaiting.candidate_sha}")
-    print()
-    print("Or allow it and stop being asked again for this run:")
-    print(f"  {resume} --allow-push-candidate {awaiting.candidate_sha} --allow-push-for-run")
-    print()
-    print(
-        "Either way the push is an ordinary non-force push of exactly this commit to "
-        f"{awaiting.remote}/{awaiting.remote_branch} at the URL the run pinned when it "
-        "started; the engine re-checks that the ref is exactly that commit, records a push "
-        "receipt, and the acceptance gate then runs unchanged. A push made outside the "
-        "engine is not explained by its records and stops the run as unauthorized remote "
-        "movement."
+        "An engine from before runs were local-first paused this run for permission to push "
+        "this commit. Runs no longer push, and a push permission is never taken as acceptance, "
+        "so the pause is left exactly as it was: nothing was run, pushed, frozen or accepted. "
+        "A legacy push pause converts only on a plain resume-plan, under the legacy migration "
+        "rules; --allow-push-candidate is refused (push_permission_deprecated)."
     )
 
 
@@ -2212,8 +2214,6 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool, source: PlanSou
                 deferred_results=tuple(
                     DeferredAnswer.parse(value) for value in (args.deferred_result or [])
                 ),
-                allow_push_candidate=args.allow_push_candidate,
-                allow_push_for_run=args.allow_push_for_run,
                 accept_advanced_head=getattr(args, "accept_advanced_head", None),
                 next_turn=args.next_turn,
                 fresh_roles=fresh_roles,
@@ -2227,7 +2227,6 @@ def _run_plan_command(args: argparse.Namespace, *, resume: bool, source: PlanSou
                 repo_root,
                 make_adapters,
                 adopt=args.adopt,
-                allow_push_for_run=args.allow_push_for_run,
                 managed=bool(getattr(args, "managed_record", None)),
                 **common,
             )
@@ -2324,7 +2323,24 @@ def _cmd_check_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refuse_retired_push_flags(args: argparse.Namespace, *, resume: bool) -> bool:
+    """Refuse a flag local-first runs retired, before anything is read,
+    created or changed (see :mod:`agent_sparring.capabilities`). Never an
+    alias for local progression."""
+
+    if getattr(args, "allow_push_candidate", None) is not None:
+        message = push_permission_deprecated(getattr(args, "run_key", None))
+    elif getattr(args, "allow_push_for_run", False):
+        message = push_not_part_of_runs()
+    else:
+        return False
+    print(f"could not {'resume' if resume else 'run'} plan: {message}", file=sys.stderr)
+    return True
+
+
 def _cmd_run_plan(args: argparse.Namespace) -> int:
+    if _refuse_retired_push_flags(args, resume=False):
+        return 1
     if args.managed:
         return _run_managed_plan(args)
     if args.target_branch:
@@ -2337,6 +2353,8 @@ def _cmd_run_plan(args: argparse.Namespace) -> int:
 
 
 def _cmd_resume_plan(args: argparse.Namespace) -> int:
+    if _refuse_retired_push_flags(args, resume=True):
+        return 1
     if args.run_key:
         try:
             repo_root = _resolve_repo_root(args, Path(args.sparring_dir))
@@ -2486,6 +2504,26 @@ def _resume_managed_plan(args: argparse.Namespace, repo_root: Path, record: mana
     return _run_in_record(args, record, resume=started)
 
 
+def _with_capabilities(payload: dict) -> dict:
+    """``payload`` with the engine's ``capabilities`` added: an added field,
+    so ``schema_version`` is unchanged (see :mod:`agent_sparring.capabilities`)."""
+
+    return {**payload, "capabilities": engine_capabilities()}
+
+
+def _cmd_capabilities(args: argparse.Namespace) -> int:
+    """What this engine can do, for a client that feature-detects it. Reads
+    nothing and writes nothing."""
+
+    if args.json:
+        json.dump({"schema_version": 1, "capabilities": engine_capabilities()}, sys.stdout, indent=2)
+        print()
+        return 0
+    for capability in engine_capabilities():
+        print(capability)
+    return 0
+
+
 def _cmd_runs(args: argparse.Namespace) -> int:
     try:
         repo_root = Path(args.repo_root) if args.repo_root else Path(".")
@@ -2494,7 +2532,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         print(f"could not list runs: {exc}", file=sys.stderr)
         return 1
     if args.json:
-        json.dump(payload, sys.stdout, indent=2)
+        json.dump(_with_capabilities(payload), sys.stdout, indent=2)
         print()
         return 0
     if not payload["runs"]:
@@ -2559,7 +2597,7 @@ def _cmd_finish_run(args: argparse.Namespace) -> int:
         return 1
     finish = status["finish"]
     if args.json:
-        json.dump(finish, sys.stdout, indent=2)
+        json.dump(_with_capabilities(finish), sys.stdout, indent=2)
         print()
     else:
         print(finish["summary"])
@@ -2588,7 +2626,7 @@ def _execute_finish_run(args: argparse.Namespace) -> int:
         print(f"could not finish run {args.run_key}: {exc}", file=sys.stderr)
         return 1
     if args.json:
-        json.dump(report, sys.stdout, indent=2)
+        json.dump(_with_capabilities(report), sys.stdout, indent=2)
         print()
     else:
         for step in report["completed_steps"]:
@@ -2741,7 +2779,7 @@ def _cmd_freeze_candidate(args: argparse.Namespace) -> int:
 
     print(f"frozen candidate: {result.candidate_sha}")
     print(f"branch: {result.branch}")
-    print(f"pushed: {result.push_detail}")
+    print(f"checked: {result.push_detail}")
     if result.ignored_dirty_paths:
         print(
             "ignored workflow-artifact changes under "
@@ -2986,8 +3024,6 @@ def _start_plan_command(args: argparse.Namespace, repo_root: Path, *, answers: d
     ]
     for decision_id, option_id in answers.items():
         parts += ["--answer", f"{decision_id}={option_id}"]
-    if args.allow_push_for_run:
-        parts.append("--allow-push-for-run")
     if token:
         parts += ["--confirm", token]
     return parts
@@ -3041,6 +3077,24 @@ def _cmd_start_plan(args: argparse.Namespace) -> int:
     sparring_dir = Path(args.sparring_dir)
     repo_root = Path(args.repo_root or ".")
     status = None
+    if args.allow_push_for_run:
+        # Refused before anything is read, prepared or written.
+        error = push_not_part_of_runs()
+        if args.json:
+            from agent_sparring.plan_start import refused_payload
+
+            json.dump(
+                refused_payload(
+                    Path(args.plan_path), repo_root, args.expected_branch, error,
+                    execution=_start_execution(args),
+                ),
+                sys.stdout,
+                indent=2,
+            )
+            print()
+        else:
+            print(f"start-plan refused: {error}", file=sys.stderr)
+        return 1
     if args.managed and args.expected_branch:
         print("start-plan refused: --expected-branch cannot be given with --managed: the engine chooses the managed branch", file=sys.stderr)
         return 1
@@ -3669,6 +3723,11 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument("stage_id")
     handoff.add_argument("--claims", required=True, help="implementation-agent claims")
     handoff.add_argument(
+        "--json",
+        action="store_true",
+        help="report the written handoff as JSON (schema_version 1, with the engine's capabilities)",
+    )
+    handoff.add_argument(
         "--goal", default=None, help="stage goal text (default: this stage's brief.md)"
     )
     handoff.add_argument("--test-evidence", default=None, help="test/build evidence text")
@@ -4154,7 +4213,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "run a multi-stage plan unattended, from a reviewed Markdown plan (each "
             "'## Stage <n> — <title>' section becomes a stage) or from --manifest; READY "
-            "freezes and accepts the exact pushed SHA and the next stage starts; "
+            "freezes and accepts the exact local SHA it was given over (nothing is pushed) and "
+            "the next stage starts; "
             "NEEDS_YOU/ESCALATE/failure pauses"
         ),
     )
@@ -4300,12 +4360,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SHA",
         help=(
-            "allow this run to push exactly this commit to its intended remote branch, so "
-            "the acceptance gate can freeze it. Refused unless the run is in fact stopped "
-            "waiting for permission to push that exact commit, which is what stops a stale "
-            "surface authorizing a candidate the run has since replaced. Ordinary non-force "
-            "push of the run's own branch only; it authorizes nothing else and it does not "
-            "relax any acceptance check"
+            "retired: runs are local-first and never push, so there is no push permission to "
+            "give. Refused with push_permission_deprecated and nothing is changed; a legacy "
+            "push pause converts only on a plain resume-plan"
         ),
     )
     resume_plan_parser.add_argument(
@@ -4324,6 +4381,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_recovery_arguments(resume_plan_parser)
     resume_plan_parser.set_defaults(func=_cmd_resume_plan, adopt=False, managed=False, target_branch=None)
+
+    capabilities_parser = subparsers.add_parser(
+        "capabilities",
+        help="list what this engine can do (e.g. local_first), for clients that feature-detect it",
+    )
+    capabilities_parser.add_argument("--json", action="store_true", help="report as JSON")
+    capabilities_parser.set_defaults(func=_cmd_capabilities)
 
     runs_parser = subparsers.add_parser(
         "runs", help="list this repository's managed runs (read-only)"
@@ -4489,7 +4553,8 @@ def build_parser() -> argparse.ArgumentParser:
         "freeze-candidate",
         help=(
             "freeze the repository's exact current HEAD as this stage's "
-            "acceptance candidate (requires a clean, pushed worktree)"
+            "acceptance candidate (requires a clean worktree on the expected branch and "
+            "preserved run history; no remote is read)"
         ),
     )
     freeze.add_argument("stage_id")
@@ -4498,8 +4563,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-branch",
         required=True,
         help=(
-            "the branch this candidate belongs to; required, verified "
-            "against the worktree and used for the pushed/reachable check"
+            "the branch this candidate belongs to; required, and the candidate must be its "
+            "exact HEAD"
         ),
     )
     freeze.set_defaults(func=_cmd_freeze_candidate)
@@ -4508,7 +4573,8 @@ def build_parser() -> argparse.ArgumentParser:
         "accept-candidate",
         help=(
             "accept exactly this stage's frozen candidate; refuses as stale "
-            "if HEAD has moved since the freeze"
+            "if HEAD has moved since the freeze, and refuses unless the reviewer's recorded "
+            "READY is at that exact commit"
         ),
     )
     accept.add_argument("stage_id")

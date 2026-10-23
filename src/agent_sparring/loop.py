@@ -39,8 +39,8 @@ to exactly what is missing:
 
 - the stage-agent turn is asked to commit that exact tree and nothing
   else (``finalize_only``; see :func:`~agent_sparring.stage_prompt.
-  build_stage_prompt`) -- never to push it: the engine pushes, after
-  authorization, once the commit is reviewed;
+  build_stage_prompt`) -- never to push it: runs are local-first, and the
+  commit is accepted locally once it is reviewed;
 - :mod:`agent_sparring.finalization` then compares the committed content
   against the tree the sparrer reviewed, path by path. Anything still
   uncommitted, or any committed content that is not the reviewed content,

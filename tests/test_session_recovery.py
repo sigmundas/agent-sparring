@@ -52,6 +52,16 @@ from test_plan import NEEDS_YOU, READY, S1, S2, _PlanRepoTestCase, _SparringAdap
 from test_stage_agent_pin import PROVIDERS_ONLY
 
 
+def _ready_at_head(repo: Path, stage: Stage) -> None:
+    """The reviewer's READY recorded over the stage's current commit, as the
+    loop records it. Plan L: accept-candidate needs the review at the exact
+    SHA, so a hand acceptance in these tests first has one."""
+
+    from agent_sparring.next_turn import capture_candidate, record_next_turn
+
+    record_next_turn(stage, "finalization", candidate=capture_candidate(repo, stage, stage.read_state()))
+
+
 def _completed(stdout="", stderr="", returncode=1):
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
@@ -404,6 +414,7 @@ class ProviderPauseRecordTests(_Stuck):
         from agent_sparring.acceptance import accept_candidate, freeze_candidate
 
         stage2 = self._stage(S2)
+        _ready_at_head(self.repo, stage2)
         freeze_candidate(stage2, self.sparring_dir, self.repo, expected_branch="feature/x")
         accept_candidate(stage2, self.repo, expected_branch="feature/x")
 
@@ -424,6 +435,7 @@ class ProviderPauseRecordTests(_Stuck):
         from agent_sparring.acceptance import accept_candidate, freeze_candidate
 
         stage2 = self._stage(S2)
+        _ready_at_head(self.repo, stage2)
         freeze_candidate(stage2, self.sparring_dir, self.repo, expected_branch="feature/x")
         accept_candidate(stage2, self.repo, expected_branch="feature/x")
         files = (self.state_path, stage2.directory / "state.json")

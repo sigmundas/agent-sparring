@@ -13,13 +13,14 @@ append-only ``events`` list and is derived from it, never stored twice.
 This module covers creation, resume lookup and the read-only listing; merge
 and cleanup are not implemented here.
 
-It also keeps the one engine fact about a run that must survive the loss of
-its plan-run state: that the run was *pinned* (see
-:mod:`agent_sparring.remote_pin`). A managed record says so with
-``pinned: true``; any other run says so in
+It also keeps, for runs recorded before runs were local-first, the one
+engine fact about such a run that must survive the loss of its plan-run
+state: that the run was *pinned* (see :mod:`agent_sparring.remote_pin`). A
+managed record says so with ``pinned: true``; any other run says so in
 ``<git-common-dir>/agent-sparring/runs/<run-key>.json``. Both live outside
 the project directory, so deleting or replacing ``.sparring/plans/<run>.json``
-cannot turn a pinned run back into one that predates pins.
+cannot turn a pinned run back into one that predates pins. Local-first runs
+pin no remote, and neither is written for them.
 """
 
 from __future__ import annotations
@@ -75,8 +76,8 @@ _RECORD_KEYS = frozenset(
 )
 #: Optional in schema v1: ``project_dir``, the project directory relative
 #: to the worktree and always contained in it (absent means ``.sparring``);
-#: and ``pinned``, ``true`` for every run created since runs pin their
-#: remote target (absent means the run predates pins).
+#: and ``pinned``, ``true`` for a run created while runs pinned their
+#: remote target (absent means the run predates pins, or is local-first).
 _OPTIONAL_KEYS = frozenset({"project_dir", "pinned"})
 DEFAULT_PROJECT_DIR = ".sparring"
 
@@ -670,7 +671,8 @@ def plan_managed_run(
         remote=remote,
         created_at=_now(),
         project_dir=project_rel.as_posix(),
-        pinned=True,
+        # Runs are local-first and pin no remote, so a new record never says
+        # pinned; ``pinned`` stays readable for records of older runs.
     )
     return ManagedRunPlan(record=record, uncommitted=dirty_paths(invoking_top))
 

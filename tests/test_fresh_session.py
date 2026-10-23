@@ -953,7 +953,7 @@ class ReadyOverCommitRecoveryTests(_PlanRepoTestCase):
         with self.assertRaises(PlanRunError) as ctx:
             self._resume(stage_adapter, sparring, stop_after_stage=S1)
 
-        self.assertIn("Only that reviewed commit may be pushed and accepted", str(ctx.exception))
+        self.assertIn("Only that reviewed commit may be accepted", str(ctx.exception))
         self.assertEqual(stage_adapter.start_calls + stage_adapter.resume_calls, [])
         self.assertEqual(sparring.start_calls + sparring.resume_calls, [])
         self.assertIsNot(stage.read_state().status, StageStatus.ACCEPTED)

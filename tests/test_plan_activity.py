@@ -105,11 +105,12 @@ class _PlanActivityCase(_PlanRepoTestCase):
 
 
 def _without_remote_pin(text: str) -> str:
-    """Plan-run state without its remote pin, whose URL is the repository's
-    own (temporary) path and whose pin time is wall-clock bookkeeping."""
+    """Plan-run state without its legacy remote pin or its configuration
+    snapshot, both of which carry the repository's own (temporary) paths."""
 
     payload = json.loads(text)
     payload.pop("remote_pin", None)
+    payload.pop("config_snapshot", None)
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
@@ -417,14 +418,13 @@ class PlanEventChronologyTests(_PlanActivityCase):
         result = self._start(_StageAdapter(self.repo, commit=True), _SparringAdapter([READY, READY]))
         self.assertIs(result.status, PlanRunStatus.COMPLETE)
 
-        # The engine pushes each committed candidate (the run holds a
-        # run-level grant) before the acceptance gate runs.
+        # Runs are local-first: nothing is pushed between READY and the
+        # acceptance gate, so no push event appears.
         s1_events, s2_events = _plan_events(self._s1()), _plan_events(self._s2())
         self.assertEqual(
             [(e["event"], e.get("summary")) for e in s1_events],
             [
                 ("plan.stage.entered", "Stage 1 — Foundation (1/2)"),
-                ("plan.candidate.pushed", None),
                 ("plan.stage.accepted", None),
             ],
         )
@@ -432,13 +432,12 @@ class PlanEventChronologyTests(_PlanActivityCase):
             [(e["event"], e.get("summary")) for e in s2_events],
             [
                 ("plan.stage.entered", "Stage 2 — Incremental rendering (2/2)"),
-                ("plan.candidate.pushed", None),
                 ("plan.stage.accepted", None),
                 ("plan.completed", "2 stage(s) accepted"),
             ],
         )
-        self.assertEqual(s1_events[2]["sha"], self._s1().read_state().candidate_sha)
-        self.assertEqual(s2_events[2]["sha"], self._s2().read_state().candidate_sha)
+        self.assertEqual(s1_events[1]["sha"], self._s1().read_state().candidate_sha)
+        self.assertEqual(s2_events[1]["sha"], self._s2().read_state().candidate_sha)
         self.assertNotEqual(s1_events[1]["sha"], s2_events[1]["sha"])
         for event in s1_events + s2_events:
             self.assertEqual((event["v"], event["actor"]), (1, "plan"))
@@ -542,7 +541,6 @@ class PlanEventChronologyTests(_PlanActivityCase):
             [(e["event"], e.get("summary")) for e in _plan_events(self._s1())],
             [
                 ("plan.stage.entered", "Stage 1 — Foundation (1/2)"),
-                ("plan.candidate.pushed", None),
                 ("plan.failed", "acceptance gate refused"),
             ],
         )
@@ -550,28 +548,38 @@ class PlanEventChronologyTests(_PlanActivityCase):
         self.assertNotIn(str(self.remote), self._s1().activity_path().read_text(encoding="utf-8"))
         self.assertIs(self._s1().read_state().status, StageStatus.WORKING)
 
-    def test_a_candidate_awaiting_push_permission_is_paused_with_a_fixed_phrase(self):
-        # A committed but unpushed candidate: the sparrer says READY and the
-        # run stops to ask, which is a pause and not a failure.
+    def test_a_committed_unpushed_candidate_is_accepted_without_a_push_pause(self):
+        # Plan L: was test_a_candidate_awaiting_push_permission_is_paused_with_
+        # a_fixed_phrase. A committed but unpushed candidate: the sparrer says
+        # READY and the run accepts it locally -- no push pause, no push.
+        remote_refs = subprocess.run(
+            ["git", "--git-dir", str(self.remote), "for-each-ref"], capture_output=True, text=True, check=True
+        ).stdout
         result = self._start(
             _StageAdapter(self.repo, commit=True, push=False),
             _SparringAdapter([READY]),
-            allow_push_for_run=False,
+            stop_after_stage=S1,
         )
 
         self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertIsNone(result.awaiting)
         self.assertEqual(
             [(e["event"], e.get("summary")) for e in _plan_events(self._s1())],
             [
                 ("plan.stage.entered", "Stage 1 — Foundation (1/2)"),
-                ("plan.paused", "push authorization required"),
+                ("plan.stage.accepted", None),
+                ("plan.paused", f"stopping after {S1}"),
             ],
         )
-        # Neither the commit nor the remote's location is copied into the log.
         log = self._s1().activity_path().read_text(encoding="utf-8")
         self.assertNotIn(str(self.remote), log)
-        self.assertNotIn(result.awaiting.candidate_sha, log)
-        self.assertIs(self._s1().read_state().status, StageStatus.WORKING)
+        self.assertIs(self._s1().read_state().status, StageStatus.ACCEPTED)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "--git-dir", str(self.remote), "for-each-ref"], capture_output=True, text=True, check=True
+            ).stdout,
+            remote_refs,
+        )
 
     def test_changed_plan_before_acceptance_is_failed(self):
         class _EditsPlan(_StageAdapter):
