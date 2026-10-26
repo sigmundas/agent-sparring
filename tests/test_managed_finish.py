@@ -1,3 +1,5 @@
+import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -9,13 +11,46 @@ from pathlib import Path
 
 import conftest_path  # noqa: F401
 
-from agent_sparring import managed_finish, managed_run
+from agent_sparring import engine_git, managed_finish, managed_run
 from agent_sparring.concurrency import worktree_lock
 from agent_sparring.plan import MarkdownPlanSource, PlanRunState, PlanRunStatus, load_plan_source
 from agent_sparring.stage import Stage, StageStatus
 
+from git_recorder import GitRecorder
 from test_managed_run import _git, _ManagedRepoTestCase
 from test_plan import _run_git
+
+
+@contextlib.contextmanager
+def remote_finish_allowed_in_test():
+    """Disable the I-L1 remote refusal, in this test only.
+
+    Plan L Stage 3: ``engine_git.run`` refuses every remote command, so a
+    legacy pinned run's remote finish -- its pushed check, ``--push-target``
+    and ``[finish] delete_remote_branch`` -- can no longer run (Stage 4
+    replaces it with ``remote_finish_removed``). Until that code is removed,
+    its own properties (the lease form, races, rejection handling,
+    retargeting) stay tested by running it with the refusal and the
+    ``protocol.allow=never`` override patched out here. That production
+    refuses the same finish, contacting nothing, is
+    :class:`LegacyRemoteFinishRefusedTests`."""
+
+    with mock.patch.object(engine_git, "remote_form", return_value=None), \
+            mock.patch.object(engine_git, "LOCAL_OVERRIDES", ()):
+        yield
+
+
+def legacy_remote_finish(test):
+    """Run ``test`` on a legacy pinned run, with
+    :func:`remote_finish_allowed_in_test`."""
+
+    @functools.wraps(test)
+    def wrapper(self, *args, **kwargs):
+        self.LEGACY_PIN = True
+        with remote_finish_allowed_in_test():
+            return test(self, *args, **kwargs)
+
+    return wrapper
 
 
 class _FinishTestCase(_ManagedRepoTestCase):
@@ -128,7 +163,12 @@ class ManagedFinishTests(_FinishTestCase):
         self.assertEqual(git["branch_tip"], head)
         self.assertEqual(git["final_candidate"], head)
         self.assertTrue(git["clean"])
-        self.assertTrue(git["candidate_pushed"])
+        # Plan L Stage 3: a local-first run's finish reads no remote (was:
+        # git["candidate_pushed"] true, read from origin). The legacy pushed
+        # check is test_candidate_not_pushed.
+        self.assertIsNone(git["candidate_pushed"])
+        (pushed,) = [c for c in finish["checks"] if c["code"] == "candidate_not_pushed"]
+        self.assertEqual((pushed["ok"], pushed["detail"]), (True, "local-first run: no remote is required or read"))
         self.assertFalse(git["target_contains_candidate"])
         self.assertEqual(git["target_checked_out_at"], str(self.repo.resolve()))
 
@@ -230,6 +270,7 @@ class ManagedFinishTests(_FinishTestCase):
         failed, _ = self._failed(record)
         self.assertEqual(failed, {"candidate_mismatch"})
 
+    @legacy_remote_finish
     def test_candidate_not_pushed(self):
         record, _ = self._complete(push=False)
         self.assertEqual(record.remote, "origin")
@@ -242,6 +283,7 @@ class ManagedFinishTests(_FinishTestCase):
         self.assertTrue(status["git"]["candidate_pushed"])
         self.assertTrue(status["finish"]["eligible"]["merge"])
 
+    @legacy_remote_finish
     def test_candidate_pushed_is_bound_to_the_recorded_remote_and_branch(self):
         # The second remote exists before the run starts: status reads remotes
         # through the run's snapshot, and a remote added later is a change.
@@ -533,6 +575,7 @@ class FinishExecutionTests(_FinishTestCase):
         _run_git(worktree, "add", "late.txt")
         _run_git(worktree, "commit", "-q", "-m", "late")
 
+    @legacy_remote_finish
     def test_unpushed_candidate_and_live_runner_refuse(self):
         record, _ = self._complete(push=False)
         code, report, _ = self._finish(record)
@@ -576,6 +619,7 @@ class FinishExecutionTests(_FinishTestCase):
         self._assert_cleaned(record, head)
         self.assertEqual(self._events(record).count("merged"), 1)
 
+    @legacy_remote_finish
     def test_push_target(self):
         record, head = self._complete()
         code, report, err = self._finish(record, "--merge-only", "--push-target")
@@ -650,6 +694,7 @@ class FinishExecutionTests(_FinishTestCase):
         self.assertEqual(managed_run.record_path(self.repo, record.run_key).read_bytes(), record_bytes)
         self.assertEqual(_git(self.repo, "for-each-ref"), refs)
 
+    @legacy_remote_finish
     def test_remote_branch_kept_by_default_with_alias_and_precise_code(self):
         record, _ = self._complete()
         head = self._set_policy(record, False)
@@ -665,6 +710,7 @@ class FinishExecutionTests(_FinishTestCase):
         self.assertNotIn("remote_branch_deleted", self._events(record))
         self._assert_cleaned(record, head)
 
+    @legacy_remote_finish
     def test_remote_branch_kept_without_policy(self):
         record, _ = self._complete()
         code, report, err = self._finish(record, "--push-target")
@@ -677,7 +723,18 @@ class FinishExecutionTests(_FinishTestCase):
 
 
 class RemoteBranchDeletionTests(_FinishTestCase):
-    """``[finish] delete_remote_branch``: compare-and-delete on the candidate."""
+    """``[finish] delete_remote_branch``: compare-and-delete on the candidate.
+
+    Plan L Stage 3: every test here is a legacy pinned run's remote finish,
+    run with :func:`remote_finish_allowed_in_test` (see its docstring)."""
+
+    LEGACY_PIN = True
+
+    def setUp(self):
+        super().setUp()
+        allowed = remote_finish_allowed_in_test()
+        allowed.__enter__()
+        self.addCleanup(allowed.__exit__, None, None, None)
 
     _finish = FinishExecutionTests._finish
     _events = FinishExecutionTests._events
@@ -1075,6 +1132,7 @@ class PlanRemovalTests(_FinishTestCase):
         self.assertEqual(_git(self.repo, "rev-parse", "main"), head)
         self.assertEqual(self._events(record)[-1], "finished")
 
+    @legacy_remote_finish
     def test_a_removal_commit_whose_event_was_lost_is_reconciled_and_pushed(self):
         record, _ = self._complete()
         head = self._enable(record)
@@ -1161,6 +1219,7 @@ class PlanRemovalTests(_FinishTestCase):
         self._assert_removed(record, head, report)
         self.assertEqual(_git(self.repo, "symbolic-ref", "--short", "HEAD"), "feature/x")
 
+    @legacy_remote_finish
     def test_push_target_carries_the_merge_and_the_removal_in_one_push(self):
         record, _ = self._complete()
         head = self._enable(record)
@@ -1513,6 +1572,64 @@ class FinishSchemaTests(_FinishTestCase):
         self.assertEqual((code, report["schema_version"]), (0, 1), err)
         self.assertIn("plan_removal", report)
         self.assertIn("remote_branch", report)
+
+
+class LegacyRemoteFinishRefusedTests(_FinishTestCase):
+    """Plan L Stage 3 (I-L1): without :func:`remote_finish_allowed_in_test`,
+    a legacy pinned run's remote finish -- its pushed check,
+    ``--push-target`` and ``delete_remote_branch`` -- contacts nothing. The
+    git recorder first on ``PATH`` sees no remote command, the remote's refs
+    are unchanged, and nothing is merged. Positive control: the very same
+    finish with the test-only switch reaches the remote."""
+
+    LEGACY_PIN = True
+    _finish = FinishExecutionTests._finish
+    _events = FinishExecutionTests._events
+    _set_policy = FinishExecutionTests._set_policy
+
+    def _legacy_run_with_every_remote_step(self):
+        record, _ = self._complete()
+        head = self._set_policy(record, True)
+        return record, head
+
+    def test_the_legacy_remote_finish_and_its_status_contact_no_remote(self):
+        record, head = self._legacy_run_with_every_remote_step()
+        remote_before = _git(self.remote, "for-each-ref")
+        main_before = _git(self.repo, "rev-parse", "main")
+        recorder = GitRecorder(self.repo.parent)
+        with recorder.active():
+            runs = self._main("runs", "--repo-root", str(self.repo), "--json")
+            dry = self._main("finish-run", "--run-key", record.run_key, "--repo-root", str(self.repo),
+                             "--dry-run", "--json")
+            code, report, err = self._finish(record, "--push-target")
+
+        self.assertEqual(runs[0], 0, runs[2])
+        self.assertEqual(dry[0], 3, dry[2])
+        self.assertEqual((code, report["stopped_at"]), (3, "checks"), err)
+        self.assertIn("candidate_not_pushed", report["reason"])
+        failed, finish = self._failed(record)
+        self.assertEqual(failed, {"candidate_not_pushed"})
+        (check,) = [c for c in finish["checks"] if c["code"] == "candidate_not_pushed"]
+        self.assertIn("remote_operation_not_allowed", check["detail"])
+        self.assertTrue(recorder.lines())
+        self.assertEqual(recorder.remote_commands(), [])
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), main_before)
+        self.assertNotIn("merged", self._events(record))
+        self.assertTrue(Path(record.worktree_path).is_dir())
+        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
+
+    def test_positive_control_with_the_test_only_switch_the_same_finish_reaches_the_remote(self):
+        record, head = self._legacy_run_with_every_remote_step()
+        recorder = GitRecorder(self.repo.parent)
+        with remote_finish_allowed_in_test(), recorder.active():
+            code, report, err = self._finish(record, "--push-target")
+        self.assertEqual(code, 0, err)
+        self.assertIn("push_target", report["completed_steps"])
+        self.assertIn("delete_remote_branch", report["completed_steps"])
+        self.assertTrue(recorder.remote_commands())
+        self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), head)
+        self.assertNotIn(record.branch, _git(self.repo, "ls-remote", "origin"))
 
 
 class FinishConfigTests(unittest.TestCase):

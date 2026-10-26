@@ -81,6 +81,7 @@ import contextvars
 import functools
 import os
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -556,7 +557,7 @@ def _checked(cwd: Path, args: Sequence[str]) -> tuple[tuple[ConfigEntry, ...] | 
         if guard is not None:
             compare_snapshot(entries, guard.entries)
         pairs += _driver_overrides(entries)
-    form = remote_form(args, entries)
+    form = remote_form(args, Path(cwd))
     if form is not None:
         raise GitConfigRefusal(
             "remote_operation_not_allowed",
@@ -641,39 +642,50 @@ def _builtins() -> frozenset[str]:
     return frozenset(listed.stdout.split()) if listed.returncode == 0 else frozenset()
 
 
-def _alias(
-    name: str, args: Sequence[str], index: int, entries: Sequence[ConfigEntry] | None
-) -> str | None:
-    """The expansion Git would run for ``name``, when it is an alias: the
-    last ``-c alias.<name>=`` before the subcommand, else the last
-    configured one. A builtin name is never an alias."""
+class _Unresolvable(Exception):
+    """Git's own configuration lookup for an alias failed."""
+
+
+def _alias(name: str, global_options: Sequence[str], cwd: Path) -> str | None:
+    """The alias value Git would use for ``name``, or ``None`` when it is
+    not an alias. A builtin name is never an alias.
+
+    Git itself is asked, with exactly the global options the command
+    carries (``-c``, ``--config-env``, ``-C``, ``--git-dir`` ...), from the
+    directory the command runs in -- so an alias set on the command line,
+    through the environment, or in another repository those options select
+    is the one found. Reading configuration contacts nothing and runs no
+    program (hooks and fsmonitor are off). Raises :class:`_Unresolvable`
+    when the lookup itself fails."""
 
     if name in _builtins():
         return None
-    key = f"alias.{name}".lower()
-    found: str | None = None
-    for entry in entries or ():
-        if entry.key.lower() == key:
-            found = entry.value
-    for i in range(index - 1):
-        if args[i] == "-c" and args[i + 1].split("=", 1)[0].lower() == key:
-            found = args[i + 1].split("=", 1)[1] if "=" in args[i + 1] else ""
-    return found
+    looked_up = subprocess.run(
+        ["git", "-C", str(cwd), *_overrides(BASE_OVERRIDES), *global_options,
+         "config", "--get", f"alias.{name}"],
+        capture_output=True, text=True, check=False, env=_environment(None),
+    )
+    if looked_up.returncode == 1:
+        return None
+    if looked_up.returncode != 0:
+        raise _Unresolvable(looked_up.stderr.strip())
+    return looked_up.stdout[:-1] if looked_up.stdout.endswith("\n") else looked_up.stdout
 
 
-def remote_form(
-    args: Sequence[str], entries: Sequence[ConfigEntry] | None = None
-) -> str | None:
-    """How ``git <args>`` would contact a remote, or ``None`` when it would
-    not (I-L1): the subcommand words that do, as Git would run them.
+def remote_form(args: Sequence[str], cwd: Path | None = None) -> str | None:
+    """How ``git <args>``, run in ``cwd``, would contact a remote, or
+    ``None`` when it would not (I-L1): the subcommand words that do, as Git
+    would run them.
 
     Every global option (``-c``, ``-C``, ``--git-dir`` ...) is looked
-    through, and an alias -- from a ``-c alias.*`` setting or any
-    configuration ``entries`` -- is expanded the way Git would. A shell
-    alias (``!...``) counts as contacting one: what it runs cannot be
+    through, and an alias is resolved by Git itself (see :func:`_alias`)
+    and split the way Git splits it (shell-like quoting), then classified
+    again. A shell alias (``!...``), or one Git's lookup or splitting
+    cannot resolve, counts as contacting one: what it runs cannot be
     known. So does any command given a repository URL.
     """
 
+    cwd = Path(cwd) if cwd is not None else Path(".")
     seen: set[str] = set()
     args = list(args)
     while True:
@@ -681,12 +693,19 @@ def remote_form(
         if name is None:
             return None
         rest = args[index + 1 :]
-        expansion = _alias(name, args, index, entries)
-        if expansion is not None and name not in seen:
+        try:
+            expansion = None if name in seen else _alias(name, args[:index], cwd)
+        except _Unresolvable:
+            return f"alias {name} (unresolvable)"
+        if expansion is not None:
             seen.add(name)
             if expansion.lstrip().startswith("!"):
                 return f"alias {name} (a shell command)"
-            args = [*args[:index], *expansion.split(), *rest]
+            try:
+                words = shlex.split(expansion)
+            except ValueError:
+                return f"alias {name} (unresolvable)"
+            args = [*args[:index], *words, *rest]
             continue
         if name in _ALWAYS_REMOTE:
             return name

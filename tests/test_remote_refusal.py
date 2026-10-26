@@ -274,6 +274,38 @@ class ReachedThroughAliasesTests(_RemoteWorld):
         git(self.repo, "config", "alias.shup", "!git ls-remote origin")
         self.check("shup", key="alias shup (a shell command)")
 
+    def test_a_quoted_alias_given_with_dash_c(self):
+        # Git splits an alias with shell-like quoting: "fetch" is fetch.
+        self.check("-c", 'alias.sync="fetch"', "sync", "origin", key="fetch")
+
+    def test_a_quoted_alias_in_the_repository_configuration(self):
+        git(self.repo, "config", "alias.qup", "'ls-remote' \"origin\"")
+        self.check("qup", key="ls-remote")
+
+    def test_an_alias_given_through_config_env(self):
+        with mock.patch.dict(os.environ, {"STAGE3_ALIAS": "fetch"}):
+            self.check("--config-env=alias.envsync=STAGE3_ALIAS", "envsync", "origin", key="fetch")
+            self.check("--config-env", "alias.envsync=STAGE3_ALIAS", "envsync", "origin", key="fetch")
+
+    def _other_repository(self) -> Path:
+        """A second repository, reaching the same marked origin, whose own
+        configuration -- not the engine's cwd -- defines the alias."""
+
+        other = self.root / "other"
+        git(self.root, "clone", "-q", str(self.bare), str(other))
+        git(other, "config", "remote.origin.uploadpack", str(self.upload))
+        git(other, "config", "alias.otherup", "ls-remote origin")
+        self.marker.unlink(missing_ok=True)
+        return other
+
+    def test_an_alias_from_another_repository_selected_with_dash_c_directory(self):
+        other = self._other_repository()
+        self.check("-C", str(other), "otherup", key="ls-remote")
+
+    def test_an_alias_from_another_repository_selected_with_git_dir(self):
+        other = self._other_repository()
+        self.check("--git-dir", str(other / ".git"), "otherup", key="ls-remote")
+
     def test_an_alias_never_shadows_a_builtin(self):
         # Git ignores an alias named like a builtin, so the engine does too:
         # its own ``status`` is not refused for an alias it would never run.
