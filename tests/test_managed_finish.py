@@ -29,7 +29,7 @@ class _FinishTestCase(_ManagedRepoTestCase):
         Stage 4's. Until then these tests keep proving what finish does for
         a pinned (legacy) run -- the remote finish, its pin and its guard."""
 
-        from agent_sparring.remote_pin import pin_remote
+        from legacy_pins import legacy_pin
 
         path = managed_run.record_path(self.repo, record.run_key)
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -37,20 +37,25 @@ class _FinishTestCase(_ManagedRepoTestCase):
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         state_path = record.sparring_dir / "plans" / f"{record.run_key}.json"
         run_state = PlanRunState.load(state_path)
-        run_state.remote_pin = pin_remote(Path(record.worktree_path), record.branch)
+        run_state.remote_pin = legacy_pin(Path(record.worktree_path), record.branch)
         run_state.config_snapshot = None
         run_state.save(state_path)
         # An engine from before local-first runs never wrote the snapshot
         # record either.
         managed_run.snapshot_flag_path(self.repo, record.run_key).unlink(missing_ok=True)
 
-    def _complete(self, *, push: bool = True, legacy_pin: bool = True):
+    #: Plan L Stage 3: engine_git refuses every remote command, so a legacy
+    #: pinned run's finish (which reads the remote) stops at its checks.
+    #: Runs are local-first by default; a class about legacy runs sets this.
+    LEGACY_PIN = False
+
+    def _complete(self, *, push: bool = True, legacy_pin: bool | None = None):
         """A managed run with every stage accepted at the worktree's HEAD
-        (a legacy pinned run unless ``legacy_pin`` is false; see
-        :meth:`_legacy_pin`)."""
+        (a legacy pinned run when ``legacy_pin``, default
+        :attr:`LEGACY_PIN`; see :meth:`_legacy_pin`)."""
 
         self._start_managed()
-        if legacy_pin:
+        if self.LEGACY_PIN if legacy_pin is None else legacy_pin:
             (started,) = self._records()
             self._legacy_pin(started)
         (record,) = self._records()

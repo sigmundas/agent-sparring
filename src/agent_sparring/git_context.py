@@ -13,7 +13,6 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from agent_sparring import engine_git
 from agent_sparring.engine_git import GitConfigRefusal, GitContextError
@@ -50,8 +49,7 @@ class GitContext:
     """Structured git identity/status for one handoff.
 
     ``base_sha`` is ``None`` when no base was given (nothing to diff
-    against yet). ``pushed``/``push_detail`` are ``None`` when the push
-    check was skipped rather than run and failed.
+    against yet).
     """
 
     branch: str
@@ -59,8 +57,6 @@ class GitContext:
     base_sha: str | None = None
     changed_files: tuple[ChangedFile, ...] = field(default_factory=tuple)
     dirty_paths: tuple[str, ...] = field(default_factory=tuple)
-    pushed: bool | None = None
-    push_detail: str | None = None
 
 
 def _run(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -267,10 +263,9 @@ def tracking_remote(repo_root: Path, branch: str) -> tuple[str, str]:
 
     ``origin`` and ``branch``'s own name are the fallbacks, which is what
     makes an unconfigured branch still have one *intended* remote ref rather
-    than none. Public because the remote ref this resolves is the identity an
-    authorized push is bound to (:mod:`agent_sparring.push_gate`), and the
-    push must target exactly the ref :func:`verify_pushed` then checks --
-    resolving it twice, in two places, is how they could disagree.
+    than none. Public because the remote ref this resolves is the identity a
+    legacy push authorization is bound to (:mod:`agent_sparring.push_gate`).
+    It reads local configuration only.
     """
 
     remote = _run(repo_root, "config", "--get", f"branch.{branch}.remote").stdout.strip()
@@ -281,92 +276,6 @@ def tracking_remote(repo_root: Path, branch: str) -> tuple[str, str]:
         merge_ref[len("refs/heads/") :] if merge_ref.startswith("refs/heads/") else branch
     )
     return remote, remote_branch
-
-
-def verify_pushed(repo_root: Path, candidate_sha: str, branch: str) -> tuple[bool, str]:
-    """Is ``candidate_sha`` reachable from ``branch``'s configured remote ref?
-
-    Returns ``(pushed, human-readable detail)``. Mirrors the reachability
-    logic (not the code) used by the Sporely V1 workflow scripts: the remote
-    ref is looked up by its full name and reachability is proven locally via
-    ``merge-base --is-ancestor``, rather than trusting any recorded flag.
-
-    This is the read for a repository no run pinned. It never follows the
-    repository's live transport configuration: under a run guard that
-    governs ``repo_root`` it uses that guard's snapshot; otherwise it
-    refuses (:class:`~agent_sparring.engine_git.GitConfigRefusal`,
-    ``repository_transport_config``) while the repository sets any
-    transport or credential key of its own, and reads with the user's
-    global and system configuration only. A pinned repository is read with
-    :func:`agent_sparring.remote_pin.verify_pinned` instead.
-    """
-
-    guard = engine_git.guard_for(Path(repo_root))
-    if guard is None:
-        engine_git.refuse_repository_transport(Path(repo_root))
-    trusted = guard.entries if guard is not None else ()
-    remote, remote_branch = tracking_remote(repo_root, branch)
-    ref = f"refs/heads/{remote_branch}"
-    # Read by URL, in an isolated repository where remote names do not
-    # exist (see agent_sparring.engine_git.run_remote).
-    got = _run(repo_root, "remote", "get-url", remote)
-    configured = got.stdout.strip() if got.returncode == 0 else ""
-    if not configured:
-        return False, f"{remote} has no configured URL, so {ref} cannot be read"
-    url = absolute_url(repo_root, configured)
-    if url.startswith("-"):
-        raise GitContextError(f"refusing to read {ref!r} at {url!r}: git would read it as an option")
-    result = engine_git.run_remote(repo_root, trusted, "ls-remote", "--exit-code", url, ref)
-    if result.returncode != 0:
-        return False, (
-            f"{remote} has no {ref} yet ({result.stderr.strip() or 'ls-remote failed'})"
-        )
-    first_line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
-    remote_sha = first_line.split()[0] if first_line else ""
-    if not _FULL_SHA_RE.match(remote_sha):
-        return False, f"{remote} {ref} did not report a usable commit id ({remote_sha!r})"
-    if remote_sha == candidate_sha:
-        return True, f"{remote}/{remote_branch} is exactly {candidate_sha}"
-    if _run(repo_root, "cat-file", "-e", f"{remote_sha}^{{commit}}").returncode != 0:
-        return False, (
-            f"{remote}/{remote_branch} is at {remote_sha}, which is not present locally; "
-            f"fetch and re-run so reachability can be proven"
-        )
-    if _run(repo_root, "merge-base", "--is-ancestor", candidate_sha, remote_sha).returncode == 0:
-        return True, f"{candidate_sha} is reachable from {remote}/{remote_branch} ({remote_sha})"
-    return False, f"{candidate_sha} is not reachable from {remote}/{remote_branch} ({remote_sha})"
-
-
-def remote_tip(
-    repo_root: Path, url: str, ref: str, *, trusted: tuple[tuple[str, str], ...]
-) -> str | None:
-    """The commit ``ref`` points at in the repository at ``url``, or ``None``
-    when that ref does not exist there.
-
-    ``url`` is passed to Git as a URL, never as a remote name, and the read
-    runs in an isolated repository configured only from ``trusted`` (see
-    :func:`agent_sparring.engine_git.run_remote`), so no repository
-    configuration can redirect it. Only a line naming exactly ``ref``
-    counts (``ls-remote`` patterns also match longer refs ending in the
-    same components). An unreachable remote raises :class:`GitContextError`
-    -- "cannot tell" is never read as "absent".
-    """
-
-    if url.startswith("-") or ref.startswith("-"):
-        raise GitContextError(f"refusing to read {ref!r} at {url!r}: git would read it as an option")
-    result = engine_git.run_remote(repo_root, trusted, "ls-remote", url, ref)
-    if result.returncode != 0:
-        raise GitContextError(
-            f"cannot read {ref} at {url}: {result.stderr.strip() or 'git ls-remote failed'}"
-        )
-    for line in result.stdout.splitlines():
-        sha, _, name = line.partition("\t")
-        if name.strip() == ref:
-            sha = sha.strip()
-            if not _FULL_SHA_RE.match(sha):
-                raise GitContextError(f"{url} {ref} did not report a usable commit id ({sha!r})")
-            return sha
-    return None
 
 
 def is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
@@ -442,19 +351,13 @@ def gather_git_context(
     *,
     base_sha: str | None = None,
     candidate_sha: str | None = None,
-    check_pushed: bool = True,
-    pin: Any = None,
 ) -> GitContext:
-    """Gather branch/commit/diff/status/push context for one repo.
+    """Gather branch/commit/diff/status context for one repo, from the
+    local repository only (I-L1: no remote is ever read).
 
     ``candidate_sha`` defaults to the current ``HEAD``. ``base_sha``, if
     given, is used to compute the changed-file list; if omitted, the
     changed-file list is empty (nothing recorded to diff against yet).
-
-    ``pin`` is the owning run's :class:`~agent_sparring.remote_pin.RemotePin`,
-    when it has one: the pushed check then reads the pinned destination
-    with the run's snapshot, and nothing else (see :func:`verify_pushed`
-    for a repository no run pinned).
     """
 
     branch = current_branch(repo_root)
@@ -466,24 +369,10 @@ def gather_git_context(
     )
     dirty = dirty_paths(repo_root)
 
-    pushed: bool | None = None
-    push_detail: str | None = None
-    if check_pushed and pin is not None:
-        from agent_sparring.remote_pin import verify_pinned
-
-        with engine_git.trusted_config(
-            [Path(repo_root)], pin.trusted_config, destinations=(pin.destination,)
-        ):
-            pushed, push_detail = verify_pinned(repo_root, pin, resolved_candidate)
-    elif check_pushed:
-        pushed, push_detail = verify_pushed(repo_root, resolved_candidate, branch)
-
     return GitContext(
         branch=branch,
         candidate_sha=resolved_candidate,
         base_sha=resolved_base,
         changed_files=files,
         dirty_paths=dirty,
-        pushed=pushed,
-        push_detail=push_detail,
     )

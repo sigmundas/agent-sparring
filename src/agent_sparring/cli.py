@@ -798,7 +798,6 @@ def _cmd_handoff(args: argparse.Namespace) -> int:
             claims=args.claims,
             test_evidence=args.test_evidence,
             self_contained=args.self_contained,
-            check_pushed=not args.no_check_pushed,
             base_sha=args.base_sha,
             candidate_sha=args.candidate_sha,
         )
@@ -3768,7 +3767,10 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument(
         "--no-check-pushed",
         action="store_true",
-        help="skip verifying the candidate commit is pushed to its remote",
+        help=(
+            "accepted for older clients; the handoff never reads a remote, so there is no "
+            "pushed check to skip"
+        ),
     )
     handoff.set_defaults(func=_cmd_handoff)
 

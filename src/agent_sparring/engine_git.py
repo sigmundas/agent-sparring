@@ -42,25 +42,33 @@ protocol, HTTP, signing, hook, fsmonitor and driver keys -- is compared, on
 every invocation inside that repository, with the snapshot captured when
 the run started. Any difference is a :class:`GitConfigRefusal` naming the
 key. Configuration that was already there at run start is the trusted
-snapshot and keeps working exactly as before (a credential helper the
-repository already used still authenticates the engine's push). User-level
+snapshot and keeps working exactly as before. User-level
 and system configuration are the user's own and are not compared.
 
 Editing ``.gitattributes`` is deliberately *not* a change: an attribute
 only selects a driver, and a driver runs only if configuration defines it.
 
-Remote operations go further than a comparison: they never read the
-repository's configuration at all. :func:`run_remote` runs them in a
-throwaway bare repository that borrows the objects and is configured from
-the trusted snapshot's transport keys only (see :func:`isolated_git_dir`),
-so configuration written between a check and the invocation cannot reach
-them either. :func:`run` refuses a remote operation outright
-(``unguarded_remote_operation``) unless a run guard governs its directory:
-a caller with no guard passes an explicit snapshot and destination to
-:func:`run_remote`, or -- having none -- uses
-:func:`refuse_repository_transport` and an empty snapshot. A push to a
-local-path destination must be to the pinned one: a local repository runs
-its own receive hooks. Local operations do read the repository's configuration;
+No remote contact (local-first, I-L1)
+-------------------------------------
+
+:func:`run` never contacts a remote. Every command form that would --
+``push``, ``fetch``, ``pull``, ``ls-remote``, ``clone``, contacting
+``remote`` and ``submodule`` forms, a command given a repository URL, and
+any of these reached through an alias, ``-c``, ``-C`` or ``--git-dir`` (see
+:func:`remote_form`) -- is refused, unconditionally and before anything
+runs, with ``remote_operation_not_allowed``. No guard, snapshot or pin
+makes an exception. Every command :func:`run` does start carries
+``protocol.allow=never`` and ``GIT_NO_LAZY_FETCH=1`` as well.
+
+:func:`run_remote` is Plan R's isolated remote primitive, kept for the
+separate, human-triggered Push to review (Plan P). Nothing in the engine
+calls it. It never reads the repository's configuration at all: it runs
+in a throwaway bare repository that borrows the objects and is configured
+from a trusted snapshot's transport keys only (see
+:func:`isolated_git_dir`), so configuration written between a check and
+the invocation cannot reach it. A push to a local-path destination must be
+to the pinned one: a local repository runs its own receive hooks. Local
+operations do read the repository's configuration;
 what they could execute is neutralized as above, and a change is refused
 before each one. A concurrent writer racing a single local invocation is
 outside what this module can stop; confining the agents is.
@@ -70,6 +78,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import functools
 import os
 import re
 import subprocess
@@ -107,6 +116,11 @@ BASE_OVERRIDES: tuple[str, ...] = (
     "gc.auto=0",
     "maintenance.auto=false",
 )
+
+#: Every :func:`run` invocation, which is always local (I-L1): no transport
+#: may start, whatever a command or a promisor remote would ask for.
+LOCAL_OVERRIDES: tuple[str, ...] = ("protocol.allow=never",)
+LOCAL_ENVIRONMENT: Mapping[str, str] = {"GIT_NO_LAZY_FETCH": "1"}
 
 #: Subcommands whose output can be routed through textconv or an external
 #: diff driver; each gets ``--no-ext-diff --no-textconv``.
@@ -475,6 +489,13 @@ def compare_snapshot(
     )
 
 
+#: Global options whose value is the next argument.
+_VALUE_OPTIONS = frozenset(
+    {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix",
+     "--attr-source"}
+)
+
+
 def subcommand(args: Sequence[str]) -> tuple[int, str | None]:
     """The index and name of the Git subcommand in ``args`` (after any
     leading ``-c key=value`` pairs and other global options)."""
@@ -482,7 +503,7 @@ def subcommand(args: Sequence[str]) -> tuple[int, str | None]:
     i = 0
     while i < len(args):
         arg = args[i]
-        if arg in ("-c", "-C", "--git-dir", "--work-tree", "--namespace"):
+        if arg in _VALUE_OPTIONS:
             i += 2
             continue
         if arg.startswith("-"):
@@ -524,16 +545,26 @@ def _refuse_merge_drivers(entries: Sequence[ConfigEntry], name: str) -> None:
 def _checked(cwd: Path, args: Sequence[str]) -> tuple[tuple[ConfigEntry, ...] | None, list[str]]:
     """Validate the configuration ``cwd`` has right now and build the
     arguments after ``git -C <cwd>``: the neutralizing overrides, then
-    ``args`` (with diff flags inserted). Raises :class:`GitConfigRefusal`."""
+    ``args`` (with diff flags inserted). Raises :class:`GitConfigRefusal`,
+    including ``remote_operation_not_allowed`` for any remote form (I-L1)."""
 
     entries = config_entries(Path(cwd))
-    pairs = list(BASE_OVERRIDES)
+    pairs = [*BASE_OVERRIDES, *LOCAL_OVERRIDES]
     if entries is not None:
         _refuse_includes(entries)
         guard = guard_for(Path(cwd))
         if guard is not None:
             compare_snapshot(entries, guard.entries)
         pairs += _driver_overrides(entries)
+    form = remote_form(args, entries)
+    if form is not None:
+        raise GitConfigRefusal(
+            "remote_operation_not_allowed",
+            form,
+            f"refusing to run git {form} in {cwd}: the engine never contacts a remote. "
+            "Implementation, review, acceptance and finish are local; publishing a commit is "
+            "a separate, explicit action",
+        )
     index, name = subcommand(args)
     rest = list(args)
     if name is not None:
@@ -586,6 +617,113 @@ def _remote_contacts(rest: Sequence[str]) -> bool:
     return False
 
 
+#: Subcommands that contact a remote in every form: transfers, their
+#: plumbing, and the commands built on them.
+_ALWAYS_REMOTE = frozenset(
+    {"push", "fetch", "pull", "ls-remote", "clone", "send-pack", "fetch-pack", "request-pull"}
+)
+
+#: An argument Git would read as a repository address: ``scheme://...``,
+#: a remote-helper ``transport::address``, or ``user@host:path``.
+_URL_RE = re.compile(
+    r"^(?:[A-Za-z][A-Za-z0-9+.-]*://|[A-Za-z][A-Za-z0-9+.-]*::|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:)"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _builtins() -> frozenset[str]:
+    """The names Git runs as itself, never as an alias."""
+
+    listed = subprocess.run(
+        ["git", "--list-cmds=builtins"], capture_output=True, text=True, check=False,
+        env=_environment(None),
+    )
+    return frozenset(listed.stdout.split()) if listed.returncode == 0 else frozenset()
+
+
+def _alias(
+    name: str, args: Sequence[str], index: int, entries: Sequence[ConfigEntry] | None
+) -> str | None:
+    """The expansion Git would run for ``name``, when it is an alias: the
+    last ``-c alias.<name>=`` before the subcommand, else the last
+    configured one. A builtin name is never an alias."""
+
+    if name in _builtins():
+        return None
+    key = f"alias.{name}".lower()
+    found: str | None = None
+    for entry in entries or ():
+        if entry.key.lower() == key:
+            found = entry.value
+    for i in range(index - 1):
+        if args[i] == "-c" and args[i + 1].split("=", 1)[0].lower() == key:
+            found = args[i + 1].split("=", 1)[1] if "=" in args[i + 1] else ""
+    return found
+
+
+def remote_form(
+    args: Sequence[str], entries: Sequence[ConfigEntry] | None = None
+) -> str | None:
+    """How ``git <args>`` would contact a remote, or ``None`` when it would
+    not (I-L1): the subcommand words that do, as Git would run them.
+
+    Every global option (``-c``, ``-C``, ``--git-dir`` ...) is looked
+    through, and an alias -- from a ``-c alias.*`` setting or any
+    configuration ``entries`` -- is expanded the way Git would. A shell
+    alias (``!...``) counts as contacting one: what it runs cannot be
+    known. So does any command given a repository URL.
+    """
+
+    seen: set[str] = set()
+    args = list(args)
+    while True:
+        index, name = subcommand(args)
+        if name is None:
+            return None
+        rest = args[index + 1 :]
+        expansion = _alias(name, args, index, entries)
+        if expansion is not None and name not in seen:
+            seen.add(name)
+            if expansion.lstrip().startswith("!"):
+                return f"alias {name} (a shell command)"
+            args = [*args[:index], *expansion.split(), *rest]
+            continue
+        if name in _ALWAYS_REMOTE:
+            return name
+        if name == "remote" and _remote_contacts(rest):
+            return f"remote {rest[0]}"
+        if name == "submodule" and rest[:1] and rest[0] in ("update", "add"):
+            return f"submodule {rest[0]}"
+        if name == "archive" and any(a == "--remote" or a.startswith("--remote=") for a in rest):
+            return "archive --remote"
+        if name == "maintenance" and rest[:1] == ["run"]:
+            # Its configured tasks may include ``prefetch``.
+            return "maintenance run"
+        if any(_URL_RE.match(arg) for arg in _addressable(args)):
+            return f"{name} with a repository URL"
+        return None
+
+
+def _addressable(args: Sequence[str]) -> Iterator[str]:
+    """The arguments Git could read as a repository: everything before a
+    ``--`` (after it come paths, whatever their names look like), except a
+    commit message."""
+
+    skip = False
+    for arg in args:
+        if arg == "--":
+            return
+        if skip:
+            skip = False
+            continue
+        if arg in ("-m", "--message"):
+            skip = True
+            continue
+        if arg.startswith("--message="):
+            continue
+        yield arg
+
+
 def _live(name: str | None, args: Sequence[str], index: int) -> bool:
     """Does ``git <args>`` run against the live configuration?
 
@@ -624,44 +762,21 @@ def run(
     written after the check -- a new filter or merge driver, an include --
     is not what the command reads.
 
-    A remote operation (:data:`REMOTE_COMMANDS`) runs only through
-    :func:`run_remote`, with the snapshot and pinned destinations of the
-    guard that governs ``cwd``. With no such guard it is refused
-    (``unguarded_remote_operation``, naming the subcommand) before anything
-    runs: there is no snapshot to hold it to, and the live configuration is
-    never followed.
+    A command that would contact a remote (see :func:`remote_form`) is
+    refused, unconditionally, with ``remote_operation_not_allowed`` before
+    anything runs (I-L1): the engine works entirely in local repositories,
+    whatever guard, snapshot or pin is in effect. Every command that does
+    run also carries ``protocol.allow=never`` and ``GIT_NO_LAZY_FETCH``, so
+    no transport -- a promisor's lazy fetch included -- can start under it.
     """
 
     entries, tail = _checked(Path(cwd), args)
     index, name = subcommand(args)
-    if name == "remote" and _remote_contacts(args[index + 1 :]):
-        # These address a remote by name, which only the live configuration
-        # resolves; the engine never needs them.
-        raise GitConfigRefusal(
-            "unguarded_remote_operation",
-            f"remote {args[index + 1]}",
-            f"refusing to run git remote {args[index + 1]} in {cwd}: it contacts a remote named "
-            "in the live configuration",
-        )
-    if name in REMOTE_COMMANDS:
-        guard = guard_for(Path(cwd))
-        if guard is None:
-            raise GitConfigRefusal(
-                "unguarded_remote_operation",
-                name,
-                f"refusing to run git {name} in {cwd}: no run guard governs it, and the engine "
-                "never contacts a remote with the repository's live configuration. A remote "
-                "operation needs a run's trusted snapshot and pinned destination",
-            )
-        # A remote operation never reads the repository's own (mutable)
-        # configuration at all: see run_remote.
-        return run_remote(
-            cwd, guard.entries, *args, text=text, input=input, pinned=guard.destinations
-        )
     argv = ["git", "-C", str(cwd), *tail]
     if name is None or _live(name, args, index) or entries is None:
         return subprocess.run(
-            argv, capture_output=True, text=text, check=False, input=input, env=_environment(env)
+            argv, capture_output=True, text=text, check=False, input=input,
+            env=_environment({**(env or {}), **LOCAL_ENVIRONMENT}),
         )
     with isolated_config(Path(cwd), entries, worktrees=name == "worktree") as isolation:
         if isolation is None:
@@ -675,6 +790,7 @@ def run(
             )
         merged = dict(env or {})
         merged.update(isolation)
+        merged.update(LOCAL_ENVIRONMENT)
         return subprocess.run(
             argv, capture_output=True, text=text, check=False, input=input,
             env=_environment(merged),
@@ -1104,6 +1220,7 @@ __all__ = [
     "is_watched",
     "isolated_git_dir",
     "refuse_repository_transport",
+    "remote_form",
     "repository_snapshot",
     "run",
     "run_remote",

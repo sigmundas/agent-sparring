@@ -22,8 +22,9 @@ and the surfaces, with no guard active:
 
 - ``sparring runs --json`` and ``finish-run --dry-run`` of a pinned managed
   run (the run's pin and snapshot: a typed refusal in the check's detail);
-- ``sparring handoff`` of a stage no run owns (a typed refusal) and of a
-  stage a pinned run owns (the pin's typed refusal);
+- ``sparring handoff`` of a stage no run owns and of a stage a pinned run
+  owns: since Plan L Stage 3 both are written from the local repository
+  alone, the recorder sees no remote command, and nothing planted runs;
 - freeze of a stage declaring a sibling repository, unowned and owned by a
   legacy run that pinned it at start, and acceptance of a stage frozen
   before the planting. Since Plan L Stage 2 these read no remote at all:
@@ -59,9 +60,11 @@ from agent_sparring.routing import RoutingAction
 from agent_sparring.cli import main
 from agent_sparring.engine_git import GitConfigRefusal
 from agent_sparring.git_context import diff_patch, dirty_paths
-from agent_sparring.push_gate import authorization_for_run, ensure_candidate_pushed
-from agent_sparring.remote_pin import pin_remote, pin_sibling
+from agent_sparring.push_gate import pinned_target, push_command
 from agent_sparring.stage import CandidateRepository, Stage, StageStatus
+
+from git_recorder import GitRecorder
+from legacy_pins import legacy_pin as pin_remote, legacy_sibling_pin as pin_sibling
 
 from test_managed_finish import _FinishTestCase
 from test_multi_repo_candidates import _commit, _make_repo
@@ -185,6 +188,8 @@ def _matrix(cls, run):
 
 
 class _StatusMatrix(_Planting, _FinishTestCase):
+    LEGACY_PIN = True
+
     def setUp(self):
         super().setUp()
         self.scratch = self.repo.parent
@@ -232,6 +237,8 @@ StatusPlantedConfigurationTests = _matrix(
 
 
 class StatusWithoutPinTests(_Planting, _FinishTestCase):
+    LEGACY_PIN = True
+
     def setUp(self):
         super().setUp()
         self.scratch = self.repo.parent
@@ -283,8 +290,13 @@ class _HandoffMatrix(_Planting, _PlanRepoTestCase):
         return code, err.getvalue()
 
     def _run_handoff(self, item: str, scope: str) -> None:
-        # A stage no run owns, and one a pinned run owns (pinned before the
-        # planting, as a run start would).
+        # A stage no run owns, and one a legacy pinned run owns (pinned
+        # before the planting, as a run start would). Plan L Stage 3: the
+        # handoff reads no remote at all, so the planted configuration
+        # decides nothing -- both handoffs are written, reporting the local
+        # commit, and the recorder sees no remote command. (Was: the
+        # unowned handoff refused with repository_transport_config and the
+        # owned one with the pin's typed refusal.)
         Stage.resolve(self.sparring_dir, "unowned").create()
         Stage.resolve(self.sparring_dir, "owned").create(run=self.RUN)
         pin = pin_remote(self.repo, "feature/x")
@@ -293,20 +305,21 @@ class _HandoffMatrix(_Planting, _PlanRepoTestCase):
         (plans / f"{self.RUN}.json").write_text(
             json.dumps({"remote_pin": pin.to_dict()}), encoding="utf-8"
         )
-        self.assertEqual(self._handoff("unowned")[0], 0)  # unplanted: the read works
+        self.assertEqual(self._handoff("unowned")[0], 0)  # unplanted
         second = self.second(self.repo)
         before = _refs(second)
-        key = self.plant(self.repo, item, scope, second)
+        self.plant(self.repo, item, scope, second)
+        recorder = GitRecorder(self.scratch)
 
-        code, err = self._handoff("unowned")
-        self.assertEqual(code, 1, err)
-        self.assertIn("repository_transport_config", err)
-        self.assertIn(key.lower().rsplit(".", 1)[-1], err.lower())
+        with recorder.active():
+            for stage_id in ("unowned", "owned"):
+                code, err = self._handoff(stage_id)
+                self.assertEqual(code, 0, err)
+                handoff = Stage.resolve(self.sparring_dir, stage_id).read_handoff()
+                self.assertIn(f"- Local commit: `{_head_sha(self.repo)}` on `feature/x`", handoff)
 
-        code, err = self._handoff("owned")
-        self.assertEqual(code, 1, err)
-        self.assertRegex(err, "repository_config_changed|remote_retargeted")
-
+        self.assertTrue(recorder.lines())
+        self.assertEqual(recorder.remote_commands(), [])
         self.assertNoMarker()
         self.assertEqual(_refs(second), before)
         self.positive_control(self.repo, item, second)
@@ -462,16 +475,20 @@ class _EngineCase(_Planting, _PlanRepoTestCase):
         return _head_sha(self.repo)
 
     def authorized_push(self, pin):
-        authorization = authorization_for_run(self.repo, branch="feature/x", pin=pin)
-        with engine_git.trusted_config([self.repo], pin.trusted_config, destinations=(pin.destination,)):
-            return ensure_candidate_pushed(
-                self.repo, stage_id=S1, expected_branch="feature/x",
-                authorization=authorization, pin=pin,
-            )
+        """The push the removed run-time gate made, through the retained
+        primitive directly (Plan L Stage 3: no production caller)."""
+
+        return engine_git.run_remote(
+            self.repo, pin.trusted_config, *push_command(pinned_target(pin, _head_sha(self.repo))),
+            pinned=pin.destination,
+        )
 
 
 class UnguardedRemoteTests(_EngineCase):
     def test_a_remote_command_with_no_guard_is_a_typed_refusal_naming_it(self):
+        # Plan L Stage 3: the code is remote_operation_not_allowed (was
+        # unguarded_remote_operation); with a guard it is the same refusal
+        # (test_a_guarded_remote_command_is_refused_too).
         second = self.second(self.repo)
         self.plant(self.repo, "uploadpack", "local", second)
         for args in (
@@ -483,12 +500,13 @@ class UnguardedRemoteTests(_EngineCase):
             with self.subTest(args=args):
                 with self.assertRaises(GitConfigRefusal) as ctx:
                     engine_git.run(self.repo, *args)
-                self.assertEqual(ctx.exception.code, "unguarded_remote_operation")
+                self.assertEqual(ctx.exception.code, "remote_operation_not_allowed")
                 self.assertEqual(ctx.exception.key, engine_git.subcommand(args)[1])
         for sub in (("update",), ("prune", "origin"), ("show", "origin"), ("add", "-f", "x", str(second))):
             with self.subTest(remote=sub), self.assertRaises(GitConfigRefusal) as ctx:
                 engine_git.run(self.repo, "remote", *sub)
-            self.assertEqual(ctx.exception.code, "unguarded_remote_operation")
+            self.assertEqual(ctx.exception.code, "remote_operation_not_allowed")
+            self.assertEqual(ctx.exception.key, f"remote {sub[0]}")
         self.assertEqual(engine_git.run(self.repo, "remote", "get-url", "origin").returncode, 0)
         self.assertNoMarker()
         self.assertNotIn("elsewhere", _refs(self.remote))
@@ -497,12 +515,25 @@ class UnguardedRemoteTests(_EngineCase):
         _plain_ok(self.repo, "-c", "push.followTags=false", "push", "-q", "origin", "HEAD:refs/heads/elsewhere")
         self.assertIn("refs/heads/elsewhere", _refs(self.remote))
 
-    def test_a_guarded_remote_command_runs_against_the_snapshot(self):
-        pin = pin_remote(self.repo, "feature/x")
+    def test_a_guarded_remote_command_is_refused_too(self):
+        # Was test_a_guarded_remote_command_runs_against_the_snapshot. Plan L
+        # Stage 3 (I-L1): there is no exception context -- a run guard, its
+        # snapshot and its pinned destination make no remote command run.
+        upload = self.script("upload-pack", f"#!/bin/sh\ntouch '{self.marker}'\nexec git upload-pack \"$@\"\n")
+        _plain_ok(self.repo, "config", "remote.origin.uploadpack", str(upload))
+        pin = pin_remote(self.repo, "feature/x")  # trusted at start, with the uploadpack
         with engine_git.trusted_config([self.repo], pin.trusted_config, destinations=(pin.destination,)):
-            result = engine_git.run(self.repo, "ls-remote", pin.destination, "refs/heads/feature/x")
+            for args in (("ls-remote", pin.destination, "refs/heads/feature/x"), ("ls-remote", "origin")):
+                with self.subTest(args=args), self.assertRaises(GitConfigRefusal) as ctx:
+                    engine_git.run(self.repo, *args)
+                self.assertEqual(ctx.exception.code, "remote_operation_not_allowed")
+        self.assertNoMarker()
+        # Positive control: plain git makes the same read, and the remote's
+        # upload-pack runs.
+        result = _plain(self.repo, "ls-remote", "origin", "refs/heads/feature/x")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(_head_sha(self.repo), result.stdout)
+        self.assertTrue(self.marker.exists())
 
     def test_an_unpinned_local_path_is_never_pushed_to(self):
         pin = pin_remote(self.repo, "feature/x")
@@ -521,11 +552,18 @@ class UnguardedRemoteTests(_EngineCase):
                     pinned=pinned,
                 )
             self.assertEqual(ctx.exception.code, "unpinned_local_remote")
+        # Plan L Stage 3: engine_git.run refuses both pushes outright (was:
+        # unpinned_local_remote for the first, a push for the second).
         with engine_git.trusted_config([self.repo], pin.trusted_config, destinations=(pin.destination,)):
-            with self.assertRaises(GitConfigRefusal) as ctx:
-                engine_git.run(self.repo, "push", f"file://{other}", f"{sha}:refs/heads/x")
-            self.assertEqual(ctx.exception.code, "unpinned_local_remote")
-            pushed = engine_git.run(self.repo, "push", pin.destination, f"{sha}:refs/heads/feature/x")
+            for args in (("push", f"file://{other}", f"{sha}:refs/heads/x"),
+                         ("push", pin.destination, f"{sha}:refs/heads/feature/x")):
+                with self.subTest(args=args), self.assertRaises(GitConfigRefusal) as ctx:
+                    engine_git.run(self.repo, *args)
+                self.assertEqual(ctx.exception.code, "remote_operation_not_allowed")
+        pushed = engine_git.run_remote(
+            self.repo, pin.trusted_config, "push", pin.destination, f"{sha}:refs/heads/feature/x",
+            pinned=pin.destination,
+        )
         self.assertEqual(pushed.returncode, 0, pushed.stderr)
         self.assertEqual(_refs(other), "")
         self.assertNoMarker()
@@ -582,22 +620,26 @@ class UnguardedRemoteTests(_EngineCase):
                         self.repo, pin.trusted_config, *args, pinned=pin.destination
                     )
                 self.assertEqual(ctx.exception.code, "unsupported_remote_form")
+                # Plan L Stage 3: engine_git.run refuses every one outright
+                # (was: unsupported_remote_form, through the guard).
                 with engine_git.trusted_config(
                     [self.repo], pin.trusted_config, destinations=(pin.destination,)
                 ), self.assertRaises(GitConfigRefusal) as ctx:
                     engine_git.run(self.repo, *args)
-                self.assertEqual(ctx.exception.code, "unsupported_remote_form")
+                self.assertEqual(ctx.exception.code, "remote_operation_not_allowed")
         self.assertNoMarker()
         self.assertEqual(_refs(other), before)
         self.assertEqual(_refs(self.remote), pinned_before)
 
-        # The forms the engine does use still work.
-        with engine_git.trusted_config([self.repo], pin.trusted_config, destinations=(pin.destination,)):
-            listed = engine_git.run(self.repo, "ls-remote", "--exit-code", pin.destination, "refs/heads/feature/x")
-            pushed = engine_git.run(
-                self.repo, "-c", "push.followTags=false", "push", "--porcelain", pin.destination,
-                f"{sha}:refs/heads/feature/x",
-            )
+        # The forms the primitive accepts still work through it.
+        listed = engine_git.run_remote(
+            self.repo, pin.trusted_config, "ls-remote", "--exit-code", pin.destination,
+            "refs/heads/feature/x", pinned=pin.destination,
+        )
+        pushed = engine_git.run_remote(
+            self.repo, pin.trusted_config, "-c", "push.followTags=false", "push", "--porcelain",
+            pin.destination, f"{sha}:refs/heads/feature/x", pinned=pin.destination,
+        )
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertEqual(pushed.returncode, 0, pushed.stderr)
         self.assertNoMarker()
@@ -760,8 +802,8 @@ class IncludeTests(_EngineCase):
         self.assertIn("one.txt", dirty_paths(self.repo))
         self.assertIn("one.txt", diff_patch(self.repo, base, sha))
         _run_git(self.repo, "checkout", "--", "one.txt")
-        outcome = self.authorized_push(pin)
-        self.assertTrue(outcome.pushed)
+        result = self.authorized_push(pin)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_plain_ok(self.remote, "rev-parse", "refs/heads/feature/x"), sha)
         # A remote operation reads the include's expanded entries, resolved
         # for the real repository (not for its throwaway one).
@@ -812,9 +854,9 @@ class EnvironmentTests(_EngineCase):
             "GIT_TERMINAL_PROMPT": "0",
         }
         with mock.patch.dict(os.environ, planted):
-            outcome = self.authorized_push(pin)
+            result = self.authorized_push(pin)
             engine_git.run_remote(self.repo, pin.trusted_config, "credential", "fill", input=CREDENTIAL_REQUEST)
-        self.assertTrue(outcome.pushed)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_plain_ok(self.remote, "rev-parse", "refs/heads/feature/x"), sha)
         self.assertNoMarker()
 

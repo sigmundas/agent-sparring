@@ -12,10 +12,11 @@ What is under test, in one sentence each:
   an older engine recorded still makes freeze and accept refuse, no push
   flag clears it, and only an explicit, recorded acknowledgement does --
   which accepts nothing;
-- the push primitive (kept, unused by runs, for Plan P) pushes only an
-  authorized commit, only to the pinned ref, and a permission for another
-  commit, ref, remote or repository does not apply;
-- retargeting the branch or the remote after the run started is a typed
+- the push primitive (``engine_git.run_remote``, kept with no production
+  caller for Plan P) pushes only the one command shape, only to the pinned
+  ref, and a permission for another commit, ref, remote or repository does
+  not cover it;
+- retargeting the branch or the remote after a legacy pin is a typed
   refusal, and nothing reaches the new target;
 - prose -- notes.md, stage files, agent output -- never authorizes a push
   or acknowledges movement;
@@ -68,11 +69,11 @@ from agent_sparring.plan import (
 from agent_sparring.providers import StageAgentResult
 from agent_sparring.push_gate import (
     PushAuthorization,
-    PushError,
     PushScope,
     authorization_for_candidate,
     authorization_for_run,
-    ensure_candidate_pushed,
+    pinned_target,
+    push_command,
 )
 from agent_sparring.remote_pin import (
     MOVEMENT_ACKNOWLEDGED,
@@ -80,9 +81,9 @@ from agent_sparring.remote_pin import (
     UNAUTHORIZED_REMOTE_MOVEMENT,
     UnauthorizedRemoteMovement,
     acknowledgement,
-    pin_remote,
-    verify_pinned,
+    require_pinned_target,
 )
+from legacy_pins import legacy_pin as pin_remote
 from agent_sparring.review_prompt import build_review_prompt
 from agent_sparring.sparring_prompt import build_sparring_prompt
 from agent_sparring.stage import Stage, StageStatus
@@ -153,6 +154,19 @@ class _AuthorityCase(_PlanRepoTestCase):
 
     def guard(self, pin):
         return engine_git.trusted_config([self.repo], pin.trusted_config)
+
+    def primitive_push(self, pin, sha: str | None = None):
+        """Push ``sha`` (default ``HEAD``) through the retained remote
+        primitive, exactly as the removed run-time push gate did: the one
+        ``push_command`` shape, to the pinned destination, configured from
+        the pin's snapshot. Plan L Stage 3: nothing in the engine calls
+        ``engine_git.run_remote`` any more; Plan P is specified against it."""
+
+        sha = sha or _head_sha(self.repo)
+        return engine_git.run_remote(
+            self.repo, pin.trusted_config, *push_command(pinned_target(pin, sha)),
+            pinned=pin.destination,
+        )
 
 
 # -- Sporely Stage 4b ---------------------------------------------------------
@@ -342,6 +356,14 @@ class ReceiptTests(_AuthorityCase):
 
 
 class PinnedPushTests(_AuthorityCase):
+    """The retained push primitive (``engine_git.run_remote`` with the one
+    ``push_command`` shape), for Plan P. Plan L Stage 3 removed the run-time
+    gate in front of it; ``test_an_engine_push_without_authorization_is_
+    refused`` and ``test_a_remote_with_several_push_urls_is_not_pinned``
+    went with it and with run-start pinning (see the Stage 3 handoff for
+    what covers them now). ``legacy_pin`` builds the pin as the removed
+    ``pin_remote`` did."""
+
     def setUp(self):
         super().setUp()
         self.other_refs_before = None
@@ -349,33 +371,14 @@ class PinnedPushTests(_AuthorityCase):
     def _pinned(self):
         return pin_remote(self.repo, "feature/x")
 
-    def test_an_engine_push_without_authorization_is_refused(self):
-        pin = self._pinned()
-        sha = self.commit("one.txt")
-        with self.guard(pin):
-            outcome = ensure_candidate_pushed(
-                self.repo, stage_id=S1, expected_branch="feature/x", authorization=None, pin=pin
-            )
-        self.assertIsNotNone(outcome.required)
-        self.assertEqual(outcome.required.candidate_sha, sha)
-        self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
-
     def test_an_authorized_push_advances_only_the_pinned_ref_to_the_authorized_sha(self):
         pin = self._pinned()
         before = _refs(self.remote).splitlines()
         sha = self.commit("one.txt")
         self.commit("not-this-one-locally-only.txt")  # HEAD moves past it...
         _run_git(self.repo, "reset", "-q", "--hard", "HEAD~1")  # ...and back
-        authorization = authorization_for_candidate(
-            self.repo, stage_id=S1, candidate_sha=sha, branch="feature/x", pin=pin
-        )
-        with self.guard(pin):
-            outcome = ensure_candidate_pushed(
-                self.repo, stage_id=S1, expected_branch="feature/x",
-                authorization=authorization, pin=pin, run=self.run_key,
-            )
-        self.assertTrue(outcome.pushed)
-        self.assertEqual(outcome.receipt.tip, sha)
+        result = self.primitive_push(pin, sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
         after = _refs(self.remote).splitlines()
         changed = sorted(set(after) ^ set(before))
         self.assertEqual(
@@ -398,15 +401,14 @@ class PinnedPushTests(_AuthorityCase):
             "url": PushAuthorization(**{**good.__dict__, "url": str(self.root / "elsewhere.git")}),
             "stage": PushAuthorization(**{**good.__dict__, "stage_id": S2}),
         }
+        target = pinned_target(pin, sha)
+        where = {"repo_root": self.repo, "branch": "feature/x", "target": target, "stage_id": S1}
+        # Positive control: the exact permission covers exactly this target.
+        self.assertTrue(good.covers(**where))
         for what, authorization in wrong.items():
-            with self.subTest(wrong=what), self.guard(pin):
-                outcome = ensure_candidate_pushed(
-                    self.repo, stage_id=S1, expected_branch="feature/x",
-                    authorization=authorization, pin=pin,
-                )
-                self.assertIsNotNone(outcome.required, what)
-                self.assertFalse(outcome.pushed)
-                self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
+            with self.subTest(wrong=what):
+                self.assertFalse(authorization.covers(**where), what)
+        self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
 
     def test_with_distinct_fetch_and_push_urls_the_push_and_its_check_are_one_repository(self):
         pushed_to = self.root / "push.git"
@@ -419,20 +421,12 @@ class PinnedPushTests(_AuthorityCase):
         self.assertEqual(pin.destination, str(pushed_to))
         self.assertEqual(pin.start_tip, _remote_sha(pushed_to, "feature/x"))
         sha = self.commit("one.txt")
-        authorization = authorization_for_run(self.repo, branch="feature/x", pin=pin)
 
-        with self.guard(pin):
-            outcome = ensure_candidate_pushed(
-                self.repo, stage_id=S1, expected_branch="feature/x",
-                authorization=authorization, pin=pin, run=self.run_key,
-            )
-            reachable, _detail = verify_pinned(self.repo, pin, sha)
+        result = self.primitive_push(pin, sha)
 
-        self.assertTrue(outcome.pushed)
-        self.assertEqual(outcome.receipt.url, str(pushed_to))
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_remote_sha(pushed_to, "feature/x"), sha)
         self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
-        self.assertTrue(reachable)
 
     def test_a_push_rewrite_present_at_start_is_resolved_into_the_pin(self):
         # pushInsteadOf applies to pushes and not to ls-remote; the pin holds
@@ -447,18 +441,10 @@ class PinnedPushTests(_AuthorityCase):
         pin = self._pinned()
         self.assertEqual(pin.destination, str(rewritten))
         sha = self.commit("one.txt")
-        authorization = authorization_for_run(self.repo, branch="feature/x", pin=pin)
 
-        with self.guard(pin):
-            outcome = ensure_candidate_pushed(
-                self.repo, stage_id=S1, expected_branch="feature/x",
-                authorization=authorization, pin=pin, run=self.run_key,
-            )
-            reachable, _ = verify_pinned(self.repo, pin, sha)
+        result = self.primitive_push(pin, sha)
 
-        self.assertTrue(outcome.pushed)
-        self.assertTrue(reachable)
-        self.assertEqual(outcome.receipt.url, str(rewritten))
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_remote_sha(rewritten, "feature/x"), sha)
         self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
 
@@ -480,18 +466,10 @@ class PinnedPushTests(_AuthorityCase):
         pin = self._pinned()
         self.assertEqual(pin.destination, str(b))
         sha = self.commit("one.txt")
-        authorization = authorization_for_run(self.repo, branch="feature/x", pin=pin)
 
-        with self.guard(pin):
-            outcome = ensure_candidate_pushed(
-                self.repo, stage_id=S1, expected_branch="feature/x",
-                authorization=authorization, pin=pin, run=self.run_key,
-            )
-            reachable, _ = verify_pinned(self.repo, pin, sha)
+        result = self.primitive_push(pin, sha)
 
-        self.assertTrue(outcome.pushed)
-        self.assertTrue(reachable)
-        self.assertEqual(outcome.receipt.url, str(b))
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_remote_sha(b, "feature/x"), sha)
         self.assertEqual(_remote_sha(c, "feature/x"), self.remote_before)
         self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
@@ -515,28 +493,11 @@ class PinnedPushTests(_AuthorityCase):
         self.assertEqual(pin.destination, str((self.repo / "../remote.git").resolve()))
         self.assertEqual(pin.start_tip, self.remote_before)
         sha = self.commit("one.txt")
-        authorization = authorization_for_run(self.repo, branch="feature/x", pin=pin)
 
-        with self.guard(pin):
-            outcome = ensure_candidate_pushed(
-                self.repo, stage_id=S1, expected_branch="feature/x",
-                authorization=authorization, pin=pin,
-            )
-            from agent_sparring.git_context import verify_pushed
+        result = self.primitive_push(pin, sha)
 
-            pushed, detail = verify_pushed(self.repo, sha, "feature/x")
-
-        self.assertTrue(outcome.pushed)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_remote_sha(self.remote, "feature/x"), sha)
-        self.assertTrue(pushed, detail)
-
-    def test_a_remote_with_several_push_urls_is_not_pinned(self):
-        second = self.bare("second.git")
-        _run_git(self.repo, "remote", "set-url", "--add", "--push", "origin", str(self.remote))
-        _run_git(self.repo, "remote", "set-url", "--add", "--push", "origin", str(second))
-        with self.assertRaises(GitContextError) as ctx:
-            self._pinned()
-        self.assertIn("exactly one repository", str(ctx.exception))
 
     def test_a_run_grant_is_bound_to_the_pinned_url(self):
         pin = self._pinned()
@@ -582,37 +543,35 @@ class AcceptanceReachabilityTests(_AuthorityCase):
 
 
 class RetargetingTests(_AuthorityCase):
-    def _push_with(self, pin):
-        authorization = authorization_for_run(self.repo, branch="feature/x", pin=pin)
-        with self.guard(pin):
-            return ensure_candidate_pushed(
-                self.repo, stage_id=S1, expected_branch="feature/x",
-                authorization=authorization, pin=pin,
-            )
+    """A legacy pin's target check (``require_pinned_target``, local
+    configuration only). Plan L Stage 3: the run-time push gate that ran it
+    before pushing is gone, so it is exercised directly; nothing is pushed
+    either way."""
 
     def test_changing_the_tracked_remote_branch_after_start_is_refused(self):
         pin = pin_remote(self.repo, "feature/x")
         self.commit("one.txt")
+        require_pinned_target(self.repo, pin)  # positive control: unchanged
         _run_git(self.repo, "config", "branch.feature/x.merge", "refs/heads/elsewhere")
 
-        with self.assertRaises(PushError) as ctx:
-            self._push_with(pin)
+        with self.assertRaises(GitConfigRefusal) as ctx:
+            require_pinned_target(self.repo, pin)
         self.assertIn("branch.feature/x.merge", str(ctx.exception))
-        self.assertIsInstance(ctx.exception.__cause__, GitConfigRefusal)
-        self.assertEqual(ctx.exception.__cause__.code, "remote_retargeted")
+        self.assertEqual(ctx.exception.code, "remote_retargeted")
         self.assertIsNone(_remote_sha(self.remote, "elsewhere"))
         self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
 
     def test_changing_the_remote_url_after_start_is_refused_and_nothing_reaches_it(self):
         pin = pin_remote(self.repo, "feature/x")
         self.commit("one.txt")
+        require_pinned_target(self.repo, pin)  # positive control: unchanged
         elsewhere = self.bare("elsewhere.git")
         _run_git(self.repo, "remote", "set-url", "origin", str(elsewhere))
 
-        with self.assertRaises(PushError) as ctx:
-            self._push_with(pin)
+        with self.assertRaises(GitConfigRefusal) as ctx:
+            require_pinned_target(self.repo, pin)
         self.assertIn("remote.origin.url", str(ctx.exception).lower())
-        self.assertIsInstance(ctx.exception.__cause__, GitConfigRefusal)
+        self.assertEqual(ctx.exception.code, "remote_retargeted")
         self.assertEqual(_refs(elsewhere), "")
         self.assertEqual(_remote_sha(self.remote, "feature/x"), self.remote_before)
 
@@ -703,22 +662,25 @@ class ForgedAuthorityTests(_AuthorityCase):
 
 class HardenedGitTests(_AuthorityCase):
     def _authorized_push(self, pin):
-        authorization = authorization_for_run(self.repo, branch="feature/x", pin=pin)
-        with self.guard(pin):
-            return ensure_candidate_pushed(
-                self.repo, stage_id=S1, expected_branch="feature/x",
-                authorization=authorization, pin=pin,
-            )
+        # Plan L Stage 3: through the retained primitive (the run-time gate
+        # that called it is gone).
+        return self.primitive_push(pin)
 
     def test_every_invocation_carries_the_neutralizing_overrides(self):
         argv = engine_git.command(self.repo, ["diff", "a..b"])
         joined = " ".join(argv)
         self.assertIn("-c core.hooksPath=/dev/null", joined)
         self.assertIn("-c core.fsmonitor=false", joined)
+        # Plan L Stage 3: and no transport may start under a local command.
+        self.assertIn("-c protocol.allow=never", joined)
         index = argv.index("diff")
         self.assertEqual(argv[index + 1 : index + 3], ["--no-ext-diff", "--no-textconv"])
-        argv = engine_git.command(self.repo, ["-c", "push.followTags=false", "push", "x", "y"])
-        self.assertEqual(argv[-4:], ["push.followTags=false", "push", "x", "y"])
+        argv = engine_git.command(self.repo, ["-c", "push.followTags=false", "rev-parse", "HEAD"])
+        self.assertEqual(argv[-3:], ["push.followTags=false", "rev-parse", "HEAD"])
+        # A remote command has no argv: it is refused before one is built.
+        with self.assertRaises(GitConfigRefusal) as ctx:
+            engine_git.command(self.repo, ["-c", "push.followTags=false", "push", "x", "y"])
+        self.assertEqual(ctx.exception.code, "remote_operation_not_allowed")
 
     def test_location_and_config_injection_environment_is_ignored(self):
         head = _head_sha(self.repo)
@@ -745,12 +707,12 @@ class HardenedGitTests(_AuthorityCase):
             target.write_text(self.script(f"hook-{name}").read_text(encoding="utf-8"), encoding="utf-8")
             target.chmod(0o755)
 
-        outcome = self._authorized_push(pin)
+        result = self._authorized_push(pin)
         with self.guard(pin):
             dirty_paths(self.repo)
             diff_patch(self.repo, self.remote_before, sha)
 
-        self.assertTrue(outcome.pushed)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_remote_sha(self.remote, "feature/x"), sha)
         self.assertNoMarker()
 
@@ -764,9 +726,9 @@ class HardenedGitTests(_AuthorityCase):
         sha = self.commit("one.txt")  # the test's own commit; its hooks are its business
         self.marker.unlink(missing_ok=True)
 
-        outcome = self._authorized_push(pin)
+        result = self._authorized_push(pin)
 
-        self.assertTrue(outcome.pushed)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_remote_sha(self.remote, "feature/x"), sha)
         self.assertNoMarker()
 
@@ -784,22 +746,23 @@ class HardenedGitTests(_AuthorityCase):
             ("merge.evil.driver", str(self.script("merge"))),
             ("filter.evil.clean", str(self.script("clean"))),
         ]
+        # Plan L Stage 3: the run-time push gate that also refused here is
+        # gone. A push through engine_git.run is refused outright (I-L1),
+        # and every local command under the guard is refused by key.
         pin = pin_remote(self.repo, "feature/x")
         sha = self.commit("one.txt")
+        with self.guard(pin):
+            dirty_paths(self.repo)  # positive control: the snapshot as captured
         for key, value in planted:
             with self.subTest(key=key):
                 _run_git(self.repo, "config", key, value)
                 try:
-                    with self.assertRaises(PushError) as ctx:
-                        self._authorized_push(pin)
-                    refusal = ctx.exception.__cause__
-                    self.assertIsInstance(refusal, GitConfigRefusal)
-                    self.assertEqual(refusal.key.lower(), key.lower())
+                    with self.guard(pin), self.assertRaises(GitConfigRefusal) as ctx:
+                        dirty_paths(self.repo)
+                    self.assertEqual(ctx.exception.key.lower(), key.lower())
                     self.assertIn(key.lower(), str(ctx.exception).lower())
                     with self.guard(pin), self.assertRaises(GitConfigRefusal):
-                        verify_pinned(self.repo, pin, sha)
-                    with self.guard(pin), self.assertRaises(GitConfigRefusal):
-                        dirty_paths(self.repo)
+                        engine_git.run(self.repo, *push_command(pinned_target(pin, sha)))
                     with self.guard(pin), self.assertRaises(GitConfigRefusal):
                         diff_patch(self.repo, self.remote_before, sha)
                 finally:
@@ -819,9 +782,9 @@ class HardenedGitTests(_AuthorityCase):
         self.assertIn(("credential.helper", f"store --file={store}"), pin.trusted_config)
         sha = self.commit("one.txt")
 
-        outcome = self._authorized_push(pin)
+        result = self._authorized_push(pin)
 
-        self.assertTrue(outcome.pushed)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_remote_sha(self.remote, "feature/x"), sha)
 
     def test_an_include_is_never_loaded(self):

@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_sparring.git_context import ChangedFile, GitContext, gather_git_context, diff_patch
-from agent_sparring.remote_pin import load_run_remote_state
 from agent_sparring.stage import HUMAN_EVIDENCE_HEADING, Stage
 
 
@@ -100,14 +99,6 @@ def _previous_sparring_section(stage: Stage) -> str:
     return "\n\n".join(parts) if parts else "(none recorded)"
 
 
-def _pushed_line(git: GitContext) -> str:
-    if git.pushed is None:
-        return "not checked"
-    if git.pushed:
-        return f"yes ({git.push_detail})"
-    return f"NO ({git.push_detail})"
-
-
 def _changed_files_block(files: tuple[ChangedFile, ...]) -> str:
     if not files:
         return "(no base commit recorded, or no changes between base and candidate)"
@@ -146,7 +137,7 @@ def render_thin_handoff(stage: Stage, handoff_input: HandoffInput) -> str:
         f"- Branch: `{git.branch}`",
         f"- Base commit: `{git.base_sha or 'not recorded'}`",
         f"- Candidate commit: `{git.candidate_sha}`",
-        f"- Pushed: {_pushed_line(git)}",
+        f"- Local commit: `{git.candidate_sha}` on `{git.branch}`",
         "",
         "### Changed files",
         "",
@@ -199,7 +190,6 @@ def generate_handoff(
     claims: str,
     test_evidence: str | None = None,
     self_contained: bool = False,
-    check_pushed: bool = True,
     base_sha: str | None = None,
     candidate_sha: str | None = None,
 ) -> str:
@@ -209,23 +199,15 @@ def generate_handoff(
     ``state.json`` values when given (useful before those are recorded,
     e.g. from the CLI); otherwise the recorded values are used.
 
-    The pushed check of a stage a pinned run owns reads that run's pinned
-    destination with its trusted snapshot; any other stage's is the
-    unpinned read of :func:`~agent_sparring.git_context.verify_pushed`.
-    Neither follows the repository's live transport configuration.
+    Everything comes from the local repository: the candidate is reported
+    as a local commit on its branch, and no remote is read (I-L1).
     """
 
     state = stage.read_state()
-    pin = None
-    if check_pushed and state.run:
-        remote = load_run_remote_state(Path(stage.directory).parent.parent, state.run)
-        pin = remote.pin if remote is not None else None
     git = gather_git_context(
         repo_root,
         base_sha=base_sha or state.base_sha,
         candidate_sha=candidate_sha or state.candidate_sha,
-        check_pushed=check_pushed,
-        pin=pin,
     )
     handoff_input = HandoffInput(
         stage_goal=stage_goal, claims=claims, git=git, test_evidence=test_evidence

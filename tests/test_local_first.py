@@ -25,7 +25,6 @@ import hashlib
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -68,9 +67,7 @@ from agent_sparring.routing import RoutingAction, RoutingResult
 from agent_sparring.sparring_exchange import record_sparring
 from agent_sparring.stage import NEXT_TURN_FINALIZATION, Stage, StageStatus, TurnCandidate
 
-REAL_GIT = shutil.which("git")
-REMOTE_SUBCOMMANDS = {"push", "fetch", "pull", "ls-remote", "clone", "send-pack", "fetch-pack"}
-VALUE_OPTIONS = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+from git_recorder import REAL_GIT, GitRecorder, git, make_bare, refs
 
 PLAN = """\
 # Local plan
@@ -128,13 +125,6 @@ open(args[args.index("-o") + 1], "w").write(json.dumps(verdict))
 '''
 
 
-def git(cwd: Path, *args: str) -> str:
-    result = subprocess.run(
-        [REAL_GIT, *args], cwd=cwd, check=True, capture_output=True, text=True
-    )
-    return result.stdout.strip()
-
-
 def head(repo: Path) -> str:
     return git(repo, "rev-parse", "HEAD")
 
@@ -164,18 +154,6 @@ def make_repo(path: Path, *, plan: str | None = PLAN, branch: str = "feature/x")
     return path
 
 
-def make_bare(path: Path, marker: Path) -> Path:
-    git(path.parent, "init", "-q", "--bare", str(path))
-    hook = path / "hooks" / "post-receive"
-    hook.write_text(f'#!/bin/sh\ntouch "{marker}"\n', encoding="utf-8")
-    hook.chmod(0o755)
-    return path
-
-
-def refs(bare: Path) -> str:
-    return git(bare.parent, "--git-dir", str(bare), "for-each-ref")
-
-
 def tree_snapshot(repo: Path) -> str:
     """Everything a refusal must leave byte-identical: ``.sparring``, refs,
     HEAD and status."""
@@ -190,44 +168,6 @@ def tree_snapshot(repo: Path) -> str:
     for args in (("for-each-ref",), ("rev-parse", "HEAD"), ("status", "--porcelain", "--untracked-files=all")):
         digest.update(git(repo, *args).encode())
     return digest.hexdigest()
-
-
-class GitRecorder:
-    """A ``git`` wrapper first on ``PATH`` that logs every invocation."""
-
-    def __init__(self, root: Path) -> None:
-        self.bin = root / "recorder"
-        self.bin.mkdir()
-        self.log = root / "git-commands.log"
-        wrapper = self.bin / "git"
-        wrapper.write_text(
-            f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{self.log}"\nexec "{REAL_GIT}" "$@"\n',
-            encoding="utf-8",
-        )
-        wrapper.chmod(0o755)
-
-    @contextlib.contextmanager
-    def active(self):
-        path = f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}"
-        with mock.patch.dict(os.environ, {"PATH": path}):
-            yield self
-
-    def lines(self) -> list[str]:
-        return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
-
-    def remote_commands(self) -> list[str]:
-        found = []
-        for line in self.lines():
-            words, index = line.split(), 0
-            while index < len(words) and words[index].startswith("-"):
-                index += 2 if words[index] in VALUE_OPTIONS else 1
-            sub = words[index] if index < len(words) else ""
-            nxt = words[index + 1] if index + 1 < len(words) else ""
-            if sub in REMOTE_SUBCOMMANDS or (sub == "remote" and nxt in {"update", "show", "prune"}) or (
-                sub == "submodule" and nxt == "update"
-            ):
-                found.append(line)
-        return found
 
 
 class _World(unittest.TestCase):

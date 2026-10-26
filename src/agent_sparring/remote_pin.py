@@ -1,4 +1,11 @@
-"""The remote a managed run pushes to, pinned, and what explains its tip.
+"""The remote records of legacy runs: pins, receipts and remote pauses.
+
+Local-first (Plan L): no run pins, observes or pushes to a remote any more,
+and nothing here reads one (I-L1). These records load inertly from legacy
+run state, and the recorded incident pauses stay answerable with the
+existing local commands; none of it authorizes, accepts or finishes
+anything. The rest of this docstring records the Plan R design they come
+from.
 
 A managed run's candidate reaches exactly one remote ref. Before this
 module, which ref that was came from ``branch.<b>.remote``/``.merge`` and
@@ -77,13 +84,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from agent_sparring import engine_git
 from agent_sparring.engine_git import GitConfigRefusal, GitContextError
 from agent_sparring.git_context import (
     config_values,
-    is_ancestor,
     is_full_sha,
-    remote_tip,
     resolved_push_url,
     tracking_remote,
 )
@@ -469,46 +473,6 @@ def _refuse(code: str, key: str, message: str) -> GitConfigRefusal:
     return GitConfigRefusal(code, key, message)
 
 
-def pin_remote(repo_root: Path, branch: str, *, legacy: bool = False) -> RemotePin:
-    """Pin ``branch``'s remote target as configured right now."""
-
-    remote, remote_branch = tracking_remote(repo_root, branch)
-    for value, what in ((remote, "remote"), (remote_branch, "remote branch"), (branch, "branch")):
-        if not SAFE_REF_RE.match(value):
-            raise RemotePinError(
-                f"refusing to pin: the {what} is named {value!r}, which git would not read as a "
-                "plain name"
-            )
-    snapshot = engine_git.capture_snapshot(Path(repo_root))
-    urls = config_values(repo_root, f"remote.{remote}.url")
-    push_urls = config_values(repo_root, f"remote.{remote}.pushurl")
-    if len(urls) > 1 or len(push_urls) > 1:
-        raise RemotePinError(
-            f"refusing to pin: remote {remote!r} has {len(urls)} URL(s) and {len(push_urls)} push "
-            "URL(s); the engine pushes to and verifies exactly one repository, so configure one"
-        )
-    url = urls[0] if urls else None
-    push_url = push_urls[0] if push_urls else None
-    ref = f"refs/heads/{remote_branch}"
-    # The effective push destination -- after pushInsteadOf/insteadOf, and
-    # absolute so a relative local path means the same repository from any
-    # directory -- is what is pinned, pushed to and read from.
-    destination = resolved_push_url(repo_root, remote) if (url or push_url) else None
-    start_tip = remote_tip(repo_root, destination, ref, trusted=snapshot) if destination else None
-    return RemotePin(
-        branch=branch,
-        remote=remote,
-        remote_branch=remote_branch,
-        url=url,
-        push_url=push_url,
-        start_tip=start_tip,
-        pinned_at=now(),
-        legacy=legacy,
-        trusted_config=snapshot,
-        resolved=destination,
-    )
-
-
 def require_pinned_target(repo_root: Path, pin: RemotePin) -> None:
     """Refuse, naming the key, if tracking or URL configuration no longer
     says what it said when the run was pinned. The engine never follows a
@@ -550,135 +514,6 @@ def require_pinned_target(repo_root: Path, pin: RemotePin) -> None:
                 f"refusing: a push to {pin.remote} would now go to {now_resolved!r}, but this run "
                 f"is pinned to {pin.resolved!r}",
             )
-
-
-def _require_url(pin: RemotePin) -> str:
-    if pin.destination is None:
-        raise RemotePinError(
-            f"this run pinned no URL for remote {pin.remote!r} (none was configured when it was "
-            "pinned), so nothing can be pushed to or verified on it"
-        )
-    return pin.destination
-
-
-def observe(repo_root: Path, pin: RemotePin) -> str | None:
-    """The pinned ref's tip right now, read at the pinned destination only
-    -- the repository the engine pushes to -- in an isolated repository
-    configured from the run's trusted snapshot."""
-
-    require_pinned_target(repo_root, pin)
-    return remote_tip(repo_root, _require_url(pin), pin.ref, trusted=pin.trusted_config)
-
-
-def _covered(
-    repo_root: Path,
-    pin: RemotePin,
-    records: Sequence[RemoteRecord],
-    candidate_sha: str,
-    stage_base: str | None,
-) -> bool:
-    """Is ``candidate_sha`` explained? Only by an engine push receipt, the
-    (non-legacy) start tip, the stage's base, or a person's
-    ``authorized_without_push`` of exactly this commit -- never by an
-    acknowledgement, which records an observation and nothing more."""
-
-    if any(
-        record.kind == AUTHORIZED_WITHOUT_PUSH and record.candidate_sha == candidate_sha
-        for record in records
-    ):
-        return True
-    explained = [record.tip for record in records if record.kind == PUSH_RECEIPT and record.tip]
-    if pin.start_tip and not pin.legacy:
-        explained.append(pin.start_tip)
-    if stage_base:
-        explained.append(stage_base)
-    return any(is_ancestor(repo_root, candidate_sha, sha) for sha in explained)
-
-
-def check_movement(
-    repo_root: Path,
-    pin: RemotePin,
-    records: Sequence[RemoteRecord],
-    *,
-    stage_id: str,
-    candidate_sha: str | None = None,
-    stage_base: str | None = None,
-) -> tuple[str | None, "RemotePause | None"]:
-    """``(observed tip, deviation or None)`` for the pinned ref.
-
-    The deviation is :class:`UnauthorizedRemoteMovement` when the ref is not
-    where the records say -- or, for a legacy pin nobody has looked past
-    yet, when the candidate is on it -- and
-    :class:`PushedCandidateUnauthorized` when the ref is where the records
-    say but the candidate on it is explained by nothing.
-
-    Raises :class:`GitContextError` (including the typed
-    :class:`GitConfigRefusal`) when the target was retargeted, the
-    configuration changed, or the remote cannot be read.
-    """
-
-    observed = observe(repo_root, pin)
-    expected = expected_tip(pin, records)
-
-    def movement(detail: str) -> UnauthorizedRemoteMovement:
-        return UnauthorizedRemoteMovement(
-            stage_id=stage_id,
-            remote=pin.remote,
-            url=pin.destination,
-            ref=pin.ref,
-            expected_tip=expected,
-            observed_tip=observed,
-            candidate_sha=candidate_sha,
-            detail=detail,
-        )
-
-    if observed != expected:
-        return observed, movement(
-            "the pinned ref moved and no engine push receipt or acknowledgement explains it"
-        )
-    if (
-        candidate_sha is not None
-        and observed is not None
-        and is_ancestor(repo_root, candidate_sha, observed)
-        and not _covered(repo_root, pin, records, candidate_sha, stage_base)
-    ):
-        if pin.legacy and not records:
-            # Nobody has looked at this ref yet: its tip was first observed
-            # when the run was pinned late, after anyone could have pushed.
-            return observed, movement(
-                f"candidate {candidate_sha} is already reachable from the pinned ref, which this "
-                "run first observed when it was pinned late; no engine push receipt covers it"
-            )
-        return observed, PushedCandidateUnauthorized(
-            stage_id=stage_id,
-            candidate_sha=candidate_sha,
-            remote=pin.remote,
-            url=pin.destination,
-            ref=pin.ref,
-            observed_tip=observed,
-            detail=(
-                "an acknowledgement records what was observed; it does not authorize a candidate"
-                if any(record.kind == MOVEMENT_ACKNOWLEDGED for record in records)
-                else None
-            ),
-        )
-    return observed, None
-
-
-def verify_pinned(repo_root: Path, pin: RemotePin, candidate_sha: str) -> tuple[bool, str]:
-    """Is ``candidate_sha`` reachable from the pinned ref, read at the pinned
-    URL? The pinned counterpart of :func:`~agent_sparring.git_context.
-    verify_pushed`."""
-
-    tip = observe(repo_root, pin)
-    where = f"{pin.remote}/{pin.remote_branch} (pinned {pin.destination})"
-    if tip is None:
-        return False, f"{where} does not exist"
-    if tip == candidate_sha:
-        return True, f"{where} is exactly {candidate_sha}"
-    if is_ancestor(repo_root, candidate_sha, tip):
-        return True, f"{candidate_sha} is reachable from {where} ({tip})"
-    return False, f"{candidate_sha} is not reachable from {where} ({tip})"
 
 
 def push_receipt(
@@ -792,13 +627,6 @@ def find_sibling_pin(
     return None
 
 
-def pin_sibling(root: Path, branch: str) -> SiblingRemotePin:
-    """Pin a declared sibling repository as configured right now, exactly
-    as :func:`pin_remote` pins the primary."""
-
-    return SiblingRemotePin(path=_resolved(root), pin=pin_remote(Path(root), branch))
-
-
 @dataclass(frozen=True)
 class RunRemoteState:
     """The remote records of one plan run, as its engine state holds them."""
@@ -862,18 +690,13 @@ __all__ = [
     "UnauthorizedRemoteMovement",
     "acknowledgement",
     "authorization_without_push",
-    "check_movement",
     "expected_tip",
     "find_sibling_pin",
     "load_run_remote_state",
-    "observe",
-    "pin_remote",
-    "pin_sibling",
     "push_receipt",
     "records_from",
     "remote_pause_from_dict",
     "require_pinned_target",
     "sibling_pins_from",
-    "verify_pinned",
     "who",
 ]

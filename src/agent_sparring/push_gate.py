@@ -1,4 +1,13 @@
-"""Authorizing, performing and verifying the one push managed acceptance needs.
+"""Push authorization records, kept so legacy runs still load.
+
+Local-first (Plan L): the engine performs no push and reads no remote
+(I-L1). Acceptance is local, and the function that pushed a candidate is
+gone; nothing here contacts a remote. What remains is data -- the
+:class:`PushAuthorization` and :class:`PushRequired` records a legacy run's
+state may hold, which load inertly and never authorize anything -- and the
+pure helpers that describe a push target (:func:`push_command`), which the
+separate Push to review (Plan P) is specified against. The rest of this
+docstring records what the removed push did under Plan R.
 
 The acceptance gate only ever freezes a commit that is *already* reachable
 from the run's pinned remote ref (see :mod:`agent_sparring.remote_pin`).
@@ -97,28 +106,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
-from agent_sparring import engine_git
-from agent_sparring.git_context import (
-    GitContextError,
-    current_branch,
-    is_ancestor,
-    is_full_sha,
-    resolve_commit,
-    tracking_remote,
-)
-from agent_sparring.remote_pin import (
-    SAFE_REF_RE,
-    RemotePause,
-    RemotePin,
-    RemoteRecord,
-    UnauthorizedRemoteMovement,
-    check_movement,
-    observe,
-    pin_remote,
-    push_receipt,
-)
+from agent_sparring.git_context import is_full_sha, tracking_remote
+from agent_sparring.remote_pin import SAFE_REF_RE, RemotePin
 
 #: The typed reason a managed run can be stopped on. One value today; it is
 #: a closed field rather than a free-form string so a consumer switches on it
@@ -335,34 +326,6 @@ class PushRequired:
         )
 
 
-@dataclass(frozen=True)
-class PushOutcome:
-    """The result of asking whether the candidate can reach the remote.
-
-    Exactly one of the four states is true:
-
-    - ``movement`` set: the pinned ref is somewhere the records do not
-      explain, or the candidate on it is explained by nothing; no receipt
-      was made, and nothing may be pushed until a person acts on it;
-    - ``required`` set: a person has to allow it; nothing was pushed;
-    - ``pushed`` true: this call pushed it, re-read the pinned ref, and
-      ``receipt`` is the record to keep;
-    - none: it was already on the pinned ref *as the records explain* and
-      nothing was done.
-    """
-
-    target: PushTarget
-    required: PushRequired | None = None
-    pushed: bool = False
-    detail: str | None = None
-    movement: RemotePause | None = None
-    receipt: RemoteRecord | None = None
-
-    @property
-    def blocked(self) -> bool:
-        return self.required is not None or self.movement is not None
-
-
 def intended_remote(repo_root: Path, branch: str) -> tuple[str, str]:
     """The remote and remote branch the acceptance gate checks against.
 
@@ -409,64 +372,6 @@ def push_command(target: PushTarget) -> list[str]:
     ]
 
 
-def _pushed_update(stdout: str, target: PushTarget) -> tuple[str, str | None, str | None] | None:
-    """``(flag, old, new)`` of the one ref update ``git push --porcelain``
-    reported for ``target``'s destination ref (``<flag>\\t<from>:<to>\\t<summary>``);
-    ``old``/``new`` as Git printed them (possibly abbreviated), ``None``
-    where the summary names none. ``None`` when the output names no such
-    update."""
-
-    destination = f"refs/heads/{target.remote_branch}"
-    for line in stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 3 or len(parts[0]) != 1 or parts[1].rpartition(":")[2] != destination:
-            continue
-        flag, summary = parts[0], parts[2].split(" ", 1)[0]
-        if ".." in summary:
-            old, _, new = summary.replace("...", "..").partition("..")
-            return flag, old, new
-        return flag, None, None
-    return None
-
-
-def _race_detail(
-    stdout: str, target: PushTarget, observed: str | None
-) -> str | None:
-    """Why the push just made is not the push the checks before it
-    authorized, or ``None`` when its old->new is exactly observed->candidate.
-
-    Between :func:`~agent_sparring.remote_pin.check_movement` and the push,
-    anyone who can write the ref can move it. A push that found the ref
-    already at the candidate (a no-op), or moved it from anything but the
-    observed tip, would otherwise leave a receipt absorbing that write."""
-
-    update = _pushed_update(stdout, target)
-    if update is None:
-        return (
-            "git push reported no update of the pinned ref, so this push cannot be shown to have "
-            f"moved it (a no-op, or a write by someone else); it was observed at "
-            f"{observed or 'nothing (absent)'} just before"
-        )
-    flag, old, new = update
-    if flag == "=":
-        return (
-            f"the push was a no-op: the ref was already at {target.candidate_sha} when it ran, "
-            f"though it was observed at {observed or 'nothing (absent)'} just before"
-        )
-    if flag == "*":
-        if observed is not None:
-            return f"the push created the ref, though it was observed at {observed} just before"
-        return None
-    if flag != " " or not old or not new:
-        return f"git push reported {flag!r} {old or ''}..{new or ''}, not a fast-forward"
-    if observed is None or not observed.startswith(old) or not target.candidate_sha.startswith(new):
-        return (
-            f"the push moved the ref {old}..{new}, but the checks before it observed "
-            f"{observed or 'nothing (absent)'} and authorized {target.candidate_sha}"
-        )
-    return None
-
-
 def pinned_target(pin: RemotePin, candidate_sha: str) -> PushTarget:
     """Where ``candidate_sha`` goes for a run pinned to ``pin``."""
 
@@ -476,154 +381,6 @@ def pinned_target(pin: RemotePin, candidate_sha: str) -> PushTarget:
         remote=pin.remote,
         remote_branch=pin.remote_branch,
         url=pin.push_destination,
-    )
-
-
-def ensure_candidate_pushed(
-    repo_root: Path,
-    *,
-    stage_id: str,
-    expected_branch: str,
-    authorization: PushAuthorization | None,
-    pin: RemotePin | None = None,
-    records: Sequence[RemoteRecord] = (),
-    run: str = "",
-    stage_base: str | None = None,
-) -> PushOutcome:
-    """Put the current candidate on the run's pinned remote ref, or say who
-    has to allow that, or stop on remote movement nobody explained.
-
-    Order matters and is the point:
-
-    1. the worktree must be on ``expected_branch`` and ``HEAD`` must resolve
-       (a push is about one exact commit of one exact branch);
-    2. the pinned target must still be what the configuration says (a
-       retarget is a typed refusal, never followed);
-    3. the pinned ref's tip must be what ``records`` explain, and a candidate
-       already reachable from it must be covered by them -- otherwise the
-       outcome carries an :class:`UnauthorizedRemoteMovement` and **nothing
-       is pushed**. Reachability alone is never success;
-    4. a candidate reachable from an explained tip needs no push;
-    5. otherwise ``authorization`` is checked against the exact commit,
-       branch, remote, URL and remote branch. No permission means
-       :class:`PushRequired`, and **nothing is pushed**;
-    6. only then is :func:`push_command` run, and the pinned ref re-read. A
-       push whose reported old->new is not observed->candidate, or that
-       changed nothing, is movement and carries no receipt. Otherwise the
-       ref must be exactly the candidate; a failure raises
-       :class:`PushError`, leaving the candidate unaccepted. Success carries
-       a push receipt for the caller to record.
-
-    ``pin`` is ``None`` only for a caller that holds no run (a direct call);
-    the target is then pinned for this call from the current configuration,
-    as weakly as a legacy run is, so an already reachable candidate is still
-    unexplained.
-
-    Nothing about the acceptance gate is relaxed by any of this: the gate
-    runs afterwards and makes its own checks for itself.
-    """
-
-    try:
-        branch = current_branch(repo_root)
-    except GitContextError as exc:
-        raise PushError(str(exc)) from exc
-    if branch != expected_branch:
-        raise PushError(
-            f"refusing to push: {repo_root} is on {branch!r}, but this run's candidate "
-            f"belongs to {expected_branch!r}"
-        )
-    try:
-        candidate_sha = resolve_commit(repo_root, "HEAD", label="candidate")
-        if pin is None:
-            pin = pin_remote(repo_root, branch, legacy=True)
-        if pin.branch != branch:
-            raise PushError(
-                f"refusing to push: this run is pinned for branch {pin.branch!r}, not {branch!r}"
-            )
-        target = pinned_target(pin, candidate_sha)
-        observed, movement = check_movement(
-            repo_root,
-            pin,
-            records,
-            stage_id=stage_id,
-            candidate_sha=candidate_sha,
-            stage_base=stage_base,
-        )
-    except GitContextError as exc:
-        raise PushError(f"refusing to push: {exc}") from exc
-
-    if movement is not None:
-        return PushOutcome(target=target, movement=movement, detail=movement.describe)
-
-    where = f"{pin.remote}/{pin.remote_branch}"
-    if observed is not None and is_ancestor(repo_root, candidate_sha, observed):
-        return PushOutcome(
-            target=target,
-            detail=f"{candidate_sha} is already on {where} ({observed}), as the engine's records explain",
-        )
-
-    detail = (
-        f"{where} is at {observed}, which does not contain {candidate_sha}"
-        if observed is not None
-        else f"{where} does not exist yet"
-    )
-    if authorization is None or not authorization.covers(
-        repo_root=repo_root, branch=branch, target=target, stage_id=stage_id
-    ):
-        return PushOutcome(
-            target=target, required=PushRequired.for_target(stage_id, target, detail)
-        )
-
-    destination = target.url or target.remote
-    try:
-        # In an isolated repository configured only from the run's trusted
-        # snapshot: no repository configuration -- not even one written
-        # after the checks above -- reaches the push.
-        result = engine_git.run_remote(
-            repo_root, pin.trusted_config, *push_command(target), pinned=pin.destination
-        )
-    except GitContextError as exc:
-        raise PushError(f"refusing to push {candidate_sha} to {destination}: {exc}") from exc
-    if result.returncode != 0:
-        raise PushError(
-            f"pushing {candidate_sha} to {where} ({destination}) failed: "
-            f"{(result.stderr or result.stdout).strip() or f'git push exited {result.returncode}'}"
-        )
-
-    try:
-        landed = observe(repo_root, pin)
-    except GitContextError as exc:
-        raise PushError(
-            f"{where} was pushed, but it could not be read back ({exc}); the candidate was not "
-            "accepted"
-        ) from exc
-    raced = _race_detail(result.stdout or "", target, observed)
-    if raced is not None:
-        # Someone else wrote the ref between the checks and this push: the
-        # tip is not one this push explains, so no receipt is made for it.
-        movement = UnauthorizedRemoteMovement(
-            stage_id=stage_id,
-            remote=pin.remote,
-            url=pin.destination,
-            ref=pin.ref,
-            expected_tip=observed,
-            observed_tip=landed,
-            candidate_sha=candidate_sha,
-            detail=raced,
-        )
-        return PushOutcome(target=target, movement=movement, detail=movement.describe)
-    if landed != candidate_sha:
-        raise PushError(
-            f"{where} was pushed, but it is still not exactly {candidate_sha} (it is "
-            f"{landed or 'absent'}); the candidate was not accepted"
-        )
-    return PushOutcome(
-        target=target,
-        pushed=True,
-        detail=f"{where} is exactly {candidate_sha}",
-        receipt=push_receipt(
-            run=run, stage_id=stage_id, pin=pin, previous_tip=observed, pushed_sha=candidate_sha
-        ),
     )
 
 
@@ -702,13 +459,11 @@ __all__ = [
     "PUSH_AUTHORIZATION_REQUIRED",
     "PushAuthorization",
     "PushError",
-    "PushOutcome",
     "PushRequired",
     "PushScope",
     "PushTarget",
     "authorization_for_candidate",
     "authorization_for_run",
-    "ensure_candidate_pushed",
     "intended_remote",
     "intended_target",
     "pinned_target",

@@ -459,47 +459,36 @@ the file system does not place in a repository gets a failed command, not a
 run against unvalidated configuration. Only commands that touch nothing executable --
 `rev-parse`, `config`, ref updates, `worktree` bookkeeping -- read the live
 file; a `worktree add` that checks files out, like every `switch` or
-`checkout`, reads the validated copy. Remote operations (push, `ls-remote`, the finish's target push and
-branch deletion) go to the pinned destination -- the push URL as Git
-resolved it at run start, after `pushInsteadOf`/`insteadOf`, made absolute
--- and run in a throwaway repository that borrows the objects and is
-configured only from the run-start snapshot's credential and transport
-settings plus a copy of your user-level and system configuration, both with
-every `url.*` rewrite removed, so the destination is never rewritten a
-second time and the engine writes and reads the same repository. A remote with several URLs or push URLs is not pinned. Editing
-`.gitattributes` alone is not a change: a driver runs only if configuration
-defines it.
+`checkout`, reads the validated copy. Editing `.gitattributes` alone is not
+a change: a driver runs only if configuration defines it.
 
-No engine remote operation follows the repository's live configuration,
-inside a run or not. A remote command with no run guard and no pinned
-destination is refused (`unguarded_remote_operation`, naming the
-subcommand). The reads that happen outside a run's own commands use the
-run's pin: `sparring runs --json` and `finish-run --dry-run` read the run's
-remote branch at its pinned destination with its run-start snapshot, and a
-run with no pin reports `remote state not checked: run has no pin` without
-contacting the remote; `sparring handoff` for a stage a pinned run owns
-reads that run's pin. Freeze and accept read no remote of any repository,
-primary or sibling (see [Local-first runs](#local-first-runs)). A read with
-no pin at all -- a stage no run owns -- uses only your global
-and system configuration, and is refused (`repository_transport_config`,
-naming the key) while the repository itself sets any credential, SSH, proxy,
-protocol or HTTP key, a `url.*` rewrite, or a remote's `pushurl`,
-`uploadpack` or `receivepack`.
+The engine never contacts a remote. Every Git command it would run that
+does -- `push`, `fetch`, `pull`, `ls-remote`, `clone`, `remote update`,
+`remote show` (without `-n`), `remote prune`, `remote set-head --auto`,
+`remote add -f`, `submodule update` or `add`, `archive --remote`,
+`request-pull`, `maintenance run`, any command given a repository URL, and
+any of these reached through an alias, `-c`, `-C` or `--git-dir` -- is
+refused before anything runs (`remote_operation_not_allowed`), inside a run
+or not; there is no exception. Every command it does run also carries
+`protocol.allow=never` and `GIT_NO_LAZY_FETCH=1`, so no transport starts
+under it, not even a partial clone's lazy fetch. `sparring runs --json`,
+`slice-branch --json`, `sparring handoff` and `finish-run --dry-run` read
+only the local repository; the handoff reports the candidate as
+`Local commit: <sha> on <branch>` (its `- Branch:` line is kept), and
+`--no-check-pushed` is still accepted, with nothing left to skip. A legacy
+run's remote finish (`--push-target`, remote branch deletion, and the
+remote check of a run an older engine pinned) is refused the same way until
+`finish-run` becomes entirely local.
 
-A remote that is a local path (or `file://`) is a repository on this
-machine: when the engine pushes to it, Git runs *that* repository's own
-receive hooks and reads its configuration, in a process the engine's
-overrides do not reach. The engine therefore pushes to a local path only
-when it is the run's pinned destination -- a repository you chose when the
-run started -- and refuses any other (`unpinned_local_remote`). Reading a
-local-path remote runs its `upload-pack`, which runs no hooks. So that the
-repository checked is always the one Git contacts, an engine remote
-operation is accepted only in the plain forms the engine itself uses (the
-repository as one argument, a few known options, `-c push.followTags`);
-anything else -- `--repo`, `--mirror`, `--all`, `--receive-pack`,
-`--upload-pack`, an option with a separate value, another `-c` setting or
-global option, a push naming no repository -- is refused
-(`unsupported_remote_form`).
+Plan R's isolated remote primitive is kept, with no caller in the engine,
+for the separate Push to review: it never reads the repository's own
+configuration -- it runs in a throwaway repository that borrows the objects
+and is configured only from a trusted snapshot's credential and transport
+settings plus a copy of your user-level and system configuration, both
+without `url.*` rewrites -- pushes to a local path only when it is the
+pinned destination (`unpinned_local_remote`), and accepts only the plain
+forms it can check (`unsupported_remote_form` for `--repo`, `--mirror`,
+`--all`, `--receive-pack`, `--upload-pack` and the like).
 
 A push authorization a legacy run recorded was bound to what it was granted
 for: that run, worktree, branch and remote branch, and for a one-candidate
