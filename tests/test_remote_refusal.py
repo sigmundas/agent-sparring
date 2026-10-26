@@ -97,20 +97,20 @@ class _RemoteWorld(unittest.TestCase):
     def snapshot(self) -> tuple[str, str]:
         return refs(self.bare), git(self.repo, "for-each-ref")
 
-    def plain(self, *args: str) -> subprocess.CompletedProcess:
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    def plain(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})}
         return subprocess.run([REAL_GIT, *args], cwd=self.repo, capture_output=True, text=True,
                               env=env, check=False, timeout=120)
 
-    def assertRefused(self, *args: str, key: str | None = None) -> GitConfigRefusal:
-        """``engine_git.run`` refuses ``args`` with the typed code, nothing
-        runs (no marker, no ref anywhere changes) and the recorder sees no
-        remote command."""
+    def assertRefused(self, *args: str, key: str | None = None, env: dict | None = None) -> GitConfigRefusal:
+        """``engine_git.run`` refuses ``args`` (with the caller's ``env``
+        overrides) with the typed code, nothing runs (no marker, no ref
+        anywhere changes) and the recorder sees no remote command."""
 
         before = self.snapshot()
         self.recorder.clear()
         with self.recorder.active(), self.assertRaises(GitConfigRefusal) as ctx:
-            engine_git.run(self.repo, *args)
+            engine_git.run(self.repo, *args, env=env)
         self.assertEqual(ctx.exception.code, REMOTE_OPERATION_NOT_ALLOWED, str(ctx.exception))
         if key is not None:
             self.assertEqual(ctx.exception.key, key)
@@ -119,12 +119,13 @@ class _RemoteWorld(unittest.TestCase):
         self.assertEqual(self.recorder.remote_commands(), [])
         return ctx.exception
 
-    def assertPlainContacts(self, *args: str, evidence=None) -> None:
-        """Positive control: plain ``git`` with the same arguments reaches
-        the remote (its marker program runs, or ``evidence()`` holds)."""
+    def assertPlainContacts(self, *args: str, evidence=None, env: dict | None = None) -> None:
+        """Positive control: plain ``git`` with the same arguments (and
+        ``env``) reaches the remote (its marker program runs, or
+        ``evidence()`` holds)."""
 
         self.marker.unlink(missing_ok=True)
-        result = self.plain(*args)
+        result = self.plain(*args, env=env)
         reached = evidence() if evidence is not None else self.marker.exists()
         self.assertTrue(reached, f"plain git {' '.join(args)} reached nothing: {result.stderr}")
         self.marker.unlink(missing_ok=True)
@@ -286,6 +287,26 @@ class ReachedThroughAliasesTests(_RemoteWorld):
         with mock.patch.dict(os.environ, {"STAGE3_ALIAS": "fetch"}):
             self.check("--config-env=alias.envsync=STAGE3_ALIAS", "envsync", "origin", key="fetch")
             self.check("--config-env", "alias.envsync=STAGE3_ALIAS", "envsync", "origin", key="fetch")
+
+    def test_an_alias_given_through_config_env_with_the_callers_environment(self):
+        # The caller's env overrides are what the command runs with, so they
+        # are what the alias is resolved with -- even when the engine's own
+        # process environment says something harmless.
+        harmless = {"STAGE3_ALIAS": "version"}
+        for value, key in (("fetch", "fetch"), ("!git ls-remote origin", "alias envsync (a shell command)")):
+            with self.subTest(alias=value), mock.patch.dict(os.environ, harmless):
+                self.assertRefused("--config-env=alias.envsync=STAGE3_ALIAS", "envsync", "origin",
+                                   key=key, env={"STAGE3_ALIAS": value})
+                # Positive control: plain git with that environment reaches
+                # the remote (the shell alias runs its own git ls-remote).
+                self.assertPlainContacts("--config-env=alias.envsync=STAGE3_ALIAS", "envsync", "origin",
+                                         env={"STAGE3_ALIAS": value})
+        # And with only the harmless value, the same call runs locally.
+        with mock.patch.dict(os.environ, harmless):
+            result = engine_git.run(self.repo, "--config-env=alias.envsync=STAGE3_ALIAS", "envsync")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("git version", result.stdout)
+        self.assertFalse(self.marker.exists())
 
     def _other_repository(self) -> Path:
         """A second repository, reaching the same marked origin, whose own

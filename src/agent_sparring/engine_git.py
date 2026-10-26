@@ -543,11 +543,15 @@ def _refuse_merge_drivers(entries: Sequence[ConfigEntry], name: str) -> None:
             )
 
 
-def _checked(cwd: Path, args: Sequence[str]) -> tuple[tuple[ConfigEntry, ...] | None, list[str]]:
+def _checked(
+    cwd: Path, args: Sequence[str], env: Mapping[str, str] | None = None
+) -> tuple[tuple[ConfigEntry, ...] | None, list[str]]:
     """Validate the configuration ``cwd`` has right now and build the
     arguments after ``git -C <cwd>``: the neutralizing overrides, then
     ``args`` (with diff flags inserted). Raises :class:`GitConfigRefusal`,
-    including ``remote_operation_not_allowed`` for any remote form (I-L1)."""
+    including ``remote_operation_not_allowed`` for any remote form (I-L1),
+    classified with ``env`` -- the caller's environment overrides, which
+    the command will run with."""
 
     entries = config_entries(Path(cwd))
     pairs = [*BASE_OVERRIDES, *LOCAL_OVERRIDES]
@@ -557,7 +561,7 @@ def _checked(cwd: Path, args: Sequence[str]) -> tuple[tuple[ConfigEntry, ...] | 
         if guard is not None:
             compare_snapshot(entries, guard.entries)
         pairs += _driver_overrides(entries)
-    form = remote_form(args, Path(cwd))
+    form = remote_form(args, Path(cwd), env=env)
     if form is not None:
         raise GitConfigRefusal(
             "remote_operation_not_allowed",
@@ -646,24 +650,28 @@ class _Unresolvable(Exception):
     """Git's own configuration lookup for an alias failed."""
 
 
-def _alias(name: str, global_options: Sequence[str], cwd: Path) -> str | None:
+def _alias(
+    name: str, global_options: Sequence[str], cwd: Path, env: Mapping[str, str] | None = None
+) -> str | None:
     """The alias value Git would use for ``name``, or ``None`` when it is
     not an alias. A builtin name is never an alias.
 
     Git itself is asked, with exactly the global options the command
     carries (``-c``, ``--config-env``, ``-C``, ``--git-dir`` ...), from the
-    directory the command runs in -- so an alias set on the command line,
-    through the environment, or in another repository those options select
-    is the one found. Reading configuration contacts nothing and runs no
-    program (hooks and fsmonitor are off). Raises :class:`_Unresolvable`
-    when the lookup itself fails."""
+    directory the command runs in, and with the environment it runs with
+    (``env``: the caller's overrides, as :func:`run` applies them) -- so an
+    alias set on the command line, through the environment, or in another
+    repository those options select is the one found. Reading configuration
+    contacts nothing and runs no program (hooks and fsmonitor are off).
+    Raises :class:`_Unresolvable` when the lookup itself fails."""
 
     if name in _builtins():
         return None
     looked_up = subprocess.run(
         ["git", "-C", str(cwd), *_overrides(BASE_OVERRIDES), *global_options,
          "config", "--get", f"alias.{name}"],
-        capture_output=True, text=True, check=False, env=_environment(None),
+        capture_output=True, text=True, check=False,
+        env=_environment({**(env or {}), **LOCAL_ENVIRONMENT}),
     )
     if looked_up.returncode == 1:
         return None
@@ -672,10 +680,12 @@ def _alias(name: str, global_options: Sequence[str], cwd: Path) -> str | None:
     return looked_up.stdout[:-1] if looked_up.stdout.endswith("\n") else looked_up.stdout
 
 
-def remote_form(args: Sequence[str], cwd: Path | None = None) -> str | None:
-    """How ``git <args>``, run in ``cwd``, would contact a remote, or
-    ``None`` when it would not (I-L1): the subcommand words that do, as Git
-    would run them.
+def remote_form(
+    args: Sequence[str], cwd: Path | None = None, *, env: Mapping[str, str] | None = None
+) -> str | None:
+    """How ``git <args>``, run in ``cwd`` with the environment overrides
+    ``env``, would contact a remote, or ``None`` when it would not (I-L1):
+    the subcommand words that do, as Git would run them.
 
     Every global option (``-c``, ``-C``, ``--git-dir`` ...) is looked
     through, and an alias is resolved by Git itself (see :func:`_alias`)
@@ -694,7 +704,7 @@ def remote_form(args: Sequence[str], cwd: Path | None = None) -> str | None:
             return None
         rest = args[index + 1 :]
         try:
-            expansion = None if name in seen else _alias(name, args[:index], cwd)
+            expansion = None if name in seen else _alias(name, args[:index], cwd, env)
         except _Unresolvable:
             return f"alias {name} (unresolvable)"
         if expansion is not None:
@@ -789,7 +799,7 @@ def run(
     no transport -- a promisor's lazy fetch included -- can start under it.
     """
 
-    entries, tail = _checked(Path(cwd), args)
+    entries, tail = _checked(Path(cwd), args, env)
     index, name = subcommand(args)
     argv = ["git", "-C", str(cwd), *tail]
     if name is None or _live(name, args, index) or entries is None:
