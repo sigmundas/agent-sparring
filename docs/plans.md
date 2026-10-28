@@ -465,12 +465,14 @@ a change: a driver runs only if configuration defines it.
 The engine never contacts a remote. Every Git command it would run that
 does -- `push`, `fetch`, `pull`, `ls-remote`, `clone`, `remote update`,
 `remote show` (without `-n`), `remote prune`, `remote set-head --auto`,
-`remote add -f`, `submodule update` or `add`, `archive --remote`,
-`request-pull`, `maintenance run`, any command given a repository URL, and
-any of these reached through an alias, `-c`, `-C` or `--git-dir` -- is
+`remote add -f`, `submodule update`, `add` or `foreach`, `archive
+--remote`, `request-pull`, `maintenance run`, any command given a
+repository URL, and any of these reached through an option before the
+nested command (`remote -v show`), an alias, `-c`, `-C` or `--git-dir` -- is
 refused before anything runs (`remote_operation_not_allowed`), inside a run
 or not; there is no exception. Every command it does run also carries
-`protocol.allow=never` and `GIT_NO_LAZY_FETCH=1`, so no transport starts
+`protocol.allow=never`, `GIT_ALLOW_PROTOCOL=none` (which outranks any
+`protocol.<name>.allow`) and `GIT_NO_LAZY_FETCH=1`, so no transport starts
 under it, not even a partial clone's lazy fetch. `sparring runs --json`,
 `slice-branch --json`, `sparring handoff` and `finish-run --dry-run` read
 only the local repository; the handoff reports the candidate as

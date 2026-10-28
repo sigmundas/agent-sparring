@@ -148,11 +148,13 @@ def is_remote_command(line: str) -> bool:
         index += 2 if words[index] in VALUE_OPTIONS else 1
     sub = words[index] if index < len(words) else ""
     rest = words[index + 1 :]
-    nxt = rest[0] if rest else ""
+    # The nested subcommand of ``remote``/``submodule``/``maintenance``,
+    # after any options (``remote -v show``, ``submodule --quiet update``).
+    nxt = next((w for w in rest if not w.startswith("-")), "")
     return (
         sub in REMOTE_SUBCOMMANDS
         or (sub == "remote" and (nxt in REMOTE_REMOTE_SUBS or (nxt == "add" and "-f" in rest)))
-        or (sub == "submodule" and nxt in ("update", "add"))
+        or (sub == "submodule" and nxt in ("update", "add", "foreach"))
         or (sub == "archive" and any(w.startswith("--remote") for w in rest))
         or (sub == "maintenance" and nxt == "run")
         or any("://" in w or "::" in w for w in words)

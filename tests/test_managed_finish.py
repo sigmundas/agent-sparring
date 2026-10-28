@@ -31,12 +31,14 @@ def remote_finish_allowed_in_test():
     replaces it with ``remote_finish_removed``). Until that code is removed,
     its own properties (the lease form, races, rejection handling,
     retargeting) stay tested by running it with the refusal and the
-    ``protocol.allow=never`` override patched out here. That production
+    transport protections (``LOCAL_OVERRIDES``, ``LOCAL_ENVIRONMENT``)
+    patched out here. That production
     refuses the same finish, contacting nothing, is
     :class:`LegacyRemoteFinishRefusedTests`."""
 
     with mock.patch.object(engine_git, "remote_form", return_value=None), \
-            mock.patch.object(engine_git, "LOCAL_OVERRIDES", ()):
+            mock.patch.object(engine_git, "LOCAL_OVERRIDES", ()), \
+            mock.patch.object(engine_git, "LOCAL_ENVIRONMENT", {}):
         yield
 
 

@@ -58,7 +58,8 @@ any of these reached through an alias, ``-c``, ``-C`` or ``--git-dir`` (see
 :func:`remote_form`) -- is refused, unconditionally and before anything
 runs, with ``remote_operation_not_allowed``. No guard, snapshot or pin
 makes an exception. Every command :func:`run` does start carries
-``protocol.allow=never`` and ``GIT_NO_LAZY_FETCH=1`` as well.
+``protocol.allow=never``, ``GIT_ALLOW_PROTOCOL=none`` (which outranks
+every ``protocol.*`` setting) and ``GIT_NO_LAZY_FETCH=1`` as well.
 
 :func:`run_remote` is Plan R's isolated remote primitive, kept for the
 separate, human-triggered Push to review (Plan P). Nothing in the engine
@@ -120,8 +121,12 @@ BASE_OVERRIDES: tuple[str, ...] = (
 
 #: Every :func:`run` invocation, which is always local (I-L1): no transport
 #: may start, whatever a command or a promisor remote would ask for.
+#: ``GIT_ALLOW_PROTOCOL`` is Git's allowlist and takes precedence over every
+#: ``protocol.allow`` and ``protocol.<name>.allow`` setting, including one
+#: the repository or the command line sets to ``always``; it names no real
+#: protocol, so none is allowed.
 LOCAL_OVERRIDES: tuple[str, ...] = ("protocol.allow=never",)
-LOCAL_ENVIRONMENT: Mapping[str, str] = {"GIT_NO_LAZY_FETCH": "1"}
+LOCAL_ENVIRONMENT: Mapping[str, str] = {"GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "none"}
 
 #: Subcommands whose output can be routed through textconv or an external
 #: diff driver; each gets ``--no-ext-diff --no-textconv``.
@@ -607,10 +612,22 @@ _LIVE_COMMANDS = frozenset(
 )
 
 
+def _nested(rest: Sequence[str]) -> tuple[str | None, list[str]]:
+    """The nested subcommand of ``git remote``/``git submodule`` and what
+    follows it. Options may come first (``remote -v show``, ``submodule
+    --quiet update``); none of them takes a separate value."""
+
+    for i, word in enumerate(rest):
+        if not word.startswith("-"):
+            return word, list(rest[i + 1 :])
+    return None, []
+
+
 def _remote_contacts(rest: Sequence[str]) -> bool:
     """Does ``git remote <rest>`` contact a remote?"""
 
-    sub = rest[0] if rest else None
+    sub, after = _nested(rest)
+    rest = after
     if sub in ("update", "prune"):
         return True
     if sub == "show":
@@ -720,12 +737,15 @@ def remote_form(
         if name in _ALWAYS_REMOTE:
             return name
         if name == "remote" and _remote_contacts(rest):
-            return f"remote {rest[0]}"
-        if name == "submodule" and rest[:1] and rest[0] in ("update", "add"):
-            return f"submodule {rest[0]}"
+            return f"remote {_nested(rest)[0]}"
+        nested = _nested(rest)[0]
+        if name == "submodule" and nested in ("update", "add", "foreach"):
+            # ``foreach`` runs a shell command in each submodule: what it
+            # runs cannot be known.
+            return f"submodule {nested}"
         if name == "archive" and any(a == "--remote" or a.startswith("--remote=") for a in rest):
             return "archive --remote"
-        if name == "maintenance" and rest[:1] == ["run"]:
+        if name == "maintenance" and nested == "run":
             # Its configured tasks may include ``prefetch``.
             return "maintenance run"
         if any(_URL_RE.match(arg) for arg in _addressable(args)):
@@ -795,7 +815,8 @@ def run(
     refused, unconditionally, with ``remote_operation_not_allowed`` before
     anything runs (I-L1): the engine works entirely in local repositories,
     whatever guard, snapshot or pin is in effect. Every command that does
-    run also carries ``protocol.allow=never`` and ``GIT_NO_LAZY_FETCH``, so
+    run also carries ``protocol.allow=never``, ``GIT_ALLOW_PROTOCOL=none``
+    and ``GIT_NO_LAZY_FETCH``, so
     no transport -- a promisor's lazy fetch included -- can start under it.
     """
 

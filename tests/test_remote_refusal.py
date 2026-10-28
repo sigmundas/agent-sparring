@@ -43,6 +43,7 @@ from git_recorder import (
     GitRecorder,
     PlantedRemotes,
     git,
+    is_remote_command,
     make_bare,
     marker_program,
     refs,
@@ -134,6 +135,25 @@ class _RemoteWorld(unittest.TestCase):
         self.assertRefused(*args, key=key)
         self.assertPlainContacts(*args, evidence=evidence)
 
+    def _plain_recorded(self, *args: str) -> subprocess.CompletedProcess:
+        """Plain ``git`` through ``PATH``, so the recorder logs it."""
+
+        self.recorder.clear()
+        with self.recorder.active():
+            return subprocess.run(["git", *args], cwd=self.repo, capture_output=True, text=True,
+                                  env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, check=False, timeout=120)
+
+    def assertPlainContactsAndIsRecorded(self, *args: str) -> None:
+        """Positive control that also proves the recorder: plain ``git``
+        through ``PATH`` with the same arguments reaches the remote, and
+        the recorder's own classification flags the logged command."""
+
+        self.marker.unlink(missing_ok=True)
+        result = self._plain_recorded(*args)
+        self.assertTrue(self.marker.exists(), f"plain git {' '.join(args)} reached nothing: {result.stderr}")
+        self.assertTrue(self.recorder.remote_commands(), self.recorder.lines())
+        self.marker.unlink(missing_ok=True)
+
 
 class RemoteFormRefusalTests(_RemoteWorld):
     def test_push(self):
@@ -216,6 +236,58 @@ class RemoteFormRefusalTests(_RemoteWorld):
         # allowed runs the marker.
         url = f"ext::sh -c touch% {self.marker}"
         self.check("-c", "protocol.ext.allow=always", "ls-remote", url, key="ls-remote")
+
+    # Options before the nested command are valid Git; with the transport
+    # explicitly allowed, the refusal is the classifier's alone.
+
+    def test_remote_show_with_an_option_first(self):
+        args = ("-c", "protocol.file.allow=always", "remote", "-v", "show", "origin")
+        self.assertRefused(*args, key="remote show")
+        self.assertPlainContactsAndIsRecorded(*args)
+
+    def test_remote_update_with_an_option_first(self):
+        args = ("-c", "protocol.file.allow=always", "remote", "--verbose", "update")
+        self.assertRefused(*args, key="remote update")
+        self.assertPlainContactsAndIsRecorded(*args)
+
+    def _submodule(self) -> Path:
+        """A committed submodule ``vendored`` of a local repository; returns
+        its module directory (where a clone of it lands)."""
+
+        sub = self.root / "sub"
+        sub.mkdir()
+        git(sub, "init", "-q", "-b", "main")
+        git(sub, "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-q",
+            "--allow-empty", "-m", "sub")
+        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendored")
+        git(self.repo, "commit", "-q", "-m", "submodule")
+        common = Path(git(self.repo, "rev-parse", "--git-common-dir"))
+        return (common if common.is_absolute() else self.repo / common) / "modules" / "vendored"
+
+    def test_submodule_update_with_an_option_first(self):
+        modules = self._submodule()
+        git(self.repo, "submodule", "deinit", "-q", "-f", "vendored")
+        subprocess.run(["rm", "-rf", str(modules)], check=True)
+        args = ("-c", "protocol.file.allow=always", "submodule", "--quiet", "update", "--init")
+        self.assertRefused(*args, key="submodule update")
+        self.assertFalse(modules.exists())
+        # Positive control: plain git with the same arguments clones the
+        # submodule from its repository, and the recorder flags it.
+        result = self._plain_recorded(*args)
+        self.assertTrue(modules.exists(), f"plain git cloned nothing: {result.stderr}")
+        self.assertTrue(self.recorder.remote_commands(), self.recorder.lines())
+
+    def test_submodule_foreach(self):
+        # ``foreach`` runs a shell command in each submodule: what it runs
+        # cannot be known, so it is refused.
+        self._submodule()
+        args = ("submodule", "--quiet", "foreach", f"touch {self.marker}")
+        self.assertRefused(*args, key="submodule foreach")
+        # Positive control: plain git runs the command, and the recorder
+        # flags it.
+        self._plain_recorded(*args)
+        self.assertTrue(self.marker.exists())
+        self.assertTrue(self.recorder.remote_commands(), self.recorder.lines())
 
     def test_any_command_given_a_repository_url(self):
         # The classifier's own URL rule, on a subcommand that is not itself
@@ -368,24 +440,39 @@ class LocalCommandsStillRunTests(_RemoteWorld):
 
 
 class TransportOffForLocalCommandsTests(_RemoteWorld):
-    """``protocol.allow=never`` and ``GIT_NO_LAZY_FETCH`` on every command
-    ``engine_git.run`` starts: shown with the classifier disabled in the test
-    only (``mock.patch``), and their own positive control with them disabled
-    as well."""
+    """``protocol.allow=never``, ``GIT_ALLOW_PROTOCOL=none`` and
+    ``GIT_NO_LAZY_FETCH`` on every command ``engine_git.run`` starts: shown
+    with the classifier disabled in the test only (``mock.patch``), and
+    their own positive control with them disabled as well."""
 
     def _unclassified(self):
         return mock.patch.object(engine_git, "remote_form", return_value=None)
 
     def test_no_transport_starts_even_if_the_classifier_missed_a_form(self):
-        with self._unclassified():
-            result = engine_git.run(self.repo, "ls-remote", "origin")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("not allowed", result.stderr)
-        self.assertFalse(self.marker.exists())
-        # Positive control: without the override as well, the same engine
-        # call reaches the remote.
-        with self._unclassified(), mock.patch.object(engine_git, "LOCAL_OVERRIDES", ()):
-            engine_git.run(self.repo, "ls-remote", "origin")
+        # Including when a protocol-specific setting says ``always`` -- on
+        # the command line or in the repository -- which outranks
+        # ``protocol.allow``: GIT_ALLOW_PROTOCOL outranks them all.
+        git(self.repo, "config", "protocol.file.allow", "always")
+        for args in (("ls-remote", "origin"), ("-c", "protocol.file.allow=always", "ls-remote", "origin")):
+            with self.subTest(args=args):
+                with self._unclassified():
+                    result = engine_git.run(self.repo, *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("not allowed", result.stderr)
+                self.assertFalse(self.marker.exists())
+                # Positive control: without the protections as well, the
+                # same engine call reaches the remote.
+                with self._unclassified(), mock.patch.object(engine_git, "LOCAL_OVERRIDES", ()), \
+                        mock.patch.object(engine_git, "LOCAL_ENVIRONMENT", {}):
+                    engine_git.run(self.repo, *args)
+                self.assertTrue(self.marker.exists())
+                self.marker.unlink()
+
+    def test_protocol_allow_alone_would_not_hold_against_a_protocol_specific_setting(self):
+        # Why GIT_ALLOW_PROTOCOL is needed: with only protocol.allow=never,
+        # a protocol.file.allow=always reaches the remote.
+        with self._unclassified(), mock.patch.object(engine_git, "LOCAL_ENVIRONMENT", {}):
+            engine_git.run(self.repo, "-c", "protocol.file.allow=always", "ls-remote", "origin")
         self.assertTrue(self.marker.exists())
 
     def test_a_promisor_remote_is_never_fetched_from_by_a_local_command(self):
@@ -406,6 +493,34 @@ class TransportOffForLocalCommandsTests(_RemoteWorld):
             fetched = engine_git.run(partial, "cat-file", "-p", blob)
         self.assertEqual(fetched.returncode, 0, fetched.stderr)
         self.assertTrue(self.marker.exists())
+
+
+# -- the recorder's own classification -----------------------------------------
+
+
+class RecorderClassificationTests(unittest.TestCase):
+    """The recorder is the test's independent oracle for I-L1: options
+    before a nested subcommand must not hide a remote command from it."""
+
+    def test_remote_forms_are_flagged_wherever_their_options_sit(self):
+        for line in (
+            "remote show origin", "remote -v show origin", "remote --verbose update",
+            "remote -v prune origin", "remote -v set-head origin --auto", "remote -v add -f x /r",
+            "submodule update --init", "submodule --quiet update --init", "submodule --quiet add /r x",
+            "submodule --quiet foreach true", "-c protocol.file.allow=always remote -v show origin",
+            "-C /repo --git-dir /repo/.git fetch origin", "maintenance run --task=prefetch",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(is_remote_command(line))
+
+    def test_local_forms_are_not_flagged(self):
+        # Positive control for the oracle: it does not flag everything.
+        for line in (
+            "remote -v", "remote", "remote get-url origin", "submodule --quiet status",
+            "rev-parse HEAD", "-c core.hooksPath=/dev/null status --porcelain",
+        ):
+            with self.subTest(line=line):
+                self.assertFalse(is_remote_command(line))
 
 
 # -- run_remote has no production caller ----------------------------------------
