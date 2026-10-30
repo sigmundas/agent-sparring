@@ -337,10 +337,15 @@ explicitly, and none of them is ever review or acceptance:
 - `unauthorized_remote_movement` and `pushed_candidate_unauthorized`
   (described below): freeze and accept refuse while one stands, and only
   `acknowledge-remote-movement` or `authorize-pushed-candidate` clears it.
-  The answer clears only that pause and accepts nothing. A pause raised
-  mid-loop then resumes the stage normally; one raised after READY (the
-  answered commit is the one the READY was over) goes through the same six
-  conditions on a plain resume.
+  The answer clears only that pause and accepts nothing; it records what the
+  pause was about (`answered_incidents`: the paused candidate, and whether
+  the stage's recorded verdict was READY then). A pause raised mid-loop then
+  resumes the stage normally; one raised after READY goes through the same
+  six conditions on a plain resume, whatever remote tip the incident
+  observed (another commit, or none). An answer an older engine recorded,
+  without that provenance, is treated the same way while READY is recorded.
+  A recorded gate that cannot be read is never taken as no gate: it fails
+  condition 5 or 6.
 
 `finish-run` of such a run is local like any other: its pin is never read
 to finish, except for the trusted configuration snapshot it carries, which
@@ -554,8 +559,10 @@ sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
   remove_plan = true` commits the plan file's removal on the target (below),
   archives the worktree's `.sparring/` state to
   `<git-common-dir>/agent-sparring/runs/<run-key>/`, removes the worktree
-  (`git worktree remove`, never `--force`), deletes the local branch (`git
-  branch -d`, never `-D`), and records the run finished. Each step records
+  (`git worktree remove`, never `--force`), deletes the local branch only
+  while it is exactly the merged candidate and the local target contains it
+  (a compare-and-delete of the ref; never `-D`, and never decided by a
+  configured upstream), and records the run finished. Each step records
   its event; it stops at the first failure, leaving the rest in place and
   saying what remains; running it again continues, skipping only steps
   whose event is recorded. `--merge-only` runs the merge and the plan

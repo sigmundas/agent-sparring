@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 import conftest_path  # noqa: F401
 
@@ -187,6 +188,63 @@ class LocalFinishTests(_LocalFinishCase):
         self.assertEqual(_git(checkout, "rev-parse", "HEAD"), sib_head)
         self.assertEqual(_git(checkout, "status", "--porcelain"), "")
         self._assert_cleaned(record, head)
+
+
+class UpstreamIndependentDeletionTests(_LocalFinishCase):
+    """The local branch is deleted on the verified local target and its
+    exact tip, never on a configured upstream (a remote-tracking ref the
+    finish never reads)."""
+
+    def _stale_upstream(self, branch: str, behind: str) -> None:
+        _run_git(self.repo, "config", f"branch.{branch}.remote", "origin")
+        _run_git(self.repo, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+        _run_git(self.repo, "update-ref", f"refs/remotes/origin/{branch}", behind)
+
+    def test_an_upstream_behind_the_candidate_does_not_block_the_local_branch_deletion(self):
+        record, head, _ = self._run()
+        base = _git(self.repo, "rev-parse", "main")
+        self._stale_upstream(record.branch, base)
+        remotes_before = self._remotes()
+        code, report, err = self._finish(record, "--merge-only")
+        self.assertEqual(code, 0, err)
+
+        # Positive control: with the target now containing the candidate,
+        # plain `git branch -d` in the target checkout still refuses a
+        # branch at the candidate whose upstream is behind -- it decides by
+        # the upstream, which is what the finish must not do.
+        _run_git(self.repo, "branch", "probe", head)
+        self._stale_upstream("probe", base)
+        control = subprocess.run(["git", "-C", str(self.repo), "branch", "-d", "probe"],
+                                 capture_output=True, text=True, check=False)
+        self.assertNotEqual(control.returncode, 0, control.stdout)
+        self.assertIn("not fully merged", control.stderr)
+        _run_git(self.repo, "branch", "-D", "probe")
+
+        recorder = GitRecorder(self.repo.parent)
+        with recorder.active():
+            code, report, err = self._finish(record)
+        self.assertEqual(code, 0, (err, report))
+        self._assert_cleaned(record, head)
+        self.assertEqual(recorder.remote_commands(), [])
+        self.assertEqual(self._remotes(), remotes_before)
+
+    def test_a_branch_not_at_the_candidate_is_kept(self):
+        # The compare-and-delete still refuses a branch that moved.
+        record, head, _ = self._run()
+        real_git = managed_run._git
+        moved = {}
+
+        def move_before_delete(cwd, *args):
+            if args[:2] == ("update-ref", "-d") and not moved:
+                moved["sha"] = _git(self.repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "late")
+                subprocess.run(["git", "-C", str(self.repo), "update-ref", f"refs/heads/{record.branch}",
+                                moved["sha"]], check=True)
+            return real_git(cwd, *args)
+
+        with mock.patch.object(managed_run, "_git", side_effect=move_before_delete):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "delete_branch"))
+        self.assertEqual(_git(self.repo, "rev-parse", f"refs/heads/{record.branch}"), moved["sha"])
 
 
 class FinishHistoryTests(_LocalFinishCase):

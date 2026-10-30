@@ -27,6 +27,7 @@ provider (scripted adapters).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -51,7 +52,9 @@ from agent_sparring.remote_pin import (
     PushedCandidateUnauthorized,
     UnauthorizedRemoteMovement,
 )
-from agent_sparring.sparring_exchange import _human_gate_lines
+from agent_sparring.deferred_gate import DEFERRED_GATE_MARKER
+from agent_sparring.human_gate import HUMAN_GATE_MARKER
+from agent_sparring.sparring_exchange import _human_gate_lines, read_recorded_outcome
 from agent_sparring.stage import STATE_FILENAME, StageStatus
 
 from git_recorder import GitRecorder
@@ -60,7 +63,7 @@ from test_managed_run import _git
 from test_manifest import _ManifestRepoTestCase, _stage_entry, manifest_payload
 from test_manifest_gates import S3C, S3D, gated_payload
 from test_multi_repo_candidates import _make_repo
-from test_plan import READY, S1, _SparringAdapter, _StageAdapter, _head_sha, _run_git, human_gate
+from test_plan import NEEDS_YOU, READY, S1, _SparringAdapter, _StageAdapter, _head_sha, _run_git, human_gate
 from test_push_authorization import _Implementer, _RemoteAwareTestCase
 
 
@@ -81,6 +84,24 @@ def _interrupted_at_freeze(start) -> None:
         except KeyboardInterrupt:
             return
     raise AssertionError("the run did not reach the acceptance gate")
+
+
+def _corrupt_after(text: str, marker: str) -> str:
+    """Make the JSON fence after ``marker`` unparseable, keeping the marker."""
+
+    at = text.index(marker)
+    start = text.index("```json", at) + len("```json")
+    return text[:start] + "\n{not json" + text[start:]
+
+
+def _drop_key(payload, key: str) -> None:
+    if isinstance(payload, dict):
+        payload.pop(key, None)
+        for value in payload.values():
+            _drop_key(value, key)
+    elif isinstance(payload, list):
+        for value in payload:
+            _drop_key(value, key)
 
 
 def _push_pause(stage_id: str, sha: str) -> PushRequired:
@@ -224,6 +245,17 @@ class LegacyPushPauseConversionTests(_LegacyCase):
     def test_an_unanswered_human_check_stays_paused(self):
         self._stays_paused(self._with_an_unanswered_check, 6)
 
+    def test_an_unreadable_human_gate_stays_paused(self):
+        # read_recorded_outcome reads a malformed gate as absent; the
+        # migration must not take that as "no checks".
+        def corrupt(sha):
+            self._with_an_unanswered_check(sha)
+            stage = self._stage(S1)
+            stage.write_sparring(_corrupt_after(stage.read_sparring(), HUMAN_GATE_MARKER))
+            self.assertIsNone(read_recorded_outcome(stage).human_gate)
+
+        self._stays_paused(corrupt, 6)
+
     def test_positive_control_the_same_check_answered_pass_converts(self):
         sha = self._legacy_push_pause()
         self._with_an_unanswered_check(sha)
@@ -301,6 +333,42 @@ class ConversionSequenceTests(_ManifestRepoTestCase):
         (owed,) = self._plan_state().deferred_human_checks
         self.assertEqual(owed.stage_id, S3C)
         self.assertFalse(owed.resolved)
+
+    def _deferral_damaged(self, damage) -> None:
+        self._paused(READY_WITH_DEFERRAL)
+        stage = self._stage(S3C)
+        stage.write_sparring(damage(stage.read_sparring()))
+        before = _files(self.sparring_dir)
+        result = self._resume(
+            _StageAdapter(self.repo, commit=True), _SparringAdapter([]),
+            stop_after_stage=S3C, report=self.reports.append,
+        )
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(result.awaiting.kind, PUSH_AUTHORIZATION_REQUIRED)
+        self.assertTrue(any("condition 5 (" in line for line in self.reports), self.reports)
+        self.assertIs(self._stage(S3C).read_state().status, StageStatus.WORKING)
+        self.assertEqual(self._plan_state().deferred_human_checks, ())
+        self.assertEqual(_files(self.sparring_dir), before)
+
+    def test_an_unreadable_deferred_gate_stays_paused(self):
+        # Positive control: test_a_recorded_deferral_converts_and_the_
+        # obligation_is_in_the_ledger, the same verdict undamaged.
+        def corrupt(text):
+            damaged = _corrupt_after(text, DEFERRED_GATE_MARKER)
+            return damaged
+
+        self._deferral_damaged(corrupt)
+
+    def test_a_deferred_gate_without_an_instance_stays_paused(self):
+        def drop_instance(text):
+            at = text.index(DEFERRED_GATE_MARKER)
+            start = text.index("```json", at) + len("```json")
+            end = text.index("```", start)
+            payload = json.loads(text[start:end])
+            _drop_key(payload, "instance_id")
+            return text[:start] + "\n" + json.dumps(payload, indent=2) + "\n" + text[end:]
+
+        self._deferral_damaged(drop_instance)
 
 
 class SiblingConversionTests(_ManifestRepoTestCase):
@@ -381,6 +449,77 @@ class IncidentPauseTests(_LegacyCase):
         # Raised after READY, it then goes through the L-D1 conditions.
         result = self._resume_plain()
         self._assert_converted(result, sha, pause=MOVEMENT_ACKNOWLEDGED)
+
+    def _acknowledged_after_ready(self, observed: str | None) -> str:
+        """READY over a commit, then a recorded movement pause whose observed
+        tip is ``observed`` (another commit, or ``None``: the ref was gone),
+        acknowledged by a person."""
+
+        sha = self._ready_not_accepted()
+        movement = UnauthorizedRemoteMovement(
+            stage_id=S1, remote="origin", url=str(self.remote), ref="refs/heads/feature/x",
+            expected_tip=self.remote_before, observed_tip=observed, candidate_sha=sha,
+        )
+        self._pause(movement)
+        acknowledge_remote_movement(
+            self.sparring_dir, run_key=self.run_key, observed=observed or "absent", by="tester"
+        )
+        (answered,) = self._plan_state().answered_incidents
+        self.assertEqual((answered["stage"], answered["candidate"], answered["after_ready"]), (S1, sha, "true"))
+        return sha
+
+    def test_an_answered_pause_after_ready_converts_whatever_tip_it_observed(self):
+        for observed in ("other", None):
+            with self.subTest(observed=observed):
+                self.tearDown()
+                self.setUp()
+                tip = self.remote_before if observed == "other" else None
+                sha = self._acknowledged_after_ready(tip)
+                self.assertNotEqual(tip, sha)
+                self._assert_converted(self._resume_plain(), sha, pause=MOVEMENT_ACKNOWLEDGED)
+
+    def _with_unanswered_check_after_ack(self, observed: str | None) -> str:
+        sha = self._acknowledged_after_ready(observed)
+        stage = self._stage(S1)
+        gate = HumanGate.from_dict(human_gate())
+        stage.write_sparring(stage.read_sparring() + "\n" + "\n".join(_human_gate_lines(gate)) + "\n")
+        return sha
+
+    def test_a_failing_condition_after_an_answer_with_another_tip_leaves_the_stage_unaccepted(self):
+        for observed in ("other", None):
+            with self.subTest(observed=observed):
+                self.tearDown()
+                self.setUp()
+                self._with_unanswered_check_after_ack(self.remote_before if observed else None)
+                before = self._engine_state()
+                result = self._resume_plain()
+                self._assert_stays(result, 6)
+                self.assertEqual(self._engine_state(), before)
+
+    def test_positive_control_without_the_routing_the_ordinary_path_would_accept_it(self):
+        # The same answered pause and unanswered check, with the post-READY
+        # routing disabled in this test only: the ordinary recorded-READY path
+        # accepts the stage, so the routing is what holds the conditions.
+        sha = self._with_unanswered_check_after_ack(self.remote_before)
+        with mock.patch.object(plan_module, "_cleared_incident_after_ready", return_value=None):
+            self._resume_plain()
+        s1 = self._stage(S1).read_state()
+        self.assertIs(s1.status, StageStatus.ACCEPTED)
+        self.assertEqual(s1.candidate_sha, sha)
+
+    def test_an_answered_pause_raised_mid_loop_resumes_the_stage_normally(self):
+        # NEEDS_YOU recorded when the pause is answered: not after READY.
+        self._start(_Implementer(self.repo), _SparringAdapter([NEEDS_YOU]), stop_after_stage=S1)
+        sha = _head_sha(self.repo)
+        self._pause(self._movement(sha))
+        acknowledge_remote_movement(self.sparring_dir, run_key=self.run_key, observed=sha, by="tester")
+        (answered,) = self._plan_state().answered_incidents
+        self.assertEqual(answered["after_ready"], "false")
+        result = self._resume_plain()
+        # The stage's own recorded NEEDS_YOU is adopted, as on any resume.
+        self.assertIs(result.status, PlanRunStatus.PAUSED)
+        self.assertEqual(self._plan_state().legacy_push_pause_converted, ())
+        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
 
     def test_an_answered_pause_after_ready_whose_conditions_fail_accepts_nothing(self):
         sha = self._ready_not_accepted()

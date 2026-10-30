@@ -1015,7 +1015,10 @@ candidate goes to its own branch of the same target name; nothing of the
 sibling's is removed); with `[finish] remove_plan` commit the plan file's
 removal on the target; archive the worktree's project state to
 `<git-common-dir>/agent-sparring/runs/<run-key>/`; `git worktree remove`
-without `--force`; `git branch -d` (never `-D`); record `finished`. Each
+without `--force`; delete the local branch as a compare-and-delete of its
+ref on the merged candidate, once the local target is verified to contain
+it -- never `git branch -d`, whose merged check prefers a configured
+upstream, and never `-D`; record `finished`. Each
 step appends an event, so a run stopped part-way is resumed by running the
 command again (a step is skipped only when its event is recorded), and the
 report says what remains. `--merge-only` stops after merge and plan

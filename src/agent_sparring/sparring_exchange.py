@@ -441,6 +441,27 @@ def _recorded_deferred_gate(text: str) -> DeferredHumanGate | None:
         return None
 
 
+def unreadable_recorded_gates(stage: Stage) -> tuple[str, ...]:
+    """Which gates ``stage``'s ``sparring.md`` carries a marker for but that
+    do not parse: ``"human_gate"`` and/or ``"deferred_human_gate"``.
+
+    :func:`read_recorded_outcome` reads such a gate as absent, which is
+    right for display; a caller that must not mistake "unreadable" for
+    "none" (the legacy migration) asks this instead. A file that cannot be
+    read at all is reported as both."""
+
+    try:
+        text = stage.read_sparring()
+    except (StageError, OSError):
+        return ("human_gate", "deferred_human_gate")
+    found: list[str] = []
+    if HUMAN_GATE_MARKER in text and _recorded_gate(text) is None:
+        found.append("human_gate")
+    if DEFERRED_GATE_MARKER in text and _recorded_deferred_gate(text) is None:
+        found.append("deferred_human_gate")
+    return tuple(found)
+
+
 def _marked_json(text: str, marker: str) -> str | None:
     """The body of the first ```` ```json ```` fence after ``marker``."""
 

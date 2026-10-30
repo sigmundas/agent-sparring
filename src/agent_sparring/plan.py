@@ -299,7 +299,11 @@ from agent_sparring.review import (
 )
 from agent_sparring.human_gate import HumanCheck, HumanGate, new_gate_instance_id
 from agent_sparring.routing import RoutingAction, RoutingResult
-from agent_sparring.sparring_exchange import RecordedOutcome, read_recorded_outcome
+from agent_sparring.sparring_exchange import (
+    RecordedOutcome,
+    read_recorded_outcome,
+    unreadable_recorded_gates,
+)
 from agent_sparring.stage import (
     ACTIVITY_FILENAME,
     HUMAN_EVIDENCE_HEADING,
@@ -665,6 +669,13 @@ class PlanRunState:
     #: L-D1 rules (see :func:`_convert_legacy_ready`): ``{"stage", "sha",
     #: "pause", "at"}``. Provenance only; omitted while empty.
     legacy_push_pause_converted: tuple[dict[str, str], ...] = field(default_factory=tuple)
+    #: Each recorded incident pause a person answered (see
+    #: :func:`acknowledge_remote_movement`, :func:`authorize_pushed_candidate`):
+    #: ``{"kind", "stage", "candidate", "after_ready", "at"}`` -- the paused
+    #: candidate and whether the stage's recorded verdict was READY when it
+    #: was answered, so a pause raised after READY goes through the L-D1
+    #: conditions whatever tip the incident observed. Omitted while empty.
+    answered_incidents: tuple[dict[str, str], ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -701,6 +712,10 @@ class PlanRunState:
             payload["legacy_push_pause_converted"] = [dict(entry) for entry in self.legacy_push_pause_converted]
         else:
             payload.pop("legacy_push_pause_converted", None)
+        if self.answered_incidents:
+            payload["answered_incidents"] = [dict(entry) for entry in self.answered_incidents]
+        else:
+            payload.pop("answered_incidents", None)
         payload["deferred_human_checks"] = [
             obligation.to_dict() for obligation in self.deferred_human_checks
         ]
@@ -839,8 +854,11 @@ class PlanRunState:
                 config_snapshot=_snapshot_from(payload.get("config_snapshot")),
                 accepted_candidates=accepted_records_from(payload.get("accepted_candidates")),
                 sibling_snapshots=sibling_snapshots_from(payload.get("sibling_snapshots")),
-                legacy_push_pause_converted=_conversions_from(
-                    payload.get("legacy_push_pause_converted")
+                legacy_push_pause_converted=_string_records(
+                    payload.get("legacy_push_pause_converted"), "legacy_push_pause_converted"
+                ),
+                answered_incidents=_string_records(
+                    payload.get("answered_incidents"), "answered_incidents"
                 ),
             )
         except (PushError, DeferredGateError, GitContextError, RunHistoryError, SnapshotError) as exc:
@@ -874,11 +892,11 @@ def _snapshot_from(value: Any) -> tuple[tuple[str, str], ...] | None:
     return tuple((pair[0], pair[1]) for pair in value)
 
 
-def _conversions_from(value: Any) -> tuple[dict[str, str], ...]:
+def _string_records(value: Any, name: str) -> tuple[dict[str, str], ...]:
     if value is None:
         return ()
     if not isinstance(value, list) or not all(isinstance(entry, Mapping) for entry in value):
-        raise PlanError("malformed plan-run state: legacy_push_pause_converted must be an array of objects")
+        raise PlanError(f"malformed plan-run state: {name} must be an array of objects")
     return tuple({str(k): str(v) for k, v in entry.items()} for entry in value)
 
 
@@ -2721,6 +2739,9 @@ def authorize_pushed_candidate(
         )
     record = authorization_without_push(run=run_key, pause=pause, by=by or who())
     state.remote_records = state.remote_records + (record,)
+    state.answered_incidents = state.answered_incidents + (
+        _incident_provenance(sparring_dir, record, pause.candidate_sha),
+    )
     state.awaiting = None
     state.status = PlanRunStatus.PAUSED
     state.save(state_path)
@@ -2731,6 +2752,47 @@ def authorize_pushed_candidate(
         "is accepted only after the independent reviewer says READY for this commit."
     )
     return record
+
+
+def _reviewed_head(stage: Stage) -> str | None:
+    """The commit ``stage``'s recorded review was over, from engine records:
+    the review record, else the ``next_turn`` marker's candidate."""
+
+    try:
+        state = stage.read_state()
+    except StageError:
+        return None
+    if state.review is not None and state.review.head_sha:
+        return state.review.head_sha
+    candidate = state.next_turn_candidate
+    return candidate.head_sha if candidate is not None else None
+
+
+def _incident_provenance(sparring_dir: Path, record: RemoteRecord, paused: str | None) -> dict[str, str]:
+    """What an answered incident pause was about, recorded with the answer:
+    its stage, the paused candidate (the pause's own, else the commit the
+    stage's recorded review was over), and whether the stage's recorded
+    verdict was READY then -- an incident raised after READY. Read from
+    engine records only; never the observed remote tip."""
+
+    stage_id = record.stage_id or ""
+    after_ready = False
+    reviewed = None
+    try:
+        stage = Stage.resolve(sparring_dir, stage_id)
+        if stage.exists() and stage.read_state().status is not StageStatus.ACCEPTED:
+            recorded = read_recorded_outcome(stage)
+            after_ready = recorded is not None and recorded.action is RoutingAction.READY
+            reviewed = _reviewed_head(stage)
+    except StageError:
+        pass
+    return {
+        "kind": record.kind,
+        "stage": stage_id,
+        "candidate": paused or reviewed or "",
+        "after_ready": "true" if after_ready else "false",
+        "at": record.recorded_at,
+    }
 
 
 def acknowledge_remote_movement(
@@ -2774,6 +2836,9 @@ def acknowledge_remote_movement(
         )
     record = acknowledgement(run=run_key, movement=movement, by=by or who())
     state.remote_records = state.remote_records + (record,)
+    state.answered_incidents = state.answered_incidents + (
+        _incident_provenance(sparring_dir, record, movement.candidate_sha),
+    )
     state.awaiting = None
     state.status = PlanRunStatus.PAUSED
     state.save(state_path)
@@ -4365,10 +4430,18 @@ def _legacy_ready_failures(
         failures.append((4, "promoted: " + ", ".join(entry.describe for entry in state.promoted_deferred)))
     if recorded is not None and recorded.promote_deferred:
         failures.append((4, "the recorded verdict promotes " + ", ".join(recorded.promote_deferred)))
+    unreadable = unreadable_recorded_gates(stage)
+    if "deferred_human_gate" in unreadable:
+        # Read as "no deferral" for display, but it may be an obligation the
+        # ledger would then never hold: an unreadable gate is not an absent one.
+        failures.append((5, "the recorded verdict carries a deferred human gate that cannot be read"))
     if recorded is not None and recorded.deferred_human_gate is not None and (
         recorded.deferred_human_gate.instance_id is None
     ):
         failures.append((5, "the recorded verdict defers a human gate that has no gate instance"))
+    if "human_gate" in unreadable:
+        failures.append((6, "the recorded verdict carries a human gate that cannot be read, so its "
+                            "checks cannot be shown answered"))
     try:
         histories = check_histories(parse_gate_answers(stage.read_notes()))
     except (StageError, OSError) as exc:
@@ -4462,12 +4535,20 @@ def _convert_legacy_ready(
 def _cleared_incident_after_ready(
     state: PlanRunState, sparring_dir: Path
 ) -> tuple[str, str, str] | None:
-    """``(stage id, candidate, answer kind)`` when the run's current stage is unaccepted,
-    its recorded verdict is READY, and a person has answered (and so
-    cleared) a recorded incident pause about that stage's candidate: an
-    incident raised after READY, which goes through the L-D1 conditions
-    rather than resuming the stage. ``None`` otherwise -- a pause raised
-    mid-loop resumes the stage normally."""
+    """``(stage id, paused candidate, answer kind)`` when the run's current
+    stage is unaccepted, its recorded verdict is READY, and a person has
+    answered (and so cleared) a recorded incident pause raised after that
+    READY: it then goes through the L-D1 conditions rather than resuming the
+    stage. ``None`` otherwise -- a pause raised mid-loop resumes the stage
+    normally.
+
+    "Raised after READY" is the provenance recorded with the answer
+    (:attr:`PlanRunState.answered_incidents`): never the remote tip the
+    incident observed, which can be any commit or none. An answer an older
+    engine recorded without provenance is treated strictly: with READY
+    recorded, it goes through the conditions too, against the paused
+    candidate or the commit the review was over. The candidate is ``""``
+    when none can be established, which the conditions then refuse."""
 
     if state.awaiting is not None:
         return None
@@ -4475,21 +4556,22 @@ def _cleared_incident_after_ready(
         stage = Stage.resolve(sparring_dir, state.current_stage)
         if not stage.exists() or stage.read_state().status is StageStatus.ACCEPTED:
             return None
-        review = stage.read_state().review
     except StageError:
         return None
     recorded = read_recorded_outcome(stage)
     if recorded is None or recorded.action is not RoutingAction.READY:
         return None
-    reviewed = review.head_sha if review is not None else None
+    answered = [entry for entry in state.answered_incidents if entry.get("stage") == state.current_stage]
+    if answered:
+        last = answered[-1]
+        if last.get("after_ready") != "true":
+            return None
+        return state.current_stage, last.get("candidate") or "", last.get("kind") or ""
     for record in reversed(state.remote_records):
-        if record.kind not in (MOVEMENT_ACKNOWLEDGED, AUTHORIZED_WITHOUT_PUSH):
-            continue
-        if record.stage_id != state.current_stage:
-            continue
-        sha = record.candidate_sha or record.tip
-        if sha is not None and reviewed is not None and sha == reviewed:
-            return state.current_stage, sha, record.kind
+        if record.kind in (MOVEMENT_ACKNOWLEDGED, AUTHORIZED_WITHOUT_PUSH) and (
+            record.stage_id == state.current_stage
+        ):
+            return state.current_stage, record.candidate_sha or _reviewed_head(stage) or "", record.kind
     return None
 
 

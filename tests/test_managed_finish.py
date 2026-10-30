@@ -652,7 +652,9 @@ class FinishExecutionTests(_FinishTestCase):
         real_git = managed_run._git
 
         def failing_branch_delete(cwd, *args):
-            if args[:2] == ("branch", "-d"):
+            # Plan L Stage 4: the branch is deleted by a compare-and-delete
+            # of its ref (was: git branch -d in the target checkout).
+            if args[:2] == ("update-ref", "-d") and args[2] == f"refs/heads/{record.branch}":
                 return subprocess.CompletedProcess(args, 1, "", "simulated failure")
             return real_git(cwd, *args)
 

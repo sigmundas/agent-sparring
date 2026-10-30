@@ -1326,13 +1326,16 @@ def _finish_locked(
             raise _StepFailed("delete_branch", f"{record.target_branch} does not contain {candidate}")
         if tip != candidate:
             raise _StepFailed("delete_branch", f"{record.branch} is at {tip}, not the merged candidate {candidate}")
-        checkout = next(
-            (e["path"] for e in managed_run.worktree_list(repo_root) if e["branch"] == record.target_branch), None
-        )
-        if checkout is not None:
-            result = managed_run._git(Path(checkout), "branch", "-d", record.branch)
-        else:
-            result = managed_run._git(repo_root, "update-ref", "-d", branch_ref, candidate)
+        checked_out = [e["path"] for e in managed_run.worktree_list(repo_root) if e["branch"] == record.branch]
+        if checked_out:
+            raise _StepFailed(
+                "delete_branch", f"{record.branch} is checked out at {', '.join(checked_out)}; it is kept"
+            )
+        # Decided by the local target verified above and the exact tip, never
+        # by `git branch -d`, whose "merged" check prefers the branch's
+        # configured upstream -- a remote-tracking ref this finish never
+        # reads. The delete itself is a compare-and-delete on the candidate.
+        result = managed_run._git(repo_root, "update-ref", "-d", branch_ref, candidate)
         if result.returncode != 0:
             raise _StepFailed("delete_branch", f"the branch could not be deleted: {result.stderr.strip()}")
     if not _events(record, "branch_deleted"):
