@@ -3,10 +3,11 @@
 What these tests hold, one sentence each:
 
 - a legacy run the engine's record outside the project directory calls
-  pinned, whose pin is gone (state deleted, ``remote_pin`` removed, or a
-  legacy-shaped state in its place), refuses ``finish-run`` with
-  ``remote_pin_missing`` (exit 3) and touches no ref of either remote
-  (Stage 4 of Plan L replaces this with the run-state integrity refusal);
+  pinned, whose pin is gone (state deleted or unreadable, ``remote_pin``
+  removed or malformed, or a legacy-shaped state in its place), refuses
+  ``finish-run`` with the run-state integrity refusal
+  (``trusted_config_missing``, exit 3) and touches no ref anywhere;
+  ``--push-target`` refuses with ``remote_finish_removed`` (Plan L Stage 4);
 - Plan L: freeze/accept resolve a stage's owner from engine run state and
   are decided locally -- reachability is never an input -- but never
   unguarded: a trusted snapshot (a legacy pin's) that is gone or damaged
@@ -32,7 +33,9 @@ from unittest import mock
 import conftest_path  # noqa: F401
 
 from agent_sparring import acceptance, engine_git, managed_run
+from agent_sparring.capabilities import REMOTE_FINISH_REMOVED
 from agent_sparring.cli import main
+from agent_sparring.trusted_snapshots import TRUSTED_CONFIG_MISSING
 from agent_sparring.plan import PlanError, PlanRunError, PlanRunStatus, resume_plan
 from agent_sparring.providers import ProviderError
 from agent_sparring.remote_pin import (
@@ -54,8 +57,17 @@ from test_plan import READY, S1, _SparringAdapter, _StageAdapter, _fixed, _head_
 
 
 class FinishWithoutThePinTests(_FinishTestCase):
-    """``finish-run --push-target`` of a pinned managed run, with a planted
-    ``pushurl`` it would otherwise follow."""
+    """``finish-run`` of a legacy pinned managed run, with a planted
+    ``pushurl`` a remote finish would have followed.
+
+    Plan L Stage 4 (see "The seven failing tests"): the finish is local, so
+    the reason a damaged run state refuses is the run-state integrity
+    refusal (``trusted_config_missing``: the run's trusted configuration
+    snapshot -- a legacy run's is its pin's -- is gone), not a missing push
+    authority. Nothing is merged and no ref changes anywhere. A damaged
+    pin is inert: ``--push-target`` refuses with ``remote_finish_removed``,
+    and the local finish contacts no remote. The original property (no
+    remote write without an intact pin) passes to Plan P."""
 
     LEGACY_PIN = True
 
@@ -85,15 +97,22 @@ class FinishWithoutThePinTests(_FinishTestCase):
         _run_git(self.repo, "remote", "set-url", "--push", "origin", str(mirror))
         before = self._refs_everywhere(mirror)
 
-        code, report, err = self._finish(record, "--push-target")
+        recorder = GitRecorder(self.repo.parent)
+        with recorder.active():
+            flagged, flagged_report, flagged_err = self._finish(record, "--push-target")
+            code, report, err = self._finish(record)
 
         # 3: refused by its checks (docs/plans.md, finish-run).
+        self.assertEqual((flagged, flagged_report["stopped_at"]), (3, "checks"), flagged_err)
+        self.assertIn(REMOTE_FINISH_REMOVED, flagged_report["reason"])
         self.assertEqual(code, 3, err)
         self.assertEqual(report["stopped_at"], "checks")
-        self.assertIn(REMOTE_PIN_MISSING, report["reason"])
+        self.assertIn(TRUSTED_CONFIG_MISSING, report["reason"])
+        self.assertNotIn(REMOTE_PIN_MISSING, report["reason"])
         self.assertEqual(report["completed_steps"], [])
         # Nothing merged, pushed or deleted: every ref of both remotes, and
         # of the repository itself, is as it was.
+        self.assertEqual(recorder.remote_commands(), [])
         self.assertEqual(self._refs_everywhere(mirror), before)
         self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
         self.assertNotIn("merged", self._events(record))
@@ -103,6 +122,7 @@ class FinishWithoutThePinTests(_FinishTestCase):
         self._refused(lambda path: path.unlink())
 
     def test_the_pin_removed_from_the_state(self):
+        # The remote half is obsolete (Plan P); a damaged legacy pin is inert.
         def drop_pin(path: Path) -> None:
             payload = json.loads(path.read_text(encoding="utf-8"))
             payload.pop("remote_pin")
@@ -137,33 +157,28 @@ class FinishWithoutThePinTests(_FinishTestCase):
 
     def test_an_intact_pin_finishes_and_the_mirror_stays_empty(self):
         # Positive control for the five refusals above: the same run, its
-        # pin intact and no pushurl planted, is not refused for a missing
-        # pin -- so their remote_pin_missing is the damage, not a fixture
-        # that always says so.
+        # pin intact and no pushurl planted, is not refused -- so their
+        # trusted_config_missing is the damage, not a fixture that always
+        # says so.
         #
-        # Plan L Stage 3 (I-L1): engine_git refuses every remote command, so
-        # this legacy remote finish no longer pushes (was: exit 0, merged,
-        # origin's main at the candidate). Its remote check is refused
-        # before anything runs and the finish stops at its checks with the
-        # typed refusal; no ref of either remote changes. Stage 4 replaces
-        # --push-target with remote_finish_removed.
+        # Plan L Stage 4: the finish is local. The intact legacy run
+        # finishes (exit 0, merged into the local main); no remote is
+        # contacted, origin's refs are unchanged and the mirror stays empty.
         record, head = self._complete()
         self.assertTrue(managed_run.read_record(self.repo, record.run_key).pinned)
         mirror = self._mirror()
-        before = self._refs_everywhere(mirror)
+        remote_before = _git(self.remote, "for-each-ref")
 
-        code, report, err = self._finish(record, "--push-target")
+        recorder = GitRecorder(self.repo.parent)
+        with recorder.active():
+            code, report, err = self._finish(record)
 
-        self.assertEqual(code, 3, err)
-        self.assertEqual(report["stopped_at"], "checks")
-        self.assertNotIn(REMOTE_PIN_MISSING, report["reason"])
-        self.assertIn("candidate_not_pushed", report["reason"])
-        failed, finish = self._failed(record)
-        self.assertEqual(failed, {"candidate_not_pushed"})
-        (check,) = [c for c in finish["checks"] if c["code"] == "candidate_not_pushed"]
-        self.assertIn("remote_operation_not_allowed", check["detail"])
-        self.assertNotIn("merged", self._events(record))
-        self.assertEqual(self._refs_everywhere(mirror), before)
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(report["stopped_at"])
+        self.assertIn("merged", self._events(record))
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), head)
+        self.assertEqual(recorder.remote_commands(), [])
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
         self.assertEqual(_git(mirror, "for-each-ref"), "")
 
     def test_a_record_from_before_pins_is_the_one_unguarded_case(self):

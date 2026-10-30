@@ -173,6 +173,7 @@ from agent_sparring.acceptance import (
     accept_candidate,
     accept_reviewed_candidate,
     freeze_candidate,
+    recorded_ready_problems,
     sibling_root,
 )
 from agent_sparring.activity import ActivityEmitter
@@ -199,6 +200,7 @@ from agent_sparring.deferred_gate import (
 )
 from agent_sparring.finalization import FinalizationError, pending_finalization
 from agent_sparring.gate_answers import (
+    check_histories,
     is_repeat_asking,
     parse_gate_answers,
     repeat_asking_count,
@@ -242,6 +244,7 @@ from agent_sparring import engine_git
 from agent_sparring.remote_pin import (
     ABSENT,
     AUTHORIZED_WITHOUT_PUSH,
+    MOVEMENT_ACKNOWLEDGED,
     PUSHED_CANDIDATE_UNAUTHORIZED,
     UNAUTHORIZED_REMOTE_MOVEMENT,
     PushedCandidateUnauthorized,
@@ -658,6 +661,10 @@ class PlanRunState:
     #: :mod:`agent_sparring.run_history`): its accepted history, which only
     #: grows. Omitted while empty.
     accepted_candidates: tuple[AcceptedCandidate, ...] = field(default_factory=tuple)
+    #: Each legacy pause this run converted into local acceptance under the
+    #: L-D1 rules (see :func:`_convert_legacy_ready`): ``{"stage", "sha",
+    #: "pause", "at"}``. Provenance only; omitted while empty.
+    legacy_push_pause_converted: tuple[dict[str, str], ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -690,6 +697,10 @@ class PlanRunState:
             payload["sibling_snapshots"] = [entry.to_dict() for entry in self.sibling_snapshots]
         else:
             payload.pop("sibling_snapshots", None)
+        if self.legacy_push_pause_converted:
+            payload["legacy_push_pause_converted"] = [dict(entry) for entry in self.legacy_push_pause_converted]
+        else:
+            payload.pop("legacy_push_pause_converted", None)
         payload["deferred_human_checks"] = [
             obligation.to_dict() for obligation in self.deferred_human_checks
         ]
@@ -828,6 +839,9 @@ class PlanRunState:
                 config_snapshot=_snapshot_from(payload.get("config_snapshot")),
                 accepted_candidates=accepted_records_from(payload.get("accepted_candidates")),
                 sibling_snapshots=sibling_snapshots_from(payload.get("sibling_snapshots")),
+                legacy_push_pause_converted=_conversions_from(
+                    payload.get("legacy_push_pause_converted")
+                ),
             )
         except (PushError, DeferredGateError, GitContextError, RunHistoryError, SnapshotError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -858,6 +872,14 @@ def _snapshot_from(value: Any) -> tuple[tuple[str, str], ...] | None:
     ):
         raise PlanError("malformed plan-run state: config_snapshot must be an array of [key, value]")
     return tuple((pair[0], pair[1]) for pair in value)
+
+
+def _conversions_from(value: Any) -> tuple[dict[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(entry, Mapping) for entry in value):
+        raise PlanError("malformed plan-run state: legacy_push_pause_converted must be an array of objects")
+    return tuple({str(k): str(v) for k, v in entry.items()} for entry in value)
 
 
 def _managed_flag(value: Any) -> bool:
@@ -2067,9 +2089,12 @@ def resume_plan(
     with ``push_permission_deprecated`` and ``allow_push_for_run`` with
     ``push_not_part_of_runs``, before anything is read or changed (see
     :mod:`agent_sparring.capabilities`); neither is ever an alias for local
-    progression. A run an older engine paused for push permission stays
-    paused on that recorded reason: a push-only permission never becomes
-    acceptance of anything.
+    progression. A run an older engine paused for push permission converts
+    only on a plain resume, and only when every L-D1 condition holds
+    (:data:`LEGACY_CONDITIONS`): its stage is then accepted locally and
+    ``legacy_push_pause_converted`` recorded. Otherwise it stays paused on
+    that recorded reason, with the failed conditions named: a push-only
+    permission never becomes acceptance of unreviewed code.
 
     An ordinary resume obeys the current stage's recorded ``next_turn``
     (see :mod:`agent_sparring.next_turn`): ``sparring`` reviews the recorded
@@ -2160,7 +2185,17 @@ def resume_plan(
         # of what makes a rerun of the same document a different run: its
         # stages are namespaced by whichever run owns them.
         source = source.in_namespace(owner.key)
-    stages = _verify_source_unchanged(source, state)
+    try:
+        stages = _verify_source_unchanged(source, state)
+    except PlanError as exc:
+        if isinstance(state.awaiting, PushRequired):
+            raise PlanError(
+                f"plan run {owner.key}: the {PUSH_AUTHORIZATION_REQUIRED} pause of stage "
+                f"{state.awaiting.stage_id!r} was not converted, because legacy migration (L-D1) "
+                f"condition 3 ({LEGACY_CONDITIONS[3]}) does not hold: {exc}. Nothing was run, "
+                "pushed, frozen or accepted, and the pause stays."
+            ) from exc
+        raise
     if not 0 <= state.current_stage_index < len(stages):
         raise PlanError(
             f"recorded stage index {state.current_stage_index} is out of range for "
@@ -4259,6 +4294,205 @@ def _require_plan_unchanged(
         ) from exc
 
 
+#: Recorded in the run state, and reported, when a legacy pause converts.
+LEGACY_PUSH_PAUSE_CONVERTED = "legacy_push_pause_converted"
+
+#: The L-D1 conditions, each verified at conversion and never assumed, by the
+#: number a refusal names.
+LEGACY_CONDITIONS = {
+    1: "the run is paused on exactly that pause, for its current stage, which is not accepted",
+    2: "the recorded verdict is READY, over exactly the paused candidate, the HEAD of the "
+       "expected branch",
+    3: "the tree is clean apart from stage artifacts, every sibling is at its recorded "
+       "candidate, and the plan is unchanged",
+    4: "no deferred obligation is promoted, and the recorded verdict promotes none",
+    5: "the recorded verdict has no deferred gate without a gate instance",
+    6: "every human check of the stage's recorded gate is answered Pass",
+}
+
+
+class _ConversionRefused(Exception):
+    """The acceptance gate refused a conversion whose conditions held."""
+
+
+def _legacy_ready_failures(
+    source: PlanSource,
+    stages: tuple[PlannedStage, ...],
+    state: PlanRunState,
+    sparring_dir: Path,
+    repo_root: Path,
+    *,
+    stage_id: str,
+    candidate_sha: str,
+) -> list[tuple[int, str]]:
+    """Every L-D1 condition that does not hold for converting ``stage_id``'s
+    recorded READY over ``candidate_sha`` into local acceptance, as
+    ``(condition, detail)``. Read-only. Condition 1's "exactly that pause"
+    is the caller's (the pause it holds); the rest is checked here."""
+
+    current = stages[state.current_stage_index]
+    if stage_id != state.current_stage or stage_id != current.stage_id:
+        return [(1, f"the pause is for stage {stage_id!r}, but the run is at {state.current_stage!r}")]
+    if current.review_only:
+        return [(1, f"stage {stage_id!r} is review-only; it has no candidate a push pause covers")]
+    try:
+        stage = Stage.resolve(sparring_dir, stage_id)
+        stage_state = stage.read_state() if stage.exists() else None
+    except StageError as exc:
+        return [(1, f"stage {stage_id!r} cannot be read: {exc}")]
+    if stage_state is None:
+        return [(1, f"stage {stage_id!r} does not exist")]
+    if stage_state.status is StageStatus.ACCEPTED:
+        return [(1, f"stage {stage_id!r} is already ACCEPTED")]
+
+    failures: list[tuple[int, str]] = []
+    recorded = read_recorded_outcome(stage)
+    if recorded is None or recorded.action is not RoutingAction.READY:
+        failures.append((
+            2, "the recorded verdict is "
+            + (recorded.action.value if recorded is not None else "absent or unreadable") + ", not READY",
+        ))
+    if stage_state.review is not None and stage_state.review.action != RoutingAction.READY.value:
+        failures.append((2, f"the engine-recorded review is {stage_state.review.action}, not READY"))
+    failures.extend(recorded_ready_problems(
+        stage, repo_root, expected_branch=state.expected_branch, candidate_sha=candidate_sha
+    ))
+    try:
+        _verify_source_unchanged(source, state)
+    except PlanError as exc:
+        failures.append((3, str(exc)))
+    if state.promoted_deferred:
+        failures.append((4, "promoted: " + ", ".join(entry.describe for entry in state.promoted_deferred)))
+    if recorded is not None and recorded.promote_deferred:
+        failures.append((4, "the recorded verdict promotes " + ", ".join(recorded.promote_deferred)))
+    if recorded is not None and recorded.deferred_human_gate is not None and (
+        recorded.deferred_human_gate.instance_id is None
+    ):
+        failures.append((5, "the recorded verdict defers a human gate that has no gate instance"))
+    try:
+        histories = check_histories(parse_gate_answers(stage.read_notes()))
+    except (StageError, OSError) as exc:
+        failures.append((6, f"the stage's human answers cannot be read: {exc}"))
+    else:
+        gate = recorded.human_gate if recorded is not None else None
+        named = [check.id for check in gate.checks] if gate is not None else []
+        for check_id in [*named, *(check_id for check_id in histories if check_id not in named)]:
+            history = histories.get(check_id)
+            if history is None:
+                failures.append((6, f"check {check_id!r} is unanswered"))
+            elif history.latest.outcome is not CheckOutcome.PASS:
+                failures.append((6, f"check {check_id!r} was last answered {history.latest.outcome.value}"))
+    return sorted(failures, key=lambda failure: failure[0])
+
+
+def _convert_legacy_ready(
+    source: PlanSource,
+    stages: tuple[PlannedStage, ...],
+    state: PlanRunState,
+    state_path: Path,
+    sparring_dir: Path,
+    repo_root: Path,
+    *,
+    stage_id: str,
+    candidate_sha: str,
+    pause: str,
+    report: Reporter,
+) -> PlanRunResult | None:
+    """Convert a legacy pause raised after READY into local acceptance (L-D1),
+    or leave it: ``None`` when converted (the caller then runs the ordinary
+    post-READY sequence over the accepted stage), else the paused result.
+
+    Only when every condition in :data:`LEGACY_CONDITIONS` holds, each
+    verified here. Then the stage is frozen and accepted locally by the
+    unchanged acceptance gate (I-L2, I-L2b), the pause is cleared and
+    ``legacy_push_pause_converted`` is recorded, together or not at all.
+    Otherwise nothing is written, pushed or granted, the stage is never
+    re-entered as an implementation turn, and the report names each failed
+    condition."""
+
+    key = _RunOwner.of(state).key
+
+    def stays(why: str) -> PlanRunResult:
+        report(
+            f"plan {state.plan}: the {pause} pause of stage {stage_id!r} for {candidate_sha} was not "
+            f"converted, {why}. Nothing was run, pushed, frozen or accepted, and the pause stays."
+        )
+        return PlanRunResult(
+            status=PlanRunStatus.PAUSED, plan=state.plan, run=key, stage_id=stage_id, awaiting=state.awaiting
+        )
+
+    failures = _legacy_ready_failures(
+        source, stages, state, sparring_dir, repo_root, stage_id=stage_id, candidate_sha=candidate_sha
+    )
+    if failures:
+        return stays("because these legacy migration (L-D1) conditions do not hold: " + "; ".join(
+            f"condition {number} ({LEGACY_CONDITIONS[number]}): {detail}" for number, detail in failures
+        ))
+    stage = Stage.resolve(sparring_dir, stage_id)
+    try:
+        with _rolled_back_on_failure((Path(state_path), stage.directory / STATE_FILENAME)):
+            try:
+                freeze_candidate(stage, sparring_dir, repo_root, expected_branch=state.expected_branch)
+                result = accept_candidate(stage, repo_root, expected_branch=state.expected_branch)
+            except AcceptanceError as exc:
+                raise _ConversionRefused(str(exc)) from exc
+            if result.candidate_sha != candidate_sha:
+                raise _ConversionRefused(f"the gate accepted {result.candidate_sha}, not {candidate_sha}")
+            state.awaiting = None
+            state.legacy_push_pause_converted = state.legacy_push_pause_converted + ({
+                "stage": stage_id,
+                "sha": candidate_sha,
+                "pause": pause,
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },)
+            state.save(state_path)
+    except _ConversionRefused as exc:
+        return stays(f"because the acceptance gate refused it ({exc})")
+    _plan_emitter(stage).emit("plan.legacy_pause_converted", sha=candidate_sha)
+    report(
+        f"plan {state.plan}: {LEGACY_PUSH_PAUSE_CONVERTED}: the {pause} pause of stage {stage_id!r}, "
+        f"recorded by an engine from before runs were local-first, was converted: the reviewer's "
+        f"READY is over exactly {candidate_sha} and every legacy migration condition holds, so it "
+        "was frozen and accepted locally. Nothing was pushed, and no push permission was taken as "
+        "acceptance."
+    )
+    return None
+
+
+def _cleared_incident_after_ready(
+    state: PlanRunState, sparring_dir: Path
+) -> tuple[str, str, str] | None:
+    """``(stage id, candidate, answer kind)`` when the run's current stage is unaccepted,
+    its recorded verdict is READY, and a person has answered (and so
+    cleared) a recorded incident pause about that stage's candidate: an
+    incident raised after READY, which goes through the L-D1 conditions
+    rather than resuming the stage. ``None`` otherwise -- a pause raised
+    mid-loop resumes the stage normally."""
+
+    if state.awaiting is not None:
+        return None
+    try:
+        stage = Stage.resolve(sparring_dir, state.current_stage)
+        if not stage.exists() or stage.read_state().status is StageStatus.ACCEPTED:
+            return None
+        review = stage.read_state().review
+    except StageError:
+        return None
+    recorded = read_recorded_outcome(stage)
+    if recorded is None or recorded.action is not RoutingAction.READY:
+        return None
+    reviewed = review.head_sha if review is not None else None
+    for record in reversed(state.remote_records):
+        if record.kind not in (MOVEMENT_ACKNOWLEDGED, AUTHORIZED_WITHOUT_PUSH):
+            continue
+        if record.stage_id != state.current_stage:
+            continue
+        sha = record.candidate_sha or record.tip
+        if sha is not None and reviewed is not None and sha == reviewed:
+            return state.current_stage, sha, record.kind
+    return None
+
+
 def _drive(
     source: PlanSource,
     stages: tuple[PlannedStage, ...],
@@ -4272,35 +4506,42 @@ def _drive(
     """:func:`_drive_pinned`, held to the run's trusted Git configuration.
 
     Runs are local-first, so no run reaches a remote pause any more; the
-    ones an older engine recorded are kept until a person resolves them
-    explicitly. A run paused on unauthorized remote movement stays paused:
-    nothing -- not evidence, not a resume -- moves it on except an explicit
+    ones an older engine recorded are kept until resolved explicitly.
+
+    A run paused for push permission (``push_authorization_required``)
+    converts on a plain resume only under every L-D1 condition
+    (:func:`_convert_legacy_ready`): its stage is then accepted locally and
+    the ordinary post-READY sequence runs. Otherwise it stays paused on that
+    reason, with the failed conditions named: nothing is pushed, and a push
+    permission never becomes acceptance.
+
+    A run paused on unauthorized remote movement stays paused: nothing --
+    not evidence, not a resume -- moves it on except an explicit
     acknowledgement (:func:`acknowledge_remote_movement`). A run paused on a
     pushed candidate likewise, except the explicit per-commit authorization
-    (:func:`authorize_pushed_candidate`). A run paused for push permission
-    stays paused on that reason: nothing is pushed, and a push permission
-    never becomes acceptance. Neither resolution is ever a review or an
-    acceptance.
+    (:func:`authorize_pushed_candidate`). Neither resolution is ever a
+    review or an acceptance: it clears only that pause. A pause that was
+    raised mid-loop then resumes the stage normally; one raised after READY
+    goes through the same L-D1 conditions on a plain resume.
     """
 
+    report_legacy: Reporter = kwargs.get("report") or (lambda message: None)
+    plain = not (
+        kwargs.get("sparrer_first") or kwargs.get("next_turn_choice") or kwargs.get("fresh_roles")
+    )
+    legacy_ready: tuple[str, str, str] | None = None
     if isinstance(state.awaiting, PushRequired):
-        # Left as recorded: not even re-saved.
-        legacy = state.awaiting
-        report_legacy: Reporter = kwargs.get("report") or (lambda message: None)
-        report_legacy(
-            f"plan {state.plan}: still paused on {PUSH_AUTHORIZATION_REQUIRED} for "
-            f"{legacy.candidate_sha} of stage {legacy.stage_id!r}, recorded by an engine from "
-            "before runs were local-first. Runs no longer push, and a push permission is never "
-            "taken as acceptance, so this pause is left exactly as it was: nothing was run, "
-            "pushed, frozen or accepted."
+        legacy_ready = (state.awaiting.stage_id, state.awaiting.candidate_sha, PUSH_AUTHORIZATION_REQUIRED)
+    elif plain:
+        legacy_ready = _cleared_incident_after_ready(state, sparring_dir)
+    if legacy_ready is not None:
+        stage_id, candidate_sha, pause = legacy_ready
+        stayed = _convert_legacy_ready(
+            source, stages, state, state_path, sparring_dir, repo_root,
+            stage_id=stage_id, candidate_sha=candidate_sha, pause=pause, report=report_legacy,
         )
-        return PlanRunResult(
-            status=PlanRunStatus.PAUSED,
-            plan=state.plan,
-            run=_RunOwner.of(state).key,
-            stage_id=legacy.stage_id,
-            awaiting=legacy,
-        )
+        if stayed is not None:
+            return stayed
     movement = state.awaiting
     if isinstance(movement, (UnauthorizedRemoteMovement, PushedCandidateUnauthorized)):
         _pause(state, state_path)

@@ -51,10 +51,14 @@ class ProjectConfig:
     # not opt in -- every migration command then refuses with a clear
     # "not configured" message rather than guessing a default.
     migrations: "MigrationsConfig | None" = None
-    # ``[finish] delete_remote_branch``: ``finish-run`` deletes the remote
-    # managed branch with a compare-and-delete lease on the merged candidate
-    # (see ``managed_finish``). Read from the reviewed candidate's config.
+    # ``[finish] delete_remote_branch``: retired (Plan L). ``finish-run`` is
+    # local and deletes no remote branch, so a reviewed candidate whose config
+    # sets it true is refused with ``remote_finish_removed`` (see
+    # ``managed_finish``), and ``check-config`` reports any config that still
+    # sets it (``finish_delete_remote_branch_set``). Still parsed, so an older
+    # config is reported rather than rejected as unknown.
     finish_delete_remote_branch: bool = False
+    finish_delete_remote_branch_set: bool = False
     # ``[finish] remove_plan``: ``finish-run`` commits the removal of the plan
     # file on the target, only when its bytes match the run's start snapshot.
     finish_remove_plan: bool = False
@@ -338,6 +342,7 @@ def parse_project_config(raw: bytes | str, *, source: str = "project.toml") -> P
         obsolete_agent_settings=obsolete,
         migrations=migrations,
         finish_delete_remote_branch=bool(delete_remote),
+        finish_delete_remote_branch_set=delete_remote is not None,
         finish_remove_plan=bool(remove_plan),
     )
 

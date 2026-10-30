@@ -1,5 +1,3 @@
-import contextlib
-import functools
 import hashlib
 import json
 import os
@@ -11,7 +9,7 @@ from pathlib import Path
 
 import conftest_path  # noqa: F401
 
-from agent_sparring import engine_git, managed_finish, managed_run
+from agent_sparring import managed_finish, managed_run
 from agent_sparring.concurrency import worktree_lock
 from agent_sparring.plan import MarkdownPlanSource, PlanRunState, PlanRunStatus, load_plan_source
 from agent_sparring.stage import Stage, StageStatus
@@ -21,38 +19,12 @@ from test_managed_run import _git, _ManagedRepoTestCase
 from test_plan import _run_git
 
 
-@contextlib.contextmanager
-def remote_finish_allowed_in_test():
-    """Disable the I-L1 remote refusal, in this test only.
-
-    Plan L Stage 3: ``engine_git.run`` refuses every remote command, so a
-    legacy pinned run's remote finish -- its pushed check, ``--push-target``
-    and ``[finish] delete_remote_branch`` -- can no longer run (Stage 4
-    replaces it with ``remote_finish_removed``). Until that code is removed,
-    its own properties (the lease form, races, rejection handling,
-    retargeting) stay tested by running it with the refusal and the
-    transport protections (``LOCAL_OVERRIDES``, ``LOCAL_ENVIRONMENT``)
-    patched out here. That production
-    refuses the same finish, contacting nothing, is
-    :class:`LegacyRemoteFinishRefusedTests`."""
-
-    with mock.patch.object(engine_git, "remote_form", return_value=None), \
-            mock.patch.object(engine_git, "LOCAL_OVERRIDES", ()), \
-            mock.patch.object(engine_git, "LOCAL_ENVIRONMENT", {}):
-        yield
-
-
-def legacy_remote_finish(test):
-    """Run ``test`` on a legacy pinned run, with
-    :func:`remote_finish_allowed_in_test`."""
-
-    @functools.wraps(test)
-    def wrapper(self, *args, **kwargs):
-        self.LEGACY_PIN = True
-        with remote_finish_allowed_in_test():
-            return test(self, *args, **kwargs)
-
-    return wrapper
+#: Plan L Stage 4: finish-run is local. The remote finish -- the pushed
+#: check, ``--push-target`` and ``[finish] delete_remote_branch`` -- is gone
+#: from the engine, and with it the test-only switch that ran it with the
+#: I-L1 refusal patched out. Each test of it is converted or removed with
+#: its named replacement in the Stage 4 handoff; what remains of the
+#: properties is :class:`RemoteFinishRemovedTests`.
 
 
 class _FinishTestCase(_ManagedRepoTestCase):
@@ -62,9 +34,9 @@ class _FinishTestCase(_ManagedRepoTestCase):
         remote pin taken at its start (with that pin's trusted snapshot)
         instead of a local-first run's own snapshot.
 
-        Plan L: local-first runs pin nothing, and finish of such a run is
-        Stage 4's. Until then these tests keep proving what finish does for
-        a pinned (legacy) run -- the remote finish, its pin and its guard."""
+        Plan L: local-first runs pin nothing. A legacy run's pin loads
+        inertly: finish reads only the trusted snapshot it carries, as the
+        run's local configuration guard, and never its remote."""
 
         from legacy_pins import legacy_pin
 
@@ -81,8 +53,6 @@ class _FinishTestCase(_ManagedRepoTestCase):
         # record either.
         managed_run.snapshot_flag_path(self.repo, record.run_key).unlink(missing_ok=True)
 
-    #: Plan L Stage 3: engine_git refuses every remote command, so a legacy
-    #: pinned run's finish (which reads the remote) stops at its checks.
     #: Runs are local-first by default; a class about legacy runs sets this.
     LEGACY_PIN = False
 
@@ -165,12 +135,17 @@ class ManagedFinishTests(_FinishTestCase):
         self.assertEqual(git["branch_tip"], head)
         self.assertEqual(git["final_candidate"], head)
         self.assertTrue(git["clean"])
-        # Plan L Stage 3: a local-first run's finish reads no remote (was:
-        # git["candidate_pushed"] true, read from origin). The legacy pushed
-        # check is test_candidate_not_pushed.
+        # Plan L: a finish reads no remote (was: git["candidate_pushed"]
+        # true, read from origin). Stage 4: there is no candidate_not_pushed
+        # check at all and nothing is kept on a remote; the local history and
+        # the no-remote-finish checks hold.
         self.assertIsNone(git["candidate_pushed"])
-        (pushed,) = [c for c in finish["checks"] if c["code"] == "candidate_not_pushed"]
-        self.assertEqual((pushed["ok"], pushed["detail"]), (True, "local-first run: no remote is required or read"))
+        codes = {c["code"]: c for c in finish["checks"]}
+        self.assertNotIn("candidate_not_pushed", codes)
+        self.assertTrue(codes["run_history_rewritten"]["ok"])
+        self.assertTrue(codes["remote_finish_removed"]["ok"])
+        self.assertEqual(finish["kept"], [])
+        self.assertEqual(git["siblings"], [])
         self.assertFalse(git["target_contains_candidate"])
         self.assertEqual(git["target_checked_out_at"], str(self.repo.resolve()))
 
@@ -272,45 +247,50 @@ class ManagedFinishTests(_FinishTestCase):
         failed, _ = self._failed(record)
         self.assertEqual(failed, {"candidate_mismatch"})
 
-    @legacy_remote_finish
-    def test_candidate_not_pushed(self):
-        record, _ = self._complete(push=False)
+    def test_an_unpushed_candidate_of_a_legacy_pinned_run_is_eligible_locally(self):
+        # Converted from test_candidate_not_pushed (Plan L Stage 4): a legacy
+        # pinned run's unpushed candidate was refused candidate_not_pushed.
+        # Now the pin is inert and nothing remote is an input: the finish is
+        # eligible on the local checks alone, and status reads no remote.
+        record, head = self._complete(push=False, legacy_pin=True)
         self.assertEqual(record.remote, "origin")
-        status = self._status(record)
+        remote_before = _git(self.remote, "for-each-ref")
+        recorder = GitRecorder(self.repo.parent)
+        with recorder.active():
+            status = self._status(record)
         failed = {c["code"] for c in status["finish"]["checks"] if not c["ok"]}
-        self.assertEqual(failed, {"candidate_not_pushed"})
-        self.assertFalse(status["git"]["candidate_pushed"])
-        _run_git(Path(record.worktree_path), "push", "-q", "origin", record.branch)
-        status = self._status(record)
-        self.assertTrue(status["git"]["candidate_pushed"])
-        self.assertTrue(status["finish"]["eligible"]["merge"])
+        self.assertEqual(failed, set())
+        self.assertEqual(status["finish"]["eligible"], {"merge": True, "cleanup": True})
+        self.assertIsNone(status["git"]["candidate_pushed"])
+        self.assertTrue(recorder.lines())
+        self.assertEqual(recorder.remote_commands(), [])
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
+        self.assertNotIn(head, remote_before)
 
-    @legacy_remote_finish
-    def test_candidate_pushed_is_bound_to_the_recorded_remote_and_branch(self):
-        # The second remote exists before the run starts: status reads remotes
-        # through the run's snapshot, and a remote added later is a change.
+    def test_the_recorded_remote_and_upstream_configuration_are_never_read(self):
+        # Converted from test_candidate_pushed_is_bound_to_the_recorded_
+        # remote_and_branch: what the record's remote or the branch's
+        # upstream holds no longer decides anything. A record naming another
+        # remote, and upstream configuration pointing elsewhere, leave the
+        # local status exactly as it is -- and no remote is contacted.
         other = self.repo.parent / "other.git"
         _run_git(self.repo.parent, "init", "-q", "--bare", str(other))
         _run_git(self.repo, "remote", "add", "upstream", str(other))
         record, head = self._complete(push=False)
         worktree = Path(record.worktree_path)
-        # Upstream config pointing at another ref that has the candidate does not count.
-        _run_git(worktree, "push", "-q", "origin", f"{head}:refs/heads/elsewhere")
         _run_git(worktree, "config", f"branch.{record.branch}.remote", "origin")
         _run_git(worktree, "config", f"branch.{record.branch}.merge", "refs/heads/elsewhere")
-        failed, _ = self._failed(record)
-        self.assertEqual(failed, {"candidate_not_pushed"})
-        # A recorded non-origin remote is checked, not origin.
-        _run_git(worktree, "push", "-q", "origin", record.branch)
         path = managed_run.record_path(self.repo, record.run_key)
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["remote"] = "upstream"
         path.write_text(json.dumps(payload), encoding="utf-8")
-        failed, _ = self._failed(record)
-        self.assertEqual(failed, {"candidate_not_pushed"})
-        _run_git(worktree, "push", "-q", "upstream", record.branch)
-        failed, _ = self._failed(record)
+        recorder = GitRecorder(self.repo.parent)
+        with recorder.active():
+            failed, finish = self._failed(record)
         self.assertEqual(failed, set())
+        self.assertTrue(finish["eligible"]["merge"])
+        self.assertEqual(recorder.remote_commands(), [])
+        self.assertEqual(_git(other, "for-each-ref"), "")
 
     def test_stale_index_stat_is_not_refreshed(self):
         record, _ = self._complete()
@@ -382,9 +362,10 @@ class ManagedFinishTests(_FinishTestCase):
         dry_run = json.loads(out)
         self.assertEqual(dry_run.pop("capabilities"), ["local_first"])
         self.assertEqual(dry_run, run["finish"])
+        # Plan L Stage 4 adds "siblings" (an added field).
         self.assertEqual(set(run["git"]), {
             "head", "branch_tip", "clean", "final_candidate", "candidate_pushed",
-            "target_tip", "target_contains_candidate", "target_checked_out_at",
+            "target_tip", "target_contains_candidate", "target_checked_out_at", "siblings",
         })
         self.assertEqual(self._refs_and_files(record), before)
 
@@ -577,18 +558,21 @@ class FinishExecutionTests(_FinishTestCase):
         _run_git(worktree, "add", "late.txt")
         _run_git(worktree, "commit", "-q", "-m", "late")
 
-    @legacy_remote_finish
-    def test_unpushed_candidate_and_live_runner_refuse(self):
-        record, _ = self._complete(push=False)
-        code, report, _ = self._finish(record)
-        self.assertEqual((code, report["stopped_at"]), (3, "checks"))
-        self.assertIn("candidate_not_pushed", report["reason"])
-        _run_git(Path(record.worktree_path), "push", "-q", "origin", record.branch)
+    def test_a_live_runner_refuses_and_an_unpushed_candidate_then_finishes_locally(self):
+        # Converted from test_unpushed_candidate_and_live_runner_refuse
+        # (Plan L Stage 4): an unpushed candidate of a legacy pinned run is no
+        # longer refused; a live runner still is.
+        record, head = self._complete(push=False, legacy_pin=True)
         with worktree_lock(Path(record.worktree_path)):
             code, report, _ = self._finish(record)
         self.assertEqual((code, report["stopped_at"]), (3, "checks"))
         self.assertIn("runner_live", report["reason"])
         self.assertNotIn("merged", self._events(record))
+        remote_before = _git(self.remote, "for-each-ref")
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self._assert_cleaned(record, head)
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
 
     def test_unmanaged_worktree_is_never_removed(self):
         record, _ = self._complete()
@@ -621,28 +605,28 @@ class FinishExecutionTests(_FinishTestCase):
         self._assert_cleaned(record, head)
         self.assertEqual(self._events(record).count("merged"), 1)
 
-    @legacy_remote_finish
-    def test_push_target(self):
+    def test_push_target_refuses_with_remote_finish_removed(self):
+        # Converted from test_push_target (Plan L Stage 4, L-D3): the flag is
+        # never an alias for a local finish. Refused before anything is read
+        # or changed, merge-only or not; nothing is merged or pushed.
         record, head = self._complete()
-        code, report, err = self._finish(record, "--merge-only", "--push-target")
+        before = self._refs_and_files(record)
+        remote_before = _git(self.remote, "for-each-ref")
+        for flags in (("--merge-only", "--push-target"), ("--push-target",), ("--push-target", "--dry-run")):
+            with self.subTest(flags=flags):
+                code, report, err = self._finish(record, *flags)
+                self.assertEqual((code, report["stopped_at"], report["completed_steps"]), (3, "checks", []), err)
+                self.assertIn("remote_finish_removed", report["reason"])
+                self.assertIn("Push to review", report["reason"])
+                self.assertEqual(report["capabilities"], ["local_first"])
+        self.assertEqual(self._refs_and_files(record), before)
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
+        self.assertNotIn("merged", self._events(record))
+        # Positive control: the same finish without the flag merges locally.
+        code, report, err = self._finish(record, "--merge-only")
         self.assertEqual(code, 0, err)
-        self.assertEqual(report["completed_steps"], ["merge", "push_target"])
-        self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), head)
-        self.assertIn("target_pushed", self._events(record))
-
-    def test_rejected_target_push_stops_with_merge_recorded(self):
-        record, head = self._complete()
-        # The remote target moves on independently: a non-forced push is rejected.
-        main = _git(self.repo, "rev-parse", "main")
-        remote_only = _git(self.repo, "commit-tree", f"{main}^{{tree}}", "-p", main, "-m", "remote only")
-        _run_git(self.repo, "push", "-q", "origin", f"{remote_only}:refs/heads/main")
-        code, report, _ = self._finish(record, "--push-target")
-        self.assertEqual(code, 1)
-        self.assertEqual((report["stopped_at"], report["completed_steps"]), ("push_target", ["merge"]))
-        self.assertEqual(report["remaining"][0], "push_target")
-        self.assertIn("merged", self._events(record))
-        self.assertTrue(Path(record.worktree_path).is_dir())
         self.assertEqual(_git(self.repo, "rev-parse", "main"), head)
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
 
     def test_partial_failure_then_rerun_completes(self):
         record, head = self._complete()
@@ -696,360 +680,177 @@ class FinishExecutionTests(_FinishTestCase):
         self.assertEqual(managed_run.record_path(self.repo, record.run_key).read_bytes(), record_bytes)
         self.assertEqual(_git(self.repo, "for-each-ref"), refs)
 
-    @legacy_remote_finish
-    def test_remote_branch_kept_by_default_with_alias_and_precise_code(self):
-        record, _ = self._complete()
+    def test_delete_remote_branch_false_finishes_locally_and_emits_no_keep_entry(self):
+        # Converted from test_remote_branch_kept_by_default_with_alias_and_
+        # precise_code (Plan L Stage 4): no keep_remote_branch entry and no
+        # remote_delete_* code any more; the finish is local, and the remote
+        # branch is never read, kept or deleted by it.
+        record, _ = self._complete(legacy_pin=True)
         head = self._set_policy(record, False)
         finish = self._status(record)["finish"]
-        (kept,) = finish["kept"]
-        self.assertEqual((kept["action"], kept["code"]), ("keep_remote_branch", "remote_delete_unavailable"))
-        code, report, err = self._finish(record, "--push-target")
+        self.assertEqual(finish["kept"], [])
+        self.assertFalse(any("remote" in action for action in finish["actions"]))
+        code, report, err = self._finish(record)
         self.assertEqual(code, 0, err)
-        self.assertNotIn("delete_remote_branch", report["completed_steps"] + report["remaining"])
-        self.assertEqual([k["code"] for k in report["kept"]], ["remote_delete_unavailable"])
-        self.assertEqual(report["remote_branch"]["code"], "remote_delete_disabled")
+        self.assertEqual(report["completed_steps"], ["merge", "archive_state", "remove_worktree", "delete_branch", "finished"])
+        self.assertEqual(report["kept"], [])
+        self.assertEqual(report["remote_branch"]["code"], "local_finish")
         self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
-        self.assertNotIn("remote_branch_deleted", self._events(record))
         self._assert_cleaned(record, head)
 
-    @legacy_remote_finish
-    def test_remote_branch_kept_without_policy(self):
-        record, _ = self._complete()
-        code, report, err = self._finish(record, "--push-target")
+    def test_without_a_policy_the_remote_branch_is_untouched_and_reported_local(self):
+        # Converted from test_remote_branch_kept_without_policy.
+        record, head = self._complete()
+        remote_before = _git(self.remote, "for-each-ref")
+        code, report, err = self._finish(record)
         self.assertEqual(code, 0, err)
-        self.assertNotIn("delete_remote_branch", report["completed_steps"])
-        self.assertIn(record.branch, _git(self.repo, "ls-remote", "origin"))
-        (kept,) = report["kept"]
-        self.assertEqual(kept["code"], "remote_delete_unavailable")
-        self.assertEqual(report["remote_branch"]["code"], "remote_delete_disabled")
+        self.assertEqual((report["kept"], report["remote_branch"]["code"]), ([], "local_finish"))
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
+        self.assertIn(record.branch, remote_before)
+        self._assert_cleaned(record, head)
 
 
-class RemoteBranchDeletionTests(_FinishTestCase):
-    """``[finish] delete_remote_branch``: compare-and-delete on the candidate.
+class RemoteFinishRemovedTests(_FinishTestCase):
+    """Plan L Stage 4 (I-L1, L-D3): finish-run is local.
 
-    Plan L Stage 3: every test here is a legacy pinned run's remote finish,
-    run with :func:`remote_finish_allowed_in_test` (see its docstring)."""
-
-    LEGACY_PIN = True
-
-    def setUp(self):
-        super().setUp()
-        allowed = remote_finish_allowed_in_test()
-        allowed.__enter__()
-        self.addCleanup(allowed.__exit__, None, None, None)
+    Replaces ``RemoteBranchDeletionTests``: ``[finish] delete_remote_branch``
+    no longer deletes anything -- a reviewed candidate that sets it true is
+    refused with ``remote_finish_removed`` and nothing is merged -- and the
+    module that finishes runs no remote command at all. The tests of the
+    compare-and-delete (its lease form, races, hook and porcelain handling,
+    an absent branch, a remote target missing or unknown, a push URL with a
+    space) are removed with that code; the Stage 4 handoff names each with
+    the test here that covers what remains of its property. Planted
+    configuration is still refused by name, now for the local finish."""
 
     _finish = FinishExecutionTests._finish
     _events = FinishExecutionTests._events
     _set_policy = FinishExecutionTests._set_policy
     _assert_cleaned = FinishExecutionTests._assert_cleaned
 
-    def _remote_has(self, record):
-        return record.branch in _git(self.repo, "ls-remote", "origin")
+    def test_delete_remote_branch_refuses_and_nothing_is_merged(self):
+        for legacy in (False, True):
+            with self.subTest(legacy_pin=legacy):
+                self.tearDown()
+                self.setUp()
+                record, _ = self._complete(legacy_pin=legacy)
+                head = self._set_policy(record, True)
+                before = self._refs_and_files(record)
+                remote_before = _git(self.remote, "for-each-ref")
+                recorder = GitRecorder(self.repo.parent)
+                with recorder.active():
+                    failed, finish = self._failed(record)
+                    dry = self._main("finish-run", "--run-key", record.run_key, "--repo-root", str(self.repo),
+                                     "--dry-run", "--json")
+                    code, report, err = self._finish(record)
+                self.assertEqual(failed, {"remote_finish_removed"})
+                (check,) = [c for c in finish["checks"] if c["code"] == "remote_finish_removed"]
+                self.assertIn("delete_remote_branch", check["detail"])
+                self.assertIn("Push to review", check["detail"])
+                self.assertEqual(dry[0], 3, dry[2])
+                self.assertEqual((code, report["stopped_at"], report["completed_steps"]), (3, "checks", []), err)
+                self.assertIn("remote_finish_removed", report["reason"])
+                self.assertEqual(self._refs_and_files(record), before)
+                self.assertNotIn("merged", self._events(record))
+                self.assertEqual(recorder.remote_commands(), [])
+                self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
+                self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
 
-    def _on_delete(self, action):
-        """Run ``action`` just before the engine's delete push, then the push."""
-
-        real_git = managed_run._git
-        calls = []
-
-        def wrapper(cwd, *args):
-            if "push" in args and "--delete" in args:
-                calls.append(args)
-                action()
-            return real_git(cwd, *args)
-
-        return mock.patch.object(managed_run, "_git", side_effect=wrapper), calls
-
-    def test_delete_succeeds_with_the_exact_lease_form(self):
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
-        finish = self._status(record)["finish"]
-        self.assertIn(
-            f"delete remote branch origin/{record.branch} only while it is exactly {head} (lease)", finish["actions"]
-        )
-        self.assertEqual([k["code"] for k in finish["kept"]], ["remote_delete_planned"])
-        patch, calls = self._on_delete(lambda: None)
-        with patch:
-            code, report, err = self._finish(record, "--push-target")
+    def test_positive_control_without_the_setting_the_same_run_finishes_locally(self):
+        record, _ = self._complete(legacy_pin=True)
+        head = self._set_policy(record, False)
+        remote_before = _git(self.remote, "for-each-ref")
+        recorder = GitRecorder(self.repo.parent)
+        with recorder.active():
+            code, report, err = self._finish(record)
         self.assertEqual(code, 0, err)
-        # To the run's pinned destination URL, never to a remote name the
-        # repository's configuration could redirect.
-        self.assertEqual(calls, [(
-            "push", "--porcelain", f"--force-with-lease=refs/heads/{record.branch}:{head}",
-            str(self.remote), "--delete", f"refs/heads/{record.branch}",
-        )])
-        self.assertEqual(report["completed_steps"][-2:], ["delete_remote_branch", "finished"])
-        self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
-        self.assertEqual(report["kept"], [])
-        self.assertFalse(self._remote_has(record))
-        self.assertIn("remote_branch_deleted", self._events(record))
         self._assert_cleaned(record, head)
-        # A finished rerun reports the recorded deletion.
-        code, report, err = self._finish(record)
-        self.assertEqual((code, report["remote_branch"]["code"], report["kept"]), (0, "remote_branch_deleted", []))
+        self.assertEqual(recorder.remote_commands(), [])
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
 
-    def test_the_lease_is_the_only_force_in_the_module(self):
+    def test_the_finish_module_runs_no_remote_command(self):
+        # Replaces test_the_lease_is_the_only_force_in_the_module: the
+        # module that finishes names no remote Git command and no force.
         import io
         import tokenize
 
         source = Path(managed_finish.__file__).read_text(encoding="utf-8")
-        forced = [
-            tok.string for tok in tokenize.generate_tokens(io.StringIO(source).readline)
-            if tok.type == tokenize.STRING and "--force" in tok.string
+        strings = [
+            tok.string.strip("\"'") for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+            if tok.type == tokenize.STRING
         ]
-        self.assertEqual(forced, ['"--force-with-lease"'])
-        self.assertEqual(managed_finish.REMOTE_DELETE_LEASE, "--force-with-lease")
-        self.assertNotIn('"-f"', source)
-
-    def _fail_branch_delete_once(self):
-        real_git = managed_run._git
-
-        def failing(cwd, *args):
-            if args[:2] == ("branch", "-d"):
-                return subprocess.CompletedProcess(args, 1, "", "simulated failure")
-            return real_git(cwd, *args)
-
-        return mock.patch.object(managed_run, "_git", side_effect=failing)
-
-    def test_already_absent_branch_is_success(self):
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
-        with self._fail_branch_delete_once():
-            code, report, _ = self._finish(record)
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_branch"))
-        _run_git(self.repo, "push", "-q", "origin", "--delete", record.branch)
-        code, report, err = self._finish(record)
-        self.assertEqual(code, 0, err)
-        self.assertEqual(report["remote_branch"]["code"], "remote_branch_absent")
-        self.assertIn("delete_remote_branch", report["completed_steps"])
-        self.assertEqual(report["kept"], [])
-        self._assert_cleaned(record, head)
-
-    def test_a_real_race_is_refused_by_the_lease_and_finish_stops(self):
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
-        raced = _git(self.repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "someone else's work")
-
-        def advance():
-            # A concurrent push lands after the engine resolved the candidate.
-            subprocess.run(
-                ["git", "-C", str(self.repo), "push", "-q", "origin", f"{raced}:refs/heads/{record.branch}"],
-                check=True, capture_output=True,
-            )
-
-        patch, calls = self._on_delete(advance)
-        with patch:
-            code, report, _ = self._finish(record, "--push-target")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(code, 1)
-        self.assertEqual(report["stopped_at"], "delete_remote_branch")
-        self.assertEqual(report["remaining"], ["delete_remote_branch", "finished"])
-        self.assertEqual(report["remote_branch"]["code"], "remote_lease_mismatch")
-        self.assertEqual([k["code"] for k in report["kept"]], ["remote_lease_mismatch"])
-        # The other push survives, untouched.
-        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), raced)
-        events = self._events(record)
-        self.assertNotIn("finished", events)
-        self.assertNotIn("remote_branch_deleted", events)
-        self.assertNotEqual(managed_run.read_record(self.repo, record.run_key).lifecycle, "finished")
-        # Re-running still refuses: the branch is not the candidate.
-        code, report, _ = self._finish(record)
-        self.assertEqual((code, report["remote_branch"]["code"]), (1, "remote_lease_mismatch"))
-        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), raced)
+        for command in ("push", "fetch", "pull", "ls-remote", "--force", "--force-with-lease", "-f"):
+            self.assertNotIn(command, strings)
+        self.assertFalse(hasattr(managed_finish, "_delete_remote_branch"))
+        self.assertFalse(hasattr(managed_finish, "_push_target"))
 
     def test_a_remote_url_changed_mid_finish_is_refused_by_name_then_rerun_completes(self):
-        # Retargeting the remote after the run started is never followed:
-        # the engine's next Git invocation refuses, naming the key, and
-        # nothing is pushed or deleted at the new URL.
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
+        # Converted (Plan L Stage 4): the finish is local, so the change is
+        # made just before its merge rather than its remote delete. The
+        # engine's next Git invocation refuses, naming the key; nothing is
+        # merged, and nothing reaches the new URL. Restored, it completes.
+        record, head = self._complete(legacy_pin=True)
         url = _git(self.repo, "remote", "get-url", "origin")
         gone = Path(str(self.remote) + ".gone")
         subprocess.run(["git", "init", "-q", "--bare", str(gone)], check=True, capture_output=True)
+        real_git = managed_run._git
 
-        def retarget():
-            subprocess.run(["git", "-C", str(self.repo), "remote", "set-url", "origin", str(gone)], check=True)
+        def retarget_before_merge(cwd, *args):
+            if args[:1] == ("merge",):
+                subprocess.run(["git", "-C", str(self.repo), "remote", "set-url", "origin", str(gone)], check=True)
+            return real_git(cwd, *args)
 
-        patch, _ = self._on_delete(retarget)
-        with patch:
-            code, report, _ = self._finish(record, "--push-target")
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
+        with mock.patch.object(managed_run, "_git", side_effect=retarget_before_merge):
+            code, report, _ = self._finish(record)
+        self.assertEqual((code, report["stopped_at"]), (1, "merge"))
         self.assertIn("repository_config_changed", report["reason"])
         self.assertIn("remote.origin.url", report["reason"])
-        self.assertNotIn("finished", self._events(record))
-        self.assertEqual(_git(gone, "for-each-ref"), "")  # nothing reached the new target
+        self.assertNotIn("merged", self._events(record))
+        self.assertNotEqual(_git(self.repo, "rev-parse", "main"), head)
+        self.assertEqual(_git(gone, "for-each-ref"), "")
         _run_git(self.repo, "remote", "set-url", "origin", url)
         code, report, err = self._finish(record)
         self.assertEqual(code, 0, err)
-        self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
-        self.assertFalse(self._remote_has(record))
-        self._assert_cleaned(record, head)
-
-
-    def test_remote_target_missing_candidate_stops_then_push_and_rerun_completes(self):
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
-        patch, calls = self._on_delete(lambda: None)
-        with patch:
-            code, report, _ = self._finish(record)  # no --push-target
-        self.assertEqual(calls, [])  # informs only: no delete was attempted
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
-        self.assertEqual(report["remote_branch"]["code"], "remote_target_missing_candidate")
-        self.assertEqual([k["code"] for k in report["kept"]], ["remote_target_missing_candidate"])
-        self.assertTrue(self._remote_has(record))
-        self.assertNotIn("finished", self._events(record))
-        _run_git(self.repo, "push", "-q", "origin", "main")
-        code, report, err = self._finish(record)
-        self.assertEqual(code, 0, err)
-        self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
         self._assert_cleaned(record, head)
 
     def test_a_push_url_added_after_the_run_started_is_refused_by_name(self):
-        # A planted remote.origin.pushurl would send the target push and the
-        # branch deletion somewhere else. It is not followed: the finish
-        # refuses before any Git invocation, naming the key, and the planted
-        # destination receives nothing.
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
+        # Converted (Plan L Stage 4): a planted remote.origin.pushurl is a
+        # change to the run's trusted configuration, so the local finish
+        # refuses at its first Git invocation, naming the key. Nothing is
+        # merged, and the planted destination receives nothing.
+        record, head = self._complete()
         mirror = self.remote.parent / "push.git"
         subprocess.run(["git", "init", "-q", "--bare", str(mirror)], check=True, capture_output=True)
         _run_git(self.repo, "remote", "set-url", "--push", "origin", str(mirror))
-        code, report, _ = self._finish(record, "--push-target")
-        self.assertEqual(code, 1)
+        main_before = _git(self.repo, "rev-parse", "main")
+        code, report, _ = self._finish(record)
+        self.assertNotEqual(code, 0)
         self.assertIsNotNone(report["stopped_at"])
         self.assertIn("repository_config_changed", report["reason"])
         self.assertIn("remote.origin.pushurl", report["reason"])
         self.assertEqual(_git(mirror, "for-each-ref"), "")
-        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), main_before)
         self.assertNotIn("merged", self._events(record))
-
-    def test_multiple_push_urls_added_after_the_run_started_are_refused_by_name(self):
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
-        second = self.remote.parent / "second.git"
-        subprocess.run(["git", "clone", "-q", "--bare", str(self.remote), str(second)], check=True, capture_output=True)
-        _run_git(self.repo, "push", "-q", "origin", "main")  # the target already contains the candidate
-        _run_git(self.repo, "remote", "set-url", "--add", "--push", "origin", str(self.remote))
-        _run_git(self.repo, "remote", "set-url", "--add", "--push", "origin", str(second))
-        patch, calls = self._on_delete(lambda: None)
-        with patch:
-            code, report, _ = self._finish(record)
-        self.assertEqual(calls, [])
-        self.assertEqual(code, 1)
-        self.assertIn("remote.origin.pushurl", report["reason"])
-        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
-        self.assertEqual(_git(second, "rev-parse", f"refs/heads/{record.branch}"), head)
-        events = self._events(record)
-        self.assertNotIn("remote_branch_deleted", events)
-        self.assertNotIn("finished", events)
-
-    def test_remote_target_not_present_locally_is_unknown(self):
-        record, _ = self._complete()
-        self._set_policy(record, True)
-        with self._fail_branch_delete_once():
-            code, report, _ = self._finish(record, "--push-target")
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_branch"))
-        # The remote target moves to a commit this repository has never fetched.
-        tree = _git(self.remote, "rev-parse", "main^{tree}")
-        unknown = _git(self.remote, "commit-tree", tree, "-p", "main", "-m", "only on the remote")
-        _run_git(self.remote, "update-ref", "refs/heads/main", unknown)
-        code, report, _ = self._finish(record)
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
-        self.assertEqual(report["remote_branch"]["code"], "remote_target_unknown")
-        self.assertIn("fetch", report["remote_branch"]["detail"])
-        self.assertTrue(self._remote_has(record))
-
-    def test_porcelain_with_two_destinations_is_never_deleted_unless_both_are(self):
-        record, _ = self._complete()
-        self._set_policy(record, True)
-        ref = f"refs/heads/{record.branch}"
-        real_git = managed_run._git
-
-        def two_sections(cwd, *args):
-            if "push" in args and "--delete" in args:
-                out = (f"To a\n-\t:{ref}\t[deleted]\nDone\n"
-                       f"To b\n!\t:{ref}\t[remote rejected] (hook declined)\nDone\n")
-                return subprocess.CompletedProcess(args, 0, out, "")
-            return real_git(cwd, *args)
-
-        with mock.patch.object(managed_run, "_git", side_effect=two_sections):
-            code, report, _ = self._finish(record, "--push-target")
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
-        self.assertEqual(report["remote_branch"]["code"], "remote_delete_rejected")
-        self.assertNotIn("remote_branch_deleted", self._events(record))
-
-    def _hook(self, body: str):
-        hook = self.remote / "hooks" / "pre-receive"
-        hook.write_text("#!/bin/sh\n" + body, encoding="utf-8")
-        hook.chmod(0o755)
-
-    def test_remote_delete_rejected_by_a_hook(self):
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
-        self._hook(
-            "while read old new ref; do\n"
-            "  case $new in 0000000000000000000000000000000000000000) echo 'deletes forbidden'; exit 1;; esac\n"
-            "done\nexit 0\n"
-        )
-        code, report, _ = self._finish(record, "--push-target")
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
-        self.assertEqual(report["remote_branch"]["code"], "remote_delete_rejected")
-        self.assertEqual([k["code"] for k in report["kept"]], ["remote_delete_rejected"])
-        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
-        self.assertNotIn("finished", self._events(record))
-
-    def test_server_side_race_after_advertisement_keeps_the_branch(self):
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
-        raced = _git(self.repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "landed mid-push")
-        _run_git(self.repo, "push", "-q", "origin", f"{raced}:refs/heads/raced-src")
-        # After the client saw the candidate advertised, the server moves the
-        # ref before the delete is applied.
-        self._hook(
-            "while read old new ref; do\n"
-            "  case $new in 0000000000000000000000000000000000000000)\n"
-            f"    env -u GIT_QUARANTINE_PATH git update-ref $ref {raced};;\n"
-            "  esac\n"
-            "done\nexit 0\n"
-        )
-        code, report, _ = self._finish(record, "--push-target")
-        self.assertEqual((code, report["stopped_at"]), (1, "delete_remote_branch"))
-        self.assertIn(report["remote_branch"]["code"], managed_finish.REMOTE_KEEP_CODES)
-        self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), raced)
-        self.assertNotIn("remote_branch_deleted", self._events(record))
-        self.assertNotIn("finished", self._events(record))
+        # Positive control: with the planted key gone, the same run finishes.
+        _run_git(self.repo, "config", "--unset", "remote.origin.pushurl")
+        code, report, err = self._finish(record)
+        self.assertEqual(code, 0, err)
+        self._assert_cleaned(record, head)
 
     def test_a_record_naming_another_branch_is_never_deleted(self):
+        # Converted (Plan L Stage 4): the remote deletion it guarded is gone;
+        # the same rule guards the local branch deletion, which only ever
+        # deletes a managed branch distinct from its target.
         import dataclasses
 
         record, _ = self._complete()
-        head = self._set_policy(record, True)
-        remote_main = _git(self.remote, "rev-parse", "refs/heads/main")
         for branch in ("main", "someone-elses-branch"):
             forged = dataclasses.replace(record, branch=branch)
-            code, detail = managed_finish._delete_remote_branch(self.repo, forged, head)
-            self.assertEqual(code, "remote_delete_rejected")
-            self.assertIn("managed branch", detail)
-            self.assertIsNotNone(managed_finish._foreign_branch(forged))
+            self.assertIn("managed branch", managed_finish._foreign_branch(forged))
         self.assertIsNone(managed_finish._foreign_branch(record))
         legacy = dataclasses.replace(record, branch="sparring/feature-plan-0123abcd")
         self.assertIsNone(managed_finish._foreign_branch(legacy))
         self.assertIsNotNone(managed_finish._foreign_branch(dataclasses.replace(legacy, target_branch=legacy.branch)))
-        self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), remote_main)
-
-    def test_a_push_url_with_a_space_is_one_url(self):
-        # Configured before the run starts, so it is part of the trusted
-        # snapshot the finish is held to.
-        spaced = Path(str(self.remote) + " with space")
-        spaced.symlink_to(self.remote)
-        _run_git(self.repo, "remote", "set-url", "--push", "origin", str(spaced))
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
-        code, report, err = self._finish(record, "--push-target")
-        self.assertEqual(code, 0, err)
-        self.assertEqual(report["remote_branch"]["code"], "remote_branch_deleted")
-        self.assertFalse(self._remote_has(record))
-        self._assert_cleaned(record, head)
 
 
 class PlanRemovalTests(_FinishTestCase):
@@ -1134,11 +935,14 @@ class PlanRemovalTests(_FinishTestCase):
         self.assertEqual(_git(self.repo, "rev-parse", "main"), head)
         self.assertEqual(self._events(record)[-1], "finished")
 
-    @legacy_remote_finish
-    def test_a_removal_commit_whose_event_was_lost_is_reconciled_and_pushed(self):
+    def test_a_removal_commit_whose_event_was_lost_is_reconciled(self):
+        # Converted from ..._is_reconciled_and_pushed (Plan L Stage 4): the
+        # reconciliation is unchanged; the finish pushes nothing, so the
+        # remote target is left exactly as it was.
         record, _ = self._complete()
         head = self._enable(record)
         real = managed_run.append_event
+        remote_before = _git(self.remote, "for-each-ref")
 
         def interrupted(repo_root, run_key, event, *args, **kwargs):
             if event == "plan_removed":
@@ -1146,14 +950,12 @@ class PlanRemovalTests(_FinishTestCase):
             return real(repo_root, run_key, event, *args, **kwargs)
 
         with mock.patch.object(managed_run, "append_event", side_effect=interrupted):
-            code, _, _ = self._finish(record, "--push-target")
+            code, _, _ = self._finish(record)
         self.assertNotEqual(code, 0)
         removal = _git(self.repo, "rev-parse", "main")
         self.assertEqual(_git(self.repo, "rev-parse", "main^"), head)
         self.assertNotIn("plan_removed", self._events(record))
-        # The remote target already holds the candidate, but not the removal.
-        _run_git(self.repo, "push", "-q", "origin", f"{head}:refs/heads/main")
-        code, report, err = self._finish(record, "--push-target")
+        code, report, err = self._finish(record)
         self.assertEqual(code, 0, err)
         self.assertEqual(report["plan_removal"]["code"], "plan_removed", report["plan_removal"])
         self.assertEqual(report["plan_removal"]["commit"], removal)
@@ -1161,7 +963,8 @@ class PlanRemovalTests(_FinishTestCase):
         self.assertEqual(event["detail"]["commit"], removal)
         self.assertTrue(event["detail"]["reconciled"])
         self.assertNotIn("plan_removal_refused", self._events(record))
-        self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), removal)
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), removal)
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
 
     def test_the_removal_commit_leaves_what_is_staged_meanwhile(self):
         record, _ = self._complete()
@@ -1221,25 +1024,22 @@ class PlanRemovalTests(_FinishTestCase):
         self._assert_removed(record, head, report)
         self.assertEqual(_git(self.repo, "symbolic-ref", "--short", "HEAD"), "feature/x")
 
-    @legacy_remote_finish
-    def test_push_target_carries_the_merge_and_the_removal_in_one_push(self):
+    def test_the_merge_and_the_removal_land_on_the_local_target_and_nothing_is_pushed(self):
+        # Converted from test_push_target_carries_the_merge_and_the_removal_
+        # in_one_push (Plan L Stage 4): both commits are on the local target;
+        # the recorder sees no remote command and origin's refs are unchanged.
         record, _ = self._complete()
         head = self._enable(record)
-        real_git = managed_run._git
-        pushes = []
-
-        def recording(cwd, *args):
-            if "push" in args and any(a.endswith(":refs/heads/main") for a in args):
-                pushes.append(args)
-            return real_git(cwd, *args)
-
-        with mock.patch.object(managed_run, "_git", side_effect=recording):
-            code, report, err = self._finish(record, "--push-target")
+        remote_before = _git(self.remote, "for-each-ref")
+        recorder = GitRecorder(self.repo.parent)
+        with recorder.active():
+            code, report, err = self._finish(record)
         self.assertEqual(code, 0, err)
-        self.assertEqual(report["completed_steps"][:3], ["merge", "remove_plan", "push_target"])
+        self.assertEqual(report["completed_steps"][:2], ["merge", "remove_plan"])
         self._assert_removed(record, head, report)
-        self.assertEqual(len(pushes), 1, pushes)
-        self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), report["plan_removal"]["commit"])
+        self.assertEqual(_git(self.repo, "rev-parse", "main"), report["plan_removal"]["commit"])
+        self.assertEqual(recorder.remote_commands(), [])
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
 
     def test_resume_after_removal_does_not_remove_twice(self):
         record, _ = self._complete()
@@ -1577,25 +1377,24 @@ class FinishSchemaTests(_FinishTestCase):
 
 
 class LegacyRemoteFinishRefusedTests(_FinishTestCase):
-    """Plan L Stage 3 (I-L1): without :func:`remote_finish_allowed_in_test`,
-    a legacy pinned run's remote finish -- its pushed check,
-    ``--push-target`` and ``delete_remote_branch`` -- contacts nothing. The
-    git recorder first on ``PATH`` sees no remote command, the remote's refs
-    are unchanged, and nothing is merged. Positive control: the very same
-    finish with the test-only switch reaches the remote."""
+    """Plan L Stage 4 (I-L1, L-D3): a legacy pinned run's remote finish --
+    ``--push-target`` and ``delete_remote_branch`` -- is refused with
+    ``remote_finish_removed``, contacting nothing: the git recorder first on
+    ``PATH`` sees no remote command, the remote's refs are unchanged, and
+    nothing is merged. Positive control: the same legacy run, without the
+    flag and the setting, finishes locally -- still contacting nothing."""
 
     LEGACY_PIN = True
     _finish = FinishExecutionTests._finish
     _events = FinishExecutionTests._events
     _set_policy = FinishExecutionTests._set_policy
-
-    def _legacy_run_with_every_remote_step(self):
-        record, _ = self._complete()
-        head = self._set_policy(record, True)
-        return record, head
+    _assert_cleaned = FinishExecutionTests._assert_cleaned
 
     def test_the_legacy_remote_finish_and_its_status_contact_no_remote(self):
-        record, head = self._legacy_run_with_every_remote_step()
+        # Retargeted from Stage 3 (was: refused at its candidate_not_pushed
+        # check, remote_operation_not_allowed in the detail).
+        record, _ = self._complete()
+        head = self._set_policy(record, True)
         remote_before = _git(self.remote, "for-each-ref")
         main_before = _git(self.repo, "rev-parse", "main")
         recorder = GitRecorder(self.repo.parent)
@@ -1603,16 +1402,18 @@ class LegacyRemoteFinishRefusedTests(_FinishTestCase):
             runs = self._main("runs", "--repo-root", str(self.repo), "--json")
             dry = self._main("finish-run", "--run-key", record.run_key, "--repo-root", str(self.repo),
                              "--dry-run", "--json")
-            code, report, err = self._finish(record, "--push-target")
+            flagged = self._finish(record, "--push-target")
+            code, report, err = self._finish(record)
 
         self.assertEqual(runs[0], 0, runs[2])
         self.assertEqual(dry[0], 3, dry[2])
+        self.assertEqual((flagged[0], flagged[1]["stopped_at"]), (3, "checks"), flagged[2])
+        self.assertIn("remote_finish_removed", flagged[1]["reason"])
         self.assertEqual((code, report["stopped_at"]), (3, "checks"), err)
-        self.assertIn("candidate_not_pushed", report["reason"])
+        self.assertIn("remote_finish_removed", report["reason"])
         failed, finish = self._failed(record)
-        self.assertEqual(failed, {"candidate_not_pushed"})
-        (check,) = [c for c in finish["checks"] if c["code"] == "candidate_not_pushed"]
-        self.assertIn("remote_operation_not_allowed", check["detail"])
+        self.assertEqual(failed, {"remote_finish_removed"})
+        self.assertNotIn("candidate_not_pushed", {c["code"] for c in finish["checks"]})
         self.assertTrue(recorder.lines())
         self.assertEqual(recorder.remote_commands(), [])
         self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
@@ -1621,17 +1422,20 @@ class LegacyRemoteFinishRefusedTests(_FinishTestCase):
         self.assertTrue(Path(record.worktree_path).is_dir())
         self.assertEqual(_git(self.remote, "rev-parse", f"refs/heads/{record.branch}"), head)
 
-    def test_positive_control_with_the_test_only_switch_the_same_finish_reaches_the_remote(self):
-        record, head = self._legacy_run_with_every_remote_step()
+    def test_positive_control_the_same_legacy_run_finishes_locally(self):
+        # Replaces ..._with_the_test_only_switch_the_same_finish_reaches_the_
+        # remote: there is no remote finish to reach any more.
+        record, _ = self._complete()
+        head = self._set_policy(record, False)
+        remote_before = _git(self.remote, "for-each-ref")
         recorder = GitRecorder(self.repo.parent)
-        with remote_finish_allowed_in_test(), recorder.active():
-            code, report, err = self._finish(record, "--push-target")
+        with recorder.active():
+            code, report, err = self._finish(record)
         self.assertEqual(code, 0, err)
-        self.assertIn("push_target", report["completed_steps"])
-        self.assertIn("delete_remote_branch", report["completed_steps"])
-        self.assertTrue(recorder.remote_commands())
-        self.assertEqual(_git(self.remote, "rev-parse", "refs/heads/main"), head)
-        self.assertNotIn(record.branch, _git(self.repo, "ls-remote", "origin"))
+        self._assert_cleaned(record, head)
+        self.assertTrue(recorder.lines())
+        self.assertEqual(recorder.remote_commands(), [])
+        self.assertEqual(_git(self.remote, "for-each-ref"), remote_before)
 
 
 class FinishConfigTests(unittest.TestCase):
@@ -1898,17 +1702,22 @@ class FinishHardeningTests(_FinishTestCase):
         archived.write_text("{broken", encoding="utf-8")
         code, report, _ = self._finish(record)
         self.assertEqual((code, report["stopped_at"]), (1, "archive_state"))
-        # Unreadable recorded authority stops the finish before any step runs.
-        self.assertIn("run_state_unreadable", report["reason"])
+        # An unreadable run state -- the run's trusted snapshot -- stops the
+        # finish before any step runs (Plan L Stage 4: the run-state
+        # integrity refusal; was run_state_unreadable).
+        self.assertIn("trusted_config_missing", report["reason"])
+        self.assertIn("cannot be read", report["reason"])
         self.assertNotIn("finished", report["completed_steps"])
         self.assertNotIn("finished", self._events(record))
 
     def test_unreadable_recorded_authority_refuses_before_any_remote_operation(self):
         # The worktree is gone, the archived run state is damaged, and the
         # repository's remote and credential configuration changed since the
-        # run started. --push-target must not fall back to that live
-        # configuration: the finish refuses before any remote operation, and
-        # no planted helper runs.
+        # run started. The finish must not fall back to that live
+        # configuration: it refuses before any Git operation, and no planted
+        # helper runs. (Plan L Stage 4: --push-target is refused outright
+        # with remote_finish_removed; the local finish refuses with the
+        # run-state integrity refusal.)
         record, _ = self._complete()
         real_append = managed_run.append_event
 
@@ -1942,10 +1751,13 @@ class FinishHardeningTests(_FinishTestCase):
             return real_git(cwd, *args)
 
         with mock.patch.object(managed_run, "_git", side_effect=recording):
-            code, report, _ = self._finish(record, "--push-target")
+            flagged, flagged_report, _ = self._finish(record, "--push-target")
+            code, report, _ = self._finish(record)
 
+        self.assertEqual((flagged, flagged_report["stopped_at"]), (3, "checks"))
+        self.assertIn("remote_finish_removed", flagged_report["reason"])
         self.assertEqual((code, report["stopped_at"]), (1, "archive_state"))
-        self.assertIn("run_state_unreadable", report["reason"])
+        self.assertIn("trusted_config_missing", report["reason"])
         self.assertEqual(remote_calls, [])
         self.assertFalse(marker.exists())
         self.assertEqual(_git(evil, "for-each-ref"), "")
@@ -2069,12 +1881,16 @@ class FinishHardeningTests(_FinishTestCase):
     def test_rerun_after_finished_reports_only_recorded_events(self):
         record, _ = self._complete()
         self.assertEqual(self._finish(record)[0], 0)
-        code, report, err = self._finish(record, "--push-target")
+        # Plan L Stage 4: the rerun is plain (--push-target is refused
+        # before anything is read; see test_push_target_refuses_with_remote_
+        # finish_removed).
+        code, report, err = self._finish(record)
         self.assertEqual(code, 0, err)
         self.assertEqual(
             report["completed_steps"], ["merge", "archive_state", "remove_worktree", "delete_branch", "finished"]
         )
         self.assertEqual(report["remaining"], [])
+        self.assertEqual(report["remote_branch"]["code"], "local_finish")
         self.assertNotIn("target_pushed", self._events(record))
 
     def test_record_changed_before_the_lock_is_re_read(self):
@@ -2163,27 +1979,35 @@ class FinishHardeningFollowUpTests(_FinishTestCase):
         return [k["code"] for k in report["kept"]]
 
     def test_kept_is_reported_on_every_return(self):
+        # Plan L Stage 4: the fields stay on every return (schema_version 1,
+        # nothing removed), but a local finish keeps nothing on a remote:
+        # kept is empty and remote_branch says the finish is local (was:
+        # keep_remote_branch / remote_delete_unavailable).
         record, _ = self._complete()
+
+        def local(report):
+            return self._kept_codes(report), report["remote_branch"]["code"]
+
         # A refusal at the checks.
         (Path(record.worktree_path) / "stray.txt").write_text("x\n", encoding="utf-8")
         code, report, _ = self._finish(record)
-        self.assertEqual((code, self._kept_codes(report)), (3, ["remote_delete_unavailable"]))
+        self.assertEqual((code, local(report)), (3, ([], "local_finish")))
         (Path(record.worktree_path) / "stray.txt").unlink()
         # --merge-only.
         code, report, err = self._finish(record, "--merge-only")
         self.assertEqual(code, 0, err)
-        self.assertEqual(self._kept_codes(report), ["remote_delete_unavailable"])
+        self.assertEqual(local(report), ([], "local_finish"))
         # A failure before local branch deletion.
         _run_git(self.repo, "worktree", "lock", record.worktree_path)
         code, report, _ = self._finish(record)
         self.assertEqual((code, report["stopped_at"]), (1, "remove_worktree"))
-        self.assertEqual(self._kept_codes(report), ["remote_delete_unavailable"])
+        self.assertEqual(local(report), ([], "local_finish"))
         _run_git(self.repo, "worktree", "unlock", record.worktree_path)
         code, report, err = self._finish(record)
-        self.assertEqual((code, self._kept_codes(report)), (0, ["remote_delete_unavailable"]), err)
+        self.assertEqual((code, local(report)), (0, ([], "local_finish")), err)
         # A finished rerun.
         code, report, err = self._finish(record)
-        self.assertEqual((code, self._kept_codes(report)), (0, ["remote_delete_unavailable"]), err)
+        self.assertEqual((code, local(report)), (0, ([], "local_finish")), err)
 
     def _text(self, record, *flags):
         return self._main("finish-run", "--run-key", record.run_key, "--repo-root", str(self.repo), *flags)
@@ -2194,7 +2018,8 @@ class FinishHardeningFollowUpTests(_FinishTestCase):
         code, out, err = self._text(record, "--merge-only")
         self.assertEqual(code, 0, err)
         self.assertNotIn("deleted ignored", out)
-        self.assertIn("kept (remote_delete_unavailable)", out)
+        self.assertNotIn("kept (", out)
+        self.assertIn("remote_branch (local_finish)", out)
         code, report, _ = self._finish(record, "--merge-only")
         self.assertEqual(report["deleted_ignored_paths"], [])
         _run_git(self.repo, "worktree", "lock", record.worktree_path)

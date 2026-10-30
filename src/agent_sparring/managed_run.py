@@ -50,8 +50,12 @@ EVENTS = (
     "created",
     "creation_failed",
     "merged",
+    # A sibling repository's accepted candidate merged into its local target.
+    "sibling_merged",
     "plan_removed",
     "plan_removal_refused",
+    # ``target_pushed`` and ``remote_branch_deleted``: only an older engine's
+    # record of a run it finished; finish-run is local now.
     "target_pushed",
     "state_archived",
     "worktree_removed",

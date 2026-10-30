@@ -25,10 +25,36 @@ CAPABILITIES: tuple[str, ...] = (LOCAL_FIRST,)
 PUSH_NOT_PART_OF_RUNS = "push_not_part_of_runs"
 #: ``resume-plan --allow-push-candidate``: there is no push permission to give.
 PUSH_PERMISSION_DEPRECATED = "push_permission_deprecated"
+#: ``finish-run --push-target`` and ``[finish] delete_remote_branch = true``:
+#: a finish is local and never contacts a remote.
+REMOTE_FINISH_REMOVED = "remote_finish_removed"
+
+_PUSH_TO_REVIEW = (
+    "To publish a commit for external review, use Push to review, a separate explicit action "
+    "that never implies acceptance."
+)
 
 
 def capabilities() -> list[str]:
     return list(CAPABILITIES)
+
+
+def push_target_removed() -> str:
+    return (
+        f"refusing: {REMOTE_FINISH_REMOVED}: --push-target is no longer accepted. finish-run is "
+        "local: it merges into the local target branch of every participating repository and "
+        "never contacts a remote. Nothing was merged, pushed or deleted. Run the same command "
+        f"without --push-target. {_PUSH_TO_REVIEW}"
+    )
+
+
+def delete_remote_branch_removed(where: str) -> str:
+    return (
+        f"{REMOTE_FINISH_REMOVED}: {where} sets [finish] delete_remote_branch = true, which is no "
+        "longer supported. finish-run is local and never contacts a remote, so it deletes no "
+        "remote branch; remove the setting (or set it to false) to finish. Nothing was merged, "
+        f"pushed or deleted. {_PUSH_TO_REVIEW}"
+    )
 
 
 def push_not_part_of_runs() -> str:
@@ -59,7 +85,10 @@ __all__ = [
     "LOCAL_FIRST",
     "PUSH_NOT_PART_OF_RUNS",
     "PUSH_PERMISSION_DEPRECATED",
+    "REMOTE_FINISH_REMOVED",
     "capabilities",
+    "delete_remote_branch_removed",
     "push_not_part_of_runs",
     "push_permission_deprecated",
+    "push_target_removed",
 ]

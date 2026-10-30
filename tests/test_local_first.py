@@ -1065,26 +1065,28 @@ class RetiredPushFlagTests(_CliWorld):
         self.assertIn(PUSH_NOT_PART_OF_RUNS, err)
         self.assertEqual(tree_snapshot(self.repo), before)
 
-    def test_positive_control_a_plain_resume_gets_past_the_flags_and_keeps_the_legacy_pause(self):
+    def test_positive_control_a_plain_resume_gets_past_the_flags_and_converts_the_legacy_pause(self):
         """Without the retired flag the same resume is not refused as
-        deprecated: it reaches the run, which stays paused on the legacy push
-        reason with nothing accepted, pushed or run (I-L3)."""
+        deprecated: it reaches the run. Plan L Stage 4 (L-D1): the pause
+        meets every legacy migration condition, so the plain resume converts
+        it -- the stage is accepted locally at exactly the reviewed commit,
+        with no provider turn and nothing pushed (was: kept paused; the
+        conversion is covered in full by test_legacy_migration)."""
 
         candidate = self._legacy_push_pause()
-        before = tree_snapshot(self.repo)
         with self.recorder.active():
             code, out, err = self.cli(
                 "resume-plan", str(self.plan_path), "--run-key", RUN_KEY, "--repo-root", str(self.repo),
-                "--expected-branch", "feature/x",
+                "--expected-branch", "feature/x", "--stop-after-stage", S1,
                 "--claude-executable", str(self.claude), "--codex-executable", str(self.codex),
             )
         self.assertEqual(code, 0, err)
         self.assertNotIn(PUSH_PERMISSION_DEPRECATED, err)
-        self.assertIn(PUSH_AUTHORIZATION_REQUIRED, out + err)
+        self.assertIn("legacy_push_pause_converted", out + err)
         # No command offering the retired permission is printed.
         self.assertNotIn(f"--allow-push-candidate {candidate}", out)
-        self.assertEqual(tree_snapshot(self.repo), before)
-        self.assertIs(self.status(S1), StageStatus.WORKING)
+        self.assertIs(self.status(S1), StageStatus.ACCEPTED)
+        self.assertEqual(head(self.repo), candidate)
         self.assertEqual(self.recorder.remote_commands(), [])
         self.assertFalse((self.root / "TRIPWIRE").exists())
 

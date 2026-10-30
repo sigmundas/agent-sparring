@@ -21,7 +21,9 @@ separately, in ``config.worktree``:
 and the surfaces, with no guard active:
 
 - ``sparring runs --json`` and ``finish-run --dry-run`` of a pinned managed
-  run (the run's pin and snapshot: a typed refusal in the check's detail);
+  run: since Plan L Stage 4 they read no remote, so nothing planted is
+  consulted, and executing the finish -- held to the run's trusted
+  snapshot -- refuses the planted change by name;
 - ``sparring handoff`` of a stage no run owns and of a stage a pinned run
   owns: since Plan L Stage 3 both are written from the local repository
   alone, the recorder sees no remote command, and nothing planted runs;
@@ -32,8 +34,8 @@ and the surfaces, with no guard active:
   to the sibling's run-start snapshot (the planted change refuses by name),
   and nothing planted runs.
 
-The status surfaces are exercised on a legacy (pinned) managed run, which
-is what still reads a remote until Plan L's Stage 4 makes finish local.
+The status surfaces are exercised on a legacy (pinned) managed run, the
+one that read a remote before Plan L's Stage 4 made finish local.
 
 A read leaves no trace in a bare repository, so "the second bare
 repository receives no contact" is shown by its refs being unchanged, by
@@ -195,36 +197,47 @@ class _StatusMatrix(_Planting, _FinishTestCase):
         self.scratch = self.repo.parent
         self.marker = self.scratch / "MARKER"
 
-    def _candidate_check(self, finish: dict) -> dict:
-        return next(c for c in finish["checks"] if c["code"] == "candidate_not_pushed")
-
     def _run_status_surfaces(self, item: str, scope: str) -> None:
-        record, _ = self._complete()
+        # Plan L Stage 4: status is local. It has no candidate_not_pushed
+        # check and reads no remote, so the planted item is never consulted
+        # (was: the remote check refused with repository_config_changed in
+        # its detail). Executing the finish, which is held to the run's
+        # trusted snapshot (a legacy pin's), refuses the planted change by
+        # name, and nothing is merged.
+        record, head = self._complete()
         worktree = Path(record.worktree_path)
         second = self.second(worktree)
         before = _refs(second)
         key = self.plant(worktree, item, scope, second)
+        main_before = _plain_ok(self.repo, "rev-parse", "main")
 
-        code, out, err = self._main("runs", "--repo-root", str(self.repo), "--json")
-        self.assertEqual(code, 0, err)
-        (run,) = json.loads(out)["runs"]
-        check = self._candidate_check(run["finish"])
-        self.assertFalse(check["ok"])
-        self.assertIn("remote state not checked", check["detail"])
-        self.assertIn("repository_config_changed", check["detail"])
-        self.assertIn(key.lower().rsplit(".", 1)[-1], check["detail"].lower())
-        self.assertFalse(run["git"]["candidate_pushed"])
-
-        code, out, err = self._main(
-            "finish-run", "--run-key", record.run_key, "--repo-root", str(self.repo), "--dry-run", "--json"
-        )
-        self.assertEqual(code, 3, err)
-        dry = json.loads(out)
+        recorder = GitRecorder(self.scratch)
+        with recorder.active():
+            code, out, err = self._main("runs", "--repo-root", str(self.repo), "--json")
+            self.assertEqual(code, 0, err)
+            (run,) = json.loads(out)["runs"]
+            dry_code, out, err = self._main(
+                "finish-run", "--run-key", record.run_key, "--repo-root", str(self.repo), "--dry-run", "--json"
+            )
+            dry = json.loads(out)
+            finish_code, out, err = self._main(
+                "finish-run", "--run-key", record.run_key, "--repo-root", str(self.repo), "--json"
+            )
+            report = json.loads(out)
+        self.assertNotIn("candidate_not_pushed", {c["code"] for c in run["finish"]["checks"]})
+        self.assertIsNone(run["git"]["candidate_pushed"])
+        self.assertEqual(dry_code, 0, err)
         # Plan L adds the engine's capabilities (an added field).
         self.assertEqual(dry.pop("capabilities"), ["local_first"])
         self.assertEqual(dry, run["finish"])
-        self.assertIn("repository_config_changed", self._candidate_check(dry)["detail"])
+        self.assertNotEqual(finish_code, 0)
+        self.assertIn("repository_config_changed", report["reason"])
+        self.assertIn(key.lower().rsplit(".", 1)[-1], report["reason"].lower())
+        self.assertEqual(_plain_ok(self.repo, "rev-parse", "main"), main_before)
+        self.assertNotEqual(main_before, head)
 
+        self.assertTrue(recorder.lines())
+        self.assertEqual(recorder.remote_commands(), [])
         self.assertNoMarker()
         self.assertEqual(_refs(second), before)
         self.positive_control(worktree, item, second)
@@ -245,6 +258,11 @@ class StatusWithoutPinTests(_Planting, _FinishTestCase):
         self.marker = self.scratch / "MARKER"
 
     def test_a_run_with_no_pin_reports_the_remote_unchecked_and_never_contacts_it(self):
+        # Plan L Stage 4: status never reads a remote, pin or no pin (was:
+        # candidate_not_pushed failing with REMOTE_NOT_CHECKED_NO_PIN, now
+        # removed with the check). The run whose recorded pin is gone is
+        # refused when the finish executes, by the run-state integrity
+        # refusal, before any Git command -- and nothing planted runs.
         record, _ = self._complete()
         worktree = Path(record.worktree_path)
         state_path = record.sparring_dir / "plans" / f"{record.run_key}.json"
@@ -254,17 +272,23 @@ class StatusWithoutPinTests(_Planting, _FinishTestCase):
         second = self.second(worktree)
         self.plant(worktree, "uploadpack", "local", second)
 
-        status = managed_finish.finish_status(self.repo, record.run_key)
-        code, out, err = self._main("runs", "--repo-root", str(self.repo), "--json")
+        recorder = GitRecorder(self.scratch)
+        with recorder.active():
+            status = managed_finish.finish_status(self.repo, record.run_key)
+            code, out, err = self._main("runs", "--repo-root", str(self.repo), "--json")
+            finish_code, finish_out, _ = self._main(
+                "finish-run", "--run-key", record.run_key, "--repo-root", str(self.repo), "--json"
+            )
 
         self.assertEqual(code, 0, err)
         (run,) = json.loads(out)["runs"]
         for finish in (status["finish"], run["finish"]):
-            check = next(c for c in finish["checks"] if c["code"] == "candidate_not_pushed")
-            self.assertEqual(
-                (check["ok"], check["detail"]), (False, managed_finish.REMOTE_NOT_CHECKED_NO_PIN)
-            )
-        self.assertEqual(managed_finish.REMOTE_NOT_CHECKED_NO_PIN, "remote state not checked: run has no pin")
+            self.assertNotIn("candidate_not_pushed", {c["code"] for c in finish["checks"]})
+        self.assertFalse(hasattr(managed_finish, "REMOTE_NOT_CHECKED_NO_PIN"))
+        report = json.loads(finish_out)
+        self.assertEqual((finish_code, report["stopped_at"]), (3, "checks"))
+        self.assertIn("trusted_config_missing", report["reason"])
+        self.assertEqual(recorder.remote_commands(), [])
         self.assertNoMarker()
         self.positive_control(worktree, "uploadpack", second)
 

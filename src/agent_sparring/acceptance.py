@@ -1002,6 +1002,75 @@ def unrepresented_dirty(repo_root: Path, stage: Stage) -> tuple[str, ...]:
     )
 
 
+def recorded_ready_problems(
+    stage: Stage, repo_root: Path, *, expected_branch: str, candidate_sha: str
+) -> tuple[tuple[int, str], ...]:
+    """Why ``candidate_sha`` is not, right now, exactly what the stage's
+    recorded READY was over, as ``(condition, detail)`` pairs: empty when it
+    is. Read-only, and held to the owning run's trusted snapshots.
+
+    For the legacy migration's conditions (see
+    :func:`agent_sparring.plan.resume_plan`): ``2`` -- the engine-recorded
+    review is a READY over ``candidate_sha``, which is the ``HEAD`` of
+    ``expected_branch``; ``3`` -- the working tree is clean apart from the
+    stage's own artifacts, and every declared sibling is clean and at
+    exactly the commit that review was over. Acceptance itself re-checks all
+    of it (:func:`freeze_candidate`, :func:`accept_candidate`)."""
+
+    problems: list[tuple[int, str]] = []
+    try:
+        state = _read_state(stage)
+        with _run_guard(stage, repo_root):
+            try:
+                branch = current_branch(repo_root)
+                head = resolve_commit(repo_root, "HEAD", label="HEAD")
+            except GitContextError as exc:
+                return ((2, f"{repo_root} cannot be read: {exc}"),)
+            if branch != expected_branch or head != candidate_sha:
+                problems.append((
+                    2, f"{repo_root} is at {head} on {branch!r}, not the paused candidate "
+                    f"{candidate_sha} as the HEAD of {expected_branch!r}",
+                ))
+            blocking, _ignored = _partition_dirty(repo_root, stage)
+            if blocking:
+                problems.append((
+                    3, "the working tree holds changes the candidate does not represent ("
+                    + ", ".join(_describe_entry(entry) for entry in blocking) + ")",
+                ))
+            reviewed_siblings: dict[str, str | None] = {}
+            if state.review is not None:
+                reviewed_siblings = {entry.name: entry.head_sha for entry in state.review.repositories}
+            elif state.next_turn_candidate is not None:
+                reviewed_siblings = {
+                    entry.name: entry.head_sha for entry in state.next_turn_candidate.repositories
+                }
+            at: list[CandidateRepository] = []
+            for repository in state.repositories:
+                root = sibling_root(repo_root, repository)
+                try:
+                    sibling_head = resolve_commit(root, "HEAD", label=f"{repository.name} HEAD")
+                    dirty = dirty_entries(root, all_untracked=True)
+                except (GitContextError, AcceptanceError, OSError) as exc:
+                    problems.append((3, f"sibling {_describe(repository)} cannot be read: {exc}"))
+                    continue
+                recorded = repository.candidate_sha or reviewed_siblings.get(repository.name)
+                if sibling_head != recorded:
+                    problems.append((
+                        3, f"sibling {_describe(repository)} is at {sibling_head}, not its recorded "
+                        f"candidate {recorded or '(none recorded)'}",
+                    ))
+                if dirty:
+                    problems.append((3, f"sibling {_describe(repository)} has uncommitted changes"))
+                at.append(replace(repository, candidate_sha=sibling_head))
+            try:
+                _require_verdict_at(replace(state, repositories=tuple(at)), stage, candidate_sha)
+            except AcceptanceError as exc:
+                problems.append((2, str(exc)))
+    except AcceptanceError as exc:
+        problems.append((2, f"the recorded review cannot be checked: {exc}"))
+    return tuple(problems)
+
+
 def pin_sibling_candidates(
     repo_root: Path,
     repositories: tuple[CandidateRepository, ...],

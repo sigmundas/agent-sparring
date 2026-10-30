@@ -16,6 +16,7 @@ It orders nothing and authorizes nothing. See
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -307,6 +308,11 @@ class RecordedOutcome:
     #: back for display and for a runner reconciling its ledger against what
     #: is actually on disk; it never makes the stage await a human.
     deferred_human_gate: DeferredHumanGate | None = None
+    #: The gate instances this verdict promoted (``## Promoted deferred
+    #: verification``). Read back so a legacy migration can refuse a verdict
+    #: that names any; a runner applies promotions only from verdicts it
+    #: produced itself.
+    promote_deferred: tuple[str, ...] = ()
 
     @property
     def awaits_a_human(self) -> bool:
@@ -358,15 +364,30 @@ def read_recorded_outcome(stage: Stage) -> RecordedOutcome | None:
         needs_you_reason=reason,
         human_gate=_recorded_gate(text),
         deferred_human_gate=_recorded_deferred_gate(text),
+        promote_deferred=_recorded_promotions(text),
     )
 
 
-def _routing_block(text: str) -> list[str]:
-    """The lines under ``## Routing outcome``, up to the next heading."""
+_PROMOTED_RE = re.compile(r"\A- gate instance `([^`]+)`")
+
+
+def _recorded_promotions(text: str) -> tuple[str, ...]:
+    """The gate instances under ``## Promoted deferred verification``."""
+
+    found: list[str] = []
+    for line in _routing_block(text, "## Promoted deferred verification"):
+        match = _PROMOTED_RE.match(line)
+        if match is not None:
+            found.append(match.group(1))
+    return tuple(found)
+
+
+def _routing_block(text: str, heading: str = "## Routing outcome") -> list[str]:
+    """The lines under ``heading``, up to the next heading."""
 
     lines = text.splitlines()
     try:
-        start = lines.index("## Routing outcome") + 1
+        start = lines.index(heading) + 1
     except ValueError:
         return []
     block: list[str] = []

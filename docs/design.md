@@ -757,7 +757,15 @@ Publishing a commit for external review is a separate, explicit action that
 never implies acceptance. The earlier design -- a typed
 `push_authorization_required` pause answered by a person's push permission
 (`agent_sparring.push_gate`) -- survives only as legacy state that still
-loads, and as the push primitive kept for that separate action.
+loads, and as the push primitive kept for that separate action. Such a
+pause converts into local acceptance only on a plain resume and only under
+six conditions verified at conversion (L-D1: the pause is exactly the
+current, unaccepted stage's; the recorded READY is over exactly the paused
+candidate at `HEAD`; the tree is clean, every sibling at its recorded
+candidate and the plan unchanged; nothing promoted; no deferral without an
+instance; every human check answered Pass); then the ordinary post-READY
+sequence runs. A push permission is never taken as acceptance of
+unreviewed code, and an answered incident pause clears only itself.
 
 ### Deferred human verification
 
@@ -971,7 +979,9 @@ refused `--managed`. As built:
 
 Merging and cleanup are one explicit engine command over one run:
 `sparring finish-run --run-key <key> [--dry-run] [--allow-merge-commit]
-[--push-target] [--merge-only] [--json]`. `--dry-run` reports every check
+[--merge-only] [--json]`. It is local (Plan L): it contacts no remote, and
+`--push-target` and `[finish] delete_remote_branch = true` refuse with
+`remote_finish_removed` -- publishing is Push to review. `--dry-run` reports every check
 below with pass/fail and the reason, and whether the run is eligible to
 **merge** and to **clean up** — separately, since a run whose project state
 cannot be archived may still be merged. Without `--dry-run` it performs only
@@ -988,7 +998,9 @@ Merging requires all of:
 4. the registered worktree has the record's branch checked out and is
    clean (no modified, staged or untracked non-ignored files);
 5. HEAD, the branch tip and the final accepted candidate agree;
-6. when the record has a remote, the **candidate** is reachable on it;
+6. in every participating repository, every candidate the run accepted
+   there is an ancestor of the commit the finish integrates
+   (`run_history_rewritten` otherwise, I-L2b) -- no remote is an input;
 7. no other worktree has the branch checked out;
 8. a checkout that has the target checked out has no staged or modified
    tracked files and no merge/rebase/cherry-pick/revert/bisect in progress;
@@ -997,18 +1009,20 @@ Merging requires all of:
    Ancestry decides, never message or patch matching; nothing is rebased.
 
 Cleanup additionally requires every ignored file under the project
-directory to be archivable. Execution then: merge; with `[finish]
-remove_plan` commit the plan file's removal on the target; push the target
-only with `--push-target` (never forced; pushing is optional, so target
-reachability is not a check); archive the worktree's project state to
+directory to be archivable. Execution then: merge locally in the primary
+repository and in each sibling the run accepted a candidate in (a sibling's
+candidate goes to its own branch of the same target name; nothing of the
+sibling's is removed); with `[finish] remove_plan` commit the plan file's
+removal on the target; archive the worktree's project state to
 `<git-common-dir>/agent-sparring/runs/<run-key>/`; `git worktree remove`
-without `--force`; `git branch -d` (never `-D`); with `[finish]
-delete_remote_branch` delete the remote branch; record `finished`. Each
+without `--force`; `git branch -d` (never `-D`); record `finished`. Each
 step appends an event, so a run stopped part-way is resumed by running the
 command again (a step is skipped only when its event is recorded), and the
-report says what remains. `--merge-only` stops after merge, plan removal
-and push. Both options are off by default and read from the reviewed
-candidate's own config.
+report says what remains. `--merge-only` stops after merge and plan
+removal. The option is off by default and read from the reviewed
+candidate's own config. Every Git command is held to the run's trusted
+configuration snapshots; a run state that no longer holds them refuses
+(`trusted_config_missing`).
 
 **Plan removal is byte-exact.** The plan is the human's document, so the
 engine may delete it only here, only by opt-in, and only when the target's
@@ -1023,26 +1037,15 @@ retries it; only an unexpected git failure stops it. A manifest run removes only
 removal commit sits one commit past the candidate; every later check uses
 ancestry, so it is still "contains the candidate".
 
-**Remote deletion is compare-and-delete.** A check-then-delete would race
-with a concurrent push and drop someone's commits, so the delete is a
-`push --force-with-lease=refs/heads/<b>:<candidate> --delete`, which the
-server refuses unless the branch is exactly the merged candidate; that
-lease is the only force anywhere in finish. A read of the remote only
-informs: the branch is read at the push URL (absent needs no delete) and
-the remote target must already contain the candidate, else the branch is
-kept (`remote_target_missing_candidate`, or `remote_target_unknown` until
-fetched). That read is point-in-time; only the delete itself is
-lease-guarded. Several push URLs are refused (`remote_multiple_push_urls`),
-and a push-only endpoint that `ls-remote` cannot read cannot use the option. A refusal is classified from the
-push's own status line. A refused or unreachable delete keeps the branch
-and stops the finish unfinished; re-running resumes. With the option off the
-branch is kept and reported (`remote_delete_disabled`, plus the legacy
-`remote_delete_unavailable` kept entry for one release).
+**No remote finish.** The lease-guarded remote branch deletion and the
+target push were removed with Plan L Stage 4: a finish neither reads nor
+writes a remote, so there is no race with a concurrent push to guard
+against. The report keeps its `kept` (always empty) and `remote_branch`
+(`local_finish`) fields for clients (`schema_version` 1).
 
 **Never automatic.** Nothing is removed on completion, on a timer or on
-window close. A dirty, paused, unaccepted, unmerged or unpushed worktree is
-never removed, and no engine path uses `--force`, `-D` or a force push —
-the one exception being the opted-in, lease-guarded remote branch delete.
+window close. A dirty, paused, unaccepted or unmerged worktree is never
+removed, and no engine path uses `--force`, `-D` or a force push.
 Abandoning a run is a separate, explicitly confirmed action that keeps the
 branch.
 

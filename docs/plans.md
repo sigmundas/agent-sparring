@@ -316,16 +316,36 @@ authorization and remote records are kept as written and decide nothing
 about acceptance. A pause it recorded stays until it is resolved
 explicitly, and none of them is ever review or acceptance:
 
-- `push_authorization_required`: a plain `resume-plan` leaves it exactly as
-  it is (it converts only under the legacy migration rules, never through
-  `--allow-push-candidate`);
+- `push_authorization_required`: converts on a plain `resume-plan` (never
+  through `--allow-push-candidate`, which refuses) only when **all** of these
+  hold, each checked at that moment: (1) the run is paused on exactly that
+  pause, for its current stage, which is not accepted; (2) the stage's
+  recorded verdict is READY, over exactly the paused candidate, which is the
+  `HEAD` of the expected branch; (3) the tree is clean apart from stage
+  artifacts, every sibling is at its recorded candidate, and the plan is
+  unchanged; (4) no deferred obligation is promoted, and the verdict
+  promotes none; (5) the verdict defers no gate without a gate instance; (6)
+  every human check of the stage's recorded gate is answered Pass. Then the
+  stage is frozen and accepted locally by the ordinary gate, the ordinary
+  post-READY sequence runs (deferrals reach the ledger; a promoted
+  obligation, the next stage's `gates_before` or completion gates stop the
+  run as usual), and the run state records `legacy_push_pause_converted`
+  (stage, commit, pause, time) with a printed notice. Otherwise the pause
+  stays, the resume names each failed condition, and nothing is written,
+  pushed, accepted or run -- the stage is never re-entered as an
+  implementation turn;
 - `unauthorized_remote_movement` and `pushed_candidate_unauthorized`
   (described below): freeze and accept refuse while one stands, and only
   `acknowledge-remote-movement` or `authorize-pushed-candidate` clears it.
+  The answer clears only that pause and accepts nothing. A pause raised
+  mid-loop then resumes the stage normally; one raised after READY (the
+  answered commit is the one the READY was over) goes through the same six
+  conditions on a plain resume.
 
-`finish-run` of such a pinned run still reads and pushes through its pin
-until finish itself becomes local; the rest of this section describes those
-legacy records.
+`finish-run` of such a run is local like any other: its pin is never read
+to finish, except for the trusted configuration snapshot it carries, which
+holds the finish's local Git commands as a local-first run's own snapshot
+does. The rest of this section describes those legacy records.
 
 The push primitive the engine kept (unused by runs) is exactly one thing:
 
@@ -477,10 +497,9 @@ under it, not even a partial clone's lazy fetch. `sparring runs --json`,
 `slice-branch --json`, `sparring handoff` and `finish-run --dry-run` read
 only the local repository; the handoff reports the candidate as
 `Local commit: <sha> on <branch>` (its `- Branch:` line is kept), and
-`--no-check-pushed` is still accepted, with nothing left to skip. A legacy
-run's remote finish (`--push-target`, remote branch deletion, and the
-remote check of a run an older engine pinned) is refused the same way until
-`finish-run` becomes entirely local.
+`--no-check-pushed` is still accepted, with nothing left to skip.
+`finish-run` is entirely local (below): `--push-target` and `[finish]
+delete_remote_branch = true` refuse with `remote_finish_removed`.
 
 Plan R's isolated remote primitive is kept, with no caller in the engine,
 for the separate Push to review: it never reads the repository's own
@@ -514,7 +533,7 @@ sparring resume-plan --run-key <run-key> [--evidence "..."]
 # list, check, finish
 sparring runs [--json]
 sparring finish-run --run-key <run-key> --dry-run [--json]       # exit 0 eligible, 3 not
-sparring finish-run --run-key <run-key> [--push-target] [--allow-merge-commit] [--merge-only] [--json]
+sparring finish-run --run-key <run-key> [--allow-merge-commit] [--merge-only] [--json]
 # what is believed unused (--dry-run reports; deleting needs a selector)
 sparring prune --dry-run [--json]
 sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
@@ -525,20 +544,30 @@ sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
   sibling directory `<repo>-sparring-<run-key>` on branch
   `sparring/<plan-slug>-<suffix>`. Only Markdown plans and plain manifests
   run managed, and only in a single repository.
-- `finish-run` re-makes every check, then in order: merges into the target
-  (fast-forward; a merge commit only with `--allow-merge-commit`; never a
-  rebase), with `[finish] remove_plan = true` commits the plan file's
-  removal on the target (below), pushes the target with `--push-target`
-  (never forced; one push carries the merge and the removal), archives
-  the worktree's `.sparring/` state to `<git-common-dir>/agent-sparring/runs/<run-key>/`,
-  removes the worktree (`git worktree remove`, never `--force`), deletes the
-  local branch (`git branch -d`, never `-D`), with `[finish]
-  delete_remote_branch = true` deletes the remote branch, and records the
-  run finished. Each step records its event; it stops at the first failure,
-  leaving the rest in place and saying what remains; running it again
-  continues, skipping only steps whose event is recorded. `--merge-only`
-  runs the merge, the plan removal and the push.
-- Both `[finish]` options default to false and are read from the reviewed
+- `finish-run` is local: it contacts no remote, reads no remote and pushes
+  nothing. It re-makes every check, then in order: merges into the local
+  target (fast-forward; a merge commit only with `--allow-merge-commit`;
+  never a rebase) in every participating repository -- the primary, then
+  each sibling the run accepted a candidate in, whose accepted candidate is
+  merged into that repository's branch of the same target name (recorded as
+  `sibling_merged`; nothing of the sibling's is deleted) -- with `[finish]
+  remove_plan = true` commits the plan file's removal on the target (below),
+  archives the worktree's `.sparring/` state to
+  `<git-common-dir>/agent-sparring/runs/<run-key>/`, removes the worktree
+  (`git worktree remove`, never `--force`), deletes the local branch (`git
+  branch -d`, never `-D`), and records the run finished. Each step records
+  its event; it stops at the first failure, leaving the rest in place and
+  saying what remains; running it again continues, skipping only steps
+  whose event is recorded. `--merge-only` runs the merge and the plan
+  removal. Every Git command of the finish is held to the run's trusted
+  configuration snapshots (a legacy run's is its pin's); a run state that
+  is gone, damaged or replaced refuses with `trusted_config_missing`.
+- `--push-target` refuses with `remote_finish_removed` before anything is
+  read or changed, and a reviewed candidate whose `[finish]
+  delete_remote_branch` is true refuses the finish with the same code,
+  nothing merged; `check-config` reports a config that still sets it.
+  Publishing a commit for external review is Push to review.
+- `[finish] remove_plan` defaults to false and is read from the reviewed
   candidate's own `.sparring/project.toml`.
 - **Plan removal** (`plan_removal.code`): the run snapshots the plan file's
   exact bytes when it starts (the manifest file for a manifest run, never
@@ -561,28 +590,10 @@ sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
   reports it and never retries. Only `plan_commit_failed` stops the finish
   (and is retried). `plan_removal_disabled` when the option is off,
   `finish_config_unreadable` when the candidate's config cannot be read.
-- **Remote branch** (`remote_branch.code`): deleted only as a
-  compare-and-delete, `git push --force-with-lease=refs/heads/<b>:<candidate>
-  <remote> --delete refs/heads/<b>`, so the server refuses unless it is
-  exactly the merged candidate. First the remote is read at its push URL:
-  an absent branch is `remote_branch_absent` (success, no push), and if the
-  remote target does not yet contain the candidate (no `--push-target`, say)
-  the branch is kept with `remote_target_missing_candidate` — push the
-  target and re-run (`remote_target_unknown` when the remote target's commit
-  is not present locally: fetch first). That target read is point-in-time;
-  only the branch deletion itself is lease-guarded. A remote with several
-  push URLs is not deleted from (`remote_multiple_push_urls`: a per-URL
-  lease delete is not supported), and a push-only endpoint whose
-  `ls-remote` fails cannot use `delete_remote_branch` (`remote_unreachable`). A refused delete is classified from the push's own
-  status: `remote_lease_mismatch` (stale info), `remote_delete_rejected`
-  (the remote refused) or `remote_unreachable`. Every one of these keeps
-  the branch, stops the finish at `delete_remote_branch` unfinished, and a
-  re-run resumes. `remote_branch_deleted` on success.
-  `remote_delete_disabled` when the option is off (the branch is kept),
-  `no_remote` when the record has none. While kept it is also listed in
-  `kept` as `keep_remote_branch`; with the option off its code is
-  `remote_delete_unavailable`, a compatibility alias kept for one release
-  and removed in the next.
+- **Remote branch** (`remote_branch.code`): always `local_finish` -- the
+  finish neither reads nor deletes a remote branch -- and `kept` is always
+  empty. Both fields stay in the report (`schema_version` 1). A run an
+  older engine finished reports the remote branch deletion it recorded.
 - `prune --dry-run` (no selector) reports finished records, records whose
   worktree directory is gone and finish archives, each with its reason,
   exactly as before. With `--older-than DAYS` and/or `--keep N` it selects
@@ -603,11 +614,16 @@ branch and worktree), `run_not_complete` (not complete, or a stage not
 accepted at the final candidate), `human_gate_pending`, `runner_live`,
 `worktree_missing`, `branch_mismatch`, `worktree_dirty`,
 `candidate_mismatch` (HEAD, branch tip and accepted candidate differ),
-`candidate_not_pushed`, `branch_in_use`, `target_checkout_dirty`,
+`run_history_rewritten` (one per participating repository: a candidate the
+run accepted there is not an ancestor of the commit the finish would
+integrate, so nothing is merged), `branch_in_use`, `target_checkout_dirty`,
 `target_operation_in_progress`, `target_advanced` (target moved past the
 base: needs `--allow-merge-commit`, or the target is missing),
-`merge_conflict`, and `unarchived_project_state` (cleanup only: the run's
-project state cannot be archived; the merge may still go ahead).
+`merge_conflict`, `sibling_merge` (one per sibling: its candidate, target,
+target checkout and merge), `remote_finish_removed` (the candidate's config
+sets `delete_remote_branch = true`), and `unarchived_project_state`
+(cleanup only: the run's project state cannot be archived; the merge may
+still go ahead). There is no `candidate_not_pushed` check.
 
 **Start and resume refusals** (`could not run plan: …` / `could not resume
 plan: …`, everything left in place): `expected_branch_with_managed`,
@@ -622,8 +638,8 @@ plan: …`, everything left in place): `expected_branch_with_managed`,
 `worktree_unregistered` (run state and record disagree: an integrity
 refusal), and `record_malformed` / `record_unreadable` /
 `record_schema_unknown`. Finish execution steps report `stopped_at` as one
-of `merge`, `remove_plan`, `push_target`, `archive_state`, `remove_worktree`,
-`delete_branch`, `delete_remote_branch`. JSON shapes: [reference](reference.md#managed-run-json).
+of `checks`, `merge`, `remove_plan`, `archive_state`, `remove_worktree`,
+`delete_branch`. JSON shapes: [reference](reference.md#managed-run-json).
 
 ## Marking stages in a plan — or handing over an execution manifest
 

@@ -97,6 +97,7 @@ from agent_sparring.deferred_gate import (
 from agent_sparring.plan_model import PlanSource
 from agent_sparring.capabilities import (
     capabilities as engine_capabilities,
+    delete_remote_branch_removed,
     push_not_part_of_runs,
     push_permission_deprecated,
 )
@@ -182,8 +183,27 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
     for resolved in (effective.stage, effective.sparring):
         print(f"{resolved.role} agent: {_describe_agent(resolved)}")
     obsolete = _warn_obsolete_settings(config)
+    remote_finish = _warn_remote_finish_setting(config)
     ignored = _report_workflow_state_ignored(args, sparring_dir)
-    return 1 if obsolete else ignored
+    return 1 if obsolete or remote_finish else ignored
+
+
+def _warn_remote_finish_setting(config: ProjectConfig) -> bool:
+    """Say, on stderr, that project.toml still sets the retired ``[finish]
+    delete_remote_branch``. True when it is set true: ``finish-run`` refuses
+    such a candidate (``remote_finish_removed``)."""
+
+    if not config.finish_delete_remote_branch_set:
+        return False
+    if config.finish_delete_remote_branch:
+        print(f"{delete_remote_branch_removed('project.toml')}", file=sys.stderr)
+        return True
+    print(
+        "obsolete: project.toml [finish] delete_remote_branch = false has no effect; finish-run "
+        "is local and never deletes a remote branch. Remove the setting.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _warn_obsolete_settings(config: ProjectConfig | None) -> bool:
@@ -2594,6 +2614,12 @@ def _cmd_prune(args: argparse.Namespace) -> int:
 
 
 def _cmd_finish_run(args: argparse.Namespace) -> int:
+    if args.push_target:
+        # A finish is local: refused before anything is read or changed,
+        # dry run or not, and never reinterpreted as a local finish.
+        return _print_finish_report(args, managed_finish.refused_push_target(
+            args.run_key, merge_only=args.merge_only
+        ), None)
     if not args.dry_run:
         return _execute_finish_run(args)
     try:
@@ -2629,11 +2655,16 @@ def _execute_finish_run(args: argparse.Namespace) -> int:
             args.run_key,
             merge_only=args.merge_only,
             allow_merge_commit=args.allow_merge_commit,
-            push_target=args.push_target,
         )
     except ManagedRunError as exc:
         print(f"could not finish run {args.run_key}: {exc}", file=sys.stderr)
         return 1
+    return _print_finish_report(args, report, refused)
+
+
+def _print_finish_report(
+    args: argparse.Namespace, report: dict[str, object], refused: dict[str, object] | None
+) -> int:
     if args.json:
         json.dump(_with_capabilities(report), sys.stdout, indent=2)
         print()
@@ -4439,10 +4470,10 @@ def build_parser() -> argparse.ArgumentParser:
     finish_run_parser = subparsers.add_parser(
         "finish-run",
         help=(
-            "merge a complete managed run into its target branch and clean it up "
-            "(archive its state, remove its worktree and branch), re-checking "
-            "eligibility first; --dry-run only reports (exit 0 done/eligible, "
-            "3 not eligible, 1 a step failed)"
+            "merge a complete managed run into its local target branch, in every "
+            "participating repository, and clean it up (archive its state, remove its "
+            "worktree and branch), re-checking eligibility first; contacts no remote; "
+            "--dry-run only reports (exit 0 done/eligible, 3 not eligible, 1 a step failed)"
         ),
     )
     finish_run_parser.add_argument("--run-key", required=True, help="the managed run to finish")
@@ -4452,9 +4483,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-merge-commit", action="store_true",
         help="accept a merge commit when the target has advanced past the run's base",
     )
-    finish_run_parser.add_argument("--merge-only", action="store_true", help="merge (and push) but do not clean up")
+    finish_run_parser.add_argument("--merge-only", action="store_true", help="merge but do not clean up")
     finish_run_parser.add_argument(
-        "--push-target", action="store_true", help="push the target branch to the record's remote (never forced)"
+        "--push-target", action="store_true",
+        help=(
+            "retired: finish-run is local and never contacts a remote. Refused with "
+            "remote_finish_removed, before anything is read or changed; use Push to review to "
+            "publish a commit for external review"
+        ),
     )
     finish_run_parser.add_argument("--json", action="store_true", help="report as JSON")
     finish_run_parser.set_defaults(func=_cmd_finish_run)

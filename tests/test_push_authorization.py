@@ -493,8 +493,11 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertIsNone(state.remote_pin)
 
     def test_the_pause_is_recorded_in_the_run_state_and_survives_a_reload(self):
-        # Now: a legacy push pause loads as written, and a plain resume keeps
-        # it exactly as it was -- no agent, no push, no acceptance.
+        # A legacy push pause loads as written. Plan L Stage 4 (L-D1): a
+        # plain resume converts it when every condition holds -- here they
+        # do -- accepting the stage locally with no agent turn and no push
+        # (was: kept exactly as it was). The pause that does not meet them
+        # stays byte-identical: test_legacy_migration.
         sha = self._legacy_push_pause()
 
         reloaded = PlanRunState.load(self.state_path)
@@ -503,14 +506,18 @@ class ManagedRunPushTests(_RemoteAwareTestCase):
         self.assertEqual(payload["awaiting"]["candidate_sha"], sha)
         self.assertIsInstance(reloaded.awaiting, PushRequired)
 
-        before = self.state_path.read_bytes()
         stage_adapter, sparring_adapter = self._unpushed(), _SparringAdapter([])
-        result = self._resume(stage_adapter, sparring_adapter)
-        self.assertEqual(result.awaiting.kind, PUSH_AUTHORIZATION_REQUIRED)
-        self.assertEqual(self.state_path.read_bytes(), before)
+        result = self._resume(stage_adapter, sparring_adapter, stop_after_stage=S1)
+        self.assertIsNone(result.awaiting)
+        self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1])
         self.assertEqual(stage_adapter.turns, 0)
         self.assertEqual(sparring_adapter.start_calls + sparring_adapter.resume_calls, [])
-        self.assertIs(self._stage(S1).read_state().status, StageStatus.WORKING)
+        s1 = self._stage(S1).read_state()
+        self.assertIs(s1.status, StageStatus.ACCEPTED)
+        self.assertEqual(s1.candidate_sha, sha)
+        (converted,) = self._plan_state().legacy_push_pause_converted
+        self.assertEqual((converted["stage"], converted["sha"]), (S1, sha))
+        self.assertIsNone(self._plan_state().push_authorization)
         self.assertNothingPushed()
 
     def test_authorizing_the_exact_candidate_is_refused_as_deprecated(self):
