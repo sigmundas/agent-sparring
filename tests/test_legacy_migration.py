@@ -507,6 +507,75 @@ class IncidentPauseTests(_LegacyCase):
         self.assertIs(s1.status, StageStatus.ACCEPTED)
         self.assertEqual(s1.candidate_sha, sha)
 
+    def _verdict_changed_after_ack(self, change) -> str:
+        sha = self._acknowledged_after_ready(self.remote_before)
+        stage = self._stage(S1)
+        stage.write_sparring(change(stage.read_sparring()))
+        return sha
+
+    @staticmethod
+    def _send_back(text: str) -> str:
+        return text.replace("- Action: `READY`", "- Action: `SEND_BACK`")
+
+    @staticmethod
+    def _unreadable(_text: str) -> str:
+        return "this is not a recorded verdict\n"
+
+    def test_a_verdict_no_longer_ready_after_the_answer_fails_condition_2(self):
+        for change in (self._send_back, self._unreadable):
+            with self.subTest(change=change.__name__):
+                self.tearDown()
+                self.setUp()
+                self._verdict_changed_after_ack(change)
+                before = self._engine_state()
+                result = self._resume_plain()
+                self._assert_stays(result, 2)
+                self.assertEqual(self._engine_state(), before)
+
+    def test_positive_control_without_the_routing_a_changed_verdict_is_acted_on(self):
+        # The same answered pause and changed verdict, with the post-READY
+        # routing disabled in this test only: the ordinary path accepts the
+        # stage (unreadable verdict, finalization marker intact) or runs an
+        # agent turn (SEND_BACK) -- so the saved provenance is what holds it.
+        for change in (self._send_back, self._unreadable):
+            with self.subTest(change=change.__name__):
+                self.tearDown()
+                self.setUp()
+                self._verdict_changed_after_ack(change)
+                self.sparring_adapter = _SparringAdapter([READY, READY])
+                with mock.patch.object(plan_module, "_cleared_incident_after_ready", return_value=None):
+                    try:
+                        self._resume_plain()
+                    except Exception:  # noqa: BLE001 -- what matters is what the run did
+                        pass
+                acted = (
+                    self._stage(S1).read_state().status is StageStatus.ACCEPTED
+                    or self.stage_adapter.turns > 0
+                    or bool(self.sparring_adapter.start_calls + self.sparring_adapter.resume_calls)
+                )
+                self.assertTrue(acted)
+
+    def test_a_chosen_next_turn_or_fresh_session_is_refused_while_the_answer_stands(self):
+        self._acknowledged_after_ready(self.remote_before)
+        before = self._engine_state()
+        for kwargs in ({"next_turn": "sparring"}, {"fresh_roles": ("sparring",)}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}), self.assertRaises(PlanError):
+                self._resume_plain(**kwargs)
+        self.assertEqual(self._engine_state(), before)
+        self._assert_no_turn()
+
+    def test_a_review_turn_after_the_answer_supersedes_it(self):
+        # Evidence runs the reviewer over the candidate: a real review, after
+        # which the answered incident no longer decides how the stage resumes.
+        sha = self._acknowledged_after_ready(self.remote_before)
+        self.sparring_adapter = _SparringAdapter([READY])
+        result = self._resume_plain(evidence="Looked at it again.")
+        self.assertEqual([stage_id for stage_id, _ in result.accepted], [S1])
+        self.assertEqual(self._stage(S1).read_state().candidate_sha, sha)
+        (answered,) = self._plan_state().answered_incidents
+        self.assertEqual(answered["superseded"], "true")
+        self.assertEqual(self._plan_state().legacy_push_pause_converted, ())
+
     def test_an_answered_pause_raised_mid_loop_resumes_the_stage_normally(self):
         # NEEDS_YOU recorded when the pause is answered: not after READY.
         self._start(_Implementer(self.repo), _SparringAdapter([NEEDS_YOU]), stop_after_stage=S1)

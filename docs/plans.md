@@ -342,7 +342,11 @@ explicitly, and none of them is ever review or acceptance:
   the stage's recorded verdict was READY then). A pause raised mid-loop then
   resumes the stage normally; one raised after READY goes through the same
   six conditions on a plain resume, whatever remote tip the incident
-  observed (another commit, or none). An answer an older engine recorded,
+  observed (another commit, or none), and whatever the stage's verdict has
+  become since (a verdict no longer READY, or no longer readable, fails
+  condition 2). That holds until a review turn runs in the stage
+  (`resume-plan --evidence`), which supersedes it; `--next-turn` and
+  `--fresh-sparrer` / `--fresh-stage-agent` are refused meanwhile. An answer an older engine recorded,
   without that provenance, is treated the same way while READY is recorded.
   A recorded gate that cannot be read is never taken as no gate: it fails
   condition 5 or 6.

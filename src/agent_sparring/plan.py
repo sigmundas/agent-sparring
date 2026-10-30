@@ -3420,6 +3420,7 @@ def _run_review(
         ) from exc
     # A provider turn ran: no later stop can be a refusal of this resume.
     state.left_provider_pause = None
+    _supersede_answered_incidents(state, state_path, stage.stage_id)
     return result
 
 
@@ -4532,23 +4533,46 @@ def _convert_legacy_ready(
     return None
 
 
+def _pending_after_ready(entry: Mapping[str, str]) -> bool:
+    return entry.get("after_ready") == "true" and entry.get("superseded") != "true"
+
+
+def _supersede_answered_incidents(state: PlanRunState, state_path: Path, stage_id: str) -> None:
+    """A provider turn ran in ``stage_id`` after a post-READY incident was
+    answered: the stage's verdict is now that turn's, so the answered
+    incident no longer decides how the stage resumes. Recorded on the
+    entry (``superseded``), never by dropping it."""
+
+    updated = tuple(
+        {**entry, "superseded": "true"}
+        if entry.get("stage") == stage_id and _pending_after_ready(entry) else entry
+        for entry in state.answered_incidents
+    )
+    if updated != state.answered_incidents:
+        state.answered_incidents = updated
+        state.save(state_path)
+
+
 def _cleared_incident_after_ready(
     state: PlanRunState, sparring_dir: Path
 ) -> tuple[str, str, str] | None:
     """``(stage id, paused candidate, answer kind)`` when the run's current
-    stage is unaccepted, its recorded verdict is READY, and a person has
-    answered (and so cleared) a recorded incident pause raised after that
-    READY: it then goes through the L-D1 conditions rather than resuming the
-    stage. ``None`` otherwise -- a pause raised mid-loop resumes the stage
-    normally.
+    stage is unaccepted and a person has answered (and so cleared) a
+    recorded incident pause raised after READY: it then goes through the
+    L-D1 conditions rather than resuming the stage. ``None`` otherwise -- a
+    pause raised mid-loop resumes the stage normally.
 
     "Raised after READY" is the provenance recorded with the answer
     (:attr:`PlanRunState.answered_incidents`): never the remote tip the
-    incident observed, which can be any commit or none. An answer an older
-    engine recorded without provenance is treated strictly: with READY
-    recorded, it goes through the conditions too, against the paused
-    candidate or the commit the review was over. The candidate is ``""``
-    when none can be established, which the conditions then refuse."""
+    incident observed, which can be any commit or none. While it stands --
+    until a provider turn runs in the stage (see
+    :func:`_supersede_answered_incidents`) -- it selects migration whatever
+    the stage's verdict now is: a verdict that is no longer READY, or no
+    longer readable, fails condition 2 there. An answer an older engine
+    recorded without provenance is treated strictly: with READY recorded,
+    it goes through the conditions too, against the paused candidate or the
+    commit the review was over. The candidate is ``""`` when none can be
+    established, which the conditions then refuse."""
 
     if state.awaiting is not None:
         return None
@@ -4558,15 +4582,21 @@ def _cleared_incident_after_ready(
             return None
     except StageError:
         return None
+    answered = [entry for entry in state.answered_incidents if entry.get("stage") == state.current_stage]
+    pending = [entry for entry in answered if _pending_after_ready(entry)]
+    if pending:
+        # The saved provenance selects migration by itself: whether the
+        # stage's verdict is still READY, or readable at all, is the
+        # migration's condition 2 to check and report, never a reason to
+        # take the ordinary path instead.
+        last = pending[-1]
+        return state.current_stage, last.get("candidate") or "", last.get("kind") or ""
+    if answered:
+        # Raised mid-loop, or superseded by a review turn that ran since.
+        return None
     recorded = read_recorded_outcome(stage)
     if recorded is None or recorded.action is not RoutingAction.READY:
         return None
-    answered = [entry for entry in state.answered_incidents if entry.get("stage") == state.current_stage]
-    if answered:
-        last = answered[-1]
-        if last.get("after_ready") != "true":
-            return None
-        return state.current_stage, last.get("candidate") or "", last.get("kind") or ""
     for record in reversed(state.remote_records):
         if record.kind in (MOVEMENT_ACKNOWLEDGED, AUTHORIZED_WITHOUT_PUSH) and (
             record.stage_id == state.current_stage
@@ -4608,14 +4638,22 @@ def _drive(
     """
 
     report_legacy: Reporter = kwargs.get("report") or (lambda message: None)
-    plain = not (
-        kwargs.get("sparrer_first") or kwargs.get("next_turn_choice") or kwargs.get("fresh_roles")
-    )
     legacy_ready: tuple[str, str, str] | None = None
     if isinstance(state.awaiting, PushRequired):
         legacy_ready = (state.awaiting.stage_id, state.awaiting.candidate_sha, PUSH_AUTHORIZATION_REQUIRED)
-    elif plain:
+    elif not kwargs.get("sparrer_first"):
+        # Evidence (sparrer_first) runs the reviewer over the candidate
+        # before anything is accepted: a real review, which supersedes the
+        # answered incident. Every other resume is routed by it.
         legacy_ready = _cleared_incident_after_ready(state, sparring_dir)
+        if legacy_ready is not None and (kwargs.get("next_turn_choice") or kwargs.get("fresh_roles")):
+            raise PlanError(
+                f"plan run {_RunOwner.of(state).key}: stage {legacy_ready[0]!r} has an answered "
+                "incident pause raised after READY, which converts only under the legacy migration "
+                "(L-D1) conditions on a plain resume, or is reviewed again with --evidence; a "
+                "chosen next turn or a fresh session does not answer it. Nothing was recorded or "
+                "changed"
+            )
     if legacy_ready is not None:
         stage_id, candidate_sha, pause = legacy_ready
         stayed = _convert_legacy_ready(
@@ -5245,6 +5283,7 @@ def _drive_pinned(
                     # A provider turn ran: no later stop can be a refusal
                     # of this resume.
                     state.left_provider_pause = None
+                    _supersede_answered_incidents(state, state_path, stage.stage_id)
                     _retire_pending_evidence(state, state_path)
                     if loop_result.outcome is not RoutingAction.READY:
                         _pause(state, state_path)
