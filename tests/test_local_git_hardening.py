@@ -703,6 +703,18 @@ class ManagedOwnershipTests(_ManagedRepoTestCase):
     def test_the_run_state_moved_to_another_stage_refuses(self):
         self._refused(self._move_run_state)
 
+    def _redeclare_run_state(self) -> None:
+        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["run"], self.record.run_key)
+        payload["run"] = "plan-someone-else-0123456789ab"
+        self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def test_the_run_state_declaring_another_run_refuses(self):
+        # The stage's run and the run state's current_stage stay correct;
+        # only the run state's own identity contradicts the managed record.
+        self.assertEqual(self._stage().read_state().run, self.record.run_key)
+        self._refused(self._redeclare_run_state)
+
     def test_the_run_state_deleted_refuses(self):
         self._refused(self.state_path.unlink)
 
@@ -761,6 +773,7 @@ class ManagedOwnershipTests(_ManagedRepoTestCase):
             **{f"run state {name}": (lambda c=content: self.state_path.write_bytes(c))
                for name, content in self.UNREADABLE.items()},
             "run state deleted": self.state_path.unlink,
+            "run state declaring another run": self._redeclare_run_state,
         }
         for name, manipulate in manipulations.items():
             with self.subTest(manipulation=name):

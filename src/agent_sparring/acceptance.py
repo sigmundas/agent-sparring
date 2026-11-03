@@ -374,8 +374,9 @@ def _managed_owner(sparring_dir: Path) -> str | None:
 
 def _managed_problems(sparring_dir: Path, stage_id: str, run: str, claimed: str | None) -> list[str]:
     """How the project directory contradicts managed run ``run`` owning
-    ``stage_id``: the stage's ``run``, the run state's existence, shape and
-    ``current_stage``, and any other run state positioned at the stage. A
+    ``stage_id``: the stage's ``run``, the run state's existence, shape,
+    declared ``run`` and ``current_stage``, and any other run state
+    positioned at the stage. A
     run state that cannot be read, or is not a JSON object, is one: it
     cannot be shown to agree."""
 
@@ -401,6 +402,11 @@ def _managed_problems(sparring_dir: Path, stage_id: str, run: str, claimed: str 
             continue
         current = payload.get("current_stage")
         if path == own:
+            # A run state recorded before run instances names no run of its
+            # own; one that names a run must name this one.
+            declared = payload.get("run")
+            if declared is not None and declared != run:
+                problems.append(f"the run state {path} declares run {declared!r}")
             if current != stage_id:
                 problems.append(f"the run state is positioned at {current!r}, not at this stage")
         elif current == stage_id:
