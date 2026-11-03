@@ -29,10 +29,11 @@ calls Git so that none of that can happen:
   ``tag.gpgSign``, ``merge.verifySignatures``, ``gpg.*program`` or
   ``gpg.ssh.defaultKeyCommand`` is overridden with the user's own global or
   system value, else Git's default -- so the user's own signing still signs;
-- **submodules' own configuration** never applies: ``status`` and ``diff``
-  get ``--ignore-submodules=dirty`` and ``submodule.recurse=false``, so no
-  populated submodule's work tree (or its filters) is examined, while a
-  gitlink pointer change is still reported;
+- **submodules' own configuration** never applies: every command carries
+  ``submodule.recurse=false``, so no ``merge``, ``switch`` or ``checkout``
+  checks a populated submodule out, and ``status`` and ``diff`` also get
+  ``--ignore-submodules=dirty``, so no submodule's work tree (or its
+  filters) is examined, while a gitlink pointer change is still reported;
 - a repository whose configuration **cannot be listed** is a refusal
   (``repository_config_unreadable``) before anything runs: what it sets
   could be neither checked nor neutralized;
@@ -140,15 +141,22 @@ BASE_OVERRIDES: tuple[str, ...] = (
 LOCAL_OVERRIDES: tuple[str, ...] = ("protocol.allow=never",)
 LOCAL_ENVIRONMENT: Mapping[str, str] = {"GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "none"}
 
+#: Every :func:`run` invocation: no command recurses into a submodule --
+#: a ``merge``, ``switch``, ``checkout`` or ``reset`` that changes a
+#: populated gitlink would otherwise check the submodule out, running its
+#: own configuration's filters, which no check here reads. The gitlink
+#: itself is still updated; the submodule's work tree is left as it was.
+NO_RECURSION_OVERRIDES: tuple[str, ...] = ("submodule.recurse=false",)
+
 #: Subcommands whose output can be routed through textconv or an external
 #: diff driver; each gets ``--no-ext-diff --no-textconv``.
 _DIFF_COMMANDS = frozenset({"diff", "show", "log"})
 
-#: Subcommands that would look inside a populated submodule's own work tree
-#: -- and so run whatever its own configuration (which no check here reads)
-#: defines, a clean filter say. Each gets ``--ignore-submodules=dirty`` and
-#: ``submodule.recurse=false``: a submodule whose checked-out commit differs
-#: from the recorded gitlink is still reported, from its ``HEAD`` alone.
+#: Subcommands that look inside a populated submodule's own work tree even
+#: without recursion -- and so run whatever its own configuration defines, a
+#: clean filter say. Each gets ``--ignore-submodules=dirty``: a submodule
+#: whose checked-out commit differs from the recorded gitlink is still
+#: reported, from its ``HEAD`` alone.
 _SUBMODULE_COMMANDS = frozenset({"status", "diff"})
 
 #: Signing configuration whose local or worktree value is never followed:
@@ -653,7 +661,7 @@ def _checked(
     entries = config_entries(Path(cwd))
     if entries is None:
         _refuse_unreadable(Path(cwd))
-    pairs = [*BASE_OVERRIDES, *LOCAL_OVERRIDES]
+    pairs = [*BASE_OVERRIDES, *LOCAL_OVERRIDES, *NO_RECURSION_OVERRIDES]
     if entries is not None:
         _refuse_includes(entries)
         guard = guard_for(Path(cwd))
@@ -676,7 +684,6 @@ def _checked(
         if name in _MERGE_COMMANDS and entries is not None:
             _refuse_merge_drivers(entries, name)
         if name in _SUBMODULE_COMMANDS:
-            pairs.append("submodule.recurse=false")
             rest = rest[: index + 1] + ["--ignore-submodules=dirty"] + rest[index + 1 :]
         if name in _DIFF_COMMANDS:
             rest = rest[: index + 1] + ["--no-ext-diff", "--no-textconv"] + rest[index + 1 :]

@@ -491,6 +491,30 @@ file; a `worktree add` that checks files out, like every `switch` or
 `checkout`, reads the validated copy. Editing `.gitattributes` alone is not
 a change: a driver runs only if configuration defines it.
 
+Signing and verification programs follow your configuration, never the
+repository's. When the repository's own (local or worktree) configuration
+sets `log.showSignature`, `commit.gpgSign`, `tag.gpgSign`,
+`merge.verifySignatures`, `gpg.program`, `gpg.<format>.program` or
+`gpg.ssh.defaultKeyCommand`, the engine overrides it with your global or
+system value, or Git's default when you set none. So `log`, `reflog`,
+`commit`, `merge` and `tag` never start a program the repository names, while
+your own global signing still signs, finish merges in a checkout included.
+Signing you configured only in a repository's own configuration is not used
+by the engine. A finish merge with no checkout is made with `commit-tree`,
+which Git never signs from configuration.
+
+The engine never recurses into submodules: every command carries
+`submodule.recurse=false`, so a `switch` or `checkout` that changes a
+populated gitlink moves the gitlink but not the submodule (Git's `merge`
+never recurses). `status` and `diff` also get `--ignore-submodules=dirty`,
+so no submodule's work tree -- and nothing its own configuration defines, a
+filter say -- is examined. A gitlink that differs from the submodule's checked-out commit is still
+reported dirty; changes inside a submodule's own work tree are not.
+
+A repository whose configuration Git cannot list (a malformed config file,
+say) is refused before the command runs (`repository_config_unreadable`):
+what it sets could be neither checked nor neutralized.
+
 The engine never contacts a remote. Every Git command it would run that
 does -- `push`, `fetch`, `pull`, `ls-remote`, `clone`, `remote update`,
 `remote show` (without `-n`), `remote prune`, `remote set-head --auto`,
@@ -850,6 +874,18 @@ the same defect one step removed.
 A `state.json` with no owner is **unowned**: a stage driven by hand with
 `new-stage`, or one written before ownership was recorded. Unowned is the only
 thing `--adopt` may take over, which is precisely what it is for.
+
+Inside a managed worktree, the project directory does not get to say
+otherwise. There the owner is the run the engine's managed record names (kept
+in the common Git directory, outside `.sparring/`). Freeze, accept and
+entering an independent review refuse with `stage_owner_mismatch` when
+`.sparring/` contradicts it:
+- the stage records no run, or another run;
+- that run's state is gone or cannot be read as a JSON object;
+- that run's state is not positioned at the stage;
+- another run's state is positioned at it, or cannot be read.
+
+An emptied `run` field there is a refusal, not an unowned stage.
 
 #### Runs recorded before run instances existed
 

@@ -340,7 +340,7 @@ def _runs_positioned_at(sparring_dir: Path, stage_id: str) -> set[str]:
     for path in sorted(plans.glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             raise AcceptanceError(
                 f"cannot read run state {path} to establish who owns stage {stage_id!r}: {exc}"
             ) from exc
@@ -374,30 +374,39 @@ def _managed_owner(sparring_dir: Path) -> str | None:
 
 def _managed_problems(sparring_dir: Path, stage_id: str, run: str, claimed: str | None) -> list[str]:
     """How the project directory contradicts managed run ``run`` owning
-    ``stage_id``: the stage's ``run``, the run state's existence and its
-    ``current_stage``, and any other run state positioned at the stage."""
+    ``stage_id``: the stage's ``run``, the run state's existence, shape and
+    ``current_stage``, and any other run state positioned at the stage. A
+    run state that cannot be read, or is not a JSON object, is one: it
+    cannot be shown to agree."""
 
     problems: list[str] = []
     if claimed != run:
         problems.append(
             f"the stage records {'run ' + repr(claimed) if claimed else 'no run'} as its owner"
         )
-    path = Path(sparring_dir) / "plans" / f"{run}.json"
-    if not path.is_file():
-        problems.append(f"the run state {path} is gone")
-    else:
+    plans = Path(sparring_dir) / "plans"
+    own = plans / f"{run}.json"
+    if not own.is_file():
+        problems.append(f"the run state {own} is gone")
+    paths = sorted(plans.glob("*.json")) if plans.is_dir() else []
+    for path in paths:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            payload = None
+        except (OSError, ValueError) as exc:
+            # ValueError: malformed JSON or bytes that are not UTF-8.
             problems.append(f"the run state {path} cannot be read ({exc})")
-        if payload is not None:
-            current = payload.get("current_stage") if isinstance(payload, dict) else None
+            continue
+        if not isinstance(payload, dict):
+            problems.append(f"the run state {path} is not a JSON object")
+            continue
+        current = payload.get("current_stage")
+        if path == own:
             if current != stage_id:
                 problems.append(f"the run state is positioned at {current!r}, not at this stage")
-    others = _runs_positioned_at(sparring_dir, stage_id) - {run}
-    if others:
-        problems.append(f"the run state of {', '.join(sorted(others))} is positioned at it too")
+        elif current == stage_id:
+            problems.append(
+                f"the run state of {payload.get('run') or path.stem} is positioned at it too"
+            )
     return problems
 
 
