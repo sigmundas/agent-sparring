@@ -24,6 +24,18 @@ calls Git so that none of that can happen:
   configuration are resolved by Git, against the repository the command
   runs in (so ``includeIf "gitdir:..."`` in ``~/.gitconfig`` keeps
   working), and a remote operation reads their expanded entries;
+- **signing and verification programs** a repository configures never
+  run: a local or worktree ``log.showSignature``, ``commit.gpgSign``,
+  ``tag.gpgSign``, ``merge.verifySignatures``, ``gpg.*program`` or
+  ``gpg.ssh.defaultKeyCommand`` is overridden with the user's own global or
+  system value, else Git's default -- so the user's own signing still signs;
+- **submodules' own configuration** never applies: ``status`` and ``diff``
+  get ``--ignore-submodules=dirty`` and ``submodule.recurse=false``, so no
+  populated submodule's work tree (or its filters) is examined, while a
+  gitlink pointer change is still reported;
+- a repository whose configuration **cannot be listed** is a refusal
+  (``repository_config_unreadable``) before anything runs: what it sets
+  could be neither checked nor neutralized;
 - background ``gc``/maintenance, which would start further Git processes,
   is off.
 
@@ -131,6 +143,30 @@ LOCAL_ENVIRONMENT: Mapping[str, str] = {"GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PRO
 #: Subcommands whose output can be routed through textconv or an external
 #: diff driver; each gets ``--no-ext-diff --no-textconv``.
 _DIFF_COMMANDS = frozenset({"diff", "show", "log"})
+
+#: Subcommands that would look inside a populated submodule's own work tree
+#: -- and so run whatever its own configuration (which no check here reads)
+#: defines, a clean filter say. Each gets ``--ignore-submodules=dirty`` and
+#: ``submodule.recurse=false``: a submodule whose checked-out commit differs
+#: from the recorded gitlink is still reported, from its ``HEAD`` alone.
+_SUBMODULE_COMMANDS = frozenset({"status", "diff"})
+
+#: Signing configuration whose local or worktree value is never followed:
+#: each makes Git start a signing or verification program. The override is
+#: the value the user's own global or system configuration gives, else
+#: Git's default, so the user's own signing keeps working (see
+#: :func:`_signing_overrides`). Keyed by what the override sets.
+_SIGNING_DEFAULTS: Mapping[str, str] = {
+    "log.showsignature": "false",
+    "commit.gpgsign": "false",
+    "tag.gpgsign": "false",
+    "merge.verifysignatures": "false",
+    "gpg.program": "gpg",
+    "gpg.x509.program": "gpgsm",
+    "gpg.ssh.program": "ssh-keygen",
+    # No program unless one is configured; empty runs none.
+    "gpg.ssh.defaultKeyCommand": "",
+}
 
 #: Subcommands that can invoke a merge driver.
 _MERGE_COMMANDS = frozenset(
@@ -537,6 +573,46 @@ def _driver_overrides(entries: Sequence[ConfigEntry]) -> list[str]:
     return pairs
 
 
+def _signing_slot(key: str) -> str | None:
+    """The :data:`_SIGNING_DEFAULTS` key whose setting ``key`` decides, or
+    ``None``. Git reads ``gpg.program`` and ``gpg.openpgp.program`` into one
+    setting, and matches the format subsection exactly."""
+
+    lowered = key.lower()
+    if lowered in ("log.showsignature", "commit.gpgsign", "tag.gpgsign", "merge.verifysignatures"):
+        return lowered
+    if _section(key) != "gpg":
+        return None
+    sub, variable = _subsection(key), _variable(key)
+    if variable == "program":
+        return {None: "gpg.program", "openpgp": "gpg.program", "x509": "gpg.x509.program",
+                "ssh": "gpg.ssh.program"}.get(sub)
+    if sub == "ssh" and variable == "defaultkeycommand":
+        return "gpg.ssh.defaultKeyCommand"
+    return None
+
+
+def _signing_overrides(entries: Sequence[ConfigEntry]) -> list[str]:
+    """Overrides for each signing setting local or worktree configuration
+    sets: the user's own (global or system) value, else Git's default."""
+
+    planted = {
+        slot for entry in entries
+        if entry.scope in _REPO_SCOPES and (slot := _signing_slot(entry.key)) is not None
+    }
+    pairs: list[str] = []
+    for slot in sorted(planted):
+        own = [entry for entry in entries
+               if entry.scope not in _REPO_SCOPES and _signing_slot(entry.key) == slot]
+        if not own:
+            pairs.append(f"{slot}={_SIGNING_DEFAULTS[slot]}")
+        elif own[-1].value is None:
+            pairs.append(slot)  # a bare boolean key: true
+        else:
+            pairs.append(f"{slot}={own[-1].value}")
+    return pairs
+
+
 def _refuse_merge_drivers(entries: Sequence[ConfigEntry], name: str) -> None:
     for entry in entries:
         if _section(entry.key) == "merge" and _variable(entry.key) == "driver":
@@ -546,6 +622,22 @@ def _refuse_merge_drivers(entries: Sequence[ConfigEntry], name: str) -> None:
                 f"refusing to run git {name}: {entry.scope} configuration defines the merge "
                 f"driver {entry.key}, and the engine never runs merge drivers",
             )
+
+
+def _refuse_unreadable(cwd: Path) -> None:
+    """A configuration listing failed in ``cwd``: refuse when ``cwd`` is a
+    directory inside a repository, whose configuration then could be neither
+    checked nor neutralized. Outside one (``init``, ``version``, a path that
+    does not exist) the command fails or runs as Git decides."""
+
+    if cwd.is_dir() and _locate(cwd) is not None:
+        raise GitConfigRefusal(
+            "repository_config_unreadable",
+            "config",
+            f"refusing to run git in {cwd}: its repository's configuration cannot be listed, so "
+            "nothing it sets can be checked or neutralized. Repair the configuration file and "
+            "retry",
+        )
 
 
 def _checked(
@@ -559,6 +651,8 @@ def _checked(
     the command will run with."""
 
     entries = config_entries(Path(cwd))
+    if entries is None:
+        _refuse_unreadable(Path(cwd))
     pairs = [*BASE_OVERRIDES, *LOCAL_OVERRIDES]
     if entries is not None:
         _refuse_includes(entries)
@@ -566,6 +660,7 @@ def _checked(
         if guard is not None:
             compare_snapshot(entries, guard.entries)
         pairs += _driver_overrides(entries)
+        pairs += _signing_overrides(entries)
     form = remote_form(args, Path(cwd), env=env)
     if form is not None:
         raise GitConfigRefusal(
@@ -580,6 +675,9 @@ def _checked(
     if name is not None:
         if name in _MERGE_COMMANDS and entries is not None:
             _refuse_merge_drivers(entries, name)
+        if name in _SUBMODULE_COMMANDS:
+            pairs.append("submodule.recurse=false")
+            rest = rest[: index + 1] + ["--ignore-submodules=dirty"] + rest[index + 1 :]
         if name in _DIFF_COMMANDS:
             rest = rest[: index + 1] + ["--no-ext-diff", "--no-textconv"] + rest[index + 1 :]
     return entries, [*_overrides(pairs), *rest]

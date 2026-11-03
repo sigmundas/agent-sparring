@@ -88,7 +88,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-from agent_sparring import engine_git
+from agent_sparring import engine_git, managed_run
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import (
     DirtyEntry,
@@ -144,6 +144,9 @@ CANDIDATE_NOT_ON_BRANCH = "candidate_not_on_branch"
 #: The typed refusal when the reviewer's recorded READY is not over the
 #: exact commit being accepted.
 VERDICT_NOT_AT_CANDIDATE = "verdict_not_at_candidate"
+#: The typed refusal when, in a managed worktree, the stage's own artifacts
+#: contradict the run its managed record names.
+STAGE_OWNER_MISMATCH = "stage_owner_mismatch"
 #: What the engine's local acceptance rule is, stated in every
 #: ``candidate_not_on_branch`` refusal.
 LOCAL_RULE = (
@@ -194,7 +197,8 @@ class AcceptanceError(RuntimeError):
 
     ``code`` names the typed refusals a caller may act on
     (:data:`CANDIDATE_NOT_ON_BRANCH`, :data:`~agent_sparring.run_history.
-    RUN_HISTORY_REWRITTEN`, :data:`VERDICT_NOT_AT_CANDIDATE`); ``None`` for
+    RUN_HISTORY_REWRITTEN`, :data:`VERDICT_NOT_AT_CANDIDATE`,
+    :data:`STAGE_OWNER_MISMATCH`); ``None`` for
     the rest. The message always starts with the code when there is one.
     """
 
@@ -243,6 +247,22 @@ class VerdictNotAtCandidateError(AcceptanceError):
     """The reviewer's recorded READY is not over the commit being accepted."""
 
     code = VERDICT_NOT_AT_CANDIDATE
+
+
+class StageOwnerMismatchError(AcceptanceError):
+    """In a managed worktree, the stage's ``.sparring/`` artifacts contradict
+    the run the engine's managed record says owns it (audit R-4)."""
+
+    code = STAGE_OWNER_MISMATCH
+
+    def __init__(self, stage_id: str, run: str, problems: list[str]) -> None:
+        super().__init__(
+            f"refusing: {STAGE_OWNER_MISMATCH}: stage {stage_id!r} is in the managed worktree of "
+            f"run {run} (the engine's managed record), but {'; '.join(problems)}. The project "
+            "directory's claims never decide who owns a managed stage; nothing was frozen or "
+            "accepted"
+        )
+        self.run = run
 
 
 @dataclass(frozen=True)
@@ -329,17 +349,81 @@ def _runs_positioned_at(sparring_dir: Path, stage_id: str) -> set[str]:
     return owners
 
 
-def _owning_run(stage: Stage) -> str | None:
-    """The run that owns ``stage``, from engine run state.
+def _managed_owner(sparring_dir: Path) -> str | None:
+    """The run whose managed worktree holds ``sparring_dir``, from the
+    engine's managed record (in the common Git directory, outside anything
+    an agent's project directory can rewrite); ``None`` outside a managed
+    worktree. A record that cannot be read refuses."""
 
-    The stage's own ``state.json`` names its owner, but an emptied or
-    rewritten ``run`` field must not make an owned stage look hand-driven
+    try:
+        top = managed_run.worktree_top(sparring_dir)
+        record = managed_run.record_for_worktree(top, top)
+    except managed_run.ManagedRunError as exc:
+        if exc.code == "not_a_repository":
+            return None
+        raise AcceptanceError(
+            f"refusing: cannot read the managed-run records to establish who owns {sparring_dir} "
+            f"({exc}); nothing was frozen or accepted"
+        ) from exc
+    # A creation_failed record never claimed its path (see
+    # managed_run.refuse_unmanaged_here).
+    if record is None or record.lifecycle == "creation_failed":
+        return None
+    return record.run_key
+
+
+def _managed_problems(sparring_dir: Path, stage_id: str, run: str, claimed: str | None) -> list[str]:
+    """How the project directory contradicts managed run ``run`` owning
+    ``stage_id``: the stage's ``run``, the run state's existence and its
+    ``current_stage``, and any other run state positioned at the stage."""
+
+    problems: list[str] = []
+    if claimed != run:
+        problems.append(
+            f"the stage records {'run ' + repr(claimed) if claimed else 'no run'} as its owner"
+        )
+    path = Path(sparring_dir) / "plans" / f"{run}.json"
+    if not path.is_file():
+        problems.append(f"the run state {path} is gone")
+    else:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            payload = None
+            problems.append(f"the run state {path} cannot be read ({exc})")
+        if payload is not None:
+            current = payload.get("current_stage") if isinstance(payload, dict) else None
+            if current != stage_id:
+                problems.append(f"the run state is positioned at {current!r}, not at this stage")
+    others = _runs_positioned_at(sparring_dir, stage_id) - {run}
+    if others:
+        problems.append(f"the run state of {', '.join(sorted(others))} is positioned at it too")
+    return problems
+
+
+def _owning_run(stage: Stage) -> str | None:
+    """The run that owns ``stage``, from engine records.
+
+    In a managed worktree the owner is the run the engine's managed record
+    names, and the stage's ``run``, that run's state (present, positioned at
+    this stage) and every other run state must agree with it; any
+    contradiction refuses with ``stage_owner_mismatch`` (audit R-4).
+
+    Elsewhere, the stage's own ``state.json`` names its owner, but an emptied
+    or rewritten ``run`` field must not make an owned stage look hand-driven
     (and so skip its run's accepted history and recorded pause): every run
     whose state is positioned at this stage owns it too, and a claim that
     contradicts them refuses. ``None`` only when neither names a run."""
 
     claimed = _read_state(stage).run
-    positioned = _runs_positioned_at(Path(stage.directory).parent.parent, stage.stage_id)
+    sparring_dir = Path(stage.directory).parent.parent
+    managed = _managed_owner(sparring_dir)
+    if managed is not None:
+        problems = _managed_problems(sparring_dir, stage.stage_id, managed, claimed)
+        if problems:
+            raise StageOwnerMismatchError(stage.stage_id, managed, problems)
+        return managed
+    positioned = _runs_positioned_at(sparring_dir, stage.stage_id)
     if claimed:
         if positioned and claimed not in positioned:
             raise AcceptanceError(
