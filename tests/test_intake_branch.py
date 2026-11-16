@@ -40,6 +40,7 @@ from agent_sparring.plan import (
     start_plan,
 )
 from agent_sparring.stage import Stage, StageStatus
+from git_recorder import GitRecorder, PlantedRemotes
 from test_intake import _git, good_interpretation
 from test_intake_sealing import APP_BRANCH, _Committer, _head, _Sealed
 from test_plan import READY, _SparringAdapter
@@ -85,7 +86,13 @@ class _WebOnMain(_Sealed):
         return load_plan_source(approval.manifest_path, self.web, manifest=True)
 
     def start_web(self, approval, adapters, branch):
-        return start_plan(self.web_source(approval), self.web_sparring, self.web, adapters, expected_branch=branch)
+        # The engine pushes each verified candidate, under the run-level
+        # grant a person gives at start -- never for a protected branch, which
+        # a slice must be moved off before it runs (and a run holding a grant
+        # for one cannot be moved).
+        return start_plan(
+            self.web_source(approval), self.web_sparring, self.web, adapters, expected_branch=branch,
+        )
 
     def failed_on_main(self):
         """Stage 1B sealed on main, and a run refused before any provider turn."""
@@ -303,6 +310,29 @@ class CliTests(_WebOnMain):
         self.assertEqual(code, 0, payload)
         self.assertEqual((payload["created"], payload["moved"]["to_branch"]), (FEATURE, FEATURE))
         self.assertEqual((payload["status"]["action"], payload["status"]["needs_branch"]), (None, False))
+
+    def test_slice_branch_json_contacts_no_remote_with_planted_configuration(self):
+        # Plan L Stage 3 (I-L1): slice-branch reads only the local
+        # repository. Planted before the slice's run starts (so its own
+        # snapshot trusts the planting), with the git recorder first on PATH.
+        root = self.web.parent / "stage3-planted"
+        root.mkdir()
+        planted = PlantedRemotes(self.web, root)
+        intake, _, web = self.failed_on_main()
+        recorder = GitRecorder(root)
+        with recorder.active():
+            code, out, _ = self._main("slice-branch", str(intake.directory), "--run", "web", "--repo-root",
+                                      str(self.web), "--json")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["status"]["action"], ACTION_CREATE)
+            code, out, _ = self._main("slice-branch", str(intake.directory), "--run", "web", "--repo-root",
+                                      str(self.web), "--create", FEATURE, "--json")
+            self.assertEqual(code, 0, out)
+        self.assertTrue(recorder.lines())
+        self.assertEqual(recorder.remote_commands(), [])
+        self.assertEqual(planted.ran(), [])
+        # Positive control: plain git in the same repository runs them.
+        self.assertEqual(sorted(planted.positive_controls()), sorted(m.name for m in planted.markers))
 
     def test_move_to_a_branch_checked_out_by_hand(self):
         intake, _, web = self.failed_on_main()

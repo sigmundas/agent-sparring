@@ -82,20 +82,42 @@ and, like every other refusal here, leaves ``state.json`` untouched.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import contextlib
+import json
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any, Iterator, Mapping
 
+from agent_sparring import engine_git, managed_run
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.git_context import (
     DirtyEntry,
     GitContextError,
     current_branch,
     dirty_entries,
+    is_ancestor,
     is_full_sha,
     resolve_commit,
-    verify_pushed,
 )
 from agent_sparring.prompt_capture import PROMPTS_DIRNAME, is_prompt_artifact
+from agent_sparring.routing import RoutingAction
+from agent_sparring.sparring_exchange import read_recorded_outcome
+from agent_sparring import trusted_snapshots
+from agent_sparring.remote_pin import (
+    REMOTE_PAUSE_KINDS,
+    PushedCandidateUnauthorized,
+    RemotePause,
+    remote_pause_from_dict,
+)
+from agent_sparring.trusted_snapshots import TRUSTED_CONFIG_MISSING, RunSnapshots, missing_message
+from agent_sparring.run_history import (
+    RUN_HISTORY_REWRITTEN,
+    AcceptedCandidate,
+    RunHistoryError,
+    describe_repository,
+    required_ancestors,
+    run_accepted,
+)
 from agent_sparring.stage import (
     ACTIVITY_FILENAME,
     BRIEF_FILENAME,
@@ -103,13 +125,34 @@ from agent_sparring.stage import (
     HANDOFF_FILENAME,
     NOTES_FILENAME,
     SPARRING_FILENAME,
+    NEXT_TURN_FINALIZATION,
+    NEXT_TURN_SPARRING,
     STATE_FILENAME,
     CandidateRepository,
+    ReviewRecord,
+    SiblingPin,
     Stage,
     StageError,
     StageMode,
     StageState,
     StageStatus,
+)
+
+#: The typed refusal when a candidate is not the exact, clean ``HEAD`` of its
+#: expected branch in a participating repository (I-L2).
+CANDIDATE_NOT_ON_BRANCH = "candidate_not_on_branch"
+#: The typed refusal when the reviewer's recorded READY is not over the
+#: exact commit being accepted.
+VERDICT_NOT_AT_CANDIDATE = "verdict_not_at_candidate"
+#: The typed refusal when, in a managed worktree, the stage's own artifacts
+#: contradict the run its managed record names.
+STAGE_OWNER_MISMATCH = "stage_owner_mismatch"
+#: What the engine's local acceptance rule is, stated in every
+#: ``candidate_not_on_branch`` refusal.
+LOCAL_RULE = (
+    "a candidate is the exact HEAD of its expected branch in every participating "
+    "repository, with a working tree clean apart from the engine's own artifacts; "
+    "no remote is consulted"
 )
 
 # The only paths ever exempted from the "no unrepresented dirty changes"
@@ -151,10 +194,28 @@ class AcceptanceError(RuntimeError):
     Every refusal leaves the stage unaccepted. ``state.json`` is only ever
     written on a *successful* freeze or acceptance, so a refused operation
     cannot half-advance the lifecycle.
+
+    ``code`` names the typed refusals a caller may act on
+    (:data:`CANDIDATE_NOT_ON_BRANCH`, :data:`~agent_sparring.run_history.
+    RUN_HISTORY_REWRITTEN`, :data:`VERDICT_NOT_AT_CANDIDATE`,
+    :data:`STAGE_OWNER_MISMATCH`); ``None`` for
+    the rest. The message always starts with the code when there is one.
     """
 
+    code: str | None = None
 
-class StaleCandidateError(AcceptanceError):
+
+class CandidateNotOnBranchError(AcceptanceError):
+    """The candidate is not the exact, clean ``HEAD`` of its expected branch
+    in a participating repository (:data:`LOCAL_RULE`)."""
+
+    code = CANDIDATE_NOT_ON_BRANCH
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"refusing: {CANDIDATE_NOT_ON_BRANCH}: {message}. The rule: {LOCAL_RULE}")
+
+
+class StaleCandidateError(CandidateNotOnBranchError):
     """Raised when the repository no longer matches the frozen candidate.
 
     The frozen ``candidate_sha`` is left exactly as it was: the new HEAD is
@@ -164,13 +225,57 @@ class StaleCandidateError(AcceptanceError):
     """
 
 
+class RunHistoryRewrittenError(AcceptanceError):
+    """A repository's stage base, or a candidate the run already accepted in
+    it, is not an ancestor of that repository's current candidate (see
+    :mod:`agent_sparring.run_history`)."""
+
+    code = RUN_HISTORY_REWRITTEN
+
+    def __init__(self, repository: str, missing: str, what: str, candidate: str) -> None:
+        super().__init__(
+            f"refusing: {RUN_HISTORY_REWRITTEN}: in {repository}, {what} ({missing}) is not an "
+            f"ancestor of the candidate {candidate}, so accepted history was rewritten. A run's "
+            "accepted history only grows, per repository: build on top of it (new commits or a "
+            "merge that contains it), or restore it. Nothing was frozen or accepted"
+        )
+        self.repository = repository
+        self.missing = missing
+
+
+class VerdictNotAtCandidateError(AcceptanceError):
+    """The reviewer's recorded READY is not over the commit being accepted."""
+
+    code = VERDICT_NOT_AT_CANDIDATE
+
+
+class StageOwnerMismatchError(AcceptanceError):
+    """In a managed worktree, the stage's ``.sparring/`` artifacts contradict
+    the run the engine's managed record says owns it (audit R-4)."""
+
+    code = STAGE_OWNER_MISMATCH
+
+    def __init__(self, stage_id: str, run: str, problems: list[str]) -> None:
+        super().__init__(
+            f"refusing: {STAGE_OWNER_MISMATCH}: stage {stage_id!r} is in the managed worktree of "
+            f"run {run} (the engine's managed record), but {'; '.join(problems)}. The project "
+            "directory's claims never decide who owns a managed stage; nothing was frozen or "
+            "accepted"
+        )
+        self.run = run
+
+
 @dataclass(frozen=True)
 class FreezeResult:
-    """What was frozen, and the push evidence it was frozen on.
+    """What was frozen, and the local evidence it was frozen on.
 
     ``repositories`` is the pinned sibling candidate set (empty for the
     ordinary single-repository stage): each declared sibling resolved to the
-    exact commit its branch was at, verified clean and pushed.
+    exact commit its branch was at, verified clean.
+
+    ``push_detail`` keeps its name for callers that read it; it describes
+    the local check the candidate passed, since nothing is pushed or read
+    from a remote.
     """
 
     candidate_sha: str
@@ -190,6 +295,30 @@ class AcceptanceResult:
     repositories: tuple[CandidateRepository, ...] = field(default_factory=tuple)
 
 
+class UnauthorizedRemoteMovementError(AcceptanceError):
+    """The run this stage belongs to is paused on a recorded remote incident
+    (unexplained movement of its legacy pinned ref, or a candidate already on
+    it -- see :mod:`agent_sparring.remote_pin`): nothing is frozen or
+    accepted until a person has resolved that pause explicitly.
+
+    Only the run's own recorded pause is read; no remote is consulted, and
+    resolving the pause is never review or acceptance."""
+
+    def __init__(self, movement: RemotePause) -> None:
+        if isinstance(movement, PushedCandidateUnauthorized):
+            action = (
+                "authorize exactly that commit (sparring authorize-pushed-candidate) once you "
+                "have looked; a run-level push grant does not"
+            )
+        else:
+            action = "acknowledge the movement (sparring acknowledge-remote-movement) once you have looked"
+        super().__init__(
+            f"refusing: {movement.kind}: {movement.describe}. Nothing was frozen or accepted; "
+            f"{action}"
+        )
+        self.movement = movement
+
+
 def _read_state(stage: Stage) -> StageState:
     try:
         return stage.read_state()
@@ -197,22 +326,488 @@ def _read_state(stage: Stage) -> StageState:
         raise AcceptanceError(f"cannot read stage state: {exc}") from exc
 
 
+def _runs_positioned_at(sparring_dir: Path, stage_id: str) -> set[str]:
+    """The run keys whose engine-written run state
+    (``<sparring_dir>/plans/<run>.json``) is positioned at ``stage_id``.
+
+    A run state that cannot be read refuses: it cannot be shown not to own
+    the stage."""
+
+    plans = Path(sparring_dir) / "plans"
+    if not plans.is_dir():
+        return set()
+    owners: set[str] = set()
+    for path in sorted(plans.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise AcceptanceError(
+                f"cannot read run state {path} to establish who owns stage {stage_id!r}: {exc}"
+            ) from exc
+        if isinstance(payload, dict) and payload.get("current_stage") == stage_id:
+            owners.add(str(payload.get("run") or path.stem))
+    return owners
+
+
+def _managed_owner(sparring_dir: Path) -> str | None:
+    """The run whose managed worktree holds ``sparring_dir``, from the
+    engine's managed record (in the common Git directory, outside anything
+    an agent's project directory can rewrite); ``None`` outside a managed
+    worktree. A record that cannot be read refuses."""
+
+    try:
+        top = managed_run.worktree_top(sparring_dir)
+        record = managed_run.record_for_worktree(top, top)
+    except managed_run.ManagedRunError as exc:
+        if exc.code == "not_a_repository":
+            return None
+        raise AcceptanceError(
+            f"refusing: cannot read the managed-run records to establish who owns {sparring_dir} "
+            f"({exc}); nothing was frozen or accepted"
+        ) from exc
+    # A creation_failed record never claimed its path (see
+    # managed_run.refuse_unmanaged_here).
+    if record is None or record.lifecycle == "creation_failed":
+        return None
+    return record.run_key
+
+
+def _managed_problems(sparring_dir: Path, stage_id: str, run: str, claimed: str | None) -> list[str]:
+    """How the project directory contradicts managed run ``run`` owning
+    ``stage_id``: the stage's ``run``, the run state's existence, shape,
+    declared ``run`` and ``current_stage``, and any other run state
+    positioned at the stage. A
+    run state that cannot be read, or is not a JSON object, is one: it
+    cannot be shown to agree."""
+
+    problems: list[str] = []
+    if claimed != run:
+        problems.append(
+            f"the stage records {'run ' + repr(claimed) if claimed else 'no run'} as its owner"
+        )
+    plans = Path(sparring_dir) / "plans"
+    own = plans / f"{run}.json"
+    if not own.is_file():
+        problems.append(f"the run state {own} is gone")
+    paths = sorted(plans.glob("*.json")) if plans.is_dir() else []
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            # ValueError: malformed JSON or bytes that are not UTF-8.
+            problems.append(f"the run state {path} cannot be read ({exc})")
+            continue
+        if not isinstance(payload, dict):
+            problems.append(f"the run state {path} is not a JSON object")
+            continue
+        current = payload.get("current_stage")
+        if path == own:
+            # A run state recorded before run instances names no run of its
+            # own; one that names a run must name this one.
+            declared = payload.get("run")
+            if declared is not None and declared != run:
+                problems.append(f"the run state {path} declares run {declared!r}")
+            if current != stage_id:
+                problems.append(f"the run state is positioned at {current!r}, not at this stage")
+        elif current == stage_id:
+            problems.append(
+                f"the run state of {payload.get('run') or path.stem} is positioned at it too"
+            )
+    return problems
+
+
+def _owning_run(stage: Stage) -> str | None:
+    """The run that owns ``stage``, from engine records.
+
+    In a managed worktree the owner is the run the engine's managed record
+    names, and the stage's ``run``, that run's state (present, positioned at
+    this stage) and every other run state must agree with it; any
+    contradiction refuses with ``stage_owner_mismatch`` (audit R-4).
+
+    Elsewhere, the stage's own ``state.json`` names its owner, but an emptied
+    or rewritten ``run`` field must not make an owned stage look hand-driven
+    (and so skip its run's accepted history and recorded pause): every run
+    whose state is positioned at this stage owns it too, and a claim that
+    contradicts them refuses. ``None`` only when neither names a run."""
+
+    claimed = _read_state(stage).run
+    sparring_dir = Path(stage.directory).parent.parent
+    managed = _managed_owner(sparring_dir)
+    if managed is not None:
+        problems = _managed_problems(sparring_dir, stage.stage_id, managed, claimed)
+        if problems:
+            raise StageOwnerMismatchError(stage.stage_id, managed, problems)
+        return managed
+    positioned = _runs_positioned_at(sparring_dir, stage.stage_id)
+    if claimed:
+        if positioned and claimed not in positioned:
+            raise AcceptanceError(
+                f"refusing: stage {stage.stage_id!r} records run {claimed!r} as its owner, but "
+                f"the run state positioned at it is {', '.join(sorted(positioned))}; nothing was "
+                "frozen or accepted"
+            )
+        return claimed
+    if len(positioned) > 1:
+        raise AcceptanceError(
+            f"refusing: runs {', '.join(sorted(positioned))} are all positioned at stage "
+            f"{stage.stage_id!r}; nothing was frozen or accepted"
+        )
+    return next(iter(positioned), None)
+
+
+@dataclass(frozen=True)
+class RunRecords:
+    """What the owning run's engine state says that acceptance needs, all of
+    it read locally: the remote incident it is paused on, if any; the
+    trusted snapshots of each participating repository's configuration it
+    holds Git to; and everything it has accepted, per repository."""
+
+    run: str
+    pause: RemotePause | None
+    snapshots: RunSnapshots
+    accepted: tuple[AcceptedCandidate, ...]
+    repo_root: Path
+
+    @property
+    def snapshot(self) -> tuple[tuple[str, str], ...] | None:
+        return self.snapshots.primary
+
+    def require_sibling_snapshot(self, root: Path, repository: CandidateRepository) -> None:
+        """Refuse an operation on a sibling the run holds no trusted
+        snapshot for: it would otherwise run unguarded (I-L4)."""
+
+        if self.snapshots.for_sibling(root) is None:
+            raise TrustedConfigMissingError(
+                missing_message(self.repo_root, self.run, what=f"sibling repository {_describe(repository)}")
+            )
+
+
+class TrustedConfigMissingError(AcceptanceError):
+    """The owning run holds no trusted configuration snapshot for a
+    participating repository, so its Git commands cannot be held to one."""
+
+    code = TRUSTED_CONFIG_MISSING
+
+
+def run_records(stage: Stage, repo_root: Path) -> RunRecords | None:
+    """The records of the run that owns ``stage`` (see :func:`_owning_run`),
+    read from that run's engine-written state and the stages it owns --
+    never from an agent-written artifact, and never from a remote. ``None``
+    for a stage no run owns.
+
+    An owned stage whose run holds no recoverable trusted snapshot of the
+    primary repository refuses (``trusted_config_missing``): its operations
+    are never run unguarded."""
+
+    run = _owning_run(stage)
+    if not run:
+        return None
+    sparring_dir = Path(stage.directory).parent.parent
+    path = sparring_dir / "plans" / f"{run}.json"
+    payload: Mapping[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AcceptanceError(
+                f"refusing: cannot read the state of run {run} ({exc}); nothing was frozen or "
+                "accepted"
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise AcceptanceError(
+                f"refusing: the state of run {run} at {path} is not a JSON object; nothing was "
+                "frozen or accepted"
+            )
+        payload = loaded
+    awaiting = payload.get("awaiting")
+    pause: RemotePause | None = None
+    if isinstance(awaiting, Mapping) and awaiting.get("kind") in REMOTE_PAUSE_KINDS:
+        try:
+            pause = remote_pause_from_dict(awaiting)
+        except (GitContextError, KeyError, TypeError, ValueError) as exc:
+            raise AcceptanceError(
+                f"refusing: run {run} is paused on a recorded remote incident that cannot be "
+                f"read ({exc}); nothing was frozen or accepted"
+            ) from exc
+    try:
+        accepted = run_accepted(sparring_dir, run)
+    except RunHistoryError as exc:
+        raise AcceptanceError(
+            f"refusing: the accepted history of run {run} cannot be read ({exc}), so it cannot "
+            "be shown to be preserved; nothing was frozen or accepted"
+        ) from exc
+    try:
+        snapshots = trusted_snapshots.from_run_state(payload)
+    except trusted_snapshots.SnapshotError as exc:
+        raise TrustedConfigMissingError(
+            f"refusing: {TRUSTED_CONFIG_MISSING}: the trusted configuration snapshots of run "
+            f"{run} cannot be read ({exc}); nothing was frozen or accepted"
+        ) from exc
+    if snapshots.primary is None:
+        raise TrustedConfigMissingError(
+            missing_message(Path(repo_root), run, what="the primary repository")
+        )
+    return RunRecords(
+        run=run, pause=pause, snapshots=snapshots, accepted=accepted, repo_root=Path(repo_root)
+    )
+
+
+@contextlib.contextmanager
+def _run_guard(stage: Stage, repo_root: Path) -> Iterator[RunRecords | None]:
+    """Hold this operation's Git invocations -- in the primary repository
+    and in each sibling -- to the owning run's trusted snapshots. An owned
+    stage always has the primary's (see :func:`run_records`)."""
+
+    records = run_records(stage, repo_root)
+    if records is None:
+        yield records
+        return
+    with trusted_snapshots.guard(Path(repo_root), records.snapshots):
+        yield records
+
+
+def _require_no_pause(records: RunRecords | None) -> None:
+    """Refuse while the owning run is paused on a recorded remote incident."""
+
+    if records is not None and records.pause is not None:
+        raise UnauthorizedRemoteMovementError(records.pause)
+
+
+def _require_history(
+    records: RunRecords | None,
+    stage_id: str,
+    root: Path,
+    candidate_sha: str,
+    stage_base: str | None,
+    repository: CandidateRepository | None = None,
+) -> None:
+    """I-L2b for one repository: its stage base and every candidate the run
+    accepted in it are ancestors of (or equal to) ``candidate_sha``.
+
+    ``repository`` is ``None`` for the primary repository. A commit that is
+    not present in the repository at all cannot be shown to be an
+    ancestor, and refuses too."""
+
+    accepted = records.accepted if records is not None else ()
+    for what, sha in required_ancestors(
+        accepted, stage_id=stage_id, stage_base=stage_base, repository=repository
+    ):
+        if not is_ancestor(root, sha, candidate_sha):
+            raise RunHistoryRewrittenError(
+                describe_repository(repository), sha, what, candidate_sha
+            )
+
+
+def require_primary_history(
+    stage: Stage,
+    repo_root: Path,
+    candidate_sha: str,
+    *,
+    earlier: tuple[tuple[str, str], ...] = (),
+) -> None:
+    """I-L2b in the primary repository, for a caller outside the freeze and
+    accept paths (an independent review being entered): the stage's base,
+    every candidate its owning run accepted here, and each ``earlier``
+    ``(stage id, commit)`` are ancestors of ``candidate_sha``.
+
+    Raises :class:`RunHistoryRewrittenError` (an :class:`AcceptanceError`)
+    naming the missing commit."""
+
+    with _run_guard(stage, repo_root) as records:
+        _require_no_pause(records)
+        _require_history(records, stage.stage_id, repo_root, candidate_sha, _read_state(stage).base_sha)
+        for stage_id, sha in earlier:
+            if not is_ancestor(repo_root, sha, candidate_sha):
+                raise RunHistoryRewrittenError(
+                    describe_repository(None),
+                    sha,
+                    f"the candidate accepted by stage {stage_id!r}",
+                    candidate_sha,
+                )
+
+
 def _require_branch(repo_root: Path, expected_branch: str, *, operation: str) -> str:
     if not expected_branch or not expected_branch.strip():
         raise AcceptanceError(
-            f"expected_branch is required to {operation}; the candidate's "
-            "intended branch is what its pushed/reachable check is made against"
+            f"expected_branch is required to {operation}; the candidate is the exact HEAD "
+            "of that branch"
         )
     try:
         branch = current_branch(repo_root)
     except GitContextError as exc:
-        raise AcceptanceError(str(exc)) from exc
+        raise CandidateNotOnBranchError(f"{exc}; refusing to {operation}") from exc
     if branch != expected_branch:
-        raise AcceptanceError(
+        raise CandidateNotOnBranchError(
             f"expected branch {expected_branch!r} but {repo_root} is on "
             f"{branch!r}; refusing to {operation} from the wrong branch"
         )
     return branch
+
+
+def _local_detail(sha: str, branch: str) -> str:
+    return f"local: {sha} is the exact HEAD of {branch}, with a clean working tree"
+
+
+#: The verdicts after which a person's explicit acceptance is the decision:
+#: the reviewer handed it to them, for exactly what was reviewed.
+_HANDED_TO_A_PERSON = (RoutingAction.ESCALATE.value, RoutingAction.NEEDS_YOU.value)
+
+
+def record_review(stage: Stage, repo_root: Path | None, action: RoutingAction) -> None:
+    """Record, beside the verdict just written, exactly what it was given
+    over: the primary ``HEAD`` and whether its working tree then held
+    nothing that commit does not represent, and each declared sibling's
+    ``HEAD`` and whether its working tree was clean (see
+    :class:`~agent_sparring.stage.ReviewRecord`). Engine-written, from the
+    repositories themselves -- never from the reviewer's words.
+
+    Fails closed. A new verdict always replaces the evidence of the one
+    before it: the earlier record is invalidated first, and when what this
+    verdict was over cannot be captured (``repo_root`` unknown, a
+    repository unreadable) the record says so and can authorize nothing --
+    neither it nor any earlier READY. A stage with no state has nothing to
+    record into."""
+
+    try:
+        state = stage.read_state()
+    except StageError:
+        return
+    # Invalidate before capturing anything: if the capture below fails in
+    # any way, no earlier review evidence survives this verdict.
+    state.review = ReviewRecord(action=action.value, head_sha=None, clean=False)
+    stage.write_state(state)
+    if repo_root is None:
+        return
+    try:
+        head = resolve_commit(repo_root, "HEAD", label="reviewed HEAD")
+        blocking, _ignored = _partition_dirty(repo_root, stage)
+        siblings = []
+        dirty_siblings = []
+        for repository in state.repositories:
+            root = sibling_root(repo_root, repository)
+            siblings.append(
+                SiblingPin(
+                    name=repository.name,
+                    head_sha=resolve_commit(root, "HEAD", label=f"{repository.name} HEAD"),
+                )
+            )
+            if dirty_entries(root, all_untracked=True):
+                dirty_siblings.append(repository.name)
+    except (GitContextError, AcceptanceError, OSError):
+        # The invalidated record written above stands: it authorizes nothing.
+        return
+    state.review = ReviewRecord(
+        action=action.value,
+        head_sha=head,
+        clean=not blocking,
+        repositories=tuple(siblings),
+        dirty_repositories=tuple(dirty_siblings),
+    )
+    stage.write_state(state)
+
+
+def _review_covers(review: ReviewRecord, sha: str, siblings: tuple[CandidateRepository, ...]) -> bool:
+    if review.head_sha is None or not review.clean or review.head_sha != sha:
+        return False
+    reviewed = {entry.name: entry.head_sha for entry in review.repositories}
+    return all(
+        repository.candidate_sha is not None
+        and reviewed.get(repository.name) == repository.candidate_sha
+        and repository.name not in review.dirty_repositories
+        for repository in siblings
+    )
+
+
+def _require_verdict_at(state: StageState, stage: Stage, sha: str) -> None:
+    """The review the engine recorded must be over exactly ``sha`` -- and,
+    for a cross-repository stage, over exactly the frozen sibling
+    candidates (I-L2). Evidence is one of:
+
+    - the stage's review record (:func:`record_review`): READY over ``sha``
+      with a clean tree -- or ESCALATE / NEEDS_YOU there, after which the
+      reviewer has handed the decision to a person and their explicit
+      ``accept-candidate`` is that decision, for exactly what was reviewed;
+    - the loop's ``next_turn`` marker (see :mod:`agent_sparring.next_turn`):
+      ``finalization`` over ``sha`` as a commit (READY), or ``sparring``
+      with ESCALATE / NEEDS_YOU recorded over it.
+
+    No evidence at all -- a stage nobody reviewed, or one whose review
+    predates this record -- refuses too: acceptance is never given to an
+    unreviewed candidate."""
+
+    review = state.review
+    if review is not None:
+        if review.action == RoutingAction.READY.value or review.action in _HANDED_TO_A_PERSON:
+            if _review_covers(review, sha, state.repositories):
+                return
+            if review.head_sha is None:
+                over = "a candidate that could not be recorded"
+            elif review.head_sha != sha or not review.clean:
+                over = f"{review.head_sha}{'' if review.clean else ' with uncommitted work'}"
+            else:
+                over = (
+                    f"{review.head_sha} with other sibling commits or uncommitted sibling work"
+                    + (f" ({', '.join(review.dirty_repositories)})" if review.dirty_repositories else "")
+                )
+            raise VerdictNotAtCandidateError(
+                f"refusing: {VERDICT_NOT_AT_CANDIDATE}: stage {stage.stage_id!r} would accept "
+                f"{sha}, but the reviewer's recorded {review.action} was over {over}. "
+                "Acceptance needs the review at that exact candidate; have it reviewed. "
+                "Nothing was accepted"
+            )
+        raise VerdictNotAtCandidateError(
+            f"refusing: {VERDICT_NOT_AT_CANDIDATE}: stage {stage.stage_id!r} would accept {sha}, "
+            f"but the reviewer's last recorded verdict is {review.action}, not a READY. Nothing "
+            "was accepted"
+        )
+    if state.next_turn is None:
+        raise VerdictNotAtCandidateError(
+            f"refusing: {VERDICT_NOT_AT_CANDIDATE}: stage {stage.stage_id!r} would accept {sha}, "
+            "but no review of it is recorded: acceptance needs the reviewer's READY at that "
+            "exact commit (run-sparring, run-loop or a managed run records it). Nothing was "
+            "accepted"
+        )
+    reviewed = state.next_turn_candidate
+    at_sha = (
+        reviewed is not None
+        and reviewed.kind == "commit"
+        and reviewed.head_sha == sha
+        and all(
+            repository.candidate_sha is not None
+            and {entry.name: entry.head_sha for entry in reviewed.repositories}.get(repository.name)
+            == repository.candidate_sha
+            for repository in state.repositories
+        )
+    )
+    if state.next_turn == NEXT_TURN_FINALIZATION and at_sha:
+        return
+    handed_to_a_person = False
+    if state.next_turn == NEXT_TURN_SPARRING and not state.implementation_unreviewed:
+        outcome = read_recorded_outcome(stage)
+        handed_to_a_person = outcome is not None and outcome.action in (
+            RoutingAction.ESCALATE,
+            RoutingAction.NEEDS_YOU,
+        )
+    if handed_to_a_person and at_sha:
+        return
+    if handed_to_a_person:
+        recorded = (
+            "the reviewer handed the decision to a person over "
+            f"{reviewed.head_sha if reviewed is not None else 'no recorded candidate'}"
+        )
+    elif state.next_turn != NEXT_TURN_FINALIZATION:
+        recorded = f"the stage's last recorded step is {state.next_turn!r}, not a READY"
+    elif reviewed is None:
+        recorded = "the recorded READY names no candidate"
+    elif reviewed.kind != "commit":
+        recorded = f"the recorded READY was over uncommitted work on {reviewed.head_sha}"
+    else:
+        recorded = f"the recorded READY is over {reviewed.head_sha}"
+    raise VerdictNotAtCandidateError(
+        f"refusing: {VERDICT_NOT_AT_CANDIDATE}: stage {stage.stage_id!r} would accept {sha}, "
+        f"but {recorded}. Acceptance needs the reviewer's READY at that exact commit; have "
+        "it reviewed. Nothing was accepted"
+    )
 
 
 def _stage_artifact_allowlist(repo_root: Path, stage: Stage) -> frozenset[str]:
@@ -351,18 +946,23 @@ def _describe(repository: CandidateRepository) -> str:
 
 
 def _freeze_siblings(
-    repo_root: Path, repositories: tuple[CandidateRepository, ...]
+    repo_root: Path,
+    repositories: tuple[CandidateRepository, ...],
+    records: RunRecords | None = None,
+    stage_id: str = "",
 ) -> tuple[CandidateRepository, ...]:
     """Resolve and pin every declared sibling candidate, or refuse.
 
     Each sibling gets the same treatment the primary repository already
     gets, in the same order: it must be on the declared branch, resolve
     HEAD, hold no dirty changes at all (a sibling holds none of *this*
-    stage's workflow artifacts, so nothing is exempt there), and have that
-    commit reachable from its branch's configured remote. A sibling that
-    declares a ``candidate_sha`` must be exactly at it -- that is the
-    reviewed commit asserted by whoever declared it, and silently pinning a
-    different one would defeat the point.
+    stage's workflow artifacts, so nothing is exempt there), and have its
+    own history preserved -- its recorded stage base and every candidate the
+    owning run (``records``) accepted in it are ancestors of that HEAD (see
+    :mod:`agent_sparring.run_history`). Nothing is read from a remote. A
+    sibling that declares a ``candidate_sha`` must be exactly at it -- that
+    is the reviewed commit asserted by whoever declared it, and silently
+    pinning a different one would defeat the point.
 
     Returns the same repositories with ``candidate_sha`` filled in with the
     resolved HEAD. Raises :class:`AcceptanceError` on the first refusal;
@@ -377,12 +977,18 @@ def _freeze_siblings(
                 f"sibling repository {_describe(repository)} does not resolve to a git "
                 f"repository at {root}; refusing to freeze an incomplete candidate set"
             )
+        if records is not None:
+            # Before any Git command runs in the sibling: an owned stage's
+            # sibling is only ever operated on under its own snapshot.
+            records.require_sibling_snapshot(root, repository)
         try:
             branch = current_branch(root)
         except GitContextError as exc:
-            raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
+            raise CandidateNotOnBranchError(
+                f"sibling repository {_describe(repository)}: {exc}"
+            ) from exc
         if branch != repository.branch:
-            raise AcceptanceError(
+            raise CandidateNotOnBranchError(
                 f"sibling repository {_describe(repository)} is on {branch!r} but its "
                 f"candidate belongs to {repository.branch!r}; refusing to freeze a "
                 "candidate set built from the wrong branch"
@@ -392,7 +998,7 @@ def _freeze_siblings(
         except GitContextError as exc:
             raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
         if repository.candidate_sha is not None and repository.candidate_sha != head:
-            raise AcceptanceError(
+            raise CandidateNotOnBranchError(
                 f"sibling repository {_describe(repository)} was declared at "
                 f"{repository.candidate_sha} but {branch} is now at {head}; refusing to "
                 "freeze a candidate set that is not the one that was reviewed"
@@ -403,32 +1009,25 @@ def _freeze_siblings(
             raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
         if dirty:
             listed = ", ".join(entry.path for entry in dirty)
-            raise AcceptanceError(
+            raise CandidateNotOnBranchError(
                 f"refusing to freeze {head} as the candidate of sibling repository "
                 f"{_describe(repository)}: its working tree holds changes that commit "
-                f"does not represent ({listed}). Commit or discard them first."
+                f"does not represent ({listed}). Commit or discard them first"
             )
-        pushed, push_detail = verify_pushed(root, head, branch)
-        if not pushed:
-            raise AcceptanceError(
-                f"refusing to freeze {head} as the candidate of sibling repository "
-                f"{_describe(repository)}: it is not available on the intended remote "
-                f"branch ({push_detail})"
-            )
-        pinned.append(
-            CandidateRepository(
-                name=repository.name,
-                path=repository.path,
-                branch=repository.branch,
-                candidate_sha=head,
-            )
-        )
+        _require_history(records, stage_id, root, head, repository.base_sha, repository)
+        pinned.append(replace(repository, candidate_sha=head))
     return tuple(pinned)
 
 
-def _verify_siblings(repo_root: Path, repositories: tuple[CandidateRepository, ...]) -> None:
+def _verify_siblings(
+    repo_root: Path,
+    repositories: tuple[CandidateRepository, ...],
+    records: RunRecords | None = None,
+    stage_id: str = "",
+) -> None:
     """Re-check that every pinned sibling candidate is still exactly what was
-    frozen, mirroring the primary repository's stale-candidate check.
+    frozen, mirroring the primary repository's stale-candidate check, and
+    that its history is still preserved.
 
     Raises :class:`StaleCandidateError` when a sibling moved on, and plain
     :class:`AcceptanceError` when it was never pinned, is on the wrong
@@ -443,13 +1042,15 @@ def _verify_siblings(repo_root: Path, repositories: tuple[CandidateRepository, .
                 "than guessing which commit was reviewed"
             )
         root = sibling_root(repo_root, repository)
+        if records is not None:
+            records.require_sibling_snapshot(root, repository)
         try:
             branch = current_branch(root)
             head = resolve_commit(root, "HEAD", label=f"{repository.name} HEAD")
         except GitContextError as exc:
             raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
         if branch != repository.branch:
-            raise AcceptanceError(
+            raise CandidateNotOnBranchError(
                 f"sibling repository {_describe(repository)} is on {branch!r} but its "
                 f"frozen candidate belongs to {repository.branch!r}; refusing acceptance"
             )
@@ -458,7 +1059,7 @@ def _verify_siblings(repo_root: Path, repositories: tuple[CandidateRepository, .
                 f"the frozen candidate of sibling repository {_describe(repository)} is "
                 f"{repository.candidate_sha}, but {branch} in {root} is now at {head}; "
                 "refusing acceptance as stale. The complete reviewed candidate set must "
-                "still be the one that was reviewed; nothing was accepted."
+                "still be the one that was reviewed; nothing was accepted"
             )
         try:
             dirty = dirty_entries(root, all_untracked=True)
@@ -466,11 +1067,12 @@ def _verify_siblings(repo_root: Path, repositories: tuple[CandidateRepository, .
             raise AcceptanceError(f"sibling repository {_describe(repository)}: {exc}") from exc
         if dirty:
             listed = ", ".join(entry.path for entry in dirty)
-            raise AcceptanceError(
+            raise CandidateNotOnBranchError(
                 f"refusing to accept {repository.candidate_sha} for sibling repository "
                 f"{_describe(repository)}: its working tree holds changes that commit does "
-                f"not represent ({listed}), even though HEAD still matches."
+                f"not represent ({listed}), even though HEAD still matches"
             )
+        _require_history(records, stage_id, root, head, repository.base_sha, repository)
 
 
 def unrepresented_dirty_entries(repo_root: Path, stage: Stage) -> tuple[DirtyEntry, ...]:
@@ -499,22 +1101,103 @@ def unrepresented_dirty(repo_root: Path, stage: Stage) -> tuple[str, ...]:
     )
 
 
+def recorded_ready_problems(
+    stage: Stage, repo_root: Path, *, expected_branch: str, candidate_sha: str
+) -> tuple[tuple[int, str], ...]:
+    """Why ``candidate_sha`` is not, right now, exactly what the stage's
+    recorded READY was over, as ``(condition, detail)`` pairs: empty when it
+    is. Read-only, and held to the owning run's trusted snapshots.
+
+    For the legacy migration's conditions (see
+    :func:`agent_sparring.plan.resume_plan`): ``2`` -- the engine-recorded
+    review is a READY over ``candidate_sha``, which is the ``HEAD`` of
+    ``expected_branch``; ``3`` -- the working tree is clean apart from the
+    stage's own artifacts, and every declared sibling is clean and at
+    exactly the commit that review was over. Acceptance itself re-checks all
+    of it (:func:`freeze_candidate`, :func:`accept_candidate`)."""
+
+    problems: list[tuple[int, str]] = []
+    try:
+        state = _read_state(stage)
+        with _run_guard(stage, repo_root):
+            try:
+                branch = current_branch(repo_root)
+                head = resolve_commit(repo_root, "HEAD", label="HEAD")
+            except GitContextError as exc:
+                return ((2, f"{repo_root} cannot be read: {exc}"),)
+            if branch != expected_branch or head != candidate_sha:
+                problems.append((
+                    2, f"{repo_root} is at {head} on {branch!r}, not the paused candidate "
+                    f"{candidate_sha} as the HEAD of {expected_branch!r}",
+                ))
+            blocking, _ignored = _partition_dirty(repo_root, stage)
+            if blocking:
+                problems.append((
+                    3, "the working tree holds changes the candidate does not represent ("
+                    + ", ".join(_describe_entry(entry) for entry in blocking) + ")",
+                ))
+            reviewed_siblings: dict[str, str | None] = {}
+            if state.review is not None:
+                reviewed_siblings = {entry.name: entry.head_sha for entry in state.review.repositories}
+            elif state.next_turn_candidate is not None:
+                reviewed_siblings = {
+                    entry.name: entry.head_sha for entry in state.next_turn_candidate.repositories
+                }
+            at: list[CandidateRepository] = []
+            for repository in state.repositories:
+                root = sibling_root(repo_root, repository)
+                try:
+                    sibling_head = resolve_commit(root, "HEAD", label=f"{repository.name} HEAD")
+                    dirty = dirty_entries(root, all_untracked=True)
+                except (GitContextError, AcceptanceError, OSError) as exc:
+                    problems.append((3, f"sibling {_describe(repository)} cannot be read: {exc}"))
+                    continue
+                recorded = repository.candidate_sha or reviewed_siblings.get(repository.name)
+                if sibling_head != recorded:
+                    problems.append((
+                        3, f"sibling {_describe(repository)} is at {sibling_head}, not its recorded "
+                        f"candidate {recorded or '(none recorded)'}",
+                    ))
+                if dirty:
+                    problems.append((3, f"sibling {_describe(repository)} has uncommitted changes"))
+                at.append(replace(repository, candidate_sha=sibling_head))
+            try:
+                _require_verdict_at(replace(state, repositories=tuple(at)), stage, candidate_sha)
+            except AcceptanceError as exc:
+                problems.append((2, str(exc)))
+    except AcceptanceError as exc:
+        problems.append((2, f"the recorded review cannot be checked: {exc}"))
+    return tuple(problems)
+
+
 def pin_sibling_candidates(
-    repo_root: Path, repositories: tuple[CandidateRepository, ...]
+    repo_root: Path,
+    repositories: tuple[CandidateRepository, ...],
+    *,
+    stage: Stage | None = None,
 ) -> tuple[CandidateRepository, ...]:
     """Resolve and pin every declared sibling candidate, or refuse.
 
     The public name for the freeze's own sibling handling, so an
     independent-review stage pins the sibling candidates it is reviewing
     under exactly the checks a freeze applies (see :func:`_freeze_siblings`)
-    instead of a second, looser version of them.
+    instead of a second, looser version of them. ``stage``, when given,
+    supplies its owning run's accepted history, which each sibling's
+    candidate must preserve, and its trusted snapshots, which every Git
+    command here is held to.
     """
 
-    return _freeze_siblings(repo_root, repositories)
+    if stage is None:
+        return _freeze_siblings(repo_root, repositories)
+    with _run_guard(stage, repo_root) as records:
+        return _freeze_siblings(repo_root, repositories, records, stage.stage_id)
 
 
 def verify_sibling_candidates(
-    repo_root: Path, repositories: tuple[CandidateRepository, ...]
+    repo_root: Path,
+    repositories: tuple[CandidateRepository, ...],
+    *,
+    stage: Stage | None = None,
 ) -> None:
     """Re-check that every pinned sibling candidate is still what was pinned.
 
@@ -522,7 +1205,11 @@ def verify_sibling_candidates(
     :func:`pin_sibling_candidates`.
     """
 
-    _verify_siblings(repo_root, repositories)
+    if stage is None:
+        _verify_siblings(repo_root, repositories)
+        return
+    with _run_guard(stage, repo_root) as records:
+        _verify_siblings(repo_root, repositories, records, stage.stage_id)
 
 
 def freeze_candidate(
@@ -536,7 +1223,7 @@ def freeze_candidate(
 
     Always freezes the resolved current ``HEAD`` — there is no revision
     parameter, because "the candidate" means the state that actually exists
-    right now and has actually been pushed, not a revision someone typed.
+    right now, not a revision someone typed.
 
     Runs inside :func:`~agent_sparring.concurrency.worktree_lock` -- the
     same lock :func:`~agent_sparring.stage_agent.run_stage_agent` holds for
@@ -552,10 +1239,14 @@ def freeze_candidate(
     4. the worktree holds no unrepresented dirty changes outside this
        stage's own artifact files (see :func:`_partition_dirty`) --
        ``sparring_dir`` itself is not treated as a blanket-exempt subtree;
-    5. that commit is reachable from ``expected_branch``'s configured
-       remote ref, proven locally by
-       :func:`~agent_sparring.git_context.verify_pushed` rather than trusted
-       from any recorded flag.
+    5. the owning run, if any, is not paused on a recorded remote incident;
+    6. history is preserved (I-L2b): the stage's ``base_sha`` and every
+       candidate the owning run already accepted in this repository are
+       ancestors of that commit;
+    7. every declared sibling passes the same checks in its own repository.
+
+    No remote and no remote configuration is read: a candidate is local
+    (I-L2), and publishing one is a separate, explicit action.
 
     Only then are ``candidate_sha`` and ``status = FROZEN`` recorded. The
     stage's ``base_sha`` and both session ids are preserved untouched.
@@ -576,8 +1267,10 @@ def freeze_candidate(
     del sparring_dir
 
     try:
-        with worktree_lock(repo_root):
-            frozen = _freeze_candidate_locked(stage, repo_root, expected_branch=expected_branch)
+        with worktree_lock(repo_root), _run_guard(stage, repo_root) as records:
+            frozen = _freeze_candidate_locked(
+                stage, repo_root, expected_branch=expected_branch, records=records
+            )
     except WorktreeLockError as exc:
         error = AcceptanceError(
             f"cannot freeze a candidate for stage {stage.stage_id!r}: {exc}"
@@ -604,6 +1297,8 @@ def _emit_refusal(stage: Stage, operation: str, exc: AcceptanceError) -> None:
 
     if isinstance(exc, StaleCandidateError):
         summary = f"{operation} refused: stale candidate"
+    elif exc.code is not None:
+        summary = f"{operation} refused: {exc.code}"
     else:
         summary = f"{operation} refused"
     stage.activity_log().emit("gate", "gate.refused", summary=summary)
@@ -614,6 +1309,7 @@ def _freeze_candidate_locked(
     repo_root: Path,
     *,
     expected_branch: str,
+    records: RunRecords | None = None,
 ) -> FreezeResult:
     state = _read_state(stage)
 
@@ -635,24 +1331,19 @@ def _freeze_candidate_locked(
     blocking, ignored = _partition_dirty(repo_root, stage)
     if blocking:
         listed = ", ".join(_describe_entry(entry) for entry in blocking)
-        raise AcceptanceError(
+        raise CandidateNotOnBranchError(
             f"refusing to freeze {candidate_sha} as the candidate for stage "
             f"{stage.stage_id!r}: the working tree holds changes that commit "
-            f"does not represent ({listed}). Commit or discard them first."
+            f"does not represent ({listed}). Commit or discard them first"
         )
 
-    pushed, push_detail = verify_pushed(repo_root, candidate_sha, branch)
-    if not pushed:
-        raise AcceptanceError(
-            f"refusing to freeze {candidate_sha} as the candidate for stage "
-            f"{stage.stage_id!r}: it is not available on the intended remote "
-            f"branch ({push_detail})"
-        )
+    _require_no_pause(records)
+    _require_history(records, stage.stage_id, repo_root, candidate_sha, state.base_sha)
 
     # A cross-repository stage is frozen as a *set*: pinning only the primary
     # commit would let a reviewed sibling move between review and acceptance.
     # Refuses before anything is written, like every check above.
-    repositories = _freeze_siblings(repo_root, state.repositories)
+    repositories = _freeze_siblings(repo_root, state.repositories, records, stage.stage_id)
 
     state.candidate_sha = candidate_sha
     state.status = StageStatus.FROZEN
@@ -662,7 +1353,7 @@ def _freeze_candidate_locked(
     return FreezeResult(
         candidate_sha=candidate_sha,
         branch=branch,
-        push_detail=push_detail,
+        push_detail=_local_detail(candidate_sha, branch),
         ignored_dirty_paths=tuple(_describe_entry(entry) for entry in ignored),
         repositories=repositories,
     )
@@ -719,9 +1410,9 @@ def accept_candidate(
     """
 
     try:
-        with worktree_lock(repo_root):
+        with worktree_lock(repo_root), _run_guard(stage, repo_root) as records:
             accepted = _accept_candidate_locked(
-                stage, repo_root, expected_branch=expected_branch
+                stage, repo_root, expected_branch=expected_branch, records=records
             )
     except WorktreeLockError as exc:
         error = AcceptanceError(
@@ -741,6 +1432,7 @@ def _accept_candidate_locked(
     repo_root: Path,
     *,
     expected_branch: str,
+    records: RunRecords | None = None,
 ) -> AcceptanceResult:
     state = _read_state(stage)
 
@@ -787,18 +1479,24 @@ def _accept_candidate_locked(
     blocking, _ignored = _partition_dirty(repo_root, stage)
     if blocking:
         listed = ", ".join(_describe_entry(entry) for entry in blocking)
-        raise AcceptanceError(
+        raise CandidateNotOnBranchError(
             f"refusing to accept {frozen_sha} for stage {stage.stage_id!r}: "
             f"the working tree holds changes that commit does not represent "
             f"({listed}), even though HEAD still matches the frozen "
-            "candidate. Commit or discard them first."
+            "candidate. Commit or discard them first"
         )
 
-    # The same two questions, asked of every pinned sibling candidate: is it
-    # still exactly the commit that was reviewed, and does its worktree still
-    # *be* that commit? A cross-repository stage is accepted as a complete
-    # set or not at all.
-    _verify_siblings(repo_root, state.repositories)
+    _require_no_pause(records)
+    _require_history(records, stage.stage_id, repo_root, frozen_sha, state.base_sha)
+
+    # The same questions, asked of every pinned sibling candidate: is it
+    # still exactly the commit that was reviewed, does its worktree still
+    # *be* that commit, and does it keep its own history? A cross-repository
+    # stage is accepted as a complete set or not at all.
+    _verify_siblings(repo_root, state.repositories, records, stage.stage_id)
+
+    # And the reviewer's verdict must be over exactly that set.
+    _require_verdict_at(state, stage, frozen_sha)
 
     state.status = StageStatus.ACCEPTED
     stage.write_state(state)
@@ -844,11 +1542,11 @@ def accept_reviewed_candidate(
     6. the worktree holds no changes that commit does not represent (the
        same allowlist the freeze uses, so this stage's own artifacts never
        block it);
-    7. the reviewed commit is still reachable from ``expected_branch``'s
-       remote -- already true when the preceding stage accepted it, and
-       cheap to prove again rather than assume across a force-push;
+    7. history is preserved: every candidate the owning run accepted in
+       this repository is an ancestor of the reviewed commit (no remote is
+       read; see :mod:`agent_sparring.run_history`);
     8. every pinned sibling candidate is still on its branch, at its pinned
-       commit, with a clean worktree.
+       commit, with a clean worktree and its own history preserved.
 
     Only then is ``candidate_sha`` written as that same reviewed commit and
     ``status`` set to ACCEPTED. ``candidate_sha == base_sha`` is not a
@@ -863,9 +1561,9 @@ def accept_reviewed_candidate(
     """
 
     try:
-        with worktree_lock(repo_root):
+        with worktree_lock(repo_root), _run_guard(stage, repo_root) as records:
             accepted = _accept_reviewed_candidate_locked(
-                stage, repo_root, expected_branch=expected_branch
+                stage, repo_root, expected_branch=expected_branch, records=records
             )
     except WorktreeLockError as exc:
         error = AcceptanceError(
@@ -885,6 +1583,7 @@ def _accept_reviewed_candidate_locked(
     repo_root: Path,
     *,
     expected_branch: str,
+    records: RunRecords | None = None,
 ) -> AcceptanceResult:
     state = _read_state(stage)
 
@@ -931,22 +1630,18 @@ def _accept_reviewed_candidate_locked(
     blocking, _ignored = _partition_dirty(repo_root, stage)
     if blocking:
         listed = ", ".join(_describe_entry(entry) for entry in blocking)
-        raise AcceptanceError(
+        raise CandidateNotOnBranchError(
             f"refusing to complete the independent review of {reviewed_sha} for stage "
             f"{stage.stage_id!r}: the working tree holds changes that commit does not "
             f"represent ({listed}), so it is not the state that was reviewed, even "
-            "though HEAD still matches. Commit or discard them first."
+            "though HEAD still matches. Commit or discard them first"
         )
 
-    pushed, push_detail = verify_pushed(repo_root, reviewed_sha, branch)
-    if not pushed:
-        raise AcceptanceError(
-            f"refusing to complete the independent review of {reviewed_sha} for stage "
-            f"{stage.stage_id!r}: that commit is no longer available on the intended "
-            f"remote branch ({push_detail})"
-        )
+    _require_verdict_at(state, stage, reviewed_sha)
+    _require_no_pause(records)
+    _require_history(records, stage.stage_id, repo_root, reviewed_sha, state.base_sha)
 
-    _verify_siblings(repo_root, state.repositories)
+    _verify_siblings(repo_root, state.repositories, records, stage.stage_id)
 
     state.status = StageStatus.ACCEPTED
     # The reviewed commit, not a new one: this stage's candidate *is* the
@@ -960,14 +1655,25 @@ def _accept_reviewed_candidate_locked(
 
 
 __all__ = [
+    "CANDIDATE_NOT_ON_BRANCH",
+    "LOCAL_RULE",
+    "RUN_HISTORY_REWRITTEN",
+    "VERDICT_NOT_AT_CANDIDATE",
     "AcceptanceError",
     "AcceptanceResult",
+    "CandidateNotOnBranchError",
     "FreezeResult",
+    "RunHistoryRewrittenError",
+    "RunRecords",
     "StaleCandidateError",
+    "UnauthorizedRemoteMovementError",
+    "VerdictNotAtCandidateError",
     "accept_candidate",
     "accept_reviewed_candidate",
     "freeze_candidate",
     "pin_sibling_candidates",
+    "require_primary_history",
+    "run_records",
     "sibling_root",
     "unrepresented_dirty",
     "unrepresented_dirty_entries",

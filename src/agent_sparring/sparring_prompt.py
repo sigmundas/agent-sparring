@@ -245,6 +245,10 @@ resumed stage-agent turn, to the same stage agent.
       EXTERNAL CONDITION     wait on a store/deploy/third-party state
       SCOPE EXPANSION        approve work beyond this stage's scope
 
+  A test, API request, SQL check or browser script an agent can run is not a
+  human check: ask for the stage to run it, or for only the specific input
+  it lacks (credentials, a disposable target, a URL).
+
   Then give the short reason. If none of the five fits, say so plainly and
   describe the category rather than forcing one.
 - ESCALATE: this deserves a stronger/different sparring environment (e.g.

@@ -44,6 +44,7 @@ from agent_sparring.intake import (
     _read_json,
     _read_text,
     all_findings,
+    recorded_findings_version,
     build_approval,
     parse_interpretation,
     posed_decisions,
@@ -472,7 +473,11 @@ def _intake_status(request: StartRequest, payload: dict[str, Any], intake_dir: P
     source = SourcePlan(label=str(record.get("plan_label")), text=snapshot)
     interpretation = parse_interpretation(_read_text(intake_dir / "interpretation.json"), mode=MODE_COMPILE)
     findings = all_findings(
-        interpretation, source, mode=MODE_COMPILE, compile_context=CompileContext.from_record(record)
+        interpretation,
+        source,
+        mode=MODE_COMPILE,
+        compile_context=CompileContext.from_record(record),
+        findings_version=recorded_findings_version(record),
     )
     payload["findings"] = [_finding(f) for f in findings]
     blocking = [f for f in findings if f.blocking]

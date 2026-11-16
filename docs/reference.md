@@ -27,8 +27,9 @@ than as something to maintain by hand: declare it where the stage is defined,
 and let the run write it. The VS Code extension has a command for this.)
 
 `freeze-candidate` then treats each sibling exactly as it treats the primary
-repository — right branch, clean worktree, commit pushed and reachable — and
-records the resolved commit as the pin. `accept-candidate` re-verifies every
+repository — the exact `HEAD` of the right branch, a clean worktree, and its
+own accepted history preserved (no remote is read) — and records the
+resolved commit as the pin. `accept-candidate` re-verifies every
 pin: a sibling that moved refuses acceptance as stale, and a dirty sibling
 refuses it too. `path` is resolved against the primary repo root when
 relative; a declared `candidate_sha` is an assertion, and freezing refuses if
@@ -462,7 +463,7 @@ itself, which is an ordinary repository file.
 | the plan document (`docs/plans/.../<plan>.md`) | human / repository | no | immutable for the lifetime of a managed run; only `finish-run` may delete it, by explicit `[finish] remove_plan` opt-in, after a byte-exact check against the run's start snapshot | the run's execution definition |
 | `PROJECT.md` | human / repository | no | edited between runs by a person | project context embedded in every prompt |
 | `project.toml` | human / repository | no | edited between runs by a person, by hand or through `sparring set-config` on their behalf | provider selection and engine configuration (model and effort are the person's own preferences, outside the repository) |
-| `plans/<run>.json` | engine | no | rewritten on every position/status change | the run's position, expected branch, plan digest, recorded push authorization and typed pause |
+| `plans/<run>.json` | engine | no | rewritten on every position/status change | the run's position, expected branch, plan digest and typed pause; the trusted configuration snapshots of the primary (`config_snapshot`) and of each sibling (`sibling_snapshots`), whose taking is also recorded in `<git-common-dir>/agent-sparring/snapshots/<run>.json` so a removed or damaged one refuses with `trusted_config_missing`, and every candidate the run accepted, per repository (`accepted_candidates`); each legacy pause it converted under the L-D1 rules (`legacy_push_pause_converted`: stage, sha, pause, at); each recorded incident pause a person answered (`answered_incidents`: kind, stage, paused candidate, `after_ready`, at); and, for a run recorded before runs were local-first, its legacy push authority as written: push authorizations, the pinned remote target, push receipts, remote-movement acknowledgements and per-commit `authorized_without_push` records, loaded inertly (that such a run is pinned is also recorded in `<git-common-dir>/agent-sparring/`, so a finish whose pin -- and so its trusted snapshot -- is gone refuses with `trusted_config_missing`) |
 | `plans/<run>.source`, `plans/<run>.source.sha256` | engine | no | written once at managed run start; archived by `finish-run` | the exact bytes of the run's plan file (Markdown plan or manifest file, never its sidecars) and their sha256, which `[finish] remove_plan` compares against |
 | `intake/<intake>/` | engine | no | written once by `prepare-plan` (the intake agent's answer is its structured result); never rewritten | a reviewable interpretation of a human plan; approval binds its exact bytes, so editing it refuses an approved run |
 | `intake/<intake>/decisions.json` | engine (`start-plan --answer`, on a person's answers) | no | written once at prepare time, inside the write-once intake; the answered intake is never written | a person's answers to an earlier intake's decisions, verbatim; `intake.json` records its digest, so approval seals it and `run-plan` re-checks it |
@@ -535,8 +536,11 @@ worktree_removed | finished`), `run_status` (the run state's status, or
 `missing` / `unreadable`), and the `git` and `finish` objects below.
 
 **`git`** — `head`, `branch_tip`, `clean`, `final_candidate`,
-`candidate_pushed`, `target_tip`, `target_contains_candidate`,
-`target_checked_out_at`; each `null` when it could not be determined.
+`candidate_pushed` (always `null`: no remote is read), `target_tip`,
+`target_contains_candidate`, `target_checked_out_at`; each `null` when it
+could not be determined. `siblings` (an added field) lists each sibling
+repository the run accepted a candidate in: `{name, path, candidate,
+target_branch, target_tip, target_checked_out_at, merge_mode}`.
 
 **`finish-run --dry-run --json`** (the `finish` object):
 
@@ -546,29 +550,31 @@ worktree_removed | finished`), `run_status` (the run state's status, or
  "merge_mode": "already_merged | fast_forward | merge_commit | null",
  "actions": ["…"], "checks": [{"code": "…", "ok": true, "detail": "…"}],
  "deleted_ignored_paths": ["…"],
- "kept": [{"action": "keep_remote_branch", "code": "remote_delete_unavailable", "detail": "…"}],
+ "kept": [],
  "summary": "…"}
 ```
 
-In the dry run, `kept` lists `keep_remote_branch` whenever the record has
-a remote: code `remote_delete_unavailable` (the option is off — a
-compatibility alias kept for one release and removed in the next) or
-`remote_delete_planned` (the option is on; `actions` then lists the leased
-delete). `actions` also lists the plan removal when `remove_plan` is on.
+`kept` is always empty: a finish is local and keeps, reads and deletes
+nothing on a remote. `actions` lists each local merge (the primary's, then
+each sibling's) and the plan removal when `remove_plan` is on.
 
 **`finish-run --json`** (execution):
 
 ```json
 {"schema_version": 1, "run_key": "…",
- "completed_steps": ["merge", "remove_plan", "push_target", "archive_state", "remove_worktree",
-                     "delete_branch", "delete_remote_branch", "finished"],
+ "completed_steps": ["merge", "remove_plan", "archive_state", "remove_worktree",
+                     "delete_branch", "finished"],
  "stopped_at": "checks | <step> | null", "reason": "… | null",
- "remaining": ["…"], "deleted_ignored_paths": ["…"], "kept": [{"action": "…", "code": "…", "detail": "…"}],
+ "remaining": ["…"], "deleted_ignored_paths": ["…"], "kept": [],
  "plan_removal": {"code": "… | null", "detail": "…", "commit": "<sha, on plan_removed>"},
- "remote_branch": {"code": "… | null", "detail": "…"}}
+ "remote_branch": {"code": "local_finish", "detail": "…"}}
 ```
 
-`remove_plan` and `delete_remote_branch` appear only when enabled.
+`remove_plan` appears only when enabled. `--push-target` is refused before
+anything is read or changed: exit `3`, `stopped_at: "checks"`, a `reason`
+naming `remote_finish_removed`. A run an older engine finished reports the
+steps it recorded, which may include `push_target` and
+`delete_remote_branch`.
 `plan_removal.code`: `plan_removed`, `plan_removal_disabled`,
 `finish_config_unreadable`, `plan_snapshot_missing`,
 `plan_snapshot_mismatch`, `plan_not_tracked`, `plan_absent`,
@@ -576,20 +582,15 @@ delete). `actions` also lists the plan removal when `remove_plan` is on.
 `git_identity_missing` (all non-stopping; a refusal is recorded and final)
 or `plan_commit_failed` (stops at `remove_plan`). A removal commit made by an
 interrupted finish (its `Sparring-Run` trailer, deleting exactly the
-snapshot) is recognised on the re-run as `plan_removed`, not `plan_absent`. `remote_branch.code`:
-`remote_branch_deleted`, `remote_branch_absent`, `remote_delete_disabled`,
-`finish_config_unreadable`, `no_remote`, or `remote_lease_mismatch` /
-`remote_unreachable` / `remote_delete_rejected` /
-`remote_target_missing_candidate` / `remote_target_unknown` (fetch first) /
-`remote_multiple_push_urls`
-(a record naming a branch outside the managed `sparring/` namespace, or its target, is
-`remote_delete_rejected` before anything is read or pushed; the branch is kept with that `kept[].code`, the finish stops at
-`delete_remote_branch` and the run is not finished). `null` means the step
-was not reached.
+snapshot) is recognised on the re-run as `plan_removed`, not `plan_absent`. `remote_branch.code`
+is `local_finish`, or for a run an older engine finished the deletion it
+recorded (`remote_branch_deleted`, `remote_branch_absent`).
 
 **`[finish]` in `project.toml`** (read from the reviewed candidate):
-`delete_remote_branch` (bool, default `false`) and `remove_plan` (bool,
-default `false`); any other key is refused.
+`remove_plan` (bool, default `false`). `delete_remote_branch` is retired:
+still parsed, but `true` refuses the finish with `remote_finish_removed`
+(nothing merged) and `check-config` reports either value; any other key is
+refused.
 
 Exit codes: `0` done (or eligible, for a dry run), `3` refused by its
 checks, `1` a step or the command failed.

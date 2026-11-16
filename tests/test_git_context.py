@@ -13,8 +13,9 @@ from agent_sparring.git_context import (
     dirty_paths,
     gather_git_context,
     resolve_commit,
-    verify_pushed,
 )
+
+from git_recorder import GitRecorder, make_bare, marker_program, refs
 
 
 def _run(repo: Path, *args: str) -> None:
@@ -88,29 +89,48 @@ class GitContextTests(unittest.TestCase):
         self.assertIn("a.txt", paths)
         self.assertIn("c.txt", paths)
 
-    def test_verify_pushed_no_remote(self):
-        pushed, detail = verify_pushed(self.repo, self.candidate_sha, "main")
-        self.assertFalse(pushed)
-        self.assertTrue(detail)
+    def _origin(self) -> tuple[Path, Path]:
+        """A real bare ``origin`` with this branch on it, whose
+        ``upload-pack`` leaves a marker when anything reads it."""
 
-    def test_verify_pushed_true_when_remote_matches(self):
-        remote = Path(self._tmp.name) / "remote.git"
-        subprocess.run(
-            ["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True
-        )
+        root = Path(self._tmp.name)
+        marker = root / "MARKER-read"
+        remote = make_bare(root / "remote.git", root / "MARKER-push")
         _run(self.repo, "remote", "add", "origin", str(remote))
         _run(self.repo, "push", "-q", "-u", "origin", "main")
-        pushed, detail = verify_pushed(self.repo, self.candidate_sha, "main")
-        self.assertTrue(pushed)
-        self.assertIn(self.candidate_sha, detail)
+        program = marker_program(root / "upload-pack", marker, "upload-pack")
+        _run(self.repo, "config", "remote.origin.uploadpack", str(program))
+        return remote, marker
+
+    def test_gather_git_context_reads_no_remote(self):
+        # Replaces test_verify_pushed_no_remote and
+        # test_verify_pushed_true_when_remote_matches: the context has no
+        # pushed check any more (I-L1), with or without an origin.
+        remote, marker = self._origin()
+        before = refs(remote)
+        recorder = GitRecorder(Path(self._tmp.name))
+        with recorder.active():
+            ctx = gather_git_context(self.repo, base_sha=self.base_sha, candidate_sha=self.candidate_sha)
+        self.assertEqual((ctx.branch, ctx.candidate_sha), ("main", self.candidate_sha))
+        self.assertTrue(recorder.lines())
+        self.assertEqual(recorder.remote_commands(), [])
+        self.assertFalse(marker.exists())
+        self.assertEqual(refs(remote), before)
+
+    def test_positive_control_plain_git_reads_the_origin_and_is_recorded(self):
+        _remote, marker = self._origin()
+        recorder = GitRecorder(Path(self._tmp.name))
+        with recorder.active():
+            subprocess.run(["git", "ls-remote", "origin"], cwd=self.repo, check=True, capture_output=True)
+        self.assertTrue(recorder.remote_commands())
+        self.assertTrue(marker.exists())
 
     def test_gather_git_context_without_base(self):
-        ctx = gather_git_context(self.repo, candidate_sha=self.candidate_sha, check_pushed=False)
+        ctx = gather_git_context(self.repo, candidate_sha=self.candidate_sha)
         self.assertEqual(ctx.branch, "main")
         self.assertEqual(ctx.candidate_sha, self.candidate_sha)
         self.assertIsNone(ctx.base_sha)
         self.assertEqual(ctx.changed_files, tuple())
-        self.assertIsNone(ctx.pushed)
 
     def test_changed_files_preserves_spaces_and_tabs_in_filenames(self):
         weird_name = "a file\twith tab.txt"
@@ -183,7 +203,6 @@ class GitContextTests(unittest.TestCase):
             self.repo,
             base_sha=self.base_sha,
             candidate_sha=self.candidate_sha,
-            check_pushed=False,
         )
         self.assertEqual({f.path for f in ctx.changed_files}, {"a.txt", "b.txt"})
         self.assertIn("c.txt", ctx.dirty_paths)

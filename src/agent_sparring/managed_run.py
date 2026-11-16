@@ -12,6 +12,15 @@ Fields other than ``events`` never change after creation. Lifecycle is the
 append-only ``events`` list and is derived from it, never stored twice.
 This module covers creation, resume lookup and the read-only listing; merge
 and cleanup are not implemented here.
+
+It also keeps, for runs recorded before runs were local-first, the one
+engine fact about such a run that must survive the loss of its plan-run
+state: that the run was *pinned* (see :mod:`agent_sparring.remote_pin`). A
+managed record says so with ``pinned: true``; any other run says so in
+``<git-common-dir>/agent-sparring/runs/<run-key>.json``. Both live outside
+the project directory, so deleting or replacing ``.sparring/plans/<run>.json``
+cannot turn a pinned run back into one that predates pins. Local-first runs
+pin no remote, and neither is written for them.
 """
 
 from __future__ import annotations
@@ -27,15 +36,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from agent_sparring import engine_git
+
 SCHEMA_VERSION = 1
 RECORDS_SUBDIR = Path("agent-sparring") / "worktrees"
+#: Where a run that has no managed record saying so records that it is pinned.
+RUNS_SUBDIR = Path("agent-sparring") / "runs"
+#: Where the engine records that a local-first run holds a trusted
+#: configuration snapshot (see :func:`mark_snapshot_recorded`).
+SNAPSHOTS_SUBDIR = Path("agent-sparring") / "snapshots"
 INPUT_KINDS = ("markdown", "manifest")
 EVENTS = (
     "created",
     "creation_failed",
     "merged",
+    # A sibling repository's accepted candidate merged into its local target.
+    "sibling_merged",
     "plan_removed",
     "plan_removal_refused",
+    # ``target_pushed`` and ``remote_branch_deleted``: only an older engine's
+    # record of a run it finished; finish-run is local now.
     "target_pushed",
     "state_archived",
     "worktree_removed",
@@ -61,9 +81,11 @@ _RECORD_KEYS = frozenset(
         "events",
     }
 )
-#: Optional in schema v1 (absent means ``.sparring``): the project
-#: directory relative to the worktree, always contained in it.
-_OPTIONAL_KEYS = frozenset({"project_dir"})
+#: Optional in schema v1: ``project_dir``, the project directory relative
+#: to the worktree and always contained in it (absent means ``.sparring``);
+#: and ``pinned``, ``true`` for a run created while runs pinned their
+#: remote target (absent means the run predates pins, or is local-first).
+_OPTIONAL_KEYS = frozenset({"project_dir", "pinned"})
 DEFAULT_PROJECT_DIR = ".sparring"
 
 
@@ -93,7 +115,21 @@ def _now() -> str:
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=False)
+    # The one engine Git path (see agent_sparring.engine_git). A refusal by
+    # configuration keeps its stable code and the key it names.
+    try:
+        return engine_git.run(cwd, *args)
+    except engine_git.GitConfigRefusal as exc:
+        raise ManagedRunError(exc.code, str(exc)) from exc
+
+
+def _git_bytes(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """:func:`_git` with byte-exact output (blob contents)."""
+
+    try:
+        return engine_git.run(cwd, *args, text=False)
+    except engine_git.GitConfigRefusal as exc:
+        raise ManagedRunError(exc.code, str(exc)) from exc
 
 
 def _git_out(cwd: Path, *args: str, code: str = "git_failed") -> str:
@@ -200,6 +236,10 @@ class ManagedRunRecord:
     project_dir: str = DEFAULT_PROJECT_DIR
     created_by: str = "engine"
     events: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    #: The run pins its remote target when it starts (see
+    #: :data:`_OPTIONAL_KEYS`). ``False`` only for a record written before
+    #: pins existed.
+    pinned: bool = False
 
     @property
     def lifecycle(self) -> str:
@@ -255,6 +295,7 @@ class ManagedRunRecord:
             "created_by": self.created_by,
             "project_dir": self.project_dir,
             "events": [dict(event) for event in self.events],
+            **({"pinned": True} if self.pinned else {}),
         }
 
     @classmethod
@@ -294,6 +335,9 @@ class ManagedRunRecord:
         remote = payload["remote"]
         if remote is not None and (not isinstance(remote, str) or not remote):
             raise bad("remote must be a string or null")
+        pinned = payload.get("pinned", False)
+        if not isinstance(pinned, bool):
+            raise bad("pinned must be true or false")
         run_key = text("run_key")
         if not _RUN_KEY_RE.match(run_key):
             raise bad(f"run_key {run_key!r} is not a valid run key")
@@ -329,6 +373,7 @@ class ManagedRunRecord:
             project_dir=project_dir,
             created_by="engine",
             events=tuple(dict(event) for event in events),
+            pinned=pinned,
         )
 
 
@@ -429,6 +474,122 @@ def append_event(repo_root: Path, run_key: str, event: str, detail: Mapping[str,
     return updated
 
 
+def run_flag_path(repo_root: Path, run_key: str) -> Path:
+    _check_run_key(run_key)
+    return git_common_dir(repo_root) / RUNS_SUBDIR / f"{run_key}.json"
+
+
+def run_flag_pinned(repo_root: Path, run_key: str) -> bool:
+    """Does the engine's run file say ``run_key`` is pinned? A file that
+    exists but cannot be read says yes: it is never taken to mean "no
+    pin"."""
+
+    path = run_flag_path(repo_root, run_key)
+    if not os.path.lexists(path):
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not (isinstance(payload, Mapping) and payload.get("pinned") is False)
+
+
+def engine_says_pinned(repo_root: Path, run_key: str) -> bool:
+    """Whether an engine record outside the project directory says
+    ``run_key`` is pinned: its managed record's ``pinned``, or its run
+    file. An unreadable managed record refuses rather than answering."""
+
+    record = read_record(repo_root, run_key)
+    return (record is not None and record.pinned) or run_flag_pinned(repo_root, run_key)
+
+
+def mark_pinned(repo_root: Path, run_key: str) -> None:
+    """Record outside the project directory that ``run_key`` is pinned.
+
+    Written for every run pinned without a managed record that says so
+    already: an unmanaged run at its start, and any run recorded before
+    pins when it is pinned late. Idempotent; never cleared."""
+
+    if engine_says_pinned(repo_root, run_key):
+        return
+    path = run_flag_path(repo_root, run_key)
+    temp = _write_temp(
+        path.parent, {"schema_version": SCHEMA_VERSION, "run_key": run_key, "pinned": True, "at": _now()}
+    )
+    try:
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def snapshot_flag_path(repo_root: Path, run_key: str) -> Path:
+    _check_run_key(run_key)
+    return git_common_dir(repo_root) / SNAPSHOTS_SUBDIR / f"{run_key}.json"
+
+
+def engine_recorded_snapshot(repo_root: Path, run_key: str) -> bool:
+    """Does the engine's record outside the project directory say that
+    ``run_key``'s trusted configuration snapshot was recorded? A file that
+    exists but cannot be read says yes: it is never taken to mean "none was
+    recorded", so a damaged or removed snapshot in the run state refuses
+    rather than dropping the guard."""
+
+    path = snapshot_flag_path(repo_root, run_key)
+    if not os.path.lexists(path):
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not (isinstance(payload, Mapping) and payload.get("snapshot") is False)
+
+
+def recorded_snapshot_siblings(repo_root: Path, run_key: str) -> frozenset[str] | None:
+    """The resolved sibling paths whose snapshots the engine's record says
+    were taken for ``run_key``; ``None`` when the record exists but cannot
+    be read (every sibling is then taken to have one)."""
+
+    path = snapshot_flag_path(repo_root, run_key)
+    if not os.path.lexists(path):
+        return frozenset()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    siblings = payload.get("siblings") if isinstance(payload, Mapping) else None
+    if siblings is None:
+        return frozenset()
+    if not isinstance(siblings, list) or not all(isinstance(entry, str) for entry in siblings):
+        return None
+    return frozenset(siblings)
+
+
+def mark_snapshot_recorded(repo_root: Path, run_key: str, *, siblings: tuple[str, ...] = ()) -> None:
+    """Record outside the project directory that ``run_key`` holds a trusted
+    configuration snapshot -- and for which sibling repositories, by
+    resolved path (see :mod:`agent_sparring.trusted_snapshots`). Written
+    before the run state that holds them; only ever extended, never cleared."""
+
+    known = recorded_snapshot_siblings(repo_root, run_key)
+    if engine_recorded_snapshot(repo_root, run_key) and (known is None or set(siblings) <= known):
+        return
+    path = snapshot_flag_path(repo_root, run_key)
+    temp = _write_temp(
+        path.parent,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "run_key": run_key,
+            "snapshot": True,
+            "siblings": sorted(set(siblings) | set(known or ())),
+            "at": _now(),
+        },
+    )
+    try:
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def record_for_worktree(repo_root: Path, worktree: Path) -> ManagedRunRecord | None:
     """The record whose managed worktree is ``worktree``, if any."""
 
@@ -462,9 +623,7 @@ def committed_project(repo_root: Path, sparring_dir: Path, target: str, base_sha
             "needs it at the same relative location",
         ) from exc
     config_rel = (project_rel / "project.toml").as_posix()
-    shown = subprocess.run(
-        ["git", "-C", str(top), "show", f"{base_sha}:{config_rel}"], capture_output=True, check=False
-    )
+    shown = _git_bytes(top, "show", f"{base_sha}:{config_rel}")
     if shown.returncode != 0:
         raise ManagedRunError(
             "project_not_committed",
@@ -508,11 +667,7 @@ def map_input(invoking_top: Path, base_sha: str, input_path: Path) -> tuple[Path
         relative = resolved.relative_to(invoking_top)
     except ValueError:
         return resolved, resolved
-    shown = subprocess.run(
-        ["git", "-C", str(invoking_top), "show", f"{base_sha}:{relative.as_posix()}"],
-        capture_output=True,
-        check=False,
-    )
+    shown = _git_bytes(invoking_top, "show", f"{base_sha}:{relative.as_posix()}")
     if shown.returncode == 0 and resolved.is_file() and shown.stdout == resolved.read_bytes():
         return relative, resolved  # relative: joined to the worktree once it is known
     return resolved, resolved
@@ -591,6 +746,8 @@ def plan_managed_run(
         remote=remote,
         created_at=_now(),
         project_dir=project_rel.as_posix(),
+        # Runs are local-first and pin no remote, so a new record never says
+        # pinned; ``pinned`` stays readable for records of older runs.
     )
     return ManagedRunPlan(record=record, uncommitted=dirty_paths(invoking_top))
 
@@ -637,9 +794,16 @@ def create_managed_worktree(repo_root: Path, plan: ManagedRunPlan) -> ManagedRun
         f"refs/heads/{record.branch}", record.base_sha, "",
     )
     if result.returncode == 0:
+        # Created without a checkout, then populated by a command that reads
+        # only validated configuration (engine_git runs `reset` isolated,
+        # `worktree` against the live repository it must register with), so
+        # no filter defined in between can run on the checkout.
         result = _git(
-            Path(repo_root), "worktree", "add", "--lock", "--reason", mark, record.worktree_path, record.branch
+            Path(repo_root), "worktree", "add", "--no-checkout", "--lock", "--reason", mark,
+            record.worktree_path, record.branch,
         )
+        if result.returncode == 0:
+            result = _git(Path(record.worktree_path), "reset", "--hard", "-q")
         # A failed add leaves the engine's branch in place: it may already be
         # checked out elsewhere, and deleting a ref never asks. The record is
         # marked creation_failed below; cleanup is not this function's.

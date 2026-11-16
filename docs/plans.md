@@ -47,8 +47,9 @@ the token and the `--json` schema; `run-plan`, `prepare-plan` and
 `NEEDS_YOU`, `ESCALATE`, a provider/integrity failure, a freeze or accept
 refusal, the SEND_BACK runaway limit, and the end of the plan; ordinary
 `READY` is accepted automatically through the existing gate, at the exact
-pushed SHA, with no human confirmation. The gate itself is unchanged: if it
-refuses, the plan stops and nothing is substituted.
+local SHA the reviewer ruled on, with no human confirmation and nothing
+pushed (see [Local-first runs](#local-first-runs)). If the gate refuses,
+the plan stops and nothing is substituted.
 
 Use `--stop-after-stage <stage-id>` to take a plan one stage at a time: the
 run accepts that stage and then pauses with its position already advanced,
@@ -69,8 +70,8 @@ Stage 4: implementation, deliberately left uncommitted
 you do the checks
     -> resume-plan --evidence "…"
     -> the SPARRER resumes against the unchanged candidate … READY
-    -> ONE bounded turn: commit that exact tree on the expected branch, push,
-       report the SHA — and change nothing else
+    -> ONE bounded turn: commit that exact tree on the expected branch (no
+       push), report the SHA — and change nothing else
     -> the engine compares the committed content against the reviewed tree,
        path by path
     -> the sparrer reviews that exact commit … READY -> freeze -> accept
@@ -247,75 +248,306 @@ checkpoint is not stopped on, and one nobody has reported failing — reopening
 a stage over a question that was never answered would throw away an accepted
 candidate for nothing.
 
-### Pushing a verified candidate
+### Local-first runs
 
-Acceptance only ever freezes a commit that is already reachable from the
-branch's intended remote ref. That rule is not new and is not relaxed. What
-*is* new is what happens when a reviewed candidate has not been pushed —
-usually because the project's own agent instructions forbid an agent from
-pushing without being told:
+Runs are local-first. Implementation, review and acceptance happen entirely
+in your local repositories: a run never pushes, never pins or reads a
+remote, and never pauses to ask for permission to push. Agents commit and
+are told not to push. Publishing a commit for external review is a separate,
+explicit action a person takes, and it never implies acceptance.
 
-```text
-    -> the sparrer reviews the commit … READY
-    -> the commit is not on origin/<branch>, and nothing has authorized a push
-    -> the run PAUSES and asks, naming the exact commit
+The acceptance gate is local, in every participating repository (the
+primary and each declared sibling):
+
+- freeze and accept take the exact `HEAD` of the expected branch, with a
+  working tree clean apart from the engine's own artifacts; anything else
+  refuses with `candidate_not_on_branch`, stating that rule;
+- accept also needs the reviewer's READY recorded at that exact commit (and,
+  for a cross-repository stage, at exactly the frozen sibling commits), and
+  refuses with `verdict_not_at_candidate` otherwise -- including when no
+  review is recorded at all. The engine records what each verdict was over
+  as it writes it (`review` in the stage's `state.json`: run-loop,
+  run-sparring, managed runs, and `record-sparring` for a verdict a person
+  records) -- each repository's `HEAD` and whether its working tree was
+  clean; a review over uncommitted work in any repository authorizes
+  nothing. Each new verdict replaces the evidence of the one before; if
+  what it was over cannot be captured, the record says so and no earlier
+  READY survives it. After ESCALATE or NEEDS_YOU the reviewer has handed the decision
+  to a person, whose explicit `accept-candidate` is that decision -- for
+  exactly the reviewed commit;
+- accepted history only grows, per repository: the repository's stage base
+  and every candidate the run already accepted there must be ancestors of
+  (or equal to) its new candidate. New commits on top and a merge that
+  contains the accepted candidate are fine; a reset or rebase that rewrites
+  it refuses with `run_history_rewritten`, naming the repository and the
+  missing commit, and nothing is frozen or accepted. An independent-review
+  stage is held to the same rule when it is entered.
+
+The run records each candidate it accepts in its run state
+(`accepted_candidates`: the primary, and each sibling by its recorded name
+and path), and each declared sibling's commit when its stage is entered
+(`base_sha` in the stage's `repositories`). The run state also holds a local
+snapshot of each participating repository's own security-relevant
+configuration (`config_snapshot` for the primary, `sibling_snapshots` for
+each sibling, taken when the run starts or, for a sibling that is not a
+repository yet, when a stage first declares it; see
+[Engine Git](#engine-git)). Every engine Git command of the run, and freeze,
+accept and review entry of its stages, is held to them. The engine records
+outside the project directory that they were taken, so a snapshot removed
+from or damaged in the run state refuses (`trusted_config_missing`) instead
+of letting the operation run unguarded; a run from before snapshots gets
+them on its next resume, with a notice that this is weaker than a run-start
+snapshot.
+
+The flags that granted push permission are retired, and refuse rather than
+being reinterpreted: `--allow-push-for-run` (start-plan, run-plan,
+resume-plan) refuses with `push_not_part_of_runs` before anything is
+created, and `resume-plan --allow-push-candidate` refuses with
+`push_permission_deprecated`, changing nothing. A client can detect the
+behaviour: `sparring capabilities --json` prints
+`{"schema_version": 1, "capabilities": ["local_first"]}`, and `runs --json`,
+`finish-run --json` and `handoff --json` carry the same `capabilities` list
+(an added field; `schema_version` stays 1).
+
+#### Runs recorded by an older engine
+
+A run recorded before runs were local-first still loads. Its pin, push
+authorization and remote records are kept as written and decide nothing
+about acceptance. A pause it recorded stays until it is resolved
+explicitly, and none of them is ever review or acceptance:
+
+- `push_authorization_required`: converts on a plain `resume-plan` (never
+  through `--allow-push-candidate`, which refuses) only when **all** of these
+  hold, each checked at that moment: (1) the run is paused on exactly that
+  pause, for its current stage, which is not accepted; (2) the stage's
+  recorded verdict is READY, over exactly the paused candidate, which is the
+  `HEAD` of the expected branch; (3) the tree is clean apart from stage
+  artifacts, every sibling is at its recorded candidate, and the plan is
+  unchanged; (4) no deferred obligation is promoted, and the verdict
+  promotes none; (5) the verdict defers no gate without a gate instance; (6)
+  every human check of the stage's recorded gate is answered Pass. Then the
+  stage is frozen and accepted locally by the ordinary gate, the ordinary
+  post-READY sequence runs (deferrals reach the ledger; a promoted
+  obligation, the next stage's `gates_before` or completion gates stop the
+  run as usual), and the run state records `legacy_push_pause_converted`
+  (stage, commit, pause, time) with a printed notice. Otherwise the pause
+  stays, the resume names each failed condition, and nothing is written,
+  pushed, accepted or run -- the stage is never re-entered as an
+  implementation turn;
+- `unauthorized_remote_movement` and `pushed_candidate_unauthorized`
+  (described below): freeze and accept refuse while one stands, and only
+  `acknowledge-remote-movement` or `authorize-pushed-candidate` clears it.
+  The answer clears only that pause and accepts nothing; it records what the
+  pause was about (`answered_incidents`: the paused candidate, and whether
+  the stage's recorded verdict was READY then). A pause raised mid-loop then
+  resumes the stage normally; one raised after READY goes through the same
+  six conditions on a plain resume, whatever remote tip the incident
+  observed (another commit, or none), and whatever the stage's verdict has
+  become since (a verdict no longer READY, or no longer readable, fails
+  condition 2). That holds until a review turn runs in the stage
+  (`resume-plan --evidence`), which supersedes it; `--next-turn` and
+  `--fresh-sparrer` / `--fresh-stage-agent` are refused meanwhile. An answer an older engine recorded,
+  without that provenance, is treated the same way while READY is recorded.
+  A recorded gate that cannot be read is never taken as no gate: it fails
+  condition 5 or 6.
+
+`finish-run` of such a run is local like any other: its pin is never read
+to finish, except for the trusted configuration snapshot it carries, which
+holds the finish's local Git commands as a local-first run's own snapshot
+does. The rest of this section describes those legacy records.
+
+The push primitive the engine kept (unused by runs) is exactly one thing:
+
+```sh
+git -c push.followTags=false push --porcelain <pinned URL> <candidate sha>:refs/heads/<remote branch>
 ```
 
-It pauses; it does not fail, and it does not push. The pause is recorded in
-the run's own state as a typed reason, so a tool reading it knows this is a
-permission question rather than a manual test:
+Ordinary, non-force, the exact authorized commit to one fully qualified ref
+at the pinned URL, so no `push.default`, `remote.*.push` or `remote.*`
+configuration can widen or redirect it, with a push receipt (run, stage,
+remote, ref, previous tip, pushed commit) as its result. No `--force`, no
+`--force-with-lease`, no tags, no ref deletion, no branch switching, no
+other branch, and no sibling repository. The pinned ref is re-read
+afterwards and must be exactly that commit; a push that fails or reports
+success without landing is an error. The push's own report of the ref's old
+and new value must be exactly the tip observed just before it and the
+candidate: if someone else wrote the ref in between, or the push changed
+nothing because the commit was already there, no receipt is made and the
+result is `unauthorized_remote_movement`.
+
+#### Remote movement the engine did not make (legacy runs)
+
+A run recorded by an older engine may be paused on remote movement it
+detected then: after an agent turn, the pinned ref's tip was one its records
+(the start tip, push receipts, acknowledgements) did not explain -- for
+example a candidate an agent pushed itself before review. Local-first runs
+no longer watch the remote, so only such a recorded pause remains:
 
 ```json
 "awaiting": {
-  "kind": "push_authorization_required",
+  "kind": "unauthorized_remote_movement",
   "stage_id": "…-stage-4-…",
-  "candidate_sha": "f2e455c…",
-  "branch": "feature/add-reference-dialog",
   "remote": "origin",
-  "remote_branch": "feature/add-reference-dialog"
+  "ref": "refs/heads/feature/add-reference-dialog",
+  "expected_tip": "1a2b3c…",
+  "observed_tip": "f2e455c…"
 }
 ```
 
-Two ways to answer it, and a third that needs nothing from the engine:
+Nothing is frozen or accepted while it stands, and no push flag clears it.
+The engine never resets, force-pushes or deletes anything on the remote.
+Once you have looked, acknowledge exactly what you saw:
 
 ```sh
-# allow exactly this commit, then continue
-sparring resume-plan … --allow-push-candidate f2e455c…
-
-# allow it and stop being asked again for this run
-sparring resume-plan … --allow-push-candidate f2e455c… --allow-push-for-run
-
-# or push it yourself and resume normally
-git push origin feature/add-reference-dialog
+sparring acknowledge-remote-movement --run-key <run> --observed f2e455c…
 sparring resume-plan …
 ```
 
-`--allow-push-for-run` can also be given to `run-plan`, which records the
-permission as part of creating the run.
+The acknowledgement is recorded in the run's state with who and when. It
+records what you observed and nothing more: it clears this pause and makes
+the observed tip the baseline for detecting *further* movement. It is not a
+review, an acceptance or a push authorization, and it never explains a
+candidate.
 
-An authorized push is exactly one thing:
+An older engine also stopped a run when the candidate itself was already on
+the remote with no push receipt for it -- the usual case after an agent's
+own push was acknowledged -- recorded as:
 
-```sh
-git -c push.followTags=false push <remote> refs/heads/<branch>:refs/heads/<remote branch>
+```json
+"awaiting": {
+  "kind": "pushed_candidate_unauthorized",
+  "stage_id": "…-stage-4-…",
+  "candidate_sha": "f2e455c…",
+  "remote": "origin",
+  "ref": "refs/heads/feature/add-reference-dialog",
+  "observed_tip": "f2e455c…"
+}
 ```
 
-Ordinary, non-force, one fully qualified refspec, so no `push.default` or
-`remote.*.push` configuration can widen it. No `--force`, no
-`--force-with-lease`, no tags, no ref deletion, no branch switching, no
-other branch, and no sibling repository — a declared sibling is a different
-repository, and authorizing this run's candidate says nothing about it. The
-engine then re-proves that the commit really is reachable from that remote
-ref, and only then runs the unchanged acceptance gate. A push that fails,
-or one that reports success without landing, stops the run with nothing
-accepted.
+No push flag clears this. Only a separate, explicit action naming the run
+and the exact commit does:
 
-Permission is bound to what it was granted for: this run, this worktree,
-this branch, that one remote branch, and — for `--allow-push-candidate` —
-that one stage and that one commit. `--allow-push-candidate` is refused
-unless the run is in fact waiting for permission to push exactly that
-commit, so a surface that has been open a while cannot authorize a candidate
-the run has since replaced. The default is no authorization at all, which is
-also what a run recorded before any of this existed loads as.
+```sh
+sparring authorize-pushed-candidate --run-key <run> --sha f2e455c…   # the full 40-character id
+sparring resume-plan …
+```
+
+It is recorded on its own in the run's state, with who and when, as
+`authorized_without_push`. It is not a review or an acceptance: the stage is
+accepted only after the independent reviewer says READY for that exact
+commit, and a SEND_BACK leaves it unaccepted as usual. Deleting or forging
+an acknowledgement changes nothing about what is authorized.
+
+A pinned legacy run is also recorded as *pinned* outside the project
+directory -- in its managed-run record (`"pinned": true`) under
+`<git-common-dir>/agent-sparring/`, or for an unmanaged run in
+`<git-common-dir>/agent-sparring/runs/<run key>.json`. If such a run's state
+file is deleted, its pin removed, or the state replaced with one shaped like
+a run from before pins, `finish-run` refuses with `remote_pin_missing`. Freeze,
+accept and resume read only the trusted snapshot such a pin carries, never
+its remote: a gone or damaged pin refuses with `trusted_config_missing`, and
+remote reachability is never an input. Freeze and accept of a stage find its
+run from the run state positioned at the stage as well as from the stage's
+own record, because the run's snapshots, accepted history and any recorded
+pause apply to it.
+
+Nothing in a plan, brief, notes, handoff or agent output is ever read as a
+push authorization, an acknowledgement or an `authorized_without_push`.
+
+#### Engine Git
+
+Every Git command the engine runs goes through one path
+(`agent_sparring.engine_git`): repository hooks, `core.fsmonitor`, textconv
+and external diff and filter drivers never run, a merge refuses while any
+merge driver is configured, and an `include`/`includeIf` in the repository's
+own (local or worktree) configuration is refused by name. Includes in your
+global and system configuration keep working: Git resolves them for the
+repository the command runs in, so `includeIf "gitdir:..."` in
+`~/.gitconfig` still applies. The engine also removes Git's location,
+program and configuration-injection environment variables before it runs
+Git (`GIT_DIR`, `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`,
+`GIT_PROXY_COMMAND`, `GIT_EXEC_PATH`, `GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_PARAMETERS`,
+`GIT_CONFIG_COUNT`/`KEY_*`/`VALUE_*`, `GIT_TEMPLATE_DIR`, `GIT_EDITOR` and
+the rest listed in `engine_git._environment`); your configuration is the
+one Git finds from `HOME`. Inside a run, a change to the repository's own credential,
+SSH, URL-rewrite, remote, protocol, HTTP, signing, hook, fsmonitor or driver
+configuration since the run started (its `config_snapshot`, or a legacy
+run's pin snapshot) is a typed refusal naming the key, and
+reordering values counts as a change; configuration that was already there
+at the start keeps working. Local commands that could reach a driver
+(`status`, `diff`, `add`, `merge`, `commit`, `reset` ...) read a private copy
+of exactly the configuration that was just checked (`GIT_COMMON_DIR` points
+at a throwaway directory holding that copy, with the real objects, refs and
+reflogs linked in), so configuration written between the check and the
+command is not what runs. The repository a command uses is found from the
+file system (the `.git` directory or file); its work tree is the
+`core.worktree` in that validated copy when one is set, otherwise the
+directory holding `.git` -- never a value read again afterwards. A directory
+the file system does not place in a repository gets a failed command, not a
+run against unvalidated configuration. Only commands that touch nothing executable --
+`rev-parse`, `config`, ref updates, `worktree` bookkeeping -- read the live
+file; a `worktree add` that checks files out, like every `switch` or
+`checkout`, reads the validated copy. Editing `.gitattributes` alone is not
+a change: a driver runs only if configuration defines it.
+
+Signing and verification programs follow your configuration, never the
+repository's. When the repository's own (local or worktree) configuration
+sets `log.showSignature`, `commit.gpgSign`, `tag.gpgSign`,
+`merge.verifySignatures`, `gpg.program`, `gpg.<format>.program` or
+`gpg.ssh.defaultKeyCommand`, the engine overrides it with your global or
+system value, or Git's default when you set none. So `log`, `reflog`,
+`commit`, `merge` and `tag` never start a program the repository names, while
+your own global signing still signs, finish merges in a checkout included.
+Signing you configured only in a repository's own configuration is not used
+by the engine. A finish merge with no checkout is made with `commit-tree`,
+which Git never signs from configuration.
+
+The engine never recurses into submodules: every command carries
+`submodule.recurse=false`, so a `switch` or `checkout` that changes a
+populated gitlink moves the gitlink but not the submodule (Git's `merge`
+never recurses). `status` and `diff` also get `--ignore-submodules=dirty`,
+so no submodule's work tree -- and nothing its own configuration defines, a
+filter say -- is examined. A gitlink that differs from the submodule's checked-out commit is still
+reported dirty; changes inside a submodule's own work tree are not.
+
+A repository whose configuration Git cannot list (a malformed config file,
+say) is refused before the command runs (`repository_config_unreadable`):
+what it sets could be neither checked nor neutralized.
+
+The engine never contacts a remote. Every Git command it would run that
+does -- `push`, `fetch`, `pull`, `ls-remote`, `clone`, `remote update`,
+`remote show` (without `-n`), `remote prune`, `remote set-head --auto`,
+`remote add -f`, `submodule update`, `add` or `foreach`, `archive
+--remote`, `request-pull`, `maintenance run`, any command given a
+repository URL, and any of these reached through an option before the
+nested command (`remote -v show`), an alias, `-c`, `-C` or `--git-dir` -- is
+refused before anything runs (`remote_operation_not_allowed`), inside a run
+or not; there is no exception. Every command it does run also carries
+`protocol.allow=never`, `GIT_ALLOW_PROTOCOL=none` (which outranks any
+`protocol.<name>.allow`) and `GIT_NO_LAZY_FETCH=1`, so no transport starts
+under it, not even a partial clone's lazy fetch. `sparring runs --json`,
+`slice-branch --json`, `sparring handoff` and `finish-run --dry-run` read
+only the local repository; the handoff reports the candidate as
+`Local commit: <sha> on <branch>` (its `- Branch:` line is kept), and
+`--no-check-pushed` is still accepted, with nothing left to skip.
+`finish-run` is entirely local (below): `--push-target` and `[finish]
+delete_remote_branch = true` refuse with `remote_finish_removed`.
+
+Plan R's isolated remote primitive is kept, with no caller in the engine,
+for the separate Push to review: it never reads the repository's own
+configuration -- it runs in a throwaway repository that borrows the objects
+and is configured only from a trusted snapshot's credential and transport
+settings plus a copy of your user-level and system configuration, both
+without `url.*` rewrites -- pushes to a local path only when it is the
+pinned destination (`unpinned_local_remote`), and accepts only the plain
+forms it can check (`unsupported_remote_form` for `--repo`, `--mirror`,
+`--all`, `--receive-pack`, `--upload-pack` and the like).
+
+A push authorization a legacy run recorded was bound to what it was granted
+for: that run, worktree, branch and remote branch, and for a one-candidate
+grant that one stage and commit. It is kept as written and grants nothing
+any more; no run pushes.
 
 ## Managed runs
 
@@ -334,7 +566,7 @@ sparring resume-plan --run-key <run-key> [--evidence "..."]
 # list, check, finish
 sparring runs [--json]
 sparring finish-run --run-key <run-key> --dry-run [--json]       # exit 0 eligible, 3 not
-sparring finish-run --run-key <run-key> [--push-target] [--allow-merge-commit] [--merge-only] [--json]
+sparring finish-run --run-key <run-key> [--allow-merge-commit] [--merge-only] [--json]
 # what is believed unused (--dry-run reports; deleting needs a selector)
 sparring prune --dry-run [--json]
 sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
@@ -345,20 +577,32 @@ sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
   sibling directory `<repo>-sparring-<run-key>` on branch
   `sparring/<plan-slug>-<suffix>`. Only Markdown plans and plain manifests
   run managed, and only in a single repository.
-- `finish-run` re-makes every check, then in order: merges into the target
-  (fast-forward; a merge commit only with `--allow-merge-commit`; never a
-  rebase), with `[finish] remove_plan = true` commits the plan file's
-  removal on the target (below), pushes the target with `--push-target`
-  (never forced; one push carries the merge and the removal), archives
-  the worktree's `.sparring/` state to `<git-common-dir>/agent-sparring/runs/<run-key>/`,
-  removes the worktree (`git worktree remove`, never `--force`), deletes the
-  local branch (`git branch -d`, never `-D`), with `[finish]
-  delete_remote_branch = true` deletes the remote branch, and records the
-  run finished. Each step records its event; it stops at the first failure,
-  leaving the rest in place and saying what remains; running it again
-  continues, skipping only steps whose event is recorded. `--merge-only`
-  runs the merge, the plan removal and the push.
-- Both `[finish]` options default to false and are read from the reviewed
+- `finish-run` is local: it contacts no remote, reads no remote and pushes
+  nothing. It re-makes every check, then in order: merges into the local
+  target (fast-forward; a merge commit only with `--allow-merge-commit`;
+  never a rebase) in every participating repository -- the primary, then
+  each sibling the run accepted a candidate in, whose accepted candidate is
+  merged into that repository's branch of the same target name (recorded as
+  `sibling_merged`; nothing of the sibling's is deleted) -- with `[finish]
+  remove_plan = true` commits the plan file's removal on the target (below),
+  archives the worktree's `.sparring/` state to
+  `<git-common-dir>/agent-sparring/runs/<run-key>/`, removes the worktree
+  (`git worktree remove`, never `--force`), deletes the local branch only
+  while it is exactly the merged candidate and the local target contains it
+  (a compare-and-delete of the ref; never `-D`, and never decided by a
+  configured upstream), and records the run finished. Each step records
+  its event; it stops at the first failure, leaving the rest in place and
+  saying what remains; running it again continues, skipping only steps
+  whose event is recorded. `--merge-only` runs the merge and the plan
+  removal. Every Git command of the finish is held to the run's trusted
+  configuration snapshots (a legacy run's is its pin's); a run state that
+  is gone, damaged or replaced refuses with `trusted_config_missing`.
+- `--push-target` refuses with `remote_finish_removed` before anything is
+  read or changed, and a reviewed candidate whose `[finish]
+  delete_remote_branch` is true refuses the finish with the same code,
+  nothing merged; `check-config` reports a config that still sets it.
+  Publishing a commit for external review is Push to review.
+- `[finish] remove_plan` defaults to false and is read from the reviewed
   candidate's own `.sparring/project.toml`.
 - **Plan removal** (`plan_removal.code`): the run snapshots the plan file's
   exact bytes when it starts (the manifest file for a manifest run, never
@@ -381,28 +625,10 @@ sparring prune [--dry-run] [--older-than DAYS] [--keep N] [--json]
   reports it and never retries. Only `plan_commit_failed` stops the finish
   (and is retried). `plan_removal_disabled` when the option is off,
   `finish_config_unreadable` when the candidate's config cannot be read.
-- **Remote branch** (`remote_branch.code`): deleted only as a
-  compare-and-delete, `git push --force-with-lease=refs/heads/<b>:<candidate>
-  <remote> --delete refs/heads/<b>`, so the server refuses unless it is
-  exactly the merged candidate. First the remote is read at its push URL:
-  an absent branch is `remote_branch_absent` (success, no push), and if the
-  remote target does not yet contain the candidate (no `--push-target`, say)
-  the branch is kept with `remote_target_missing_candidate` — push the
-  target and re-run (`remote_target_unknown` when the remote target's commit
-  is not present locally: fetch first). That target read is point-in-time;
-  only the branch deletion itself is lease-guarded. A remote with several
-  push URLs is not deleted from (`remote_multiple_push_urls`: a per-URL
-  lease delete is not supported), and a push-only endpoint whose
-  `ls-remote` fails cannot use `delete_remote_branch` (`remote_unreachable`). A refused delete is classified from the push's own
-  status: `remote_lease_mismatch` (stale info), `remote_delete_rejected`
-  (the remote refused) or `remote_unreachable`. Every one of these keeps
-  the branch, stops the finish at `delete_remote_branch` unfinished, and a
-  re-run resumes. `remote_branch_deleted` on success.
-  `remote_delete_disabled` when the option is off (the branch is kept),
-  `no_remote` when the record has none. While kept it is also listed in
-  `kept` as `keep_remote_branch`; with the option off its code is
-  `remote_delete_unavailable`, a compatibility alias kept for one release
-  and removed in the next.
+- **Remote branch** (`remote_branch.code`): always `local_finish` -- the
+  finish neither reads nor deletes a remote branch -- and `kept` is always
+  empty. Both fields stay in the report (`schema_version` 1). A run an
+  older engine finished reports the remote branch deletion it recorded.
 - `prune --dry-run` (no selector) reports finished records, records whose
   worktree directory is gone and finish archives, each with its reason,
   exactly as before. With `--older-than DAYS` and/or `--keep N` it selects
@@ -423,11 +649,16 @@ branch and worktree), `run_not_complete` (not complete, or a stage not
 accepted at the final candidate), `human_gate_pending`, `runner_live`,
 `worktree_missing`, `branch_mismatch`, `worktree_dirty`,
 `candidate_mismatch` (HEAD, branch tip and accepted candidate differ),
-`candidate_not_pushed`, `branch_in_use`, `target_checkout_dirty`,
+`run_history_rewritten` (one per participating repository: a candidate the
+run accepted there is not an ancestor of the commit the finish would
+integrate, so nothing is merged), `branch_in_use`, `target_checkout_dirty`,
 `target_operation_in_progress`, `target_advanced` (target moved past the
 base: needs `--allow-merge-commit`, or the target is missing),
-`merge_conflict`, and `unarchived_project_state` (cleanup only: the run's
-project state cannot be archived; the merge may still go ahead).
+`merge_conflict`, `sibling_merge` (one per sibling: its candidate, target,
+target checkout and merge), `remote_finish_removed` (the candidate's config
+sets `delete_remote_branch = true`), and `unarchived_project_state`
+(cleanup only: the run's project state cannot be archived; the merge may
+still go ahead). There is no `candidate_not_pushed` check.
 
 **Start and resume refusals** (`could not run plan: …` / `could not resume
 plan: …`, everything left in place): `expected_branch_with_managed`,
@@ -442,8 +673,8 @@ plan: …`, everything left in place): `expected_branch_with_managed`,
 `worktree_unregistered` (run state and record disagree: an integrity
 refusal), and `record_malformed` / `record_unreadable` /
 `record_schema_unknown`. Finish execution steps report `stopped_at` as one
-of `merge`, `remove_plan`, `push_target`, `archive_state`, `remove_worktree`,
-`delete_branch`, `delete_remote_branch`. JSON shapes: [reference](reference.md#managed-run-json).
+of `checks`, `merge`, `remove_plan`, `archive_state`, `remove_worktree`,
+`delete_branch`. JSON shapes: [reference](reference.md#managed-run-json).
 
 ## Marking stages in a plan — or handing over an execution manifest
 
@@ -509,6 +740,19 @@ the run ledger. Only
 `fail`/`blocked` keep the run stopped, reaching a gate never satisfies it, and
 `--evidence` is refused at a `before_stage` stop. The v2 digest covers every
 gate field and its position; version-1 digests are unchanged.
+
+A gate of kind `authorization` is a person's decision to continue into the
+stages it blocks, not a verification. Its obligation has category
+`AUTHORIZATION` and asks for a decision scoped to the blocked stage (or to
+completing the run); `pass` means Continue, `blocked` means Not now. It is
+minted only once every other gate at the same checkpoint has passed, so the
+decision follows the evidence it depends on. Before a run's first stage, an
+authorization gate with no other gate at that checkpoint is recorded as
+passed by the approved start of the slice whose manifest listed it, because
+that start is the same decision; with a verification gate at the
+checkpoint, the start predates the evidence and the decision is asked after
+it passes. Other kinds are never satisfied this way, and the start grants no
+push authorization.
 
 `repositories` is for a stage whose reviewed candidate spans more than one
 repository; see [Cross-repository candidates](reference.md#cross-repository-candidates). `mode` is for a stage
@@ -630,6 +874,18 @@ the same defect one step removed.
 A `state.json` with no owner is **unowned**: a stage driven by hand with
 `new-stage`, or one written before ownership was recorded. Unowned is the only
 thing `--adopt` may take over, which is precisely what it is for.
+
+Inside a managed worktree, the project directory does not get to say
+otherwise. There the owner is the run the engine's managed record names (kept
+in the common Git directory, outside `.sparring/`). Freeze, accept and
+entering an independent review refuse with `stage_owner_mismatch` when
+`.sparring/` contradicts it:
+- the stage records no run, or another run;
+- that run's state is gone or cannot be read as a JSON object;
+- that run's state is not positioned at the stage;
+- another run's state is positioned at it, or cannot be read.
+
+An emptied `run` field there is a refusal, not an unowned stage.
 
 #### Runs recorded before run instances existed
 

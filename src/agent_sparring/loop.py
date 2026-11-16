@@ -37,9 +37,10 @@ So READY is terminal only once the reviewed candidate is a commit. When it
 is not, this loop routes one more ordinary cycle, with both halves narrowed
 to exactly what is missing:
 
-- the stage-agent turn is asked to commit and push that exact tree and
-  nothing else (``finalize_only``; see :func:`~agent_sparring.stage_prompt.
-  build_stage_prompt`);
+- the stage-agent turn is asked to commit that exact tree and nothing
+  else (``finalize_only``; see :func:`~agent_sparring.stage_prompt.
+  build_stage_prompt`) -- never to push it: runs are local-first, and the
+  commit is accepted locally once it is reviewed;
 - :mod:`agent_sparring.finalization` then compares the committed content
   against the tree the sparrer reviewed, path by path. Anything still
   uncommitted, or any committed content that is not the reviewed content,
@@ -106,8 +107,10 @@ configured limit.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Iterator
 
 from agent_sparring.deferred_gate import DeferredObligation
 from agent_sparring.finalization import (
@@ -125,6 +128,7 @@ from agent_sparring.next_turn import (
     record_next_turn,
     verify_candidate,
 )
+from agent_sparring.remote_pin import RemoteMovementDetected
 from agent_sparring.providers import (
     SparringAgentAdapter,
     StageAgentAdapter,
@@ -238,6 +242,34 @@ class LoopResult:
             )
 
 
+@contextlib.contextmanager
+def checked_turn(after_turn: Callable[[], None] | None) -> Iterator[None]:
+    """Run ``after_turn`` once the agent turn in the block is over, however
+    it ended: returned, raised, timed out or interrupted -- the agent may
+    have acted before it failed.
+
+    Movement the check finds (:class:`RemoteMovementDetected`) takes
+    precedence over the turn's own failure, which stays attached as its
+    context. Any other failure of the check after a failed turn is noted on
+    the turn's failure rather than replacing it; after a turn that returned,
+    it propagates as it always did."""
+
+    if after_turn is None:
+        yield
+        return
+    try:
+        yield
+    except BaseException as failure:
+        try:
+            after_turn()
+        except RemoteMovementDetected:
+            raise
+        except Exception as check_failure:
+            failure.add_note(f"the after-turn remote check could not be made either: {check_failure}")
+        raise
+    after_turn()
+
+
 def run_unattended_loop(
     stage: Stage,
     sparring_dir: Path,
@@ -251,8 +283,17 @@ def run_unattended_loop(
     start_with: str = "stage",
     pending_deferred: tuple[DeferredObligation, ...] = (),
     sparring_first_reason: str = "evidence",
+    after_turn: Callable[[], None] | None = None,
 ) -> LoopResult:
     """Drive the stage<->sparring loop until a terminal routing action.
+
+    ``after_turn``, when given, is called after every agent turn (stage and
+    sparring alike), before anything else looks at its result -- including
+    a turn that raised or timed out, since the agent may have acted before
+    it failed. The managed plan runner uses it to check its pinned remote
+    ref for movement its records do not explain; whatever it raises
+    propagates unchanged and stops the loop, taking precedence over the
+    turn's own failure (which stays attached as its context).
 
     ``pending_deferred`` is the managed run's ledger of human verification
     already owed, passed straight through to every sparring turn of this
@@ -403,19 +444,20 @@ def run_unattended_loop(
                 # Implementation work is owed from here until this turn and
                 # all of its records succeed.
                 record_next_turn(stage, NEXT_TURN_STAGE)
-            try:
-                stage_run = run_stage_agent(
-                    stage,
-                    sparring_dir,
-                    repo_root,
-                    stage_adapter,
-                    expected_branch=expected_branch,
-                    self_check=self_check,
-                    finalize_only=finalizing,
-                )
-            except StageAgentRunError as exc:
-                activity.emit("loop.stopped", cycle=cycle, summary="stage-agent turn failed")
-                raise LoopError(f"stage-agent turn failed: {exc}") from exc
+            with checked_turn(after_turn):
+                try:
+                    stage_run = run_stage_agent(
+                        stage,
+                        sparring_dir,
+                        repo_root,
+                        stage_adapter,
+                        expected_branch=expected_branch,
+                        self_check=self_check,
+                        finalize_only=finalizing,
+                    )
+                except StageAgentRunError as exc:
+                    activity.emit("loop.stopped", cycle=cycle, summary="stage-agent turn failed")
+                    raise LoopError(f"stage-agent turn failed: {exc}") from exc
 
         if stage_run is not None and stage_run.result.is_error:
             # The provider's own machine-readable output reported this turn
@@ -487,7 +529,7 @@ def run_unattended_loop(
                 f"identical across all {len(outcome.committed.entries)} path(s) that make "
                 "up this candidate; the only files that changed are this stage's own "
                 "workflow artifacts, which are outside candidate identity. That turn was "
-                "asked to commit and push, and nothing else. Any human evidence recorded "
+                "asked to commit, and nothing else. Any human evidence recorded "
                 "for this stage therefore still describes exactly this content."
             )
             pending = None
@@ -538,20 +580,21 @@ def run_unattended_loop(
                     raise CandidateRefused(str(exc)) from exc
                 raise LoopError(str(exc)) from exc
 
-        try:
-            sparring_run = run_sparring_agent(
-                stage,
-                sparring_dir,
-                repo_root,
-                sparring_adapter,
-                expected_branch=expected_branch,
-                finalization=finalization_note,
-                evidence_first=evidence_first,
-                pending_deferred=pending_deferred,
-            )
-        except SparringAgentRunError as exc:
-            activity.emit("loop.stopped", cycle=cycle, summary="sparring-agent turn failed")
-            raise LoopError(f"sparring-agent turn failed: {exc}") from exc
+        with checked_turn(after_turn):
+            try:
+                sparring_run = run_sparring_agent(
+                    stage,
+                    sparring_dir,
+                    repo_root,
+                    sparring_adapter,
+                    expected_branch=expected_branch,
+                    finalization=finalization_note,
+                    evidence_first=evidence_first,
+                    pending_deferred=pending_deferred,
+                )
+            except SparringAgentRunError as exc:
+                activity.emit("loop.stopped", cycle=cycle, summary="sparring-agent turn failed")
+                raise LoopError(f"sparring-agent turn failed: {exc}") from exc
         finalization_note = None
 
         cycle_records.append(

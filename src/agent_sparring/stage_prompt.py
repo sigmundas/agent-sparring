@@ -49,7 +49,7 @@ def _stage_file(stage: Stage, filename: str) -> str:
 
 
 def _finalization_section(expected_branch: str) -> list[str]:
-    """The bounded commit/push turn's instruction.
+    """The bounded commit turn's instruction.
 
     Deliberately the narrowest turn this package ever asks for: the work is
     already implemented, already reviewed, and (for a human-gated stage)
@@ -70,8 +70,8 @@ def _finalization_section(expected_branch: str) -> list[str]:
         "freezes an exact commit. Turn this exact working tree into that "
         "commit, and change nothing about it.",
         "",
-        f"- Commit the stage's work on `{expected_branch}` and push "
-        f"`{expected_branch}`.",
+        f"- Commit the stage's work on `{expected_branch}`. Do not push it: runs "
+        "are local-first, and the commit is accepted locally.",
         "- Report the exact committed SHA.",
         "- Run only the checks you need in order to commit safely.",
         "- Do not re-implement, refactor, rename, reformat, reword or "
@@ -113,7 +113,7 @@ def assemble_stage_prompt(
     fields, no pass/fail gate. Independent sparring still runs afterward
     regardless of what this section asks for.
 
-    ``finalize_only`` (default false) turns this into a commit/push turn for
+    ``finalize_only`` (default false) turns this into a commit turn for
     an already-reviewed candidate: it replaces the ordinary "act on the
     human's answer" and self-check instructions -- both of which invite
     implementation work -- with the bounded finalization instruction, since

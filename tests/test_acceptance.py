@@ -11,6 +11,7 @@ from agent_sparring.acceptance import (
     StaleCandidateError,
     accept_candidate,
     freeze_candidate,
+    record_review,
 )
 from agent_sparring.concurrency import worktree_lock
 from agent_sparring.human_gate import HumanCheck, HumanGate
@@ -93,6 +94,9 @@ class AcceptanceTests(unittest.TestCase):
         )
 
     def _accept(self):
+        # Plan L (I-L2): accept needs the reviewer's READY recorded at the
+        # exact candidate, which the engine records when a verdict is written.
+        record_review(self.stage, self.repo, RoutingAction.READY)
         return accept_candidate(self.stage, self.repo, expected_branch="feature/x")
 
     # -- freeze ---------------------------------------------------------
@@ -125,14 +129,23 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(_head_sha(self.repo), before_head)
         self.assertEqual(_commit_count(self.repo), before_count)
 
-    def test_unpushed_candidate_cannot_be_frozen(self):
+    def test_an_unpushed_candidate_is_frozen_locally_and_the_remote_is_untouched(self):
+        # Plan L (I-L2): was test_unpushed_candidate_cannot_be_frozen. Remote
+        # state is never an input; the local rule (exact clean HEAD of the
+        # expected branch) is what refuses, see test_local_first.LocalRuleTests.
+        remote_refs = subprocess.run(
+            ["git", "--git-dir", str(self.remote), "for-each-ref"], capture_output=True, text=True, check=True
+        ).stdout
         unpushed = self._commit_more("unpushed.txt", push=False)
-        with self.assertRaises(AcceptanceError) as ctx:
-            self._freeze()
-        self.assertIn(unpushed, str(ctx.exception))
-        state = self.stage.read_state()
-        self.assertEqual(state.status, StageStatus.WORKING)
-        self.assertIsNone(state.candidate_sha)
+        result = self._freeze()
+        self.assertEqual(result.candidate_sha, unpushed)
+        self.assertIs(self.stage.read_state().status, StageStatus.FROZEN)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "--git-dir", str(self.remote), "for-each-ref"], capture_output=True, text=True, check=True
+            ).stdout,
+            remote_refs,
+        )
 
     def test_dirty_working_tree_cannot_be_frozen(self):
         (self.repo / "impl.txt").write_text("uncommitted edit\n", encoding="utf-8")
@@ -528,6 +541,7 @@ class NarrowedDirtyExemptionTests(unittest.TestCase):
 
         first = freeze_candidate(stage, sparring_dir, self.repo, expected_branch="feature/x")
         self.assertEqual(first.candidate_sha, self.candidate_sha)
+        record_review(stage, self.repo, RoutingAction.READY)  # Plan L: review at the SHA
         accept_candidate(stage, self.repo, expected_branch="feature/x")
         self.assertEqual(stage.read_state().status, StageStatus.ACCEPTED)
 
@@ -607,6 +621,8 @@ class AcceptanceDirtyRecheckTests(unittest.TestCase):
             RoutingResult(action=RoutingAction.READY, summary="evidence satisfied"),
             findings="same commit, manual check now satisfied",
         )
+        # What the READY was over, as the engine records it with a verdict.
+        record_review(self.stage, self.repo, RoutingAction.READY)
 
         result = accept_candidate(self.stage, self.repo, expected_branch="feature/x")
         self.assertEqual(result.candidate_sha, self.candidate_sha)
@@ -665,6 +681,7 @@ class AcceptanceWorktreeLockTests(unittest.TestCase):
 
     def test_accept_refuses_while_worktree_lock_is_held_elsewhere(self):
         freeze_candidate(self.stage, self.sparring_dir, self.repo, expected_branch="feature/x")
+        record_review(self.stage, self.repo, RoutingAction.READY)  # Plan L: review at the SHA
 
         with worktree_lock(self.repo):
             with self.assertRaises(AcceptanceError):

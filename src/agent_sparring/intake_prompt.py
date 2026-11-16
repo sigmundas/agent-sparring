@@ -106,6 +106,32 @@ plan below.
   mentions that is not itself executable stage work -- deployments, release
   activation, production data runs, owner go-aheads, security sign-offs that
   gate later work. `after_stage`: the stage it follows (or null).
+  `kind`: `authorization` when the gate is only a person's decision to let
+  the blocked stages start (a go-ahead, permission to continue); `manual`
+  when a person must do or verify something agents cannot: human judgment
+  or taste, physical/device or real-world access, real external accounts or
+  consequential external actions, or a capability genuinely unavailable to
+  agents; `production`, `external` or `deferred` otherwise. Ordinary tests,
+  HTTP/API requests, SQL assertions, migrations against a disposable target,
+  browser automation and other scriptable procedures are agent verification:
+  stage work whose results the stage reports as test evidence and the
+  independent review checks, not human gates. If the agent would lack one
+  specific input (credentials, a disposable database, a URL), that input is
+  what the stage asks the person for, not the whole check. When the plan
+  itself declares such a scriptable check as a manual gate, keep the gate
+  exactly as declared and raise a recommendation finding that names it and
+  proposes reclassifying it as agent verification; only the person changes it. Keep a
+  verification and the go-ahead that follows it as separate gates; the
+  runtime asks for the verification first and the decision once it passes.
+  The engine already enforces its own operations, so they are never gates:
+  approving and starting the prepared run slice (which authorizes exactly the
+  stages it contains), its verification policy, and candidate push
+  authorization (the engine asks before pushing unless the person allowed
+  pushes when starting). Plan text that only restates such an approval is
+  context, not a gate. Authorization the plan requires beyond the run being
+  started -- continuing into a later stage, production changes, publication
+  -- stays a gate. Where the plan's scope is unclear, raise a finding
+  instead of inventing an approval gate.
   `blocks_stages`: labels of executable stages that must not start until the
   gate is satisfied (empty if nothing executable depends on it). Gates sit
   only at run boundaries: `after_stage` must be the LAST stage of its run,

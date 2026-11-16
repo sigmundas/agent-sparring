@@ -39,6 +39,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Union
 
+from agent_sparring import engine_git
 from agent_sparring.config import MigrationsConfig
 from agent_sparring.migration_adapters import get_adapter
 from agent_sparring.migration_history import (
@@ -220,9 +221,16 @@ class MigrationReport:
 
 
 def _run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo_root), *args], capture_output=True, text=True, check=False
-    )
+    return _engine_git(repo_root, *args)
+
+
+def _engine_git(repo_root: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess:
+    """The one engine Git path (see agent_sparring.engine_git)."""
+
+    try:
+        return engine_git.run(repo_root, *args, text=text)
+    except engine_git.GitContextError as exc:
+        raise MigrationStatusError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -300,11 +308,7 @@ def _duplicate_problems(listings: dict[str, _RefListing]) -> list[FileProblem]:
 
 
 def _show(repo_root: Path, ref: str, path: str) -> bytes:
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), "show", f"{ref}:{path}"],
-        capture_output=True,
-        check=False,
-    )
+    result = _engine_git(repo_root, "show", f"{ref}:{path}", text=False)
     if result.returncode != 0:
         raise MigrationStatusError(
             f"git show {ref}:{path} failed in {repo_root}: "
@@ -322,12 +326,7 @@ def _references(repo_root: Path, ref: str, version: str, exclude_path: str | Non
     pathspecs = [".", ":(exclude).sparring"]
     if exclude_path:
         pathspecs.append(f":(exclude){exclude_path}")
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), "grep", "-I", "-l", "-F", version, ref, "--", *pathspecs],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    result = _engine_git(repo_root, "grep", "-I", "-l", "-F", version, ref, "--", *pathspecs)
     if result.returncode == 1:
         return ()
     if result.returncode not in (0, 1):

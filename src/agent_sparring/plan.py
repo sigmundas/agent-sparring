@@ -108,20 +108,27 @@ there is a real candidate and it holds the work the human actually
 verified. See that module's "Finalization" section; nothing about the gate
 here is relaxed for it.
 
-Pushing a verified candidate
-----------------------------
+Local-first runs
+----------------
 
-The acceptance gate only freezes a commit that is already reachable from its
-intended remote branch, and that has always been the rule. What used to
-happen when it was not -- the reviewer said READY over a committed but
-unpushed candidate, the gate refused, and nothing in the workflow could get
-past it -- is now a typed stop: :mod:`agent_sparring.push_gate` reports that
-this exact candidate needs a person's permission to be pushed, the run pauses
-with that recorded in its state, and a resume carrying the permission pushes
-exactly that commit, re-proves reachability, and then runs the same
-unchanged gate. Permission can cover one candidate or every later verified
-candidate of this run; without it nothing is ever pushed. See that module for
-the two scopes, what the push is allowed to be, and what it is not.
+A run works entirely in the local repositories. It never pushes, pins a
+remote, reads a remote or waits for permission to push: the acceptance gate
+freezes the exact, clean ``HEAD`` of the expected branch in each
+participating repository, and accepts it only at the reviewer's READY over
+that exact commit (see :mod:`agent_sparring.acceptance`). Publishing a
+commit for external review is a separate, explicit action that never
+implies acceptance.
+
+What pushing used to give for free -- accepted history that only grows --
+is kept explicitly: the run records each candidate it accepts, per
+repository (``accepted_candidates``), and the gate refuses
+``run_history_rewritten`` when a repository's stage base or an earlier
+accepted candidate is not an ancestor of its new candidate (see
+:mod:`agent_sparring.run_history`).
+
+A run recorded by an older engine still loads. Its remote pauses stay until
+a person resolves them explicitly, and none of them, nor a push
+permission, is ever taken as review or acceptance.
 
 Adapters are built per planned stage
 ------------------------------------
@@ -166,6 +173,8 @@ from agent_sparring.acceptance import (
     accept_candidate,
     accept_reviewed_candidate,
     freeze_candidate,
+    recorded_ready_problems,
+    sibling_root,
 )
 from agent_sparring.activity import ActivityEmitter
 from agent_sparring.plan_obligations import (
@@ -179,6 +188,7 @@ from agent_sparring.plan_obligations import (
 )
 from agent_sparring.deferred_gate import (
     CHECKPOINT_PLAN_COMPLETION,
+    CheckOutcome,
     DEFERRED_VERIFICATION_REQUIRED,
     CheckResult,
     DeferredAnswer,
@@ -190,12 +200,13 @@ from agent_sparring.deferred_gate import (
 )
 from agent_sparring.finalization import FinalizationError, pending_finalization
 from agent_sparring.gate_answers import (
+    check_histories,
     is_repeat_asking,
     parse_gate_answers,
     repeat_asking_count,
     stalled_checks,
 )
-from agent_sparring.git_context import GitContextError, is_ignored, resolve_commit
+from agent_sparring.git_context import GitContextError, is_full_sha, is_ignored, resolve_commit
 from agent_sparring.loop import (
     DEFAULT_MAX_SEND_BACK_CYCLES,
     CandidateRefused,
@@ -224,12 +235,44 @@ from agent_sparring.intake_approval import (
 )
 from agent_sparring.plan_model import ManifestGate, PlanSource, PlannedStage, digest_planned_stages
 from agent_sparring.push_gate import (
+    PUSH_AUTHORIZATION_REQUIRED,
     PushAuthorization,
     PushError,
     PushRequired,
-    authorization_for_candidate,
-    authorization_for_run,
-    ensure_candidate_pushed,
+)
+from agent_sparring import engine_git
+from agent_sparring.remote_pin import (
+    ABSENT,
+    AUTHORIZED_WITHOUT_PUSH,
+    MOVEMENT_ACKNOWLEDGED,
+    PUSHED_CANDIDATE_UNAUTHORIZED,
+    UNAUTHORIZED_REMOTE_MOVEMENT,
+    PushedCandidateUnauthorized,
+    RemotePause,
+    RemotePin,
+    RemoteRecord,
+    SiblingRemotePin,
+    UnauthorizedRemoteMovement,
+    acknowledgement,
+    authorization_without_push,
+    records_from,
+    sibling_pins_from,
+    who,
+)
+from agent_sparring.capabilities import push_not_part_of_runs, push_permission_deprecated
+from agent_sparring import trusted_snapshots
+from agent_sparring.trusted_snapshots import (
+    RunSnapshots,
+    SiblingSnapshot,
+    SnapshotError,
+    sibling_snapshots_from,
+)
+from agent_sparring.run_history import (
+    AcceptedCandidate,
+    RunHistoryError,
+    accepted_from_stage,
+    merged as merged_accepted,
+    records_from as accepted_records_from,
 )
 from agent_sparring.providers import (
     ProviderSessionUnresumable,
@@ -256,7 +299,11 @@ from agent_sparring.review import (
 )
 from agent_sparring.human_gate import HumanCheck, HumanGate, new_gate_instance_id
 from agent_sparring.routing import RoutingAction, RoutingResult
-from agent_sparring.sparring_exchange import RecordedOutcome, read_recorded_outcome
+from agent_sparring.sparring_exchange import (
+    RecordedOutcome,
+    read_recorded_outcome,
+    unreadable_recorded_gates,
+)
 from agent_sparring.stage import (
     ACTIVITY_FILENAME,
     HUMAN_EVIDENCE_HEADING,
@@ -265,6 +312,7 @@ from agent_sparring.stage import (
     NEXT_TURN_FINALIZATION,
     NEXT_TURN_SPARRING,
     NEXT_TURN_STAGE,
+    CandidateRepository,
     Stage,
     StageError,
     StageStatus,
@@ -528,19 +576,25 @@ class PlanRunState:
     #: document had exactly one execution and its key named it, so that is
     #: not a guess about the file, it is what the file means.
     run: str | None = None
-    #: What a person has allowed this run to push, and for exactly what (see
-    #: :mod:`agent_sparring.push_gate`). ``None`` -- including for every run
-    #: recorded before push authorization existed -- means no authorization:
-    #: a verified candidate that is not on its intended remote branch stops
-    #: the run and asks.
+    #: Legacy only: what a person allowed a run recorded before runs were
+    #: local-first to push (see :mod:`agent_sparring.push_gate`). Loaded and
+    #: kept as written, never granted any more and never read as acceptance.
     push_authorization: PushAuthorization | None = None
     #: Why this run is stopped, when the reason is a typed one the runner
     #: itself recorded rather than a reviewer's verdict:
-    #: :class:`~agent_sparring.push_gate.PushRequired`, or
-    #: :class:`~agent_sparring.deferred_gate.DeferredVerificationRequired`.
+    #: :class:`~agent_sparring.deferred_gate.DeferredVerificationRequired`,
+    #: or, recorded only by an engine from before runs were local-first and
+    #: kept until resolved explicitly,
+    #: :class:`~agent_sparring.push_gate.PushRequired`,
+    #: :class:`~agent_sparring.remote_pin.UnauthorizedRemoteMovement` or
+    #: :class:`~agent_sparring.remote_pin.PushedCandidateUnauthorized`.
     #: Cleared whenever the run enters a stage for execution, so it can never
-    #: describe an older pause than the one the run is actually in.
-    awaiting: PushRequired | DeferredVerificationRequired | None = None
+    #: describe an older pause than the one the run is actually in -- except
+    #: those three legacy pauses, which a run never leaves by entering a
+    #: stage: only an explicit acknowledgement clears unauthorized movement,
+    #: only an explicit per-commit authorization clears a pushed candidate,
+    #: and a push pause stays until the legacy migration resolves it.
+    awaiting: PushRequired | DeferredVerificationRequired | RemotePause | None = None
     #: The obligation ledger: human verification a reviewer deferred rather
     #: than stopped for (see :mod:`agent_sparring.deferred_gate`).
     #:
@@ -585,6 +639,43 @@ class PlanRunState:
     #: :mod:`agent_sparring.managed_run`). Omitted while ``False``, and
     #: absent from older states, which read as unmanaged.
     managed: bool = False
+    #: Legacy only: the remote target a run recorded before runs were
+    #: local-first pinned when it started (see :mod:`agent_sparring.remote_pin`).
+    #: Never written for a new run, and read only for the trusted
+    #: configuration snapshot it carries. Omitted while ``None``.
+    remote_pin: RemotePin | None = None
+    #: Legacy only: a pinned run's push receipts, acknowledgements and
+    #: per-commit authorizations. Kept as written. Omitted while empty.
+    remote_records: tuple[RemoteRecord, ...] = field(default_factory=tuple)
+    #: Legacy only: the sibling pins a run recorded before runs were
+    #: local-first took at its start. Kept as written. Omitted while empty.
+    sibling_pins: tuple[SiblingRemotePin, ...] = field(default_factory=tuple)
+    #: The trusted snapshot of the primary repository's own security-relevant
+    #: Git configuration, captured locally when the run started (see
+    #: :func:`agent_sparring.engine_git.capture_snapshot`). Every engine Git
+    #: command the run makes there is held to it. ``None`` -- and omitted --
+    #: for a run recorded before it existed, which uses its legacy pin's.
+    config_snapshot: tuple[tuple[str, str], ...] | None = None
+    #: Each declared sibling repository's trusted snapshot, by resolved path,
+    #: taken locally when the run started or, for a sibling that was not a
+    #: repository then, when its stage was first entered (see
+    #: :mod:`agent_sparring.trusted_snapshots`). Omitted while empty.
+    sibling_snapshots: tuple[SiblingSnapshot, ...] = field(default_factory=tuple)
+    #: Every candidate this run accepted, per repository, in order (see
+    #: :mod:`agent_sparring.run_history`): its accepted history, which only
+    #: grows. Omitted while empty.
+    accepted_candidates: tuple[AcceptedCandidate, ...] = field(default_factory=tuple)
+    #: Each legacy pause this run converted into local acceptance under the
+    #: L-D1 rules (see :func:`_convert_legacy_ready`): ``{"stage", "sha",
+    #: "pause", "at"}``. Provenance only; omitted while empty.
+    legacy_push_pause_converted: tuple[dict[str, str], ...] = field(default_factory=tuple)
+    #: Each recorded incident pause a person answered (see
+    #: :func:`acknowledge_remote_movement`, :func:`authorize_pushed_candidate`):
+    #: ``{"kind", "stage", "candidate", "after_ready", "at"}`` -- the paused
+    #: candidate and whether the stage's recorded verdict was READY when it
+    #: was answered, so a pause raised after READY goes through the L-D1
+    #: conditions whatever tip the incident observed. Omitted while empty.
+    answered_incidents: tuple[dict[str, str], ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -593,6 +684,38 @@ class PlanRunState:
             self.push_authorization.to_dict() if self.push_authorization is not None else None
         )
         payload["awaiting"] = self.awaiting.to_dict() if self.awaiting is not None else None
+        if self.remote_pin is not None:
+            payload["remote_pin"] = self.remote_pin.to_dict()
+        else:
+            payload.pop("remote_pin", None)
+        if self.remote_records:
+            payload["remote_records"] = [record.to_dict() for record in self.remote_records]
+        else:
+            payload.pop("remote_records", None)
+        if self.sibling_pins:
+            payload["sibling_pins"] = [entry.to_dict() for entry in self.sibling_pins]
+        else:
+            payload.pop("sibling_pins", None)
+        if self.config_snapshot is not None:
+            payload["config_snapshot"] = [list(pair) for pair in self.config_snapshot]
+        else:
+            payload.pop("config_snapshot", None)
+        if self.accepted_candidates:
+            payload["accepted_candidates"] = [entry.to_dict() for entry in self.accepted_candidates]
+        else:
+            payload.pop("accepted_candidates", None)
+        if self.sibling_snapshots:
+            payload["sibling_snapshots"] = [entry.to_dict() for entry in self.sibling_snapshots]
+        else:
+            payload.pop("sibling_snapshots", None)
+        if self.legacy_push_pause_converted:
+            payload["legacy_push_pause_converted"] = [dict(entry) for entry in self.legacy_push_pause_converted]
+        else:
+            payload.pop("legacy_push_pause_converted", None)
+        if self.answered_incidents:
+            payload["answered_incidents"] = [dict(entry) for entry in self.answered_incidents]
+        else:
+            payload.pop("answered_incidents", None)
         payload["deferred_human_checks"] = [
             obligation.to_dict() for obligation in self.deferred_human_checks
         ]
@@ -721,8 +844,24 @@ class PlanRunState:
                     else None
                 ),
                 managed=_managed_flag(payload.get("managed", False)),
+                remote_pin=(
+                    RemotePin.from_dict(payload["remote_pin"])
+                    if payload.get("remote_pin")
+                    else None
+                ),
+                remote_records=records_from(payload.get("remote_records")),
+                sibling_pins=sibling_pins_from(payload.get("sibling_pins")),
+                config_snapshot=_snapshot_from(payload.get("config_snapshot")),
+                accepted_candidates=accepted_records_from(payload.get("accepted_candidates")),
+                sibling_snapshots=sibling_snapshots_from(payload.get("sibling_snapshots")),
+                legacy_push_pause_converted=_string_records(
+                    payload.get("legacy_push_pause_converted"), "legacy_push_pause_converted"
+                ),
+                answered_incidents=_string_records(
+                    payload.get("answered_incidents"), "answered_incidents"
+                ),
             )
-        except (PushError, DeferredGateError) as exc:
+        except (PushError, DeferredGateError, GitContextError, RunHistoryError, SnapshotError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanError(f"malformed plan-run state: {exc}") from exc
@@ -742,6 +881,25 @@ class PlanRunState:
         path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _snapshot_from(value: Any) -> tuple[tuple[str, str], ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(
+        isinstance(pair, list) and len(pair) == 2 and all(isinstance(v, str) for v in pair)
+        for pair in value
+    ):
+        raise PlanError("malformed plan-run state: config_snapshot must be an array of [key, value]")
+    return tuple((pair[0], pair[1]) for pair in value)
+
+
+def _string_records(value: Any, name: str) -> tuple[dict[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(entry, Mapping) for entry in value):
+        raise PlanError(f"malformed plan-run state: {name} must be an array of objects")
+    return tuple({str(k): str(v) for k, v in entry.items()} for entry in value)
+
+
 def _managed_flag(value: Any) -> bool:
     if not isinstance(value, bool):
         raise PlanError(f"malformed plan-run state: managed must be true or false, not {value!r}")
@@ -750,7 +908,7 @@ def _managed_flag(value: Any) -> bool:
 
 def _awaiting_from_dict(
     payload: Any,
-) -> "PushRequired | DeferredVerificationRequired | None":
+) -> "PushRequired | DeferredVerificationRequired | RemotePause | None":
     """The typed pause a recorded run is stopped on.
 
     Dispatched on ``kind`` and on nothing else, so adding a reason is adding
@@ -765,6 +923,10 @@ def _awaiting_from_dict(
     kind = payload.get("kind") if isinstance(payload, Mapping) else None
     if kind == DEFERRED_VERIFICATION_REQUIRED:
         return DeferredVerificationRequired.from_dict(payload)
+    if kind == UNAUTHORIZED_REMOTE_MOVEMENT:
+        return UnauthorizedRemoteMovement.from_dict(payload)
+    if kind == PUSHED_CANDIDATE_UNAUTHORIZED:
+        return PushedCandidateUnauthorized.from_dict(payload)
     return PushRequired.from_dict(payload)
 
 
@@ -1147,19 +1309,19 @@ class PlanRunResult:
     #: :func:`_recorded_pause`. The two are never both set.
     recorded: RecordedOutcome | None = None
     #: Set instead of either when the run stopped on a typed reason of its
-    #: own rather than on a reviewer's verdict: a verified candidate that
-    #: needs push authorization (see :mod:`agent_sparring.push_gate`). The
-    #: reviewer said READY; what is missing is a person's permission, not a
-    #: review outcome, so this is not dressed up as one.
-    #:
-    #: The same field also carries
+    #: own rather than on a reviewer's verdict:
     #: :class:`~agent_sparring.deferred_gate.DeferredVerificationRequired`,
     #: for the run that has nothing left to implement but still owes a
-    #: person the verification an earlier reviewer deferred. It is the same
-    #: kind of fact -- the engine stopped on a typed reason of its own, not
-    #: on a verdict -- so a consumer switches on ``kind`` rather than on
-    #: which field is populated.
-    awaiting: PushRequired | DeferredVerificationRequired | None = None
+    #: person the verification an earlier reviewer deferred. A consumer
+    #: switches on ``kind`` rather than on which field is populated.
+    #:
+    #: A run an older engine paused on a remote reason reports that pause
+    #: here, unchanged, until it is resolved explicitly:
+    #: :class:`~agent_sparring.push_gate.PushRequired`,
+    #: :class:`~agent_sparring.remote_pin.UnauthorizedRemoteMovement` or
+    #: :class:`~agent_sparring.remote_pin.PushedCandidateUnauthorized`. A
+    #: local-first run never reaches one.
+    awaiting: PushRequired | DeferredVerificationRequired | RemotePause | None = None
     #: The obligations a :class:`DeferredVerificationRequired` pause is
     #: about, in full, so a caller can render them without re-reading the
     #: run state. Empty otherwise.
@@ -1281,11 +1443,11 @@ def start_plan(
     with stage instances of its own, while the earlier run stays on disk
     exactly as it is.
 
-    ``allow_push_for_run`` records, as part of creating the run, that this
-    run may push the verified candidates it produces to their intended remote
-    branch (see :mod:`agent_sparring.push_gate`). Without it the run has no
-    push authorization at all and stops the first time a verified candidate
-    is not already on the remote.
+    Runs are local-first: nothing is pushed, no remote is pinned or read,
+    and acceptance is decided in the local repositories alone (see
+    :mod:`agent_sparring.acceptance`). ``allow_push_for_run`` is retired and
+    refuses with ``push_not_part_of_runs`` before anything is created (see
+    :mod:`agent_sparring.capabilities`); it is never reinterpreted.
 
     ``adopt`` opts in to running a plan whose stages *already exist* on disk
     -- the migration case, where a sequence was driven stage by stage before
@@ -1312,6 +1474,8 @@ def start_plan(
     git-ignored. A *complete* run never refuses a fresh one.
     """
 
+    if allow_push_for_run:
+        raise PlanError(push_not_part_of_runs())
     if not expected_branch or not expected_branch.strip():
         raise PlanError("expected_branch is required for a plan run")
     from agent_sparring.managed_run import ManagedRunError, refuse_unmanaged_here
@@ -1413,16 +1577,24 @@ def start_plan(
         run=key,
         managed=managed,
     )
-    if allow_push_for_run:
-        try:
-            state.push_authorization = authorization_for_run(
-                Path(repo_root), branch=expected_branch
-            )
-        except PushError as exc:
-            raise PlanError(str(exc)) from exc
-        report(f"push authorization recorded for this run: {state.push_authorization.describe}")
+    # The one place the repository's own security-relevant configuration is
+    # trusted: every engine Git command of this run is held to it, and a
+    # later change to it is refused rather than followed. Read locally;
+    # nothing about a remote is pinned, read or contacted.
+    try:
+        state.config_snapshot = engine_git.capture_snapshot(Path(repo_root))
+        state.sibling_snapshots = _capture_sibling_snapshots(Path(repo_root), stages, ())
+    except GitContextError as exc:
+        raise PlanError(
+            f"refusing a fresh run of {label}: cannot snapshot a repository's configuration "
+            f"({exc})"
+        ) from exc
     if managed:
         _write_plan_snapshot(repo_root, sparring_dir, key)
+    # Outside the project directory, before the state that holds them:
+    # removing them from the run state can then never make this run look as
+    # if it never had them.
+    _mark_snapshots(repo_root, key, state)
     state.save(state_path)
     # Claimed only now that the run exists: a refusal above must not leave a
     # stage marked as owned by a run that was never recorded.
@@ -1445,6 +1617,162 @@ def start_plan(
         report=report,
         stop_after_stage=stop_after_stage,
     )
+
+
+def _sibling_roots(repo_root: Path, stages: Sequence[PlannedStage]) -> list[tuple[Any, Path]]:
+    """Every declared sibling repository, once per resolved path, with its
+    root."""
+
+    seen: set[str] = set()
+    found: list[tuple[Any, Path]] = []
+    for planned in stages:
+        for repository in planned.repositories:
+            root = sibling_root(repo_root, repository)
+            path = trusted_snapshots.resolved(root)
+            if path not in seen:
+                seen.add(path)
+                found.append((repository, root))
+    return found
+
+
+def _capture_sibling_snapshots(
+    repo_root: Path, stages: Sequence[PlannedStage], existing: tuple[SiblingSnapshot, ...]
+) -> tuple[SiblingSnapshot, ...]:
+    """``existing`` plus a fresh snapshot of every declared sibling that is a
+    repository and has none yet (a run start)."""
+
+    have = {entry.path for entry in existing}
+    captured = list(existing)
+    for _repository, root in _sibling_roots(repo_root, stages):
+        path = trusted_snapshots.resolved(root)
+        if path in have or not (root / ".git").exists():
+            continue
+        captured.append(SiblingSnapshot(path=path, entries=trusted_snapshots.capture(root)))
+        have.add(path)
+    return tuple(captured)
+
+
+def _mark_snapshots(repo_root: Path, run_key: str, state: "PlanRunState") -> None:
+    """Record outside the project directory that ``run_key`` holds trusted
+    snapshots, and for which siblings (see
+    :func:`agent_sparring.managed_run.mark_snapshot_recorded`)."""
+
+    from agent_sparring.managed_run import ManagedRunError, mark_snapshot_recorded
+
+    try:
+        mark_snapshot_recorded(
+            Path(repo_root), run_key, siblings=tuple(entry.path for entry in state.sibling_snapshots)
+        )
+    except (ManagedRunError, OSError) as exc:
+        raise PlanError(
+            f"cannot record run {run_key}'s trusted configuration snapshots outside the project "
+            f"directory ({exc}); nothing was run"
+        ) from exc
+
+
+def _run_snapshots(state: "PlanRunState") -> RunSnapshots:
+    try:
+        return trusted_snapshots.from_run_state(state.to_dict())
+    except SnapshotError as exc:
+        raise PlanError(f"malformed plan-run state: {exc}") from exc
+
+
+def _recorded_siblings(repo_root: Path, run_key: str) -> frozenset[str] | None:
+    from agent_sparring.managed_run import ManagedRunError, recorded_snapshot_siblings
+
+    try:
+        return recorded_snapshot_siblings(Path(repo_root), run_key)
+    except (ManagedRunError, OSError):
+        return None
+
+
+def _snapshot_for_sibling(
+    state: "PlanRunState",
+    state_path: Path,
+    repo_root: Path,
+    root: Path,
+    repository: Any,
+    *,
+    report: Reporter,
+) -> SiblingSnapshot | None:
+    """Make sure the run holds ``root``'s trusted snapshot, taking it now if
+    the engine never took one. Returns the snapshot taken now, ``None`` when
+    one was already held or ``root`` is not a repository yet. A snapshot the
+    engine's outside record says was taken, and the run state no longer
+    holds, refuses: it is never taken again from the current configuration."""
+
+    key = _RunOwner.of(state).key
+    if not (root / ".git").exists() or _run_snapshots(state).for_sibling(root) is not None:
+        return None
+    path = trusted_snapshots.resolved(root)
+    known = _recorded_siblings(repo_root, key)
+    if known is None or path in known:
+        raise PlanError(
+            trusted_snapshots.missing_message(
+                repo_root, key, what=f"sibling repository {repository.name!r} ({root})",
+                consequence="Nothing was run",
+            )
+        )
+    try:
+        entry = SiblingSnapshot(path=path, entries=trusted_snapshots.capture(root))
+    except GitContextError as exc:
+        raise PlanError(
+            f"cannot snapshot the configuration of sibling repository {repository.name!r} "
+            f"({root}): {exc}; nothing was run"
+        ) from exc
+    state.sibling_snapshots = state.sibling_snapshots + (entry,)
+    _mark_snapshots(repo_root, key, state)
+    state.save(state_path)
+    report(
+        f"sibling repository {repository.name!r} ({root}): trusted configuration snapshot "
+        "recorded now, as it is the first time this run works in it"
+    )
+    return entry
+
+
+def _ensure_snapshots(
+    state: "PlanRunState",
+    state_path: Path,
+    repo_root: Path,
+    stages: Sequence[PlannedStage],
+    *,
+    report: Reporter,
+) -> None:
+    """Before a resume runs anything: the run holds a trusted snapshot of
+    the primary repository and of every declared sibling that is a
+    repository. A run recorded before snapshots existed gets them now, from
+    the current configuration, with a notice that this is weaker than a
+    run-start snapshot; a snapshot the engine's outside record says was
+    taken and the run state no longer holds refuses, and is never taken
+    again."""
+
+    key = _RunOwner.of(state).key
+    if _run_snapshots(state).primary is None:
+        if trusted_snapshots.engine_recorded(repo_root, key):
+            raise PlanError(
+                trusted_snapshots.missing_message(
+                    repo_root, key, what="the primary repository", consequence="Nothing was run"
+                )
+            )
+        try:
+            state.config_snapshot = trusted_snapshots.capture(Path(repo_root))
+        except GitContextError as exc:
+            raise PlanError(
+                f"plan run {key} holds no trusted configuration snapshot and one cannot be taken "
+                f"now ({exc}); nothing was run"
+            ) from exc
+        _mark_snapshots(repo_root, key, state)
+        state.save(state_path)
+        report(
+            f"notice: plan run {key} was recorded before runs held a trusted configuration "
+            "snapshot, so one is recorded now, from the current configuration. This is weaker "
+            "than a run-start snapshot: configuration changed before this moment is taken as "
+            "trusted. A later change to it is refused."
+        )
+    elif state.config_snapshot is not None:
+        _mark_snapshots(repo_root, key, state)
+    for repository, root in _sibling_roots(Path(repo_root), stages):
+        _snapshot_for_sibling(state, state_path, Path(repo_root), root, repository, report=report)
 
 
 def _require_managed_record(repo_root: Path, run_key: str, expected_branch: str) -> None:
@@ -1775,17 +2103,16 @@ def resume_plan(
     stage agent. A stage with no implementation session yet has no candidate
     to spar, so it starts normally.
 
-    ``allow_push_candidate`` is a person allowing this run to push *exactly*
-    that commit, and it is refused unless the run is in fact stopped waiting
-    for permission to push exactly that commit (see
-    :mod:`agent_sparring.push_gate`). That refusal is the point: a stale
-    surface offering the permission it was rendered from cannot authorize a
-    candidate the run has since replaced. ``allow_push_for_run`` records the
-    wider permission -- the verified candidates this run produces from now on
-    -- and the two combine, so a person can allow the candidate in front of
-    them and stop being asked in the same action. Either one is recorded in
-    the run's own state before anything runs, so it survives a reload and a
-    later resume; neither is ever inferred from evidence text.
+    Runs are local-first and never push. ``allow_push_candidate`` refuses
+    with ``push_permission_deprecated`` and ``allow_push_for_run`` with
+    ``push_not_part_of_runs``, before anything is read or changed (see
+    :mod:`agent_sparring.capabilities`); neither is ever an alias for local
+    progression. A run an older engine paused for push permission converts
+    only on a plain resume, and only when every L-D1 condition holds
+    (:data:`LEGACY_CONDITIONS`): its stage is then accepted locally and
+    ``legacy_push_pause_converted`` recorded. Otherwise it stays paused on
+    that recorded reason, with the failed conditions named: a push-only
+    permission never becomes acceptance of unreviewed code.
 
     An ordinary resume obeys the current stage's recorded ``next_turn``
     (see :mod:`agent_sparring.next_turn`): ``sparring`` reviews the recorded
@@ -1833,6 +2160,10 @@ def resume_plan(
     longer matches the digest recorded at start.
     """
 
+    if allow_push_candidate is not None:
+        raise PlanError(push_permission_deprecated(run_key))
+    if allow_push_for_run:
+        raise PlanError(push_not_part_of_runs())
     try:
         source = _coerce_source(plan, repo_root)
     except (PlanError, ManifestError) as exc:
@@ -1872,7 +2203,17 @@ def resume_plan(
         # of what makes a rerun of the same document a different run: its
         # stages are namespaced by whichever run owns them.
         source = source.in_namespace(owner.key)
-    stages = _verify_source_unchanged(source, state)
+    try:
+        stages = _verify_source_unchanged(source, state)
+    except PlanError as exc:
+        if isinstance(state.awaiting, PushRequired):
+            raise PlanError(
+                f"plan run {owner.key}: the {PUSH_AUTHORIZATION_REQUIRED} pause of stage "
+                f"{state.awaiting.stage_id!r} was not converted, because legacy migration (L-D1) "
+                f"condition 3 ({LEGACY_CONDITIONS[3]}) does not hold: {exc}. Nothing was run, "
+                "pushed, frozen or accepted, and the pause stays."
+            ) from exc
+        raise
     if not 0 <= state.current_stage_index < len(stages):
         raise PlanError(
             f"recorded stage index {state.current_stage_index} is out of range for "
@@ -1884,6 +2225,20 @@ def resume_plan(
     # over that run's stages.
     _refuse_foreign_stages(sparring_dir, stages, owner=owner)
     _require_state_ignored(repo_root, state_path)
+    if isinstance(state.awaiting, PushRequired) and (
+        (evidence is not None and evidence.strip())
+        or deferred_results
+        or next_turn is not None
+        or fresh_roles
+        or accept_advanced_head is not None
+    ):
+        # Nothing answers a legacy push pause but its own migration, on a
+        # plain resume: refused before anything is recorded.
+        raise PlanError(
+            f"plan run {owner.key} is paused on {PUSH_AUTHORIZATION_REQUIRED}, recorded by an "
+            "engine from before runs were local-first; evidence, deferred results, a chosen "
+            "next turn or a fresh session do not answer it. Nothing was recorded or changed"
+        )
     if next_turn is not None and evidence is not None and evidence.strip():
         if next_turn != NEXT_TURN_SPARRING:
             raise PlanError(
@@ -1920,11 +2275,12 @@ def resume_plan(
             next_turn,
             evidence=bool(evidence and evidence.strip()),
         )
+    _ensure_snapshots(state, state_path, Path(repo_root), stages, report=report)
     rollback: tuple[Path, ...] = ()
     if accept_advanced_head is not None:
         # Likewise validated in full before anything is written: a refused
-        # re-pin must not leave a push grant, a deferred answer or a marker
-        # behind. The evidence path below repeats the proof before writing.
+        # re-pin must not leave a deferred answer or a marker behind. The
+        # evidence path below repeats the proof before writing.
         stage_dir = _check_advanced_head(
             sparring_dir,
             repo_root,
@@ -1943,19 +2299,10 @@ def resume_plan(
             stage_dir / ACTIVITY_FILENAME,
         )
     # With --accept-advanced-head, everything this resume writes before an
-    # agent runs -- push grant, re-pin, evidence, evidence_pending -- lands
-    # together or not at all, up to the first provider turn (including any
-    # refusal _drive raises before one); without it, this is a no-op.
+    # agent runs -- re-pin, evidence, evidence_pending -- lands together or
+    # not at all, up to the first provider turn (including any refusal
+    # _drive raises before one); without it, this is a no-op.
     with _rolled_back_on_failure(rollback) as guard:
-        _grant_push_authorization(
-            state,
-            state_path,
-            Path(repo_root),
-            allow_push_candidate=allow_push_candidate,
-            allow_push_for_run=allow_push_for_run,
-            report=report,
-        )
-
         # Before anything runs, and before the ordinary evidence path: these
         # answer the run's own checkpoint rather than a stage's review, and a
         # refusal here must stop the resume rather than leave half of it applied.
@@ -2353,165 +2700,154 @@ def _rolled_back_on_failure(paths: Sequence[Path]) -> Iterator[_Rollback]:
         raise
 
 
-def _grant_push_authorization(
-    state: PlanRunState,
-    state_path: Path,
-    repo_root: Path,
+def authorize_pushed_candidate(
+    sparring_dir: Path,
     *,
-    allow_push_candidate: str | None,
-    allow_push_for_run: bool,
-    report: Reporter,
-) -> None:
-    """Record what a person just allowed this run to push, or refuse.
+    run_key: str,
+    candidate_sha: str,
+    by: str | None = None,
+    report: Reporter = lambda message: None,
+) -> RemoteRecord:
+    """A person's explicit authorization of exactly one commit that is
+    already on the pinned ref with no engine receipt, naming the run and the
+    full commit id.
 
-    A one-candidate permission is checked against the run's own recorded
-    reason for being stopped, and against nothing else. Three refusals, all
-    before anything runs:
-
-    - the run is not waiting for push permission at all (so there is no
-      candidate this could be about);
-    - it is waiting for a *different* commit -- the surface the person acted
-      on was showing a candidate this run has replaced;
-    - the sha is not a full commit id, so what was authorized is ambiguous.
-
-    A run-scoped permission needs no pending request: it is a person saying
-    "don't ask me again for this run", which is a decision about the run
-    rather than about one commit. Both are written to the run state
-    immediately, so the permission is durable even if this call then fails
-    for an unrelated reason -- except under ``--accept-advanced-head``, whose
-    rollback takes back a grant together with everything else that resume
-    wrote before its first provider turn.
+    Refused unless the run is paused on ``pushed_candidate_unauthorized`` for
+    exactly that commit. Recorded in the run's state as its own
+    ``authorized_without_push`` record, with who and when; the pause is
+    cleared and the run stays paused, to be resumed separately. It is not a
+    review or an acceptance: the stage is accepted only after the
+    independent reviewer's READY for that commit.
     """
 
-    if not allow_push_candidate and not allow_push_for_run:
-        return
-
-    awaiting = state.awaiting
-    if allow_push_candidate:
-        wanted = allow_push_candidate.strip().lower()
-        if awaiting is None:
-            raise PlanError(
-                f"plan run for {state.plan} is not waiting for permission to push a "
-                "candidate, so there is nothing to authorize for one"
-            )
-        if awaiting.candidate_sha.lower() != wanted:
-            raise PlanError(
-                f"plan run for {state.plan} is waiting for permission to push "
-                f"{awaiting.candidate_sha} of stage {awaiting.stage_id!r}, not "
-                f"{allow_push_candidate}; refusing to authorize a commit this run is not "
-                "waiting on"
-            )
-
-    granted: PushAuthorization
-    try:
-        if not allow_push_for_run and awaiting is not None:
-            granted = authorization_for_candidate(
-                repo_root,
-                stage_id=awaiting.stage_id,
-                candidate_sha=awaiting.candidate_sha,
-                branch=state.expected_branch,
-            )
-        else:
-            granted = authorization_for_run(repo_root, branch=state.expected_branch)
-    except PushError as exc:
-        raise PlanError(str(exc)) from exc
-
-    state.push_authorization = granted
-    state.save(state_path)
-    report(f"push authorization recorded: {granted.describe}")
-
-
-def _ensure_candidate_pushed(
-    state: PlanRunState,
-    state_path: Path,
-    activity: ActivityEmitter,
-    repo_root: Path,
-    stage: Stage,
-    *,
-    report: Reporter,
-) -> PushRequired | None:
-    """Put the verified candidate where the acceptance gate requires it, or
-    say that a person has to allow that first.
-
-    Returns the typed request when the run must stop for permission -- the
-    run is already paused and the request recorded by the time it returns.
-    Returns ``None`` when nothing was needed or the push succeeded and
-    reachability was re-proven; a failure of either raises
-    :class:`PlanRunError` with the run paused and the stage unaccepted.
-    """
-
-    try:
-        outcome = ensure_candidate_pushed(
-            repo_root,
-            stage_id=stage.stage_id,
-            expected_branch=state.expected_branch,
-            authorization=state.push_authorization,
+    state_path = run_state_path(sparring_dir, run_key)
+    if not state_path.is_file():
+        raise PlanError(f"no plan run {run_key!r} is recorded at {state_path}")
+    state = PlanRunState.load(state_path)
+    pause = state.awaiting
+    if not isinstance(pause, PushedCandidateUnauthorized):
+        raise PlanError(
+            f"plan run {run_key} is not paused on {PUSHED_CANDIDATE_UNAUTHORIZED}; there is no "
+            "pushed candidate to authorize"
         )
-    except PushError as exc:
-        raise _fail(
-            state,
-            state_path,
-            activity,
-            why="push failed",
-            message=(
-                f"plan {state.plan} stopped at stage {stage.stage_id!r}: the reviewer said "
-                f"READY but the candidate could not be put on its intended remote branch "
-                f"({exc}); nothing was accepted"
-            ),
-        ) from exc
-
-    if outcome.required is not None:
-        state.awaiting = outcome.required
-        _pause(state, state_path)
-        activity.emit("plan.paused", summary="push authorization required")
-        report(
-            f"stage {stage.stage_id}: {outcome.required.describe}. The plan is paused until "
-            "you allow that push; nothing was pushed and nothing was accepted."
+    wanted = candidate_sha.strip().lower()
+    if not is_full_sha(wanted) or wanted != pause.candidate_sha.lower():
+        raise PlanError(
+            f"plan run {run_key} is paused on candidate {pause.candidate_sha}, not "
+            f"{candidate_sha}; refusing to authorize a commit the run is not paused on (give the "
+            "full 40-character commit id)"
         )
-        return outcome.required
-
+    record = authorization_without_push(run=run_key, pause=pause, by=by or who())
+    state.remote_records = state.remote_records + (record,)
+    state.answered_incidents = state.answered_incidents + (
+        _incident_provenance(sparring_dir, record, pause.candidate_sha),
+    )
     state.awaiting = None
-    if outcome.pushed:
-        activity.emit("plan.candidate.pushed", sha=outcome.target.candidate_sha)
-        report(
-            f"stage {stage.stage_id}: pushed the verified candidate "
-            f"{outcome.target.candidate_sha} to {outcome.target.remote}/"
-            f"{outcome.target.remote_branch} as authorized ({outcome.detail})"
-        )
-    return None
+    state.status = PlanRunStatus.PAUSED
+    state.save(state_path)
+    report(
+        f"{AUTHORIZED_WITHOUT_PUSH} recorded by {record.by} at {record.recorded_at}: candidate "
+        f"{pause.candidate_sha} of stage {pause.stage_id!r}, already on {pause.remote} "
+        f"{pause.ref}. Nothing was reviewed or accepted; resume the run to continue -- the stage "
+        "is accepted only after the independent reviewer says READY for this commit."
+    )
+    return record
 
 
-def _resuming_authorized_push(
-    repo_root: Path, stage: Stage, awaiting: PushRequired | None
-) -> PushRequired | None:
-    """Is this stage the one the run stopped on for push permission, still at
-    the same commit?
+def _reviewed_head(stage: Stage) -> str | None:
+    """The commit ``stage``'s recorded review was over, from engine records:
+    the review record, else the ``next_turn`` marker's candidate."""
 
-    When it is, there is nothing left for either agent to do: the reviewer's
-    READY is on disk, the candidate is that exact commit, and the only step
-    between it and the acceptance gate is the push the person has now allowed.
-    Entering at the stage agent would spend an unbounded implementation turn
-    on work that is already verified and would move the very commit that was
-    authorized; entering at the sparrer would re-derive a verdict already
-    recorded.
+    try:
+        state = stage.read_state()
+    except StageError:
+        return None
+    if state.review is not None and state.review.head_sha:
+        return state.review.head_sha
+    candidate = state.next_turn_candidate
+    return candidate.head_sha if candidate is not None else None
 
-    Anything that does not line up exactly -- another stage, a verdict that
-    is not READY or cannot be read, a ``HEAD`` that has moved since the run
-    stopped -- yields ``None``, and the stage is entered the ordinary way.
+
+def _incident_provenance(sparring_dir: Path, record: RemoteRecord, paused: str | None) -> dict[str, str]:
+    """What an answered incident pause was about, recorded with the answer:
+    its stage, the paused candidate (the pause's own, else the commit the
+    stage's recorded review was over), and whether the stage's recorded
+    verdict was READY then -- an incident raised after READY. Read from
+    engine records only; never the observed remote tip."""
+
+    stage_id = record.stage_id or ""
+    after_ready = False
+    reviewed = None
+    try:
+        stage = Stage.resolve(sparring_dir, stage_id)
+        if stage.exists() and stage.read_state().status is not StageStatus.ACCEPTED:
+            recorded = read_recorded_outcome(stage)
+            after_ready = recorded is not None and recorded.action is RoutingAction.READY
+            reviewed = _reviewed_head(stage)
+    except StageError:
+        pass
+    return {
+        "kind": record.kind,
+        "stage": stage_id,
+        "candidate": paused or reviewed or "",
+        "after_ready": "true" if after_ready else "false",
+        "at": record.recorded_at,
+    }
+
+
+def acknowledge_remote_movement(
+    sparring_dir: Path,
+    *,
+    run_key: str,
+    observed: str,
+    by: str | None = None,
+    report: Reporter = lambda message: None,
+) -> RemoteRecord:
+    """A person's explicit acknowledgement of the remote movement a run is
+    paused on, naming the run and the observed tip (``absent`` for a ref
+    that is gone).
+
+    Refused unless the run is paused on exactly that movement. Recorded in
+    the run's own state with who and when; the pause is cleared and the run
+    stays paused, to be resumed separately. It is not a review, an
+    acceptance or a push authorization, and it records none of those.
     """
 
-    if awaiting is None:
-        return None
-    if awaiting.stage_id != stage.stage_id:
-        return None
-    outcome = read_recorded_outcome(stage)
-    if outcome is None or outcome.action is not RoutingAction.READY:
-        return None
-    try:
-        head = resolve_commit(repo_root, "HEAD", label="HEAD")
-    except GitContextError:
-        return None
-    return awaiting if head == awaiting.candidate_sha else None
+    state_path = run_state_path(sparring_dir, run_key)
+    if not state_path.is_file():
+        raise PlanError(f"no plan run {run_key!r} is recorded at {state_path}")
+    state = PlanRunState.load(state_path)
+    movement = state.awaiting
+    if not isinstance(movement, UnauthorizedRemoteMovement):
+        raise PlanError(
+            f"plan run {run_key} is not paused on {UNAUTHORIZED_REMOTE_MOVEMENT}; there is "
+            "nothing to acknowledge"
+        )
+    wanted = observed.strip().lower()
+    if wanted == ABSENT:
+        matches = movement.observed_tip is None
+    else:
+        matches = movement.observed_tip is not None and movement.observed_tip.lower() == wanted
+    if not matches:
+        raise PlanError(
+            f"plan run {run_key} is paused on {movement.remote} {movement.ref} at "
+            f"{movement.observed_label}, not {observed}; refusing to acknowledge a tip the run "
+            "did not observe"
+        )
+    record = acknowledgement(run=run_key, movement=movement, by=by or who())
+    state.remote_records = state.remote_records + (record,)
+    state.answered_incidents = state.answered_incidents + (
+        _incident_provenance(sparring_dir, record, movement.candidate_sha),
+    )
+    state.awaiting = None
+    state.status = PlanRunStatus.PAUSED
+    state.save(state_path)
+    report(
+        f"acknowledged by {record.by} at {record.recorded_at}: {movement.remote} {movement.ref} "
+        f"at {movement.observed_label} (the records explained {movement.expected_tip or ABSENT}). "
+        "Nothing was reviewed, accepted, pushed or authorized; resume the run to continue."
+    )
+    return record
 
 
 def _unreadable_resume_input(
@@ -2755,7 +3091,15 @@ def _ensure_stage(
     return stage
 
 
-def _declare_repositories(stage: Stage, planned: PlannedStage) -> None:
+def _declare_repositories(
+    stage: Stage,
+    planned: PlannedStage,
+    repo_root: Path,
+    *,
+    run_state: PlanRunState | None = None,
+    state_path: Path | None = None,
+    report: Reporter = lambda message: None,
+) -> tuple[SiblingSnapshot, ...]:
     """Record this stage's declared sibling repositories in ``state.json``.
 
     Declaring them here, rather than passing them into the acceptance gate,
@@ -2765,44 +3109,98 @@ def _declare_repositories(stage: Stage, planned: PlannedStage) -> None:
     who happens to be driving it. Only the declaration is written -- the
     pinned commits are the freeze's business (see
     :func:`agent_sparring.acceptance.freeze_candidate`).
+
+    With it, each sibling's ``base_sha``: the commit the sibling is at when
+    the stage is first declared, before any provider turn, which its
+    candidate must descend from (see :mod:`agent_sparring.run_history`).
+    Recorded once and kept, like the stage's own ``base_sha``; never taken
+    from the plan input.
+
+    And the run's trusted snapshot of each sibling (``run_state``): a
+    sibling that was not a repository when the run started gets one here,
+    the first time a stage of the run declares it -- returned, so the caller
+    can hold the rest of the run to it too. One the engine's outside record
+    says was taken and the run state no longer holds refuses.
     """
 
-    declared = tuple(planned.repositories)
+    declared = tuple(
+        replace(repository, base_sha=None) for repository in planned.repositories
+    )
     if not declared:
-        return
+        return ()
+    captured: list[SiblingSnapshot] = []
+    if run_state is not None and state_path is not None:
+        for repository in declared:
+            entry = _snapshot_for_sibling(
+                run_state, state_path, repo_root, sibling_root(repo_root, repository), repository,
+                report=report,
+            )
+            if entry is not None:
+                captured.append(entry)
     try:
         state = stage.read_state()
     except StageError as exc:
         raise PlanError(str(exc)) from exc
-    current = tuple(
-        repository.__class__(
-            name=repository.name,
-            path=repository.path,
-            branch=repository.branch,
-            candidate_sha=None,
-        )
-        for repository in state.repositories
-    )
-    if current == declared:
-        return
-    # Re-declaring keeps any commit already pinned for a repository the plan
-    # still declares identically; a changed declaration replaces it, because
-    # a pin from a different declaration is not this stage's candidate set.
-    pinned = {
-        (repository.name, repository.path, repository.branch): repository.candidate_sha
+    # Re-declaring keeps any commit already pinned, and the base already
+    # recorded, for a repository the plan still declares identically; a
+    # changed declaration replaces them, because a pin from a different
+    # declaration is not this stage's candidate set.
+    recorded = {
+        (repository.name, repository.path, repository.branch): repository
         for repository in state.repositories
     }
-    state.repositories = tuple(
-        repository.__class__(
-            name=repository.name,
-            path=repository.path,
-            branch=repository.branch,
-            candidate_sha=repository.candidate_sha
-            or pinned.get((repository.name, repository.path, repository.branch)),
+    repositories = []
+    for repository in declared:
+        earlier = recorded.get((repository.name, repository.path, repository.branch))
+        base = earlier.base_sha if earlier is not None else None
+        if base is None and state.status is StageStatus.WORKING and state.base_sha is None:
+            # No implementation turn has run (the stage's own base is
+            # recorded by the first one), so where the sibling is now is
+            # where this stage starts from.
+            base = _sibling_head(repo_root, repository)
+        repositories.append(
+            replace(
+                repository,
+                candidate_sha=repository.candidate_sha
+                or (earlier.candidate_sha if earlier is not None else None),
+                base_sha=base,
+            )
         )
-        for repository in declared
+    if tuple(repositories) != state.repositories:
+        state.repositories = tuple(repositories)
+        stage.write_state(state)
+    return tuple(captured)
+
+
+def _record_accepted(state: PlanRunState, state_path: Path, stage: Stage) -> None:
+    """Add what ``stage`` accepted -- the primary candidate and each
+    sibling's, by its recorded name and path -- to the run's accepted
+    history (see :mod:`agent_sparring.run_history`). Idempotent; saved only
+    when something was added."""
+
+    try:
+        stage_state = stage.read_state()
+    except StageError:
+        return
+    combined = merged_accepted(
+        state.accepted_candidates, accepted_from_stage(stage.stage_id, stage_state)
     )
-    stage.write_state(state)
+    if combined != state.accepted_candidates:
+        state.accepted_candidates = combined
+        state.save(state_path)
+
+
+def _sibling_head(repo_root: Path, repository: CandidateRepository) -> str | None:
+    """A declared sibling's current commit, or ``None`` when it is not a
+    repository (yet) or has no commit to resolve."""
+
+    root = sibling_root(repo_root, repository)
+    if not (root / ".git").exists():
+        return None
+    try:
+        return resolve_commit(root, "HEAD", label=f"{repository.name} base")
+    except GitContextError:
+        return None
 
 
 def _stop_index(stages: tuple[PlannedStage, ...], stop_after_stage: str | None) -> int | None:
@@ -3022,6 +3420,7 @@ def _run_review(
         ) from exc
     # A provider turn ran: no later stop can be a refusal of this resume.
     state.left_provider_pause = None
+    _supersede_answered_incidents(state, state_path, stage.stage_id)
     return result
 
 
@@ -3515,8 +3914,42 @@ def _claim_from_plan(
         )
 
 
+#: A plan-declared gate that is a person's decision to continue, not a
+#: verification (see :data:`agent_sparring.intake.GATE_KINDS`).
+GATE_KIND_AUTHORIZATION = "authorization"
+
+
 def _manifest_gate_category(gate: ManifestGate) -> str:
+    if gate.kind == GATE_KIND_AUTHORIZATION:
+        return "AUTHORIZATION"
     return "EXTERNAL_CONDITION" if gate.kind == "external" else "OTHER"
+
+
+def _manifest_gate_check(gate: ManifestGate, blocked: str | None) -> HumanCheck:
+    if gate.kind == GATE_KIND_AUTHORIZATION:
+        target = f"continuing into {blocked}" if blocked else "completing this run"
+        return HumanCheck(
+            id=gate.id,
+            instruction=(
+                f"Decide whether to authorize {target}: {gate.title}. Why the plan asks: "
+                f"{gate.reason}"
+            ),
+            pass_criteria=(
+                f"Continue authorizes {target} only, not any later stage, production change "
+                "or publication. Not now keeps the run stopped here."
+            ),
+        )
+    return HumanCheck(
+        id=gate.id,
+        instruction=(
+            f"Confirm the plan-declared {gate.kind} gate {gate.title!r} is "
+            f"satisfied. Why it exists: {gate.reason}"
+        ),
+        pass_criteria=(
+            "The gate is actually satisfied. Reaching this point in the run "
+            "does not satisfy it."
+        ),
+    )
 
 
 def _owe_manifest_gates(
@@ -3528,6 +3961,8 @@ def _owe_manifest_gates(
     *,
     checkpoint: str,
     report: Reporter,
+    blocked: str | None = None,
+    authorized_by_start: bool = False,
 ) -> tuple[DeferredObligation, ...]:
     """Mint one engine-owned obligation per plan-declared ``gates`` entry
     owed by ``checkpoint``, and return the ones still unresolved.
@@ -3537,14 +3972,25 @@ def _owe_manifest_gates(
     it -- instead of asking anew. ``stage_id`` is the accepted stage the gate
     follows (or, before the run's first stage, the gated stage itself, whose
     answer then lives only in the run ledger); the answer is written to its
-    ``notes.md`` when that exists. Every gate kind is
-    owed the same way: nothing about a gate is ever taken as satisfied.
+    ``notes.md`` when that exists. ``blocked`` names the stage the gates
+    precede (None for completion gates).
+
+    Reaching a gate never satisfies it. Authorization gates (a person's
+    go-ahead) are asked as one decision, and only once every other gate at
+    the same checkpoint has passed, so the decision is made on the evidence
+    it depends on. The one exception is ``authorized_by_start``: before the
+    run's first stage, the approved start of this run slice -- whose
+    manifest listed these gates -- is that same decision for those stages,
+    so it is recorded rather than asked again, provided no verification at
+    this checkpoint had yet to pass when it was given. Any approved start of
+    the slice counts (start-plan --confirm, or approve-plan then run-plan):
+    each is an explicit approval of a manifest that lists the gate. Every
+    other gate kind
+    is owed as a verification.
     """
 
-    owed: list[DeferredObligation] = []
-    minted = False
-    for gate in gates:
-        existing = next(
+    def existing_for(gate: ManifestGate) -> DeferredObligation | None:
+        return next(
             (
                 entry
                 for entry in state.deferred_human_checks
@@ -3554,38 +4000,53 @@ def _owe_manifest_gates(
             ),
             None,
         )
+
+    verifications = tuple(gate for gate in gates if gate.kind != GATE_KIND_AUTHORIZATION)
+    decisions = tuple(gate for gate in gates if gate.kind == GATE_KIND_AUTHORIZATION)
+    # The start covers the decisions only when nothing at this checkpoint was
+    # still to be verified first; such a start predates the evidence.
+    start_covers = authorized_by_start and not verifications
+    owed: list[DeferredObligation] = []
+    minted = False
+    for gate in (*verifications, *decisions):
+        existing = existing_for(gate)
         if existing is None:
+            if gate.kind == GATE_KIND_AUTHORIZATION and owed:
+                # Asked once the verification it follows has passed.
+                continue
             existing = DeferredObligation(
                 stage_id=stage_id,
                 gate=HumanGate(
                     category=_manifest_gate_category(gate),
                     title=gate.title,
-                    checks=(
-                        HumanCheck(
-                            id=gate.id,
-                            instruction=(
-                                f"Confirm the plan-declared {gate.kind} gate {gate.title!r} is "
-                                f"satisfied. Why it exists: {gate.reason}"
-                            ),
-                            pass_criteria=(
-                                "The gate is actually satisfied. Reaching this point in the run "
-                                "does not satisfy it."
-                            ),
-                        ),
-                    ),
+                    checks=(_manifest_gate_check(gate, blocked),),
                 ).asked_again(new_gate_instance_id()),
                 rationale=gate.reason,
                 checkpoint=checkpoint,
                 manifest_gate=True,
             )
+            if gate.kind == GATE_KIND_AUTHORIZATION and start_covers:
+                existing = existing.with_result(
+                    CheckResult(
+                        check_id=gate.id,
+                        outcome=CheckOutcome.PASS,
+                        note="authorized by the approved start of this run slice",
+                    )
+                )
             state.record_deferred(existing)
             minted = True
             if activity is not None:
                 activity.emit("plan.gate_owed", summary=f"{gate.title} ({gate.kind}) at {checkpoint}")
-            report(
-                f"plan-declared {gate.kind} gate {gate.title!r} ({gate.id}) is owed at {checkpoint}: "
-                f"gate instance {existing.instance_id}"
-            )
+            if existing.resolved:
+                report(
+                    f"plan-declared authorization gate {gate.title!r} ({gate.id}) is satisfied by "
+                    f"the approved start of this run slice: gate instance {existing.instance_id}"
+                )
+            else:
+                report(
+                    f"plan-declared {gate.kind} gate {gate.title!r} ({gate.id}) is owed at "
+                    f"{checkpoint}: gate instance {existing.instance_id}"
+                )
         if not existing.resolved:
             owed.append(existing)
     if minted:
@@ -3899,7 +4360,363 @@ def _require_plan_unchanged(
         ) from exc
 
 
+#: Recorded in the run state, and reported, when a legacy pause converts.
+LEGACY_PUSH_PAUSE_CONVERTED = "legacy_push_pause_converted"
+
+#: The L-D1 conditions, each verified at conversion and never assumed, by the
+#: number a refusal names.
+LEGACY_CONDITIONS = {
+    1: "the run is paused on exactly that pause, for its current stage, which is not accepted",
+    2: "the recorded verdict is READY, over exactly the paused candidate, the HEAD of the "
+       "expected branch",
+    3: "the tree is clean apart from stage artifacts, every sibling is at its recorded "
+       "candidate, and the plan is unchanged",
+    4: "no deferred obligation is promoted, and the recorded verdict promotes none",
+    5: "the recorded verdict has no deferred gate without a gate instance",
+    6: "every human check of the stage's recorded gate is answered Pass",
+}
+
+
+class _ConversionRefused(Exception):
+    """The acceptance gate refused a conversion whose conditions held."""
+
+
+def _legacy_ready_failures(
+    source: PlanSource,
+    stages: tuple[PlannedStage, ...],
+    state: PlanRunState,
+    sparring_dir: Path,
+    repo_root: Path,
+    *,
+    stage_id: str,
+    candidate_sha: str,
+) -> list[tuple[int, str]]:
+    """Every L-D1 condition that does not hold for converting ``stage_id``'s
+    recorded READY over ``candidate_sha`` into local acceptance, as
+    ``(condition, detail)``. Read-only. Condition 1's "exactly that pause"
+    is the caller's (the pause it holds); the rest is checked here."""
+
+    current = stages[state.current_stage_index]
+    if stage_id != state.current_stage or stage_id != current.stage_id:
+        return [(1, f"the pause is for stage {stage_id!r}, but the run is at {state.current_stage!r}")]
+    if current.review_only:
+        return [(1, f"stage {stage_id!r} is review-only; it has no candidate a push pause covers")]
+    try:
+        stage = Stage.resolve(sparring_dir, stage_id)
+        stage_state = stage.read_state() if stage.exists() else None
+    except StageError as exc:
+        return [(1, f"stage {stage_id!r} cannot be read: {exc}")]
+    if stage_state is None:
+        return [(1, f"stage {stage_id!r} does not exist")]
+    if stage_state.status is StageStatus.ACCEPTED:
+        return [(1, f"stage {stage_id!r} is already ACCEPTED")]
+
+    failures: list[tuple[int, str]] = []
+    recorded = read_recorded_outcome(stage)
+    if recorded is None or recorded.action is not RoutingAction.READY:
+        failures.append((
+            2, "the recorded verdict is "
+            + (recorded.action.value if recorded is not None else "absent or unreadable") + ", not READY",
+        ))
+    if stage_state.review is not None and stage_state.review.action != RoutingAction.READY.value:
+        failures.append((2, f"the engine-recorded review is {stage_state.review.action}, not READY"))
+    failures.extend(recorded_ready_problems(
+        stage, repo_root, expected_branch=state.expected_branch, candidate_sha=candidate_sha
+    ))
+    try:
+        _verify_source_unchanged(source, state)
+    except PlanError as exc:
+        failures.append((3, str(exc)))
+    if state.promoted_deferred:
+        failures.append((4, "promoted: " + ", ".join(entry.describe for entry in state.promoted_deferred)))
+    if recorded is not None and recorded.promote_deferred:
+        failures.append((4, "the recorded verdict promotes " + ", ".join(recorded.promote_deferred)))
+    unreadable = unreadable_recorded_gates(stage)
+    if "deferred_human_gate" in unreadable:
+        # Read as "no deferral" for display, but it may be an obligation the
+        # ledger would then never hold: an unreadable gate is not an absent one.
+        failures.append((5, "the recorded verdict carries a deferred human gate that cannot be read"))
+    if recorded is not None and recorded.deferred_human_gate is not None and (
+        recorded.deferred_human_gate.instance_id is None
+    ):
+        failures.append((5, "the recorded verdict defers a human gate that has no gate instance"))
+    if "human_gate" in unreadable:
+        failures.append((6, "the recorded verdict carries a human gate that cannot be read, so its "
+                            "checks cannot be shown answered"))
+    try:
+        histories = check_histories(parse_gate_answers(stage.read_notes()))
+    except (StageError, OSError) as exc:
+        failures.append((6, f"the stage's human answers cannot be read: {exc}"))
+    else:
+        gate = recorded.human_gate if recorded is not None else None
+        named = [check.id for check in gate.checks] if gate is not None else []
+        for check_id in [*named, *(check_id for check_id in histories if check_id not in named)]:
+            history = histories.get(check_id)
+            if history is None:
+                failures.append((6, f"check {check_id!r} is unanswered"))
+            elif history.latest.outcome is not CheckOutcome.PASS:
+                failures.append((6, f"check {check_id!r} was last answered {history.latest.outcome.value}"))
+    return sorted(failures, key=lambda failure: failure[0])
+
+
+def _convert_legacy_ready(
+    source: PlanSource,
+    stages: tuple[PlannedStage, ...],
+    state: PlanRunState,
+    state_path: Path,
+    sparring_dir: Path,
+    repo_root: Path,
+    *,
+    stage_id: str,
+    candidate_sha: str,
+    pause: str,
+    report: Reporter,
+) -> PlanRunResult | None:
+    """Convert a legacy pause raised after READY into local acceptance (L-D1),
+    or leave it: ``None`` when converted (the caller then runs the ordinary
+    post-READY sequence over the accepted stage), else the paused result.
+
+    Only when every condition in :data:`LEGACY_CONDITIONS` holds, each
+    verified here. Then the stage is frozen and accepted locally by the
+    unchanged acceptance gate (I-L2, I-L2b), the pause is cleared and
+    ``legacy_push_pause_converted`` is recorded, together or not at all.
+    Otherwise nothing is written, pushed or granted, the stage is never
+    re-entered as an implementation turn, and the report names each failed
+    condition."""
+
+    key = _RunOwner.of(state).key
+
+    def stays(why: str) -> PlanRunResult:
+        report(
+            f"plan {state.plan}: the {pause} pause of stage {stage_id!r} for {candidate_sha} was not "
+            f"converted, {why}. Nothing was run, pushed, frozen or accepted, and the pause stays."
+        )
+        return PlanRunResult(
+            status=PlanRunStatus.PAUSED, plan=state.plan, run=key, stage_id=stage_id, awaiting=state.awaiting
+        )
+
+    failures = _legacy_ready_failures(
+        source, stages, state, sparring_dir, repo_root, stage_id=stage_id, candidate_sha=candidate_sha
+    )
+    if failures:
+        return stays("because these legacy migration (L-D1) conditions do not hold: " + "; ".join(
+            f"condition {number} ({LEGACY_CONDITIONS[number]}): {detail}" for number, detail in failures
+        ))
+    stage = Stage.resolve(sparring_dir, stage_id)
+    try:
+        with _rolled_back_on_failure((Path(state_path), stage.directory / STATE_FILENAME)):
+            try:
+                freeze_candidate(stage, sparring_dir, repo_root, expected_branch=state.expected_branch)
+                result = accept_candidate(stage, repo_root, expected_branch=state.expected_branch)
+            except AcceptanceError as exc:
+                raise _ConversionRefused(str(exc)) from exc
+            if result.candidate_sha != candidate_sha:
+                raise _ConversionRefused(f"the gate accepted {result.candidate_sha}, not {candidate_sha}")
+            state.awaiting = None
+            state.legacy_push_pause_converted = state.legacy_push_pause_converted + ({
+                "stage": stage_id,
+                "sha": candidate_sha,
+                "pause": pause,
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },)
+            state.save(state_path)
+    except _ConversionRefused as exc:
+        return stays(f"because the acceptance gate refused it ({exc})")
+    _plan_emitter(stage).emit("plan.legacy_pause_converted", sha=candidate_sha)
+    report(
+        f"plan {state.plan}: {LEGACY_PUSH_PAUSE_CONVERTED}: the {pause} pause of stage {stage_id!r}, "
+        f"recorded by an engine from before runs were local-first, was converted: the reviewer's "
+        f"READY is over exactly {candidate_sha} and every legacy migration condition holds, so it "
+        "was frozen and accepted locally. Nothing was pushed, and no push permission was taken as "
+        "acceptance."
+    )
+    return None
+
+
+def _pending_after_ready(entry: Mapping[str, str]) -> bool:
+    return entry.get("after_ready") == "true" and entry.get("superseded") != "true"
+
+
+def _supersede_answered_incidents(state: PlanRunState, state_path: Path, stage_id: str) -> None:
+    """A provider turn ran in ``stage_id`` after a post-READY incident was
+    answered: the stage's verdict is now that turn's, so the answered
+    incident no longer decides how the stage resumes. Recorded on the
+    entry (``superseded``), never by dropping it."""
+
+    updated = tuple(
+        {**entry, "superseded": "true"}
+        if entry.get("stage") == stage_id and _pending_after_ready(entry) else entry
+        for entry in state.answered_incidents
+    )
+    if updated != state.answered_incidents:
+        state.answered_incidents = updated
+        state.save(state_path)
+
+
+def _cleared_incident_after_ready(
+    state: PlanRunState, sparring_dir: Path
+) -> tuple[str, str, str] | None:
+    """``(stage id, paused candidate, answer kind)`` when the run's current
+    stage is unaccepted and a person has answered (and so cleared) a
+    recorded incident pause raised after READY: it then goes through the
+    L-D1 conditions rather than resuming the stage. ``None`` otherwise -- a
+    pause raised mid-loop resumes the stage normally.
+
+    "Raised after READY" is the provenance recorded with the answer
+    (:attr:`PlanRunState.answered_incidents`): never the remote tip the
+    incident observed, which can be any commit or none. While it stands --
+    until a provider turn runs in the stage (see
+    :func:`_supersede_answered_incidents`) -- it selects migration whatever
+    the stage's verdict now is: a verdict that is no longer READY, or no
+    longer readable, fails condition 2 there. An answer an older engine
+    recorded without provenance is treated strictly: with READY recorded,
+    it goes through the conditions too, against the paused candidate or the
+    commit the review was over. The candidate is ``""`` when none can be
+    established, which the conditions then refuse."""
+
+    if state.awaiting is not None:
+        return None
+    try:
+        stage = Stage.resolve(sparring_dir, state.current_stage)
+        if not stage.exists() or stage.read_state().status is StageStatus.ACCEPTED:
+            return None
+    except StageError:
+        return None
+    answered = [entry for entry in state.answered_incidents if entry.get("stage") == state.current_stage]
+    pending = [entry for entry in answered if _pending_after_ready(entry)]
+    if pending:
+        # The saved provenance selects migration by itself: whether the
+        # stage's verdict is still READY, or readable at all, is the
+        # migration's condition 2 to check and report, never a reason to
+        # take the ordinary path instead.
+        last = pending[-1]
+        return state.current_stage, last.get("candidate") or "", last.get("kind") or ""
+    if answered:
+        # Raised mid-loop, or superseded by a review turn that ran since.
+        return None
+    recorded = read_recorded_outcome(stage)
+    if recorded is None or recorded.action is not RoutingAction.READY:
+        return None
+    for record in reversed(state.remote_records):
+        if record.kind in (MOVEMENT_ACKNOWLEDGED, AUTHORIZED_WITHOUT_PUSH) and (
+            record.stage_id == state.current_stage
+        ):
+            return state.current_stage, record.candidate_sha or _reviewed_head(stage) or "", record.kind
+    return None
+
+
 def _drive(
+    source: PlanSource,
+    stages: tuple[PlannedStage, ...],
+    state: PlanRunState,
+    state_path: Path,
+    sparring_dir: Path,
+    repo_root: Path,
+    make_adapters: AdapterFactory,
+    **kwargs: Any,
+) -> PlanRunResult:
+    """:func:`_drive_pinned`, held to the run's trusted Git configuration.
+
+    Runs are local-first, so no run reaches a remote pause any more; the
+    ones an older engine recorded are kept until resolved explicitly.
+
+    A run paused for push permission (``push_authorization_required``)
+    converts on a plain resume only under every L-D1 condition
+    (:func:`_convert_legacy_ready`): its stage is then accepted locally and
+    the ordinary post-READY sequence runs. Otherwise it stays paused on that
+    reason, with the failed conditions named: nothing is pushed, and a push
+    permission never becomes acceptance.
+
+    A run paused on unauthorized remote movement stays paused: nothing --
+    not evidence, not a resume -- moves it on except an explicit
+    acknowledgement (:func:`acknowledge_remote_movement`). A run paused on a
+    pushed candidate likewise, except the explicit per-commit authorization
+    (:func:`authorize_pushed_candidate`). Neither resolution is ever a
+    review or an acceptance: it clears only that pause. A pause that was
+    raised mid-loop then resumes the stage normally; one raised after READY
+    goes through the same L-D1 conditions on a plain resume.
+    """
+
+    report_legacy: Reporter = kwargs.get("report") or (lambda message: None)
+    legacy_ready: tuple[str, str, str] | None = None
+    if isinstance(state.awaiting, PushRequired):
+        legacy_ready = (state.awaiting.stage_id, state.awaiting.candidate_sha, PUSH_AUTHORIZATION_REQUIRED)
+    elif not kwargs.get("sparrer_first"):
+        # Evidence (sparrer_first) runs the reviewer over the candidate
+        # before anything is accepted: a real review, which supersedes the
+        # answered incident. Every other resume is routed by it.
+        legacy_ready = _cleared_incident_after_ready(state, sparring_dir)
+        if legacy_ready is not None and (kwargs.get("next_turn_choice") or kwargs.get("fresh_roles")):
+            raise PlanError(
+                f"plan run {_RunOwner.of(state).key}: stage {legacy_ready[0]!r} has an answered "
+                "incident pause raised after READY, which converts only under the legacy migration "
+                "(L-D1) conditions on a plain resume, or is reviewed again with --evidence; a "
+                "chosen next turn or a fresh session does not answer it. Nothing was recorded or "
+                "changed"
+            )
+    if legacy_ready is not None:
+        stage_id, candidate_sha, pause = legacy_ready
+        stayed = _convert_legacy_ready(
+            source, stages, state, state_path, sparring_dir, repo_root,
+            stage_id=stage_id, candidate_sha=candidate_sha, pause=pause, report=report_legacy,
+        )
+        if stayed is not None:
+            return stayed
+    movement = state.awaiting
+    if isinstance(movement, (UnauthorizedRemoteMovement, PushedCandidateUnauthorized)):
+        _pause(state, state_path)
+        report: Reporter = kwargs.get("report") or (lambda message: None)
+        key = _RunOwner.of(state).key
+        if isinstance(movement, PushedCandidateUnauthorized):
+            action = (
+                f"Authorize exactly that commit with `sparring authorize-pushed-candidate "
+                f"--run-key {key} --sha {movement.candidate_sha}` once you have looked; a "
+                "run-level push grant does not clear this."
+            )
+        else:
+            action = (
+                f"Acknowledge it with `sparring acknowledge-remote-movement --run-key {key} "
+                f"--observed {movement.observed_label}` once you have looked."
+            )
+        report(
+            f"plan {state.plan}: still paused on {movement.kind}: {movement.describe}. Nothing "
+            f"was run, pushed, frozen or accepted. {action}"
+        )
+        return PlanRunResult(
+            status=PlanRunStatus.PAUSED,
+            plan=state.plan,
+            run=_RunOwner.of(state).key,
+            stage_id=movement.stage_id,
+            awaiting=movement,
+        )
+    # Every engine Git command of the run, in the primary repository and in
+    # each sibling, is held to that repository's trusted snapshot (a legacy
+    # run's come from its pins). Start and resume make sure they exist; a
+    # run without the primary's is never driven unguarded.
+    snapshots = _run_snapshots(state)
+    if snapshots.primary is None:
+        raise PlanError(
+            trusted_snapshots.missing_message(
+                Path(repo_root), _RunOwner.of(state).key, what="the primary repository",
+                consequence="Nothing was run",
+            )
+        )
+    with contextlib.ExitStack() as guards:
+        guards.enter_context(trusted_snapshots.guard(Path(repo_root), snapshots))
+        return _drive_pinned(
+            source,
+            stages,
+            state,
+            state_path,
+            sparring_dir,
+            repo_root,
+            make_adapters,
+            guards=guards,
+            **kwargs,
+        )
+
+
+def _drive_pinned(
     source: PlanSource,
     stages: tuple[PlannedStage, ...],
     state: PlanRunState,
@@ -3916,9 +4733,13 @@ def _drive(
     next_turn_choice: str | None = None,
     fresh_roles: tuple[str, ...] = (),
     fresh_reason: str | None = None,
+    guards: contextlib.ExitStack | None = None,
 ) -> PlanRunResult:
     """Walk the plan's stages from the recorded position until it pauses,
     fails or completes.
+
+    ``guards`` holds the run's trusted-configuration guards; a sibling
+    snapshot taken when its stage is first entered joins it at once.
 
     One loop for both plan inputs and for both entry modes: ``sparrer_first``
     only changes where the *first* stage entered starts (see
@@ -3935,10 +4756,6 @@ def _drive(
     total = len(stages)
     accepted: list[tuple[str, str]] = []
     stop_index = _stop_index(stages, stop_after_stage)
-    # The typed reason this run was stopped, if it was. Consumed by the first
-    # stage entered, exactly like ``sparrer_first``: it is a fact about where
-    # the run stopped, not about every stage that follows.
-    pending_push = state.awaiting if isinstance(state.awaiting, PushRequired) else None
     # Only for the observational plan.paused event: the run state, not this,
     # is the authority for where a stopped run is positioned.
     last_activity: ActivityEmitter | None = None
@@ -3975,6 +4792,8 @@ def _drive(
                 plan_stage.gates_before,
                 checkpoint=before_stage_checkpoint(plan_stage.stage_id),
                 report=report,
+                blocked=plan_stage.label,
+                authorized_by_start=True,
             )
             if gated:
                 return _stop_for_deferred(
@@ -4054,6 +4873,9 @@ def _drive(
             report(f"stage {position} {stage.stage_id}: already ACCEPTED at "
                    f"{stage_state.candidate_sha}; advancing")
             accepted.append((stage.stage_id, str(stage_state.candidate_sha)))
+            # Accepted outside this loop (by hand, or by a run killed between
+            # the gate and this record): the run's history records it now.
+            _record_accepted(state, state_path, stage)
             # Leaving the pause without a turn still leaves it: the reason
             # must not survive into the advance or completion saves.
             _leave_provider_pause(state)
@@ -4120,7 +4942,12 @@ def _drive(
             # The declared cross-repository candidate set belongs to the
             # stage, so the acceptance gate finds it wherever it is invoked
             # from. Written before any provider turn.
-            _declare_repositories(stage, plan_stage)
+            for entry in _declare_repositories(
+                stage, plan_stage, Path(repo_root), run_state=state, state_path=state_path,
+                report=report,
+            ):
+                if guards is not None:
+                    guards.enter_context(engine_git.trusted_config([Path(entry.path)], entry.entries))
 
             if plan_stage.review_only:
                 _refuse_unapplied(
@@ -4228,6 +5055,7 @@ def _drive(
                         f"{repository.candidate_sha}"
                     )
                 accepted.append((stage.stage_id, result.candidate_sha))
+                _record_accepted(state, state_path, stage)
                 activity.emit("plan.stage.accepted", sha=result.candidate_sha)
                 _reconcile_deferred(
                     state,
@@ -4239,27 +5067,20 @@ def _drive(
                 )
 
             else:
-                # A run stopped for push permission, resumed with it, and
-                # still at the exact commit it stopped over, has nothing left
-                # for either agent: the READY is recorded, the candidate is
-                # that commit, and the only missing step is the push itself.
-                # None on the authorized-push path below, where no agent
-                # runs at all: there is no fresh verdict then, and the
-                # obligations the recorded one raised were folded into the
-                # ledger by the run that produced it.
+                # None on the recorded-READY path below, where no agent runs
+                # at all: there is no fresh verdict then, and the obligations
+                # the recorded one raised were folded into the ledger by the
+                # run that produced it.
                 loop_result: LoopResult | None = None
-                authorized_push = _resuming_authorized_push(repo_root, stage, pending_push)
-                pending_push = None  # only the stage this resume entered
                 # READY was recorded over a candidate that was already a
                 # commit, and the run stopped before acceptance: the
                 # next_turn marker says so, with the commit it was given
-                # over. Only the push and acceptance gates are left, for
-                # exactly that commit; a moved candidate is refused rather
-                # than handed to either agent.
+                # over. Only the acceptance gate is left, for exactly that
+                # commit; a moved candidate is refused rather than handed to
+                # either agent.
                 ready_commit = False
                 if (
-                    authorized_push is None
-                    and not sparrer_first
+                    not sparrer_first
                     and stage_state.next_turn == NEXT_TURN_FINALIZATION
                     and stage_state.next_turn_candidate is not None
                     and stage_state.next_turn_candidate.kind == "commit"
@@ -4280,7 +5101,7 @@ def _drive(
                                 f"before any provider turn: {exc}"
                             ),
                         ) from exc
-                if authorized_push is not None or ready_commit:
+                if ready_commit:
                     _refuse_unapplied(
                         state,
                         state_path,
@@ -4289,26 +5110,10 @@ def _drive(
                         fresh_roles=entering_fresh,
                         next_turn_choice=next_turn_choice,
                         why=(
-                            "the reviewer already said READY over this commit; only the push "
-                            "and acceptance gates are left and no agent runs"
+                            "the reviewer already said READY over this commit; only the "
+                            "acceptance gate is left and no agent runs"
                         ),
                     )
-                if authorized_push is not None:
-                    # Both flags belong to the one stage this resume entered;
-                    # neither may leak into the next stage, whose
-                    # implementation turn must still run.
-                    sparrer_first = False
-                    activity.emit(
-                        "plan.stage.entered",
-                        summary=f"{plan_stage.display} ({position}); pushing the "
-                        "authorized candidate",
-                    )
-                    report(
-                        f"stage {position} {stage.stage_id}: the reviewer already said READY "
-                        f"over {authorized_push.candidate_sha}; pushing exactly that commit "
-                        "as authorized and then running the acceptance gate. No agent runs."
-                    )
-                elif ready_commit:
                     activity.emit(
                         "plan.stage.entered",
                         summary=f"{plan_stage.display} ({position}); completing a recorded READY",
@@ -4316,8 +5121,8 @@ def _drive(
                     report(
                         f"stage {position} {stage.stage_id}: the reviewer already said READY over "
                         f"{stage_state.next_turn_candidate.head_sha}, which is still the "
-                        "candidate; running the push and acceptance gates for exactly that "
-                        "commit. No agent runs."
+                        "candidate; running the acceptance gate for exactly that commit. No "
+                        "agent runs."
                     )
                 else:
                     if sparrer_first:
@@ -4404,8 +5209,8 @@ def _drive(
                             ),
                             "finalization": (
                                 "the sparrer already said READY and the reviewed candidate is "
-                                "not committed; committing and pushing exactly that work, then "
-                                "reviewing the commit"
+                                "not committed; committing exactly that work, then reviewing "
+                                "the commit (nothing is pushed)"
                             ),
                             "stage": "running the implementation <-> sparring loop",
                         }[start_with]
@@ -4478,6 +5283,7 @@ def _drive(
                     # A provider turn ran: no later stop can be a refusal
                     # of this resume.
                     state.left_provider_pause = None
+                    _supersede_answered_incidents(state, state_path, stage.stage_id)
                     _retire_pending_evidence(state, state_path)
                     if loop_result.outcome is not RoutingAction.READY:
                         _pause(state, state_path)
@@ -4505,26 +5311,13 @@ def _drive(
 
                 # READY: first make sure the reviewed plan the sparrer judged
                 # against is still the plan on disk -- an implementation turn
-                # could have edited and committed a stage section -- then put
-                # that exact commit where the gate requires it (only ever with
-                # a person's permission), and then invoke the existing hard
-                # gate. Any refusal stops the plan; nothing else is ever
-                # substituted.
+                # could have edited and committed a stage section -- then
+                # invoke the existing hard gate, locally: nothing is pushed
+                # and no remote is read. Any refusal stops the plan; nothing
+                # else is ever substituted.
                 _require_plan_unchanged(
                     source, state, state_path, activity, before="accepting the candidate"
                 )
-                required = _ensure_candidate_pushed(
-                    state, state_path, activity, repo_root, stage, report=report
-                )
-                if required is not None:
-                    return PlanRunResult(
-                        status=PlanRunStatus.PAUSED,
-                        plan=state.plan,
-                        run=_RunOwner.of(state).key,
-                        stage_id=stage.stage_id,
-                        awaiting=required,
-                        accepted=tuple(accepted),
-                    )
                 try:
                     frozen = freeze_candidate(
                         stage, sparring_dir, repo_root, expected_branch=state.expected_branch
@@ -4550,6 +5343,7 @@ def _drive(
                         f"{repository.branch} pinned and verified at {repository.candidate_sha}"
                     )
                 accepted.append((stage.stage_id, result.candidate_sha))
+                _record_accepted(state, state_path, stage)
                 activity.emit("plan.stage.accepted", sha=result.candidate_sha)
                 # The reviewer's own words for what this acceptance does and
                 # does not claim. A stage accepted with a deferred obligation
@@ -4589,6 +5383,7 @@ def _drive(
                 upcoming.gates_before,
                 checkpoint=before_stage_checkpoint(upcoming.stage_id),
                 report=report,
+                blocked=upcoming.label,
             )
             if gated:
                 return _stop_for_deferred(
@@ -4687,6 +5482,8 @@ __all__ = [
     "PlanStage",
     "PlannedStage",
     "RecordedRun",
+    "acknowledge_remote_movement",
+    "authorize_pushed_candidate",
     "describe_source",
     "find_runs",
     "legacy_run_key",

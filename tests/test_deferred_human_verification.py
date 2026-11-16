@@ -13,6 +13,7 @@ nothing here second-guesses it.
 
 import json
 import unittest
+from unittest import mock
 
 import conftest_path  # noqa: F401
 
@@ -689,7 +690,6 @@ class _FinalizingStageAdapter:
         else:
             _git(self.repo, "add", "-A", "implementation.txt")
             _git(self.repo, "commit", "-q", "-m", "finalize the reviewed tree")
-            _git(self.repo, "push", "-q", "origin", "feature/x")
         return StageAgentResult(session_id=session_id, text="claims", is_error=False)
 
     def start(self, prompt: str):
@@ -815,19 +815,24 @@ class ObligationCannotBeLostTests(_DeferredRunCase):
             ["contrast", "resize-readability"],
         )
 
-    def test_a_deferral_survives_a_resume_that_only_pushes_an_authorized_candidate(self):
-        # The run stops for push permission *before* the ledger is written,
-        # and the resume that answers it runs no agent at all -- so there is
-        # no fresh verdict to fold in, only the recorded one.
+    def test_a_deferral_survives_a_resume_that_only_completes_a_recorded_ready(self):
+        # Plan L (was: "...only pushes an authorized candidate"; runs no
+        # longer push). The run stops between the reviewer's READY and the
+        # acceptance gate *before* the ledger is written -- here it is
+        # interrupted -- and the resume that completes it runs no agent at
+        # all, so there is no fresh verdict to fold in, only the recorded one.
         stage_adapter = _StageAdapter(self.repo, commit=True, push=False)
-        first = self._start(stage_adapter, _SparringAdapter([READY_WITH_DEFERRAL]))
-        self.assertIsNotNone(first.awaiting)
+        with mock.patch("agent_sparring.plan.freeze_candidate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self._start(stage_adapter, _SparringAdapter([READY_WITH_DEFERRAL]))
         self.assertEqual(self._plan_state().deferred_human_checks, ())
+        calls = len(stage_adapter.start_calls) + len(stage_adapter.resume_calls)
 
-        sha = self._stage(S1).read_state().candidate_sha or first.awaiting.candidate_sha
-        result = self._resume(
-            stage_adapter, _SparringAdapter([READY]), allow_push_candidate=sha
-        )
+        sparring = _SparringAdapter([READY])
+        result = self._resume(stage_adapter, sparring, stop_after_stage=S1)
+        # No agent ran for the stage the resume completed.
+        self.assertEqual(len(stage_adapter.start_calls) + len(stage_adapter.resume_calls), calls)
+        self.assertEqual(len(sparring.start_calls) + len(sparring.resume_calls), 0)
         # The stage accepted, and the obligation its recorded verdict raised
         # is in the ledger even though no agent ran in this process.
         owed = self._plan_state().deferred_human_checks

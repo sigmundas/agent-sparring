@@ -178,20 +178,30 @@ class CandidateRepository:
     with the resolved HEAD, and from then on it is the pinned candidate. A
     declaration that already carries a ``candidate_sha`` is an assertion:
     freezing refuses if the sibling is not exactly there.
+
+    ``base_sha`` is the sibling's commit when the stage was entered, the
+    sibling's counterpart of the stage's own ``base_sha``: its candidate must
+    descend from it (see :mod:`agent_sparring.run_history`). ``None`` -- and
+    absent from ``state.json`` -- for a declaration recorded before it
+    existed, or a sibling that was not a repository yet.
     """
 
     name: str
     path: str
     branch: str
     candidate_sha: str | None = None
+    base_sha: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "name": self.name,
             "path": self.path,
             "branch": self.branch,
             "candidate_sha": self.candidate_sha,
         }
+        if self.base_sha is not None:
+            payload["base_sha"] = self.base_sha
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Any) -> "CandidateRepository":
@@ -204,11 +214,15 @@ class CandidateRepository:
         sha = payload.get("candidate_sha")
         if sha is not None and not isinstance(sha, str):
             raise StageError("repository entry field 'candidate_sha' must be a string or null")
+        base = payload.get("base_sha")
+        if base is not None and not isinstance(base, str):
+            raise StageError("repository entry field 'base_sha' must be a string or null")
         return cls(
             name=str(payload["name"]),
             path=str(payload["path"]),
             branch=str(payload["branch"]),
             candidate_sha=sha,
+            base_sha=base,
         )
 
 
@@ -390,6 +404,65 @@ class TurnCandidate:
         for repo in self.repositories:
             text += f", sibling {repo.name} at {repo.head_sha or 'unresolved'}"
         return text
+
+
+@dataclass(frozen=True)
+class ReviewRecord:
+    """The reviewer's latest verdict and exactly what it was given over,
+    recorded by the engine when the verdict is written (see
+    :func:`agent_sparring.acceptance.record_review`).
+
+    ``head_sha`` is the primary repository's ``HEAD`` at the verdict and
+    ``clean`` whether its working tree then held nothing that commit does
+    not represent; ``repositories`` is each declared sibling's ``HEAD`` by
+    name, and ``dirty_repositories`` names every sibling whose working tree
+    then held changes its ``HEAD`` does not represent. Acceptance needs this
+    at the exact candidate set, clean in every repository (I-L2).
+
+    ``head_sha`` is ``None`` when what the verdict was over could not be
+    captured: the record then still replaces any earlier one, and can never
+    authorize an acceptance."""
+
+    action: str
+    head_sha: str | None
+    clean: bool
+    repositories: tuple[SiblingPin, ...] = ()
+    dirty_repositories: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "action": self.action,
+            "head_sha": self.head_sha,
+            "clean": self.clean,
+        }
+        if self.repositories:
+            payload["repositories"] = [repo.to_dict() for repo in self.repositories]
+        if self.dirty_repositories:
+            payload["dirty_repositories"] = list(self.dirty_repositories)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "ReviewRecord":
+        if not isinstance(payload, dict):
+            raise StageError("state.json field 'review' must be an object or null")
+        action = _optional_str_field(payload, "action")
+        head = _optional_str_field(payload, "head_sha")
+        clean = payload.get("clean")
+        if not action or not isinstance(clean, bool):
+            raise StageError("state.json field 'review' needs action, head_sha and clean")
+        raw = payload.get("repositories") or []
+        if not isinstance(raw, list):
+            raise StageError("review.repositories must be a list")
+        dirty = payload.get("dirty_repositories") or []
+        if not isinstance(dirty, list) or not all(isinstance(name, str) for name in dirty):
+            raise StageError("review.dirty_repositories must be a list of names")
+        return cls(
+            action=action,
+            head_sha=head,
+            clean=clean,
+            repositories=tuple(SiblingPin.from_dict(entry) for entry in raw),
+            dirty_repositories=tuple(dirty),
+        )
 
 
 @dataclass(frozen=True)
@@ -582,9 +655,17 @@ class StageState:
     # until a fresh session is first started; until then the recorded
     # session ids above *are* generation 1.
     sessions: dict[str, list[SessionGeneration]] = field(default_factory=dict)
+    # The reviewer's latest verdict and what it was given over (see
+    # ReviewRecord). ``None`` -- and absent from state.json -- until the
+    # engine records a verdict, so existing files stay byte-identical.
+    review: ReviewRecord | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        if self.review is None:
+            payload.pop("review", None)
+        else:
+            payload["review"] = self.review.to_dict()
         if self.next_turn is None:
             payload.pop("next_turn", None)
         if self.next_turn_candidate is None:
@@ -728,6 +809,11 @@ class StageState:
             # execution -- its legacy run instance -- so reading it as the
             # owning run is not an interpretation, it is what it recorded.
             run=_optional_str_field(payload, "run" if "run" in payload else "plan"),
+            review=(
+                ReviewRecord.from_dict(payload["review"])
+                if payload.get("review") is not None
+                else None
+            ),
         )
 
 

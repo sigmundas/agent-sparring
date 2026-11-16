@@ -175,11 +175,10 @@ class _StageAdapter:
             path.write_text(body, encoding="utf-8")
 
     def _mode_commit(self) -> None:
-        """Commit and push exactly what is in the worktree."""
+        """Commit exactly what is in the worktree (the engine pushes)."""
 
         _run_git(self.repo, "add", "-A")
         _run_git(self.repo, "commit", "-q", "-m", "stage work")
-        _run_git(self.repo, "push", "-q", "origin", "HEAD")
 
     def _mode_commit_and_alter(self) -> None:
         """"Improve" one reviewed file on the way past, then commit."""
@@ -196,7 +195,6 @@ class _StageAdapter:
 
         _run_git(self.repo, "add", "ui/measurement_content_view.py")
         _run_git(self.repo, "commit", "-q", "-m", "part of the stage work")
-        _run_git(self.repo, "push", "-q", "origin", "HEAD")
 
     def _mode_noop(self) -> None:
         """A turn that reports success and changes nothing."""
@@ -344,14 +342,14 @@ class HumanGatedStageLifecycleTests(_RepoCase):
         self.assertEqual(s1.candidate_sha, accepted_sha)
         self.assertEqual(s1.base_sha, base)
 
-        # 4. The accepted commit contains the work the human verified, and
-        #    it is pushed -- the whole point of the invariant.
+        # 4. The accepted commit contains the work the human verified -- the
+        #    whole point of the invariant. Runs are local-first (Plan L): it
+        #    is the branch's local HEAD, and the remote is left as it was.
         committed = _run_git(self.repo, "show", "--name-only", "--format=", accepted_sha)
         for name in IMPLEMENTATION:
             self.assertIn(name, committed)
-        self.assertEqual(
-            _run_git(self.remote, "rev-parse", "refs/heads/feature/x"), accepted_sha
-        )
+        self.assertEqual(_run_git(self.repo, "rev-parse", "refs/heads/feature/x"), accepted_sha)
+        self.assertEqual(_run_git(self.remote, "rev-parse", "refs/heads/feature/x"), base)
         self.assertEqual(
             _run_git(self.repo, "status", "--porcelain", "--untracked-files=all"), ""
         )
@@ -614,9 +612,10 @@ class StuckRunRecoveryTests(_RepoCase):
         self.assertNotEqual(accepted, base)
         self.assertEqual(accepted, _head(self.repo))
         self.assertIs(stage.read_state().status, StageStatus.ACCEPTED)
-        self.assertEqual(
-            _run_git(self.remote, "rev-parse", "refs/heads/feature/x"), accepted
-        )
+        # Local-first (Plan L): accepted as the branch's local HEAD; the
+        # remote never receives it from the engine.
+        self.assertEqual(_run_git(self.repo, "rev-parse", "refs/heads/feature/x"), accepted)
+        self.assertNotEqual(_run_git(self.remote, "rev-parse", "refs/heads/feature/x"), accepted)
         # Both recorded sessions were reused, not replaced.
         self.assertEqual(stage.read_state().implementation_session_id, "impl-1")
         self.assertEqual(stage.read_state().sparring_session_id, "spar-1")
@@ -643,7 +642,6 @@ class StuckRunRecoveryTests(_RepoCase):
         stage = self._leave_stuck()
         _run_git(self.repo, "add", "-A")
         _run_git(self.repo, "commit", "-q", "-m", "committed by hand meanwhile")
-        _run_git(self.repo, "push", "-q", "origin", "HEAD")
 
         stage_adapter = _StageAdapter(self.repo, ["noop", "noop"])
         result = self._resume(stage_adapter, _SparringAdapter([READY, NEEDS_YOU]))

@@ -77,6 +77,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from agent_sparring import engine_git
 from agent_sparring.acceptance import STAGE_ARTIFACT_FILENAMES
 from agent_sparring.prompt_capture import PROMPTS_DIRNAME, is_prompt_artifact
 from agent_sparring.git_context import (
@@ -238,13 +239,13 @@ def _uncommitted_content_paths(repo_root: Path, stage: Stage) -> tuple[str, ...]
 
 
 def _git(repo_root: Path, *args: str, env: dict[str, str] | None = None) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), *args],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-    )
+    # The one engine Git path (see agent_sparring.engine_git): ``git add``
+    # into the throwaway index runs no clean filter, and nothing here runs a
+    # hook. ``env`` is applied over its sanitized environment.
+    try:
+        result = engine_git.run(repo_root, *args, env=env)
+    except engine_git.GitContextError as exc:
+        raise FinalizationError(str(exc)) from exc
     if result.returncode != 0:
         raise FinalizationError(
             result.stderr.strip() or f"git {' '.join(args)} failed in {repo_root}"
@@ -264,7 +265,7 @@ def _read_content(
     """
 
     with tempfile.TemporaryDirectory(prefix="agent-sparring-index-") as tmp:
-        env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
+        env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
         _git(repo_root, "read-tree", rev, env=env)
         if include_worktree:
             _git(repo_root, "add", "-A", env=env)

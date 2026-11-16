@@ -10,20 +10,37 @@ the lock file outside the repository.
 
 Eligibility is advice, never a token: a finish that executes re-runs every
 check itself.
+
+Both are local (Plan L): no remote is read, and a finish merges into the
+local target branch of every participating repository and contacts none.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import os
 import shutil
 import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from agent_sparring import managed_run
+from agent_sparring import engine_git, managed_run, trusted_snapshots
+from agent_sparring.capabilities import (
+    REMOTE_FINISH_REMOVED,
+    delete_remote_branch_removed,
+    push_target_removed,
+)
 from agent_sparring.concurrency import WorktreeLockError, worktree_lock
 from agent_sparring.managed_run import ManagedRunError, ManagedRunRecord
+from agent_sparring.run_history import (
+    RUN_HISTORY_REWRITTEN,
+    RunHistoryError,
+    describe_repository,
+    run_accepted,
+)
+from agent_sparring.trusted_snapshots import TRUSTED_CONFIG_MISSING
 
 #: The ``finish`` object of ``runs --json`` / ``finish-run --dry-run``; its shape is unchanged.
 FINISH_SCHEMA_VERSION = 1
@@ -56,6 +73,7 @@ def _empty_git() -> dict[str, Any]:
         "target_tip": None,
         "target_contains_candidate": None,
         "target_checked_out_at": None,
+        "siblings": [],
     }
 
 
@@ -113,31 +131,18 @@ def _status(cwd: Path, *, all_untracked: bool = False) -> list[tuple[str, str]]:
     return entries
 
 
-def _remote_contains(cwd: Path, remote: str, branch: str, candidate: str) -> tuple[bool, str]:
-    """Is ``candidate`` reachable from ``refs/heads/<branch>`` on the record's
-    ``remote`` -- bound to the record, never to mutable upstream config."""
-
-    ref = f"refs/heads/{branch}"
-    result = managed_run._git(cwd, "ls-remote", "--exit-code", remote, ref)
-    if result.returncode != 0:
-        return False, f"{remote} has no {ref} ({result.stderr.strip() or 'ls-remote found nothing'})"
-    remote_sha = (result.stdout.split() or [""])[0]
-    if remote_sha == candidate:
-        return True, f"{remote}/{branch} is exactly {candidate}"
-    if _rev(cwd, remote_sha) is None:
-        return False, f"{remote}/{branch} is at {remote_sha}, which is not present locally; fetch and re-check"
-    if _is_ancestor(cwd, candidate, remote_sha):
-        return True, f"{candidate} is reachable from {remote}/{branch} ({remote_sha})"
-    return False, f"{candidate} is not reachable from {remote}/{branch} ({remote_sha})"
-
-
 def _is_ancestor(cwd: Path, ancestor: str, descendant: str) -> bool:
     return managed_run._git(cwd, "merge-base", "--is-ancestor", ancestor, descendant).returncode == 0
 
 
-def _final_candidate(record: ManagedRunRecord, state: Any) -> tuple[bool, str, str | None]:
-    """``(every stage accepted, detail, last accepted stage's candidate)``
-    in plan order, read from the run's own stage states."""
+def _final_candidate(
+    record: ManagedRunRecord, state: Any
+) -> tuple[bool, str, str | None, tuple[Any, ...]]:
+    """``(every stage accepted, detail, last accepted stage's candidate,
+    each sibling's last accepted candidate)`` in plan order, read from the
+    run's own stage states. A sibling is ``(its accepted
+    :class:`~agent_sparring.stage.CandidateRepository`, its root resolved
+    against the run's worktree)``."""
 
     from agent_sparring.plan import MarkdownPlanSource, load_plan_source
     from agent_sparring.stage import Stage, StageStatus
@@ -147,8 +152,9 @@ def _final_candidate(record: ManagedRunRecord, state: Any) -> tuple[bool, str, s
     if isinstance(source, MarkdownPlanSource):
         source = source.in_namespace(record.run_key)
     if source.digest() != state.plan_digest:
-        return False, f"{record.input_path} no longer matches the plan this run executed", None
+        return False, f"{record.input_path} no longer matches the plan this run executed", None, ()
     candidate: str | None = None
+    siblings: dict[tuple[str, str], Any] = {}
     unaccepted: list[str] = []
     for planned in source.stages():
         stage = Stage.resolve(record.sparring_dir, planned.stage_id)
@@ -162,9 +168,15 @@ def _final_candidate(record: ManagedRunRecord, state: Any) -> tuple[bool, str, s
             unaccepted.append(planned.stage_id)
             continue
         candidate = stage_state.candidate_sha
+        for repository in stage_state.repositories:
+            if repository.candidate_sha:
+                siblings.pop((repository.name, repository.path), None)
+                siblings[(repository.name, repository.path)] = (
+                    repository, (worktree / repository.path).resolve()
+                )
     if unaccepted:
-        return False, "not accepted by this run: " + ", ".join(unaccepted), candidate
-    return True, "every stage is accepted", candidate
+        return False, "not accepted by this run: " + ", ".join(unaccepted), candidate, ()
+    return True, "every stage is accepted", candidate, tuple(siblings.values())
 
 
 def _ignored(worktree: Path, *pathspec: str, directory: bool = False) -> list[str]:
@@ -268,58 +280,26 @@ _IN_PROGRESS = (
     ("BISECT_LOG", "a bisect"),
 )
 
-# Remote branch deletion policy. The remote managed branch is deleted only
-# when the reviewed candidate's ``[finish] delete_remote_branch`` is true,
-# and only as a compare-and-delete at the mutation itself:
-# ``git push --force-with-lease=refs/heads/<b>:<candidate> <remote> --delete
-# refs/heads/<b>`` -- the server refuses the delete unless the ref is
-# exactly the merged candidate, so a concurrent push is never dropped. This
-# is the single use of force in this module (a test pins it). Before the
-# push the remote is read at its push URL -- an absent branch needs no
-# delete, and a remote target not yet containing the candidate keeps the
-# branch (``remote_target_missing_candidate``) -- but those reads only
-# inform; the lease is the guard. The "target contains the candidate" read
-# is point-in-time: the target may move after it, and only the branch
-# deletion itself is lease-guarded. A remote with several push URLs is not
-# deleted from (``remote_multiple_push_urls``: no per-URL lease), and a
-# push-only endpoint whose ``ls-remote`` fails cannot use the option
-# (``remote_unreachable``). A refused push is classified from its own
-# porcelain status lines; it is deleted only when every line says so. Any refusal keeps the branch and stops the finish
-# at ``delete_remote_branch``, unfinished, so a re-run resumes.
+# A finish is local (Plan L, I-L1): it merges into the local target branch of
+# every participating repository -- the primary and each sibling the run
+# accepted a candidate in -- after the run's accepted history is shown to be
+# preserved in each (I-L2b), and cleans up locally. It contacts no remote:
+# nothing is read from one, pushed to one or deleted on one. A record's
+# ``remote`` and a legacy run's pin load inertly and are never read to
+# finish. ``--push-target`` and a reviewed candidate whose ``[finish]
+# delete_remote_branch`` is true refuse with ``remote_finish_removed`` (see
+# :mod:`agent_sparring.capabilities`); publishing is Push to review.
 #
-# When the policy is false the branch is kept and reported both with the
-# precise ``remote_branch.code`` ``remote_delete_disabled`` and with the
-# legacy ``kept`` entry ``keep_remote_branch``/``remote_delete_unavailable``:
-# that code is a compatibility alias kept for one release and removed in
-# the next.
-REMOTE_DELETE_UNAVAILABLE = "[finish] delete_remote_branch is not enabled, so the remote branch is kept"
-REMOTE_DELETE_LEASE = "--force-with-lease"
-REMOTE_KEEP_CODES = (
-    "remote_lease_mismatch", "remote_unreachable", "remote_delete_rejected", "remote_target_missing_candidate",
-    "remote_target_unknown", "remote_multiple_push_urls",
-)
+# The report's ``kept`` is always empty and its ``remote_branch`` says the
+# finish is local (``local_finish``), unless an older engine recorded a
+# remote branch deletion for a run it finished.
+LOCAL_FINISH = "local_finish"
+LOCAL_FINISH_DETAIL = "finish-run is local: no remote branch is read, pushed or deleted"
 
-
-def _kept_remote(repo_root: Path, record: ManagedRunRecord, candidate: str | None,
-                 code: str | None = None, detail: str | None = None) -> list[dict[str, str]]:
-    """The ``keep_remote_branch`` entry for a record with a remote.
-
-    ``code`` names why the branch is still there: a refusal of the delete,
-    or -- when ``None`` -- the policy: ``remote_delete_planned`` when the
-    candidate's config enables deletion (it is still kept until finish
-    deletes it), else the alias ``remote_delete_unavailable``."""
-
-    if not record.remote:
-        return []
-    where = f"{record.remote}/{record.branch}"
-    if code is None:
-        if candidate and _finish_policy(repo_root, record, candidate)["delete_remote_branch"]:
-            code = "remote_delete_planned"
-            detail = f"kept until finish-run deletes it with a lease on {candidate}"
-        else:
-            code = "remote_delete_unavailable"
-            detail = REMOTE_DELETE_UNAVAILABLE
-    return [{"action": "keep_remote_branch", "code": code, "detail": f"{where}: {detail}"}]
+# A sibling's target is the branch of the run's own target name in that
+# sibling repository. A sibling's branch is the plan's declaration, never a
+# managed one, so finish merges its accepted candidate and deletes nothing
+# there.
 
 
 # Checks that block only cleanup; a merge (``--merge-only``) may still run.
@@ -360,6 +340,7 @@ def finish_status(
 
     state = None
     candidate: str | None = None
+    siblings: tuple[Any, ...] = ()
     try:
         state_path = record.sparring_dir / "plans" / f"{record.run_key}.json"
         state = PlanRunState.load(state_path) if state_path.is_file() else None
@@ -372,7 +353,7 @@ def finish_status(
             checks.add("run_not_complete", False, f"the run is {state.status.value}, not complete")
         else:
             try:
-                accepted, detail, candidate = _final_candidate(record, state)
+                accepted, detail, candidate, siblings = _final_candidate(record, state)
             except Exception as exc:  # noqa: BLE001 -- any unreadable input or stage is "not complete"
                 accepted, detail = False, f"the run's stages cannot be read: {exc}"
             checks.add("run_not_complete", accepted, f"the run is complete; {detail}" if accepted else detail)
@@ -451,15 +432,16 @@ def finish_status(
         f"HEAD, {record.branch} and the final accepted candidate are {candidate}" if agreed
         else f"HEAD {git['head']}, branch tip {git['branch_tip']}, final accepted candidate {candidate} differ",
     )
-    if record.remote:
-        if candidate and present:
-            pushed, detail = _remote_contains(worktree, record.remote, record.branch, candidate)
-        else:
-            pushed, detail = False, "no candidate in a present worktree to check against the remote"
-        git["candidate_pushed"] = pushed
-        checks.add("candidate_not_pushed", pushed, detail)
+    # I-L2b at finish: every candidate the run accepted here is an ancestor
+    # of the one commit the finish integrates. Nothing remote is read.
+    try:
+        history = run_accepted(record.sparring_dir, record.run_key)
+    except (RunHistoryError, ManagedRunError) as exc:
+        history, history_error = (), f"the run's accepted history cannot be read: {exc}"
     else:
-        checks.add("candidate_not_pushed", True, "the record has no remote")
+        history_error = None
+    if candidate is not None:
+        _history_check(checks, repo_root, history, history_error, None, candidate)
 
     others = [e["path"] for e in entries if e["branch"] == record.branch and e["path"] != str(worktree.resolve())]
     checks.add(
@@ -528,11 +510,26 @@ def finish_status(
             checks.add("target_advanced", True, f"{record.target_branch} has not diverged from the candidate")
             checks.add("merge_conflict", True, "no merge commit is needed")
 
-    kept = _kept_remote(repo_root, record, candidate)
+    # -- the siblings ---------------------------------------------------------------
+    snapshots = _snapshots_of(state)
+    for repository, root in siblings:
+        git["siblings"].append(_sibling_status(
+            checks, record, repository, root, history, history_error,
+            allow_merge_commit=allow_merge_commit, snapshots=snapshots,
+        ))
+
+    # -- no remote finish ---------------------------------------------------------
+    policy = _finish_policy(repo_root, record, candidate)
+    checks.add(
+        REMOTE_FINISH_REMOVED, not policy["delete_remote_branch"],
+        delete_remote_branch_removed(policy["source"]) if policy["delete_remote_branch"]
+        else LOCAL_FINISH_DETAIL,
+    )
+
     if not all(item["ok"] for item in checks.items if item["code"] not in CLEANUP_CHECKS):
         return {"git": git, "finish": _finish(
             record.run_key, managed=True, checks=checks, merge_mode=merge_mode,
-            deleted_ignored=deleted_ignored, kept=kept,
+            deleted_ignored=deleted_ignored,
         )}
 
     # Every merge check passed: after the planned merge the target contains the candidate.
@@ -542,7 +539,12 @@ def finish_status(
         actions.append(f"fast-forward {record.target_branch} to {candidate}")
     elif merge_mode == "merge_commit":
         actions.append(f"merge {candidate} into {record.target_branch} with a merge commit")
-    policy = _finish_policy(repo_root, record, candidate)
+    for sibling in git["siblings"]:
+        where = f"{record.target_branch} of sibling repository {sibling['name']!r}"
+        if sibling["merge_mode"] == "fast_forward":
+            actions.append(f"fast-forward {where} to {sibling['candidate']}")
+        elif sibling["merge_mode"] == "merge_commit":
+            actions.append(f"merge {sibling['candidate']} into {where} with a merge commit")
     if policy["remove_plan"]:
         actions.append(
             f"remove the plan {record.input_path} from {record.target_branch} in a commit of its own, "
@@ -554,17 +556,113 @@ def finish_status(
             f"remove worktree {record.worktree_path}",
             f"delete local branch {record.branch}",
         ]
-        if record.remote and policy["delete_remote_branch"]:
-            actions.append(
-                f"delete remote branch {record.remote}/{record.branch} only while it is exactly {candidate} (lease)"
-            )
-        else:
-            actions += [f"keep remote branch {record.remote}/{record.branch} ({item['code']})" for item in kept]
     return {"git": git, "finish": _finish(
         record.run_key, managed=True, checks=checks, merge_mode=merge_mode,
         eligible_merge=True, eligible_cleanup=cleanup, actions=actions,
-        deleted_ignored=deleted_ignored, kept=kept,
+        deleted_ignored=deleted_ignored,
     )}
+
+
+def _snapshots_of(state: Any) -> Any:
+    """The trusted snapshots ``state`` holds, or ``None`` when it holds none
+    that can be read (the finish's guard refuses that case on its own)."""
+
+    if state is None:
+        return None
+    try:
+        return trusted_snapshots.from_run_state(state.to_dict())
+    except trusted_snapshots.SnapshotError:
+        return None
+
+
+def _history_check(checks: _Checks, root: Path, history: tuple[Any, ...], error: str | None,
+                   repository: Any, candidate: str) -> bool:
+    """Add one repository's ``run_history_rewritten`` check (I-L2b): every
+    candidate the run accepted in it is an ancestor of (or equal to)
+    ``candidate``, the commit the finish integrates there."""
+
+    label = describe_repository(repository)
+    if error is not None:
+        return checks.add(RUN_HISTORY_REWRITTEN, False, f"{label}: {error}")
+    key = (None, None) if repository is None else (repository.name, repository.path)
+    for entry in history:
+        if entry.key == key and not _is_ancestor(root, entry.sha, candidate):
+            return checks.add(
+                RUN_HISTORY_REWRITTEN, False,
+                f"{label}: the candidate accepted by stage {entry.stage_id!r} ({entry.sha}) is not an "
+                f"ancestor of {candidate}, the commit this finish would integrate; the run's accepted "
+                "history was rewritten, so nothing is merged",
+            )
+    return checks.add(
+        RUN_HISTORY_REWRITTEN, True,
+        f"{label}: every candidate the run accepted is an ancestor of {candidate}",
+    )
+
+
+def _sibling_status(checks: _Checks, record: ManagedRunRecord, repository: Any, root: Path,
+                    history: tuple[Any, ...], history_error: str | None, *,
+                    allow_merge_commit: bool, snapshots: Any) -> dict[str, Any]:
+    """Check one sibling repository's local merge of its accepted candidate
+    into its own ``record.target_branch``, adding ``run_history_rewritten``
+    and ``sibling_merge`` checks; returns its ``git["siblings"]`` entry."""
+
+    candidate = repository.candidate_sha
+    target_ref = f"refs/heads/{record.target_branch}"
+    where = f"{describe_repository(repository)}"
+    entry: dict[str, Any] = {
+        "name": repository.name, "path": str(root), "candidate": candidate,
+        "target_branch": record.target_branch, "target_tip": None,
+        "target_checked_out_at": None, "merge_mode": None,
+    }
+    if snapshots is not None and snapshots.primary is not None and snapshots.for_sibling(root) is None:
+        checks.add("sibling_merge", False, f"{where}: {TRUSTED_CONFIG_MISSING}: the run holds no "
+                   "trusted configuration snapshot for it, so no Git command runs there")
+        return entry
+    if not (root / ".git").exists() or _rev(root, candidate) is None:
+        checks.add("sibling_merge", False, f"{where}: its accepted candidate {candidate} is not present there")
+        return entry
+    _history_check(checks, root, history, history_error, repository, candidate)
+    target_tip = _rev(root, target_ref)
+    entry["target_tip"] = target_tip
+    if target_tip is None:
+        checks.add("sibling_merge", False, f"{where}: target branch {record.target_branch} does not exist")
+        return entry
+    try:
+        worktrees = managed_run.worktree_list(root)
+        target_at = next((e["path"] for e in worktrees if e["branch"] == record.target_branch), None)
+        entry["target_checked_out_at"] = target_at
+        problems: list[str] = []
+        if target_at is not None:
+            tracked = [path for code, path in _status(Path(target_at)) if code not in ("??", "!!")]
+            if tracked:
+                problems.append(f"{target_at} has staged or modified files: " + ", ".join(tracked[:10]))
+            operations = _operations_in_progress(Path(target_at))
+            if operations:
+                problems.append(f"{target_at} has {', '.join(operations)} in progress")
+    except ManagedRunError as exc:
+        problems = [str(exc)]
+    if _is_ancestor(root, candidate, target_tip):
+        mode = "already_merged"
+    elif _is_ancestor(root, target_tip, candidate):
+        mode = "fast_forward"
+    else:
+        mode = "merge_commit"
+        if not allow_merge_commit:
+            problems.append(
+                f"{record.target_branch} has diverged from {candidate}; only a merge commit can finish it "
+                "(--allow-merge-commit)"
+            )
+        simulated = managed_run._git(root, "merge-tree", "--write-tree", "--no-messages", target_tip, candidate)
+        if simulated.returncode != 0:
+            problems.append("the merge conflicts" if simulated.returncode == 1
+                            else f"the merge could not be simulated: {simulated.stderr.strip()}")
+    entry["merge_mode"] = mode
+    checks.add(
+        "sibling_merge", not problems,
+        f"{where}: " + ("; ".join(problems) if problems
+                        else f"{record.target_branch} at {target_tip} can take {candidate} ({mode})"),
+    )
+    return entry
 
 
 def runs_report(repo_root: Path) -> dict[str, Any]:
@@ -583,14 +681,14 @@ def runs_report(repo_root: Path) -> dict[str, Any]:
 FINISH_STEPS = (
     "merge",
     "remove_plan",
-    "push_target",
     "archive_state",
     "remove_worktree",
     "delete_branch",
-    "delete_remote_branch",
     "finished",
 )
 # The step each recorded event proves done, for reporting a finished run.
+# ``target_pushed`` and ``remote_branch_deleted`` are only ever an older
+# engine's record of a run it finished, reported as history.
 _EVENT_STEPS = (
     ("merged", "merge"),
     ("plan_removed", "remove_plan"),
@@ -604,12 +702,10 @@ _EVENT_STEPS = (
 )
 
 
-def _planned_steps(*, merge_only: bool, push_target: bool, remove_plan: bool, delete_remote: bool) -> list[str]:
-    steps = ["merge"] + (["remove_plan"] if remove_plan else []) + (["push_target"] if push_target else [])
+def _planned_steps(*, merge_only: bool, remove_plan: bool) -> list[str]:
+    steps = ["merge"] + (["remove_plan"] if remove_plan else [])
     if not merge_only:
-        steps += ["archive_state", "remove_worktree", "delete_branch"]
-        steps += ["delete_remote_branch"] if delete_remote else []
-        steps.append("finished")
+        steps += ["archive_state", "remove_worktree", "delete_branch", "finished"]
     return steps
 ARCHIVE_SUBDIR = Path("agent-sparring") / "runs"
 
@@ -623,19 +719,6 @@ class _StepFailed(Exception):
 
 def _events(record: ManagedRunRecord, name: str) -> list[dict[str, Any]]:
     return [event for event in record.events if event["event"] == name]
-
-
-def _remote_sha(cwd: Path, remote: str, branch: str) -> tuple[bool, str | None, str]:
-    """``(ls-remote succeeded, sha or None when absent, error)``."""
-
-    result = managed_run._git(cwd, "ls-remote", remote, f"refs/heads/{branch}")
-    if result.returncode != 0:
-        return False, None, result.stderr.strip() or f"git ls-remote {remote} failed"
-    for line in result.stdout.splitlines():
-        sha, _, ref = line.partition("\t")
-        if ref == f"refs/heads/{branch}":
-            return True, sha, ""
-    return True, None, ""
 
 
 def archive_dir(repo_root: Path, run_key: str) -> Path:
@@ -772,9 +855,7 @@ def _candidate_config(repo_root: Path, record: ManagedRunRecord, candidate: str)
     from agent_sparring.config import CONFIG_FILENAME, ProjectConfigError, parse_project_config
 
     spec = f"{candidate}:{(Path(record.project_dir) / CONFIG_FILENAME).as_posix()}"
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), "show", spec], capture_output=True, check=False
-    )
+    result = managed_run._git_bytes(repo_root, "show", spec)
     if result.returncode != 0:
         return None, f"{spec} cannot be read"
     try:
@@ -784,28 +865,41 @@ def _candidate_config(repo_root: Path, record: ManagedRunRecord, candidate: str)
 
 
 def _finish_policy(repo_root: Path, record: ManagedRunRecord, candidate: str | None) -> dict[str, Any]:
-    """The candidate's ``[finish]`` opt-ins; both false when unreadable,
-    with ``error`` saying why (reported as ``finish_config_unreadable``)."""
+    """The candidate's ``[finish]`` settings; both false when unreadable,
+    with ``error`` saying why (reported as ``finish_config_unreadable``).
+    ``delete_remote_branch`` is read only to refuse it
+    (``remote_finish_removed``); ``source`` names the config it came from."""
 
     config, detail = _candidate_config(repo_root, record, candidate) if candidate else (None, "no candidate")
     return {
         "delete_remote_branch": bool(config is not None and config.finish_delete_remote_branch),
         "remove_plan": bool(config is not None and config.finish_remove_plan),
         "error": None if config is not None or not candidate else detail,
+        "source": detail if config is not None else None,
     }
 
 
 def _merge(record: ManagedRunRecord, git: dict[str, Any], merge_mode: str, repo_root: Path) -> dict[str, Any]:
-    candidate = git["final_candidate"]
-    old_tip = git["target_tip"]
-    target_ref = f"refs/heads/{record.target_branch}"
-    checkout = git["target_checked_out_at"]
+    return _merge_into(
+        repo_root, target_branch=record.target_branch, source_branch=record.branch,
+        candidate=git["final_candidate"], old_tip=git["target_tip"],
+        checkout=git["target_checked_out_at"], merge_mode=merge_mode,
+    )
+
+
+def _merge_into(repo_root: Path, *, target_branch: str, source_branch: str, candidate: str,
+                old_tip: str, checkout: str | None, merge_mode: str) -> dict[str, Any]:
+    """Merge ``candidate`` into ``target_branch`` of the repository at
+    ``repo_root`` exactly as the checks saw it: in its checkout when one has
+    it, else as a compare-and-swap of the ref. Local only."""
+
+    target_ref = f"refs/heads/{target_branch}"
     now_at = next(
-        (e["path"] for e in managed_run.worktree_list(repo_root) if e["branch"] == record.target_branch), None
+        (e["path"] for e in managed_run.worktree_list(repo_root) if e["branch"] == target_branch), None
     )
     if now_at != checkout:
         raise _StepFailed(
-            "merge", f"target_moved: {record.target_branch} is now checked out at {now_at or 'no checkout'}, "
+            "merge", f"target_moved: {target_branch} is now checked out at {now_at or 'no checkout'}, "
             f"not {checkout or 'no checkout'}; nothing was merged",
         )
     if checkout is not None:
@@ -846,7 +940,7 @@ def _merge(record: ManagedRunRecord, git: dict[str, Any], merge_mode: str, repo_
                 raise _StepFailed("merge", "the merge conflicts" if tree.returncode == 1 else tree.stderr.strip())
             commit = managed_run._git(
                 repo_root, "commit-tree", tree.stdout.split()[0], "-p", old_tip, "-p", candidate,
-                "-m", f"Merge branch '{record.branch}' into {record.target_branch}",
+                "-m", f"Merge branch '{source_branch}' into {target_branch}",
             )
             if commit.returncode != 0:
                 raise _StepFailed("merge", f"git commit-tree failed: {commit.stderr.strip()}")
@@ -856,7 +950,7 @@ def _merge(record: ManagedRunRecord, git: dict[str, Any], merge_mode: str, repo_
             raise _StepFailed("merge", f"{target_ref} moved; nothing was merged ({result.stderr.strip()})")
     target_sha = _rev(repo_root, target_ref)
     if target_sha is None or not _is_ancestor(repo_root, candidate, target_sha):
-        raise _StepFailed("merge", f"{record.target_branch} does not contain {candidate} after the merge")
+        raise _StepFailed("merge", f"{target_branch} does not contain {candidate} after the merge")
     return {"mode": merge_mode, "target_sha": target_sha, "candidate": candidate}
 
 
@@ -930,16 +1024,24 @@ def finish_run(
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Execute a finish: ``(report, finish block when the checks refused)``.
 
+    Local only (I-L1): ``push_target`` refuses with ``remote_finish_removed``
+    before anything is read or changed (see :mod:`agent_sparring.capabilities`).
+
     Holds the worktree lock throughout, re-reads the record under it and
     re-runs every eligibility check itself. Each step is skipped when its
     event is recorded and still true, appends its event when done, and the
-    first failure stops everything after it. The opt-in steps
-    (``remove_plan``, ``delete_remote_branch``) are planned once the merged
-    candidate -- whose own config enables them -- is known."""
+    first failure stops everything after it. The opt-in step
+    (``remove_plan``) is planned once the merged candidate -- whose own
+    config enables it -- is known."""
 
-    planned = _planned_steps(merge_only=merge_only, push_target=push_target, remove_plan=False, delete_remote=False)
+    planned = _planned_steps(merge_only=merge_only, remove_plan=False)
     completed: list[str] = []
-    notes: dict[str, Any] = {"deleted_ignored": [], "kept": [], "plan_removal": None, "remote_branch": None}
+    notes: dict[str, Any] = {
+        "deleted_ignored": [], "kept": [], "plan_removal": None,
+        "remote_branch": _outcome(LOCAL_FINISH, LOCAL_FINISH_DETAIL),
+    }
+    if push_target:
+        return refused_push_target(run_key, merge_only=merge_only), None
     try:
         record = managed_run.read_record(repo_root, run_key)
     except (ManagedRunError, OSError) as exc:
@@ -964,11 +1066,6 @@ def finish_run(
             if not _owned(locked) or locked.worktree_path != record.worktree_path:
                 status = finish_status(repo_root, run_key, lock_held=True)
                 return report("checks", status["finish"]["summary"]), status["finish"]
-            # The remote branch is reported on every return, including
-            # --merge-only, refusals and failures, until it is deleted.
-            merged = _events(locked, "merged")
-            merged_candidate = merged[-1]["detail"].get("candidate") if merged else None
-            notes["kept"] = _kept_remote(repo_root, locked, merged_candidate)
             if _events(locked, "finished"):
                 # Report only what the record shows actually happened.
                 recorded = {event["event"] for event in locked.events}
@@ -976,11 +1073,14 @@ def finish_run(
                 planned[:] = list(completed)
                 notes["plan_removal"] = _recorded_plan_removal(locked)
                 notes["remote_branch"] = _recorded_remote_branch(locked)
-                if notes["remote_branch"]["code"] in ("remote_branch_deleted", "remote_branch_absent"):
-                    notes["kept"] = []
                 return report(None, "the run is already finished"), None
-            return _finish_locked(repo_root, locked, planned, completed, notes, merge_only=merge_only,
-                                  allow_merge_commit=allow_merge_commit, push_target=push_target)
+            # Every Git invocation of the finish, in the primary repository
+            # and in each sibling, is held to that repository's trusted
+            # configuration snapshot: a changed configuration is a typed
+            # refusal, never followed.
+            with _run_guard(repo_root, locked):
+                return _finish_locked(repo_root, locked, planned, completed, notes, merge_only=merge_only,
+                                      allow_merge_commit=allow_merge_commit)
     except WorktreeLockError as exc:
         return report("checks", f"runner_live: {exc}"), None
     except _StepFailed as exc:
@@ -990,6 +1090,77 @@ def finish_run(
         # stops at the step in progress; later steps stay untouched.
         stopped = next((step for step in planned if step not in completed), None)
         return report(stopped, f"{type(exc).__name__}: {exc}"), None
+
+
+def _run_guard(repo_root: Path, record: ManagedRunRecord):
+    """The trusted-configuration guard of ``record``'s run, from the
+    snapshots in its engine-written plan-run state (in the worktree, or in
+    the archive once the worktree is gone): its own local-first snapshots,
+    or for a run recorded before them the trusted snapshot its legacy pin
+    carries -- the local configuration only; the pin's remote destination
+    is never read (I-L1). Every engine Git command of the finish, in the
+    primary repository and in each sibling, is held to its repository's.
+
+    Fails closed, with the run-state integrity refusal
+    (``trusted_config_missing``) before any Git invocation: a copy that
+    exists but cannot be read is never taken to mean "no snapshot", and a
+    run the engine's record outside the project directory says held one
+    (its snapshot record, or a legacy pin record) whose snapshot is gone --
+    state deleted, pin removed or damaged, or replaced with a legacy-shaped
+    file -- refuses. Only a run whose engine record proves it predates both
+    finishes under the hardened Git path alone.
+    """
+
+    roots: list[tuple[Path, str]] = []
+    try:
+        roots.append((record.sparring_dir, "checks"))
+    except ManagedRunError:
+        pass
+    roots.append((archive_dir(repo_root, record.run_key), "archive_state"))
+    unreadable: list[tuple[str, str]] = []
+    for root, step in roots:
+        path = Path(root) / "plans" / f"{record.run_key}.json"
+        if not os.path.lexists(path):
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("it is not a JSON object")
+            snapshots = trusted_snapshots.from_run_state(payload)
+        except (OSError, ValueError, trusted_snapshots.SnapshotError) as exc:
+            unreadable.append((step, f"{path}: {exc}"))
+            continue
+        if snapshots.primary is not None:
+            return _guarded(repo_root, record, snapshots)
+    nothing = "refusing to finish without it -- nothing was merged or deleted by this finish"
+    if unreadable:
+        step, detail = unreadable[0]
+        raise _StepFailed(
+            step,
+            f"{TRUSTED_CONFIG_MISSING}: the run state holding this run's trusted configuration "
+            f"snapshot cannot be read ({detail}); {nothing}",
+        )
+    if record.pinned or trusted_snapshots.engine_recorded(repo_root, record.run_key):
+        raise _StepFailed(
+            "checks",
+            f"{TRUSTED_CONFIG_MISSING}: the engine's record says this run held a trusted "
+            "configuration snapshot (its own, or a legacy pin's), but none can be found in its "
+            f"run state (removed, damaged or replaced); {nothing}",
+        )
+    # Readable without a snapshot, or absent, and the engine's record
+    # agrees: a run recorded before pins and snapshots.
+    return contextlib.nullcontext()
+
+
+@contextlib.contextmanager
+def _guarded(repo_root: Path, record: ManagedRunRecord, snapshots: Any):
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(engine_git.trusted_config(
+            [Path(repo_root), Path(record.worktree_path)], snapshots.primary
+        ))
+        for path, entries in snapshots.siblings.items():
+            stack.enter_context(engine_git.trusted_config([Path(path)], entries))
+        yield snapshots
 
 
 def _recorded_plan_removal(record: ManagedRunRecord) -> dict[str, Any]:
@@ -1005,18 +1176,29 @@ def _recorded_plan_removal(record: ManagedRunRecord) -> dict[str, Any]:
 
 
 def _recorded_remote_branch(record: ManagedRunRecord) -> dict[str, Any]:
+    """What a finished run's record says of its remote branch: an older
+    engine's recorded deletion, as history, else that the finish is local."""
+
     deleted = _events(record, "remote_branch_deleted")
     if deleted:
         detail = deleted[-1]["detail"]
         return _outcome(detail.get("code", "remote_branch_deleted"), detail.get("detail", "recorded"))
-    if not record.remote:
-        return _outcome("no_remote", "the record has no remote")
-    return _outcome(None, "no remote branch deletion is recorded")
+    return _outcome(LOCAL_FINISH, LOCAL_FINISH_DETAIL)
+
+
+def refused_push_target(run_key: str, *, merge_only: bool = False) -> dict[str, Any]:
+    """The ``finish-run`` report of ``--push-target``: refused with
+    ``remote_finish_removed`` before anything is read or changed."""
+
+    return _report(
+        run_key, [], "checks", push_target_removed(), _planned_steps(merge_only=merge_only, remove_plan=False),
+        remote_branch=_outcome(LOCAL_FINISH, LOCAL_FINISH_DETAIL),
+    )
 
 
 def _finish_locked(
     repo_root: Path, record: ManagedRunRecord, planned: list[str], completed: list[str],
-    notes: dict[str, Any], *, merge_only: bool, allow_merge_commit: bool, push_target: bool,
+    notes: dict[str, Any], *, merge_only: bool, allow_merge_commit: bool,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     run_key = record.run_key
 
@@ -1027,10 +1209,9 @@ def _finish_locked(
 
     def plan_steps(candidate: str) -> dict[str, bool]:
         policy = _finish_policy(repo_root, record, candidate)
-        planned[:] = _planned_steps(
-            merge_only=merge_only, push_target=push_target, remove_plan=policy["remove_plan"],
-            delete_remote=policy["delete_remote_branch"] and bool(record.remote),
-        )
+        if policy["delete_remote_branch"]:
+            raise _StepFailed("checks", delete_remote_branch_removed(policy["source"]))
+        planned[:] = _planned_steps(merge_only=merge_only, remove_plan=policy["remove_plan"])
         unreadable = policy["error"] and _outcome(
             "finish_config_unreadable", f"the candidate's [finish] config cannot be read: {policy['error']}"
         )
@@ -1038,10 +1219,6 @@ def _finish_locked(
             notes["plan_removal"] = unreadable or _outcome(
                 "plan_removal_disabled", "[finish] remove_plan is not enabled"
             )
-        if not record.remote:
-            notes["remote_branch"] = _outcome("no_remote", "the record has no remote; nothing to delete")
-        elif not policy["delete_remote_branch"]:
-            notes["remote_branch"] = unreadable or _outcome("remote_delete_disabled", REMOTE_DELETE_UNAVAILABLE)
         return policy
 
     removed = bool(_events(record, "worktree_removed"))
@@ -1074,14 +1251,20 @@ def _finish_locked(
         target_tip = _rev(repo_root, f"refs/heads/{record.target_branch}")
         if target_tip is None or not _is_ancestor(repo_root, candidate, target_tip):
             raise _StepFailed("merge", f"{record.target_branch} no longer contains the merged candidate {candidate}")
+        for event in _events(record, "sibling_merged"):
+            sibling = event["detail"]
+            root, sha = Path(sibling["path"]), sibling["candidate"]
+            tip = _rev(root, f"refs/heads/{record.target_branch}")
+            if tip is None or not _is_ancestor(root, sha, tip):
+                raise _StepFailed(
+                    "merge", f"{record.target_branch} of sibling repository {sibling['name']!r} no longer "
+                    f"contains the merged candidate {sha}",
+                )
         policy = plan_steps(candidate)
         completed.append("merge")
         if policy["remove_plan"]:
             record = _remove_plan_step(repo_root, record, notes)
             completed.append("remove_plan")
-        if push_target:
-            record = _push_target(repo_root, record, candidate)
-            completed.append("push_target")
         if merge_only:
             return report(None, "--merge-only: cleanup was not requested"), None
         if not _archive_readable(repo_root, record):
@@ -1090,13 +1273,11 @@ def _finish_locked(
     else:
         status = finish_status(repo_root, run_key, allow_merge_commit=allow_merge_commit, lock_held=True)
         finish, git = status["finish"], status["git"]
-        if git["final_candidate"]:
-            notes["kept"] = _kept_remote(repo_root, record, git["final_candidate"])
         if not finish["eligible"]["merge"] or (not merge_only and not finish["eligible"]["cleanup"]):
             return report("checks", finish["summary"]), finish
         candidate = git["final_candidate"]
         policy = plan_steps(candidate)
-        # 1. merge
+        # 1. merge, locally, in the primary repository and then in each sibling
         if finish["merge_mode"] == "already_merged":
             if not _events(record, "merged"):
                 record = managed_run.append_event(repo_root, run_key, "merged", {
@@ -1106,25 +1287,23 @@ def _finish_locked(
             record = managed_run.append_event(
                 repo_root, run_key, "merged", _merge(record, git, finish["merge_mode"], repo_root)
             )
+        for sibling in git["siblings"]:
+            record = _merge_sibling(repo_root, record, sibling)
         completed.append("merge")
         # 2. remove the plan (opt-in; refusals are reported, not stops)
         if policy["remove_plan"]:
             record = _remove_plan_step(repo_root, record, notes)
             completed.append("remove_plan")
-        # 3. push target
-        if push_target:
-            record = _push_target(repo_root, record, candidate)
-            completed.append("push_target")
         if merge_only:
             return report(None, "--merge-only: cleanup was not requested"), None
-        # 4. archive every ignored file under the project directory
+        # 3. archive every ignored file under the project directory
         destination, archived = _archive_state(repo_root, record)
         if not _archive_readable(repo_root, record):
             raise _StepFailed("archive_state", "unarchived_project_state: the archived run state is unreadable")
         if not _events(record, "state_archived"):
             record = managed_run.append_event(repo_root, run_key, "state_archived", {"path": str(destination)})
         completed.append("archive_state")
-        # 5. remove worktree -- only what is archived or reported may go
+        # 4. remove worktree -- only what is archived or reported may go
         _verify_archived(record, archived)
         deleted_ignored = _deleted_ignored(record)
         result = managed_run._git(repo_root, "worktree", "remove", record.worktree_path)
@@ -1135,7 +1314,7 @@ def _finish_locked(
         record = managed_run.append_event(repo_root, run_key, "worktree_removed")
     completed.append("remove_worktree")
 
-    # 6. delete local branch
+    # 5. delete local branch
     branch_ref = f"refs/heads/{record.branch}"
     tip = _rev(repo_root, branch_ref)
     if tip is not None:
@@ -1147,44 +1326,48 @@ def _finish_locked(
             raise _StepFailed("delete_branch", f"{record.target_branch} does not contain {candidate}")
         if tip != candidate:
             raise _StepFailed("delete_branch", f"{record.branch} is at {tip}, not the merged candidate {candidate}")
-        checkout = next(
-            (e["path"] for e in managed_run.worktree_list(repo_root) if e["branch"] == record.target_branch), None
-        )
-        if checkout is not None:
-            result = managed_run._git(Path(checkout), "branch", "-d", record.branch)
-        else:
-            result = managed_run._git(repo_root, "update-ref", "-d", branch_ref, candidate)
+        checked_out = [e["path"] for e in managed_run.worktree_list(repo_root) if e["branch"] == record.branch]
+        if checked_out:
+            raise _StepFailed(
+                "delete_branch", f"{record.branch} is checked out at {', '.join(checked_out)}; it is kept"
+            )
+        # Decided by the local target verified above and the exact tip, never
+        # by `git branch -d`, whose "merged" check prefers the branch's
+        # configured upstream -- a remote-tracking ref this finish never
+        # reads. The delete itself is a compare-and-delete on the candidate.
+        result = managed_run._git(repo_root, "update-ref", "-d", branch_ref, candidate)
         if result.returncode != 0:
             raise _StepFailed("delete_branch", f"the branch could not be deleted: {result.stderr.strip()}")
     if not _events(record, "branch_deleted"):
         record = managed_run.append_event(repo_root, run_key, "branch_deleted")
     completed.append("delete_branch")
 
-    # 7. delete the remote branch (opt-in; compare-and-delete on the candidate)
-    if "delete_remote_branch" in planned:
-        merged = _events(record, "merged")
-        merged_candidate = merged[-1]["detail"].get("candidate") if merged else None
-        if not merged_candidate:
-            raise _StepFailed("delete_remote_branch", "the record has no merged candidate")
-        if _events(record, "remote_branch_deleted"):
-            notes["remote_branch"] = _recorded_remote_branch(record)
-        else:
-            code, detail = _delete_remote_branch(repo_root, record, merged_candidate)
-            notes["remote_branch"] = _outcome(code, detail)
-            if code in REMOTE_KEEP_CODES:
-                notes["kept"] = _kept_remote(repo_root, record, merged_candidate, code=code, detail=detail)
-                raise _StepFailed("delete_remote_branch", f"{code}: {detail}")
-            record = managed_run.append_event(
-                repo_root, run_key, "remote_branch_deleted",
-                {"code": code, "detail": detail, "remote": record.remote, "candidate": merged_candidate},
-            )
-        notes["kept"] = []
-        completed.append("delete_remote_branch")
-
-    # 8. finished
+    # 6. finished
     managed_run.append_event(repo_root, run_key, "finished")
     completed.append("finished")
     return report(None, None), None
+
+
+def _merge_sibling(repo_root: Path, record: ManagedRunRecord, sibling: dict[str, Any]) -> ManagedRunRecord:
+    """Merge one sibling's accepted candidate into its local target, as
+    :func:`_sibling_status` checked it, and record ``sibling_merged``. Its
+    branch is the plan's, not a managed one: nothing there is deleted."""
+
+    detail = {"name": sibling["name"], "path": sibling["path"], "candidate": sibling["candidate"]}
+    recorded = [event["detail"] for event in _events(record, "sibling_merged")]
+    if sibling["merge_mode"] == "already_merged":
+        if not any(entry.get("path") == sibling["path"] and entry.get("candidate") == sibling["candidate"]
+                   for entry in recorded):
+            record = managed_run.append_event(repo_root, record.run_key, "sibling_merged", {
+                **detail, "mode": "already_merged", "target_sha": sibling["target_tip"],
+            })
+        return record
+    merged = _merge_into(
+        Path(sibling["path"]), target_branch=sibling["target_branch"], source_branch=record.branch,
+        candidate=sibling["candidate"], old_tip=sibling["target_tip"],
+        checkout=sibling["target_checked_out_at"], merge_mode=sibling["merge_mode"],
+    )
+    return managed_run.append_event(repo_root, record.run_key, "sibling_merged", {**detail, **merged})
 
 
 def _foreign_branch(record: ManagedRunRecord) -> str | None:
@@ -1207,75 +1390,6 @@ def _foreign_branch(record: ManagedRunRecord) -> str | None:
             "distinct from its target; refusing to delete it"
         )
     return None
-
-
-def _delete_remote_branch(repo_root: Path, record: ManagedRunRecord, candidate: str) -> tuple[str, str]:
-    """Delete ``refs/heads/<branch>`` on the record's remote only while it is
-    exactly ``candidate``: the lease is checked by the server at the delete
-    itself. ``(code, detail)``.
-
-    Before the push, the remote is read at its **push** URL (where the
-    delete goes, after ``pushurl``/``pushInsteadOf``): an absent branch is
-    success without a push, and a remote target that does not yet contain
-    the candidate keeps the branch (``remote_target_missing_candidate``).
-    Those reads inform only; the lease is the guard. A refused push is
-    classified from its own ``--porcelain`` status line, never by reading
-    the remote again, so a refusal is never reported as absent or deleted."""
-
-    ref = f"refs/heads/{record.branch}"
-    where = f"{record.remote}/{record.branch}"
-    refused = _foreign_branch(record)
-    if refused:
-        return "remote_delete_rejected", f"{refused}; nothing was read or pushed and {where} is kept"
-    push_urls = managed_run._git(repo_root, "remote", "get-url", "--push", "--all", record.remote)
-    urls = [u for u in push_urls.stdout.splitlines() if u.strip()] if push_urls.returncode == 0 else []
-    if len(urls) > 1:
-        return "remote_multiple_push_urls", (
-            f"{record.remote} has {len(urls)} push URLs ({', '.join(urls)}); a per-URL lease delete is not "
-            f"supported, so nothing was read or pushed and {where} is kept"
-        )
-    url = urls[0] if urls else record.remote
-    ok, branch_sha, error = _remote_sha(repo_root, url, record.branch)
-    if not ok:
-        return "remote_unreachable", f"{where} cannot be reached at {url} ({error}); the branch is kept"
-    if branch_sha is None:
-        return "remote_branch_absent", f"{where} does not exist at {url}; nothing to delete"
-    ok, target_sha, error = _remote_sha(repo_root, url, record.target_branch)
-    if not ok:
-        return "remote_unreachable", f"{record.remote}/{record.target_branch} cannot be read at {url} ({error})"
-    if target_sha is not None and _rev(repo_root, target_sha) is None:
-        return "remote_target_unknown", (
-            f"{record.remote}/{record.target_branch} at {url} is {target_sha}, which is not present locally; "
-            f"fetch first, then re-run. {where} is kept"
-        )
-    if target_sha is None or not _is_ancestor(repo_root, candidate, target_sha):
-        return "remote_target_missing_candidate", (
-            f"{record.remote}/{record.target_branch} at {url} is {target_sha or 'absent'} and does not contain "
-            f"the merged candidate {candidate}; push the target (--push-target) and re-run. {where} is kept"
-        )
-    result = managed_run._git(
-        repo_root, "push", "--porcelain", f"{REMOTE_DELETE_LEASE}={ref}:{candidate}", record.remote, "--delete", ref,
-    )
-    lines = result.stdout.splitlines()
-    sections = [line for line in lines if line.startswith("To ")]
-    statuses = [line.split("\t") for line in lines if line.count("\t") >= 2 and f":{ref}" in line]
-    error = (result.stderr.strip() or result.stdout.strip() or "git push --delete failed").splitlines()[-1]
-    if not statuses:
-        return "remote_unreachable", f"the delete of {where} did not reach the remote ({error}); the branch is kept"
-    if result.returncode == 0 and all(status[0] == "-" for status in statuses):
-        return "remote_branch_deleted", f"{where} was exactly {candidate} and is deleted"
-    summary = "; ".join(status[2] for status in statuses if status[0] != "-") or error
-    if len(sections) > 1 or len(statuses) > 1:
-        return "remote_delete_rejected", (
-            f"the delete of {where} went to {max(len(sections), len(statuses))} destinations and not every one "
-            f"deleted it ({summary}); it is not recorded deleted"
-        )
-    if "stale info" in summary:
-        return "remote_lease_mismatch", (
-            f"{where} is no longer exactly the merged candidate {candidate}; the lease refused the delete "
-            f"({summary}) and it is kept"
-        )
-    return "remote_delete_rejected", f"the remote refused deleting {where}: {summary}; the branch is kept"
 
 
 # -- plan removal ------------------------------------------------------------------
@@ -1327,10 +1441,12 @@ def _plan_snapshot(repo_root: Path, record: ManagedRunRecord) -> tuple[bytes, st
 
 def _git_bytes(cwd: Path, *args: str, env: dict[str, str] | None = None,
                stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        ["git", "-C", str(cwd), *args], capture_output=True, check=False, input=stdin,
-        env={**os.environ, **env} if env else None,
-    )
+    # The one engine Git path; ``env`` is applied over its sanitized
+    # environment, so a deliberate GIT_INDEX_FILE here still takes effect.
+    try:
+        return engine_git.run(cwd, *args, text=False, input=stdin, env=env)
+    except engine_git.GitConfigRefusal as exc:
+        raise ManagedRunError(exc.code, str(exc)) from exc
 
 
 def _git_identity(repo_root: Path) -> str | None:
@@ -1499,34 +1615,6 @@ def _commit_removal_by_plumbing(repo_root: Path, target_ref: str, rel: str, old:
     if swapped.returncode != 0:
         return None, _outcome("plan_commit_failed", f"{target_ref} moved: {swapped.stderr.strip()}")
     return new, None
-
-
-def _push_target(repo_root: Path, record: ManagedRunRecord, candidate: str) -> ManagedRunRecord:
-    """Push the target unless the remote target already contains the
-    candidate (and a recorded plan-removal commit); never forced, so a
-    rejection stops the finish here."""
-
-    if not record.remote:
-        raise _StepFailed("push_target", "the record has no remote to push the target to")
-    ok, remote_tip, error = _remote_sha(repo_root, record.remote, record.target_branch)
-    if not ok:
-        raise _StepFailed("push_target", error)
-    removal = _events(record, "plan_removed")
-    must_contain = [candidate] + ([removal[-1]["detail"]["commit"]] if removal else [])
-    if (
-        remote_tip is None
-        or _rev(repo_root, remote_tip) is None
-        or not all(_is_ancestor(repo_root, sha, remote_tip) for sha in must_contain)
-    ):
-        result = managed_run._git(
-            repo_root, "-c", "push.followTags=false", "push", record.remote,
-            f"refs/heads/{record.target_branch}:refs/heads/{record.target_branch}",
-        )
-        if result.returncode != 0:
-            raise _StepFailed("push_target", f"the push was rejected: {result.stderr.strip()}")
-    if not _events(record, "target_pushed"):
-        record = managed_run.append_event(repo_root, record.run_key, "target_pushed", {"remote": record.remote})
-    return record
 
 
 # -- prune ------------------------------------------------------------------------

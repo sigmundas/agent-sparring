@@ -171,6 +171,16 @@ MODES: tuple[str, ...] = (MODE_FAITHFUL, MODE_REFINE, MODE_COMPILE)
 #: a brief that no longer renders to what its own intake recorded is refused.
 BRIEF_FORMAT_VERSION = 2
 
+#: Which engine findings :func:`check_interpretation` computes, recorded in
+#: ``intake.json`` as ``findings_version`` by every intake prepared from this
+#: version on. ``2`` adds the ``automatable_human_gate`` recommendation; an
+#: intake recording no value was prepared before that check existed (``1``).
+#: Approval recomputes findings -- and re-renders ``report.md`` from them --
+#: with the set its own intake recorded, so a check added later never changes
+#: the report a person already reviewed. The report is still compared byte
+#: for byte; only the set of checks is versioned.
+FINDINGS_VERSION = 2
+
 #: Name of the file that proves a ``prepare_plan`` turn finished. Written as
 #: the very last step of a successful prepare; an intake whose ``intake.json``
 #: names this key (every intake from this version on) is usable only once it
@@ -242,7 +252,10 @@ TRANSFORMS: tuple[str, ...] = (
     "conditional_sibling",
 )
 
-GATE_KINDS: tuple[str, ...] = ("production", "manual", "external", "deferred")
+#: ``authorization`` is a person's decision to let the run continue into the
+#: stages a gate blocks (a go-ahead); every other kind is something that must
+#: be done or verified. The runtime asks for the two differently.
+GATE_KINDS: tuple[str, ...] = ("production", "manual", "authorization", "external", "deferred")
 STAGE_MODES: tuple[str, ...] = tuple(mode.value for mode in StageMode)
 
 _HORIZONTAL_RULE_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
@@ -296,7 +309,37 @@ _GATE_KIND_EVIDENCE: dict[str, re.Pattern[str]] = {
     "manual": re.compile(r"\b(manual\w*|canar(y|ies)|owner|go-ahead|sign-?off|approv\w*)\b", re.IGNORECASE),
     "external": re.compile(r"\b(external|third[- ]party|vendor|upstream)\b", re.IGNORECASE),
     "deferred": re.compile(r"\b(defer\w*|later|follow-?up)\b", re.IGNORECASE),
+    "authorization": re.compile(r"\b(go-ahead|authori[sz]\w*|permission|approv\w*)\b", re.IGNORECASE),
 }
+#: A manual gate and an authorization gate are both a person's action, and the
+#: same words ("approval", "go-ahead") evidence either; moving a gate may not
+#: turn it into another family, but within this one the kind is the
+#: interpreter's reading.
+_GATE_KIND_FAMILY: dict[str, str] = {"authorization": "manual"}
+_AUTHORIZATION_WORDING_RE = re.compile(r"\b(go-ahead|authori[sz]\w*|permission)\b", re.IGNORECASE)
+#: A manual gate whose own text describes only scriptable verification (API
+#: requests, SQL, a migration on a disposable target, tests, browser
+#: automation) and none of what makes a check genuinely human. Matching gates
+#: get a recommendation finding proposing agent verification; the gate itself
+#: is never changed. The heuristic deliberately leans toward not flagging: any
+#: human-only word suppresses the finding, because a missed flag only loses
+#: advice while a wrong one asks a person to give up a genuine check.
+#: "operator" is deliberately not a human-only word: plans describe
+#: scriptable checks as an operator's procedure (the ingestion G1).
+_SCRIPTABLE_CHECK_RE = re.compile(
+    r"\b(api|http\w*|endpoints?|requests?|curl|sql|queries|query|migrations?|"
+    r"disposable|staging|local target|playwright|browser automation|scripts?|"
+    r"automated|unit tests?|integration tests?|test suites?|assertions?)\b",
+    re.IGNORECASE,
+)
+_HUMAN_ONLY_CHECK_RE = re.compile(
+    r"\b(devices?|hardware|physical\w*|android|ios|iphone|ipad|phones?|tablets?|"
+    r"cameras?|gps|offline|on-site|field|visual\w*|look(s|ing)?|feel|tast\w*|"
+    r"aesthetic\w*|design\w*|usability|accessibility|screen readers?|real (sessions?|hardware)|human|manually|sign(s|ed)?[- ]off|judg(e)?ment|subjective|real (users?|accounts?|customers?)|"
+    r"e-?mails?|payments?|publish\w*|app stores?|production|prod|live|deploy\w*|"
+    r"go-ahead|authori[sz]\w*|permission|decid\w*|decision|continu\w*|scope)\b",
+    re.IGNORECASE,
+)
 
 
 class IntakeError(RuntimeError):
@@ -922,6 +965,7 @@ def check_interpretation(
     *,
     mode: str,
     compile_context: CompileContext | None = None,
+    findings_version: int = FINDINGS_VERSION,
 ) -> tuple[Finding, ...]:
     """Everything the engine can verify about an interpretation, as findings.
 
@@ -1055,6 +1099,30 @@ def check_interpretation(
                 f"context block {block.id!r} is attached to no stage, so its text reaches no "
                 "brief; attach it to the stages it constrains, or exclude it with a reason",
                 ranges=block.ranges,
+            )
+
+    # A plan may declare a scriptable check as a manual gate. Flag it with a
+    # proposal, never change it: the gate stays as declared unless the person
+    # amends the plan. Only for intakes whose findings version includes it.
+    for gate in interpretation.gates if findings_version >= 2 else ():
+        if gate.kind != "manual":
+            continue
+        good = [r for r in gate.ranges if 1 <= r.start <= r.end <= total]
+        text = " ".join([gate.title, *(source.lines[n - 1] for n in sorted(_lines(good, total)))])
+        if _SCRIPTABLE_CHECK_RE.search(text) and not _HUMAN_ONLY_CHECK_RE.search(text):
+            add(
+                "automatable_human_gate",
+                f"manual gate {gate.id!r} ({gate.title}) describes scriptable verification "
+                "(API/SQL/migration/test/browser automation): its described steps appear "
+                "scriptable and mention no device, real-world, external or production action. "
+                "Consider reclassifying "
+                "it as agent verification: the stage runs it and reports the results as test "
+                "evidence, the independent review checks them, and the person supplies only "
+                "inputs the agent lacks (credentials, a disposable target, a URL). The gate "
+                "is kept as declared unless you amend the plan.",
+                stages=[s for s in (gate.after_stage, *gate.blocks_stages) if s],
+                ranges=good,
+                severity=SEVERITY_RECOMMENDATION,
             )
 
     # Gates may only sit at run-slice boundaries. The runtime cannot wait for
@@ -1475,8 +1543,18 @@ def _transform_problem(
             if not set(finding.stages) & ({gate.after_stage} | set(gate.blocks_stages)):
                 return f"gate {gate.id!r} neither follows nor blocks the named stages"
             text = " ".join(source.lines[n - 1] for n in sorted(_lines(gate.ranges, total)))
-            kinds = {kind for kind, evidence in _GATE_KIND_EVIDENCE.items() if evidence.search(text)}
-            if kinds != {gate.kind}:
+            kinds = {
+                _GATE_KIND_FAMILY.get(kind, kind)
+                for kind, evidence in _GATE_KIND_EVIDENCE.items()
+                if evidence.search(text)
+            }
+            # An authorization is never inferred from verification wording.
+            if gate.kind == "authorization" and not _AUTHORIZATION_WORDING_RE.search(text):
+                return (
+                    f"gate {gate.id!r}'s source text does not state an authorization "
+                    "(go-ahead, permission or authorization)"
+                )
+            if kinds != {_GATE_KIND_FAMILY.get(gate.kind, gate.kind)}:
                 found = ", ".join(sorted(kinds)) or "none"
                 return (
                     f"gate {gate.id!r}'s source text does not establish its kind {gate.kind!r} "
@@ -1538,11 +1616,14 @@ def all_findings(
     *,
     mode: str,
     compile_context: CompileContext | None = None,
+    findings_version: int = FINDINGS_VERSION,
 ) -> tuple[Finding, ...]:
     """Agent findings then engine findings, blocking first within each. In
     compile mode the agent's auto-resolutions are guarded first."""
 
-    engine = check_interpretation(interpretation, source, mode=mode, compile_context=compile_context)
+    engine = check_interpretation(
+        interpretation, source, mode=mode, compile_context=compile_context, findings_version=findings_version
+    )
     agent = (
         guard_compile_findings(interpretation, source, compile_context)
         if mode == MODE_COMPILE and compile_context is not None
@@ -1550,6 +1631,18 @@ def all_findings(
     )
     ordered = list(agent) + list(engine)
     return tuple(sorted(ordered, key=lambda f: SEVERITIES.index(f.severity)))
+
+
+def recorded_findings_version(record: Mapping[str, Any]) -> int:
+    """The ``findings_version`` an intake recorded (see ``FINDINGS_VERSION``):
+    ``1`` when absent, from before the field existed; an unknown value refuses."""
+
+    value = record.get("findings_version")
+    if value is None:
+        return 1
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= FINDINGS_VERSION:
+        raise IntakeError(f"intake.json records an unsupported findings version {value!r}; run prepare-plan again")
+    return value
 
 
 def slice_manifest_gates(
@@ -2180,7 +2273,9 @@ def prepare_plan(
         if mode == MODE_COMPILE
         else None
     )
-    findings = all_findings(interpretation, source, mode=mode, compile_context=compile_context)
+    findings = all_findings(
+        interpretation, source, mode=mode, compile_context=compile_context, findings_version=FINDINGS_VERSION
+    )
     if validate is not None:
         validate(interpretation, findings)
 
@@ -2229,6 +2324,7 @@ def prepare_plan(
         "version": INTAKE_VERSION,
         "intake_id": intake_id,
         "brief_format_version": BRIEF_FORMAT_VERSION,
+        "findings_version": FINDINGS_VERSION,
         "completion_marker": COMPLETION_MARKER_FILENAME,
         "mode": mode,
         "created_at": now().isoformat(),
@@ -3067,6 +3163,7 @@ def build_approval(
         include_goal = True
     else:
         raise IntakeError(f"intake.json records an unsupported brief format {brief_format!r}; run prepare-plan again")
+    findings_version = recorded_findings_version(record)
     marker_problem = completion_marker_problem(intake_dir, record)
     if marker_problem:
         raise IntakeError(marker_problem)
@@ -3091,7 +3188,9 @@ def build_approval(
     source = SourcePlan(label=str(record["plan_label"]), text=snapshot)
     interpretation = parse_interpretation(interpretation_text, mode=mode)
     compile_context = CompileContext.from_record(record) if mode == MODE_COMPILE else None
-    findings = all_findings(interpretation, source, mode=mode, compile_context=compile_context)
+    findings = all_findings(
+        interpretation, source, mode=mode, compile_context=compile_context, findings_version=findings_version
+    )
     # Derived from the interpretation itself, never taken from intake.json.
     amendment_proposed = (
         mode != MODE_COMPILE

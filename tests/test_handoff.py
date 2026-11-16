@@ -52,7 +52,6 @@ class HandoffTests(unittest.TestCase):
         self.stage = Stage.resolve(self.sparring_dir, "stage-1").create()
 
     def _git_context(self, **kwargs):
-        kwargs.setdefault("check_pushed", False)
         return gather_git_context(
             self.repo, base_sha=self.base_sha, candidate_sha=self.candidate_sha, **kwargs
         )
@@ -84,7 +83,7 @@ class HandoffTests(unittest.TestCase):
         self.assertIn("+two", content)
 
     def test_self_contained_without_base_reports_unavailable(self):
-        git = gather_git_context(self.repo, candidate_sha=self.candidate_sha, check_pushed=False)
+        git = gather_git_context(self.repo, candidate_sha=self.candidate_sha)
         handoff_input = HandoffInput(stage_goal="g", claims="c", git=git)
         content = build_self_contained_packet(self.stage, handoff_input, self.repo)
         self.assertIn("cannot compute a diff", content)
@@ -144,10 +143,18 @@ class HandoffTests(unittest.TestCase):
             self.repo,
             stage_goal="Implement the thing.",
             claims="Done.",
-            check_pushed=False,
         )
         self.assertEqual(self.stage.read_handoff(), content)
         self.assertIn(self.candidate_sha, content)
+
+    def test_the_handoff_reports_a_local_commit_and_keeps_the_branch_line(self):
+        content = render_thin_handoff(
+            self.stage, HandoffInput(stage_goal="g", claims="c", git=self._git_context())
+        )
+        self.assertIn(f"- Local commit: `{self.candidate_sha}` on `main`", content)
+        # Kept for the current VS Code extension, which reads it.
+        self.assertIn("- Branch: `main`", content)
+        self.assertNotIn("Pushed:", content)
 
 
 if __name__ == "__main__":

@@ -115,10 +115,14 @@ S3 = f"{KEY}-stage-3-prefetch-and-enrichment"
 class _StageAdapter:
     """Issues a distinct session id per fresh start (``impl-1``, ``impl-2``,
     ...) and echoes the resumed id back, so tests can tell fresh sessions
-    from resumed ones. Can commit (and optionally push) a file on each turn,
-    and can fail on a given 1-indexed call."""
+    from resumed ones. Can commit a file on each turn, and can fail on a given
+    1-indexed call.
 
-    def __init__(self, repo: Path, *, commit: bool = False, push: bool = True, fail_at: int | None = None):
+    It does not push by default: runs are local-first and nothing pushes.
+    ``push=True`` models an agent pushing on its own, which a local-first
+    run neither needs nor reads."""
+
+    def __init__(self, repo: Path, *, commit: bool = False, push: bool = False, fail_at: int | None = None):
         self.repo = repo
         self.commit = commit
         self.push = push
@@ -270,7 +274,15 @@ class _PlanRepoTestCase(unittest.TestCase):
         self.run_key = plan_key("docs/plan.md")
         self.state_path = run_state_path(self.sparring_dir, self.run_key)
 
+    #: Runs are local-first and never push, so no run is started with the
+    #: retired run-level push grant (it refuses with push_not_part_of_runs;
+    #: see test_local_first.py). Kept as a switch only for a test that
+    #: asserts that refusal.
+    GRANT_PUSH_FOR_RUN = False
+
     def _start(self, stage_adapter, sparring_adapter, **kwargs):
+        if self.GRANT_PUSH_FOR_RUN:
+            kwargs.setdefault("allow_push_for_run", True)
         return start_plan(
             self.plan_path, self.sparring_dir, self.repo, _fixed(stage_adapter, sparring_adapter),
             expected_branch="feature/x", run_key=kwargs.pop("run_key", self.run_key), **kwargs,
@@ -668,7 +680,6 @@ class PlanRunTests(_PlanRepoTestCase):
         (self.repo / "prereq.txt").write_text("prerequisite\n", encoding="utf-8")
         _run_git(self.repo, "add", "prereq.txt")
         _run_git(self.repo, "commit", "-q", "-m", "separate prerequisite")
-        _run_git(self.repo, "push", "-q", "origin", "feature/x")
         advanced = _head_sha(self.repo)
         return stage_adapter, pinned, advanced
 
@@ -817,8 +828,8 @@ class PlanRunTests(_PlanRepoTestCase):
         self.assertEqual(stage_adapter.start_calls, [])
 
     def test_stage_agent_editing_a_plan_stage_section_blocks_acceptance_and_advance(self):
-        # The implementation turn rewrites (and commits and pushes) a stage
-        # section of the reviewed plan; the sparrer still says READY.
+        # The implementation turn rewrites (and commits) a stage section of
+        # the reviewed plan; the sparrer still says READY.
         class _PlanEditingStageAdapter(_StageAdapter):
             def _turn(self, session_id):
                 text = self.repo.joinpath("docs/plan.md").read_text(encoding="utf-8")
@@ -826,7 +837,6 @@ class PlanRunTests(_PlanRepoTestCase):
                     text.replace("Render incrementally.", "Render everything at once."), encoding="utf-8"
                 )
                 _run_git(self.repo, "commit", "-q", "-am", "agent edits the plan")
-                _run_git(self.repo, "push", "-q", "origin", "feature/x")
                 return super()._turn(session_id)
 
         stage_adapter = _PlanEditingStageAdapter(self.repo)
@@ -855,7 +865,6 @@ class PlanRunTests(_PlanRepoTestCase):
                     text.replace("Trailing prose", "Trailing prose, amended"), encoding="utf-8"
                 )
                 _run_git(self.repo, "commit", "-q", "-am", "agent edits non-stage prose")
-                _run_git(self.repo, "push", "-q", "origin", "feature/x")
                 return super()._turn(session_id)
 
         result = self._start(_ProseEditingStageAdapter(self.repo), _SparringAdapter([READY, READY]))
@@ -1003,7 +1012,8 @@ class PlanCliTests(_PlanRepoTestCase):
         adapters = (_StageAdapter(self.repo, commit=True), _SparringAdapter([READY]))
         code, out, err = self._main(
             "run-plan", str(self.plan_path), "--repo-root", str(self.repo),
-            "--expected-branch", "feature/x", "--stop-after-stage", S1, adapters=adapters,
+            "--expected-branch", "feature/x", "--stop-after-stage", S1,
+            adapters=adapters,
         )
 
         self.assertEqual(code, 0, err)

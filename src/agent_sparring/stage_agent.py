@@ -334,7 +334,6 @@ def run_stage_agent(
                     repo_root,
                     stage_goal=stage.read_brief(),
                     claims=result.text,
-                    check_pushed=False,
                     base_sha=base_sha,
                 )
             except GitContextError as exc:

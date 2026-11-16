@@ -50,8 +50,9 @@ def _head(repo: Path) -> str:
 
 
 class _Committer:
-    """A stage agent that commits and pushes one file per turn on ``branch``,
-    optionally doing something else first (the ``during`` hook)."""
+    """A stage agent that commits one file per turn on ``branch``, optionally
+    doing something else first (the ``during`` hook). It never pushes: the
+    engine pushes, after authorization."""
 
     def __init__(self, repo: Path, branch: str, *, during=None, fail_at=None):
         self.repo, self.branch, self.during, self.fail_at = repo, branch, during, fail_at
@@ -67,7 +68,6 @@ class _Committer:
         path.write_text("work\n", encoding="utf-8")
         _git(self.repo, "add", path.name)
         _git(self.repo, "commit", "-q", "-m", f"turn {self.calls}")
-        _git(self.repo, "push", "-q", "origin", self.branch)
         return StageAgentResult(session_id=session_id, text="claims", is_error=False)
 
     def start(self, prompt):

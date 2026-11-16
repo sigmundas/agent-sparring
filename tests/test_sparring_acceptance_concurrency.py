@@ -30,6 +30,7 @@ from agent_sparring.acceptance import (
     AcceptanceError,
     accept_candidate,
     freeze_candidate,
+    record_review,
 )
 from agent_sparring.loop import run_unattended_loop
 from agent_sparring.providers import SparringAgentResult, StageAgentResult
@@ -177,6 +178,9 @@ class SparringAcceptanceConcurrencyTests(unittest.TestCase):
         )
 
     def _accept(self):
+        # Plan L (I-L2): the reviewer's READY at the exact candidate, as the
+        # engine records it with a verdict.
+        record_review(self.stage, self.repo, RoutingAction.READY)
         return accept_candidate(self.stage, self.repo, expected_branch="feature/x")
 
     # -- Finding: sparring must not reverse a concurrent ACCEPTED transition
